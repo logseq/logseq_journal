@@ -480,6 +480,7 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
             Core.graph_key_handle
               ~id:("graph-key-" ^ Core.effect_id_to_string (Core.effect_ticket_id ticket))
               ~scope
+          | Await_io _
           | Asset_io _
           | Protected_io _
           | Request _
@@ -596,6 +597,7 @@ let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
             Core.graph_key_handle
               ~id:("graph-key-" ^ Core.effect_id_to_string (Core.effect_ticket_id ticket))
               ~scope
+          | Await_io _
           | Asset_io _
           | Protected_io _
           | Request _
@@ -1758,14 +1760,15 @@ let test_cache_staged_preview () =
     let file, _, _ = cache_stage request ~file_type:"pdf" source in
     let lease, path = request (Core.Retain_staged_file file) |> retained_value in
     cache_unit (request (Core.Release_staged_file file));
-    cache_unit (request Core.Close_asset_scope);
-    cache_bool
-      "close invalidates preview lease"
-      true
-      (request (Core.Retain_asset_file lease) = Ok (Core.Asset_retained None));
-    cache_bool "close finishes deferred cleanup" false (Sys.file_exists path);
+    cache_bool "close cannot invalidate a live preview" true
+      (Result.is_error(request Core.Close_asset_scope));
+    cache_bool "failed close preserves retained bytes" true(Sys.file_exists path);
+    cache_unit(request(Core.Release_asset_file lease));
+    cache_unit(request Core.Close_asset_scope);
+    cache_bool "checked release finishes deferred cleanup" false(Sys.file_exists path);
     let file, _, _ = cache_stage request ~file_type:"pdf" source in
-    let _, path = request (Core.Retain_staged_file file) |> retained_value in
+    let lease, path = request (Core.Retain_staged_file file) |> retained_value in
+    cache_unit(request(Core.Release_asset_file lease));
     cache_unit (request Core.Close_asset_scope);
     cache_bool "close preserves nonterminal staging" true (Sys.file_exists path))
 ;;

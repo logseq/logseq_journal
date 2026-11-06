@@ -19,6 +19,7 @@ type t =
   ; fingerprint : string
   ; mutation : Types.local_mutation
   ; normalized_transaction : string
+  ; append_create : bool
   ; mutable dependency_shadows : dependency_shadows
   ; effect_footprint : footprint
   ; delete_artifacts : delete_artifacts option
@@ -126,10 +127,30 @@ type asset_reference_v16 =
   }
 [@@deriving yojson]
 
+type append_node_wire =
+  { uuid : string; title : string; task_status : string option; children : append_node_wire list }
+[@@deriving yojson]
+
+type append_journal_wire =
+  {mutation_id:string;page:string;title:string;journal_day:int;root:append_node_wire}
+[@@deriving yojson]
+
+let rec append_to_wire (node:Types.append_node) : append_node_wire =
+  {uuid=Graph.Uuid.to_string node.uuid;title=node.title;
+   task_status=Option.map Graph.Uuid.to_string node.task_status;
+   children=Rrbvec.map append_to_wire node.children |> Rrbvec.to_list}
+let rec append_of_wire (node:append_node_wire) =
+  let* uuid=Graph.Uuid.of_string node.uuid in
+  let* task_status=match node.task_status with None->Ok None
+    |Some id->Graph.Uuid.of_string id |> Result.map Option.some in
+  let* children=list_map_result append_of_wire node.children in
+  Ok Types.{uuid;title=node.title;task_status;children=Rrbvec.of_list children}
+
 type mutation_wire =
   | Set_asset_reference of asset_reference_v16
   | Publish_asset of publish_asset_v16
   | Save_block of save_block_v16
+  | Append_journal of append_journal_wire
   | Insert_blocks of insert_blocks_v16
   | Delete_blocks of delete_blocks_v16
   | Create_journal_page of create_journal_page_v16
@@ -152,6 +173,9 @@ let mutation_to_wire = function
       ; checksum = version.checksum
       ; file_type = version.file_type
       }
+  | Types.Append_journal{mutation_id;page;title;journal_day;root}->
+    Append_journal{mutation_id=Graph.Uuid.to_string mutation_id;page=Graph.Uuid.to_string page;
+      title;journal_day;root=append_to_wire root}
   | Types.Save_block { mutation_id; block; title } ->
     Save_block
       { block = Graph.Uuid.to_string block
@@ -198,6 +222,11 @@ let mutation_to_wire = function
 ;;
 
 let mutation_of_wire = function
+  | Append_journal value->
+    let* mutation_id=Graph.Uuid.of_string value.mutation_id in
+    let* page=Graph.Uuid.of_string value.page in
+    let* root=append_of_wire value.root in
+    Ok(Types.Append_journal{mutation_id;page;title=value.title;journal_day=value.journal_day;root})
   | Set_asset_reference value ->
     let* mutation_id = Graph.Uuid.of_string value.mutation_id in
     let* block = Graph.Uuid.of_string value.block in
@@ -579,7 +608,8 @@ let acceptance_barrier_of_dto barrier =
 ;;
 
 type outbox_record_v16 =
-  { acceptance_barrier : acceptance_barrier_v16 option
+  { append_create : bool [@default false]
+  ; acceptance_barrier : acceptance_barrier_v16 option
   ; attempt_count : int
   ; blocked_prior_state : transport_state_wire option
   ; blocked_reason : Json.block_reason option
@@ -612,6 +642,7 @@ let mutation_id = function
   | Types.Save_block value -> value.mutation_id
   | Publish_asset value -> value.mutation_id
   | Set_asset_reference value -> value.mutation_id
+  | Append_journal value -> value.mutation_id
   | Insert_blocks value -> value.mutation_id
   | Delete_blocks value -> value.mutation_id
   | Create_journal_page value -> value.mutation_id
@@ -620,7 +651,8 @@ let mutation_id = function
 ;;
 
 let encode ~sync_revision (record : t) =
-  ({ acceptance_barrier = Option.map acceptance_barrier_to_dto record.acceptance_barrier
+  ({ append_create=record.append_create
+   ; acceptance_barrier = Option.map acceptance_barrier_to_dto record.acceptance_barrier
    ; attempt_count = record.attempt_count
    ; blocked_prior_state = Option.map transport_state_to_wire record.blocked_prior_state
    ; blocked_reason = record.blocked_reason
@@ -716,6 +748,7 @@ let decode source =
           ; fingerprint = dto.fingerprint
           ; mutation = dto.mutation
           ; normalized_transaction = dto.normalized_transaction
+          ; append_create=dto.append_create
           ; dependency_shadows
           ; effect_footprint
           ; delete_artifacts

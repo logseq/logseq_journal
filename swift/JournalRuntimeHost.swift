@@ -14,13 +14,20 @@ struct JournalRuntimeHost: View {
   let platform: JournalApplicationPlatform
   let payload: Data
   let extensions: LUIAppleExtensionRegistry
-  @State private var runtime: JournalRuntime?
-  @State private var startingRuntime: JournalRuntime?
+  @State private var lifetime = JournalRuntimeLifetime()
+  private var runtime: JournalRuntime? {
+    get { lifetime.runtime }
+    nonmutating set { lifetime.runtime = newValue }
+  }
+  private var startingRuntime: JournalRuntime? {
+    get { lifetime.startingRuntime }
+    nonmutating set { lifetime.startingRuntime = newValue }
+  }
   @State private var fallbackClock = JournalStartupClock()
   @State private var graphScrollOffsets = JournalGraphScrollOffsets()
   @Environment(\.journalStartupClock) private var inheritedClock
   @State private var failure: Error?
-  @State private var retry = 0
+  @State private var startupRevision = 0
   private var clock: JournalStartupClock { inheritedClock ?? fallbackClock }
 
   private var content: some SwiftUI.View {
@@ -30,13 +37,7 @@ struct JournalRuntimeHost: View {
           Label("Unable to open journal", systemImage: "exclamationmark.folder")
         } description: {
           Text(runtime?.failureDescription ?? failure.map { JournalRuntime.safeDescription($0,operation:"runtime.start.failed") } ??
-            "Journal could not start (runtime.start.failed). Retry opening Journal.")
-        } actions: {
-          Button("Retry") {
-            guard runtime?.stop() != false, startingRuntime?.stop() != false else { return }
-            runtime = nil; startingRuntime = nil; failure = nil; graphScrollOffsets.retain([]); clock.restart(); retry += 1
-          }
-            .accessibilityIdentifier("journal-runtime-retry")
+            "Journal could not start (runtime.start.failed).")
         }
       } else if let runtime, let rootID = runtime.rootID {
         LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
@@ -63,7 +64,7 @@ struct JournalRuntimeHost: View {
     .environment(\.journalStartupClock, clock)
     .environment(\.journalGraphScrollOffsets, graphScrollOffsets)
     .background(JournalEnvironmentObserver { platform.pushEnvironment($0) })
-    .task(id: retry) {
+    .task(id: startupRevision) {
       if runtime == nil && startingRuntime == nil {
         do {
           let next = try JournalRuntime(
@@ -84,7 +85,7 @@ struct JournalRuntimeHost: View {
                 startingRuntime = nil
                 if Task.isCancelled {
                   if let stoppedFailure = next.failure { failure = stoppedFailure }
-                  else { retry += 1 }
+                  else { startupRevision += 1 }
                 }
               }
             } else if startingRuntime === next {
@@ -100,11 +101,6 @@ struct JournalRuntimeHost: View {
             .error("Unable to start journal runtime (runtime.start.failed)")
         }
       }
-    }
-    .onDisappear {
-      graphScrollOffsets.retain([])
-      runtime?.stop()
-      if startingRuntime?.stop() == false { failure = startingRuntime?.failure }
     }
   }
 }
@@ -185,7 +181,6 @@ struct JournalHost: View {
   let authentication: any JournalAuthenticationAPI
   @Environment(\.scenePhase) private var scenePhase
   @State private var setup: Result<JournalRuntimeSetup, Error>?
-  @State private var retry = 0
   @State private var signInPresented = false
   @State private var signInStartsImmediately = false
   @State private var clock = JournalStartupClock()
@@ -200,9 +195,6 @@ struct JournalHost: View {
           Label("Unable to open local application storage", systemImage: "exclamationmark.folder")
         } description: {
           Text(JournalRuntime.safeDescription(error,operation:"storage.setup.failed"))
-        } actions: {
-          Button("Retry") { setup = nil; clock.restart(); retry += 1 }
-            .accessibilityIdentifier("journal-storage-retry")
         }
       case .success(let setup):
         VStack(spacing: 0) {
@@ -218,7 +210,7 @@ struct JournalHost: View {
       }
     }
     .environment(\.journalStartupClock, clock)
-    .task(id: retry) {
+    .task {
       guard setup == nil else { return }
       do { setup = .success(try await prepare()) }
       catch { if !Task.isCancelled { setup = .failure(error) } }

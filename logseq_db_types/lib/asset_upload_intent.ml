@@ -6,6 +6,7 @@ type phase =
   | Metadata_pending
   | Complete
   | Cancelled
+[@@deriving yojson]
 
 type t =
   { operation_id : Graph_types.Uuid.t
@@ -107,3 +108,104 @@ let restore t ~phase ~revision =
   then Error "Invalid persisted upload checkpoint"
   else Ok { t with phase; revision }
 ;;
+
+module Pure_codec = struct
+  let (let*)=Result.bind
+  module Intent=struct type nonrec t=t let prepare=prepare let restore=restore end
+  module Uuid=Graph_types.Uuid
+  module Asset=Asset_descriptor
+
+
+type asset_version =
+  { checksum : string
+  ; file_type : string
+  }
+[@@deriving yojson]
+
+type checkpoint =
+  { format_version : int
+  ; operation_id : Uuid.t
+  ; origin : string
+  ; account : string
+  ; graph : Uuid.t
+  ; asset : Uuid.t
+  ; version : asset_version
+  ; title : string
+  ; size : int64
+  ; staged_file : string
+  ; replace_reference : Uuid.t option
+  ; target : Uuid.t
+  ; local_mutation : Uuid.t
+  ; metadata_mutation : Uuid.t
+  ; phase : phase
+  ; revision : int
+  }
+[@@deriving yojson]
+
+let encode (i : Intent.t) =
+  checkpoint_to_yojson
+    { format_version = 1
+    ; operation_id = i.operation_id
+    ; origin = i.origin
+    ; account = i.account
+    ; graph = i.graph
+    ; asset = i.asset
+    ; version = { checksum = i.version.checksum; file_type = i.version.file_type }
+    ; title = i.title
+    ; size = i.size
+    ; staged_file = i.staged_file
+    ; replace_reference = i.replace_reference
+    ; target = i.target
+    ; local_mutation = i.local_mutation
+    ; metadata_mutation = i.metadata_mutation
+    ; phase = i.phase
+    ; revision = i.revision
+    }
+  |> Yojson.Safe.to_string
+;;
+
+let decode payload =
+  try
+    if String.length payload > 8192
+    then Error "Upload checkpoint exceeds size limit"
+    else
+      let* value =
+        Json_codec.decode
+          checkpoint_of_yojson
+          (Yojson.Safe.from_string payload)
+        |> Result.map_error (fun _ -> "Upload checkpoint shape is invalid")
+      in
+      if value.format_version <> 1
+      then Error "Unsupported upload checkpoint format"
+      else
+        let* version =
+          Asset.version
+            ~checksum:value.version.checksum
+            ~file_type:value.version.file_type
+          |> Result.map_error (fun _ -> "Upload checkpoint asset version is invalid")
+        in
+        let* prepared =
+          Intent.prepare
+            ~operation_id:value.operation_id
+            ~origin:value.origin
+            ~account:value.account
+            ~graph:value.graph
+            ~asset:value.asset
+            ~version
+            ~title:value.title
+            ~size:value.size
+            ~staged_file:value.staged_file
+            ~replace_reference:value.replace_reference
+            ~target:value.target
+            ~local_mutation:value.local_mutation
+            ~metadata_mutation:value.metadata_mutation
+          |> Result.map_error (fun _ -> "Upload checkpoint intent is invalid")
+        in
+        Intent.restore prepared ~phase:value.phase ~revision:value.revision
+        |> Result.map_error (fun _ -> "Upload checkpoint phase is invalid")
+  with
+  | Yojson.Json_error _ -> Error "Upload checkpoint JSON is invalid"
+  | Failure _ | Invalid_argument _ -> Error "Upload checkpoint shape is invalid"
+;;
+
+end

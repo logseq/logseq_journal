@@ -1,0 +1,345 @@
+(** Pure Worker request/observation/resource coordination, not the whole App.
+    Navigation/feed/Favorites algorithms, Capture editing and media UI stay with
+    their current business owners. step performs no DB/network/clock/callback IO. *)
+module Worker = Worker_api
+
+type t
+type view
+type 'a ticket
+type change_application
+
+val initial : client_id:Worker.Uuid.t -> t
+val view : t -> view
+val bootstrap : view -> Worker.bootstrap_state
+val projection : view -> Worker.projection option
+
+(** Latest original notifications accepted by Core for current residents since
+    the previous view. Stale/foreign notices never reach this outlet; it retains
+    no delivery history. Queued consumers still validate the notice session. *)
+val changefeed_updates : previous:view option -> view -> Worker.changefeed_notice Rrbvec.t
+
+(** Original accepted asset facts changed since the previous view, for current
+    sessions and active demand rounds. A newer sequence is an update even when
+    its content is identical. This retains no delivery history; queued consumers
+    still check current ownership before applying a notification. *)
+val asset_updates : previous:view option -> view -> Worker.asset_notice Rrbvec.t
+
+val intent_progress : view -> Worker.durable_intent -> Worker.mutation_progress option
+
+(** A queued business callback rechecks presentation after ticket Forget. It
+    cannot use a captured success to settle a later focus generation. *)
+val current_presentation : ?owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
+  -> view -> Worker.presentation -> bool
+val revalidate_reply : view -> 'a ticket -> 'a Worker.reply -> 'a Worker.reply
+
+(** Immutable acknowledgement decision captured while planning this ticket.
+    The effect interpreter forwards it without consulting a later UI/view. *)
+val ticket_acknowledgement : unit ticket -> (Worker.presentation * Worker.receipt option) option
+val import_progress : view -> Worker.asset_import_intent -> Worker.import_progress option
+
+(** App-owned picker/staged sources cannot retire until accepted source preparation
+    has a checked durable Imported receipt or known rejection. Unknown keeps its
+    original execution owner across binding retry, without replaying the operation. *)
+val import_sources_pending : view -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope option -> bool
+val import_source_pending : view -> operation:Worker.Uuid.t -> bool
+val pending_import_source_intents:view -> Worker.asset_import_intent Rrbvec.t
+val import_source_proof : view -> Worker.asset_import_intent -> Worker.import_source_proof option
+
+(** Pending in-memory adoption proofs, separate from persistent original receipts.
+    Return only after all retained Hosts have applied the matching source proof;
+    never returns or erases an Unknown intent or its physical source obligation. *)
+val completed_import_source_proofs : view -> Worker.import_source_proof Rrbvec.t
+val import_source_proof_consumed : Worker.import_source_proof -> view Rrbvec.t -> bool
+val handoff : view -> Worker.handoff_id -> Worker.handoff_state option
+val asset_notices : view -> Worker.asset_demand -> Worker.asset_notice list
+val session_asset_notices : view -> Worker.session -> Worker.asset_notice list
+
+(** Exact consumer facts and session-level capacity/upload facts are separate;
+    upload state is keyed by its checked operation ID. Polling either outlet does
+    not acknowledge/release the other; latest-fact retention is bounded. *)
+val ticket_id : 'a ticket -> Worker.request_id
+
+val reply : view -> 'a ticket -> 'a Worker.reply option
+
+(** Exact immutable execution provenance is recorded only when Send is emitted,
+    including reads queued before baseline. Collect it before Forget; no queued
+    owner or later projection may stand in for the session/budget actually sent. *)
+val query_origin : view -> 'a ticket -> (Worker.session * Worker.read_budget) option
+
+(** Legacy UI/runtime producers consult the same pure retirement decision before
+    creating work. This grants no physical cleanup or host-action permission. *)
+val host_change_blocks : t -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope -> bool
+
+(** Reuse the coordinator's current Open-session and host-handoff fences before
+    presenting buffered read data. A supplied business owner must exactly match
+    the session's account/graph generations and graph UUID. This is a pure local
+    eligibility check; it
+    does not grant backend resource release, writer or deletion permission. *)
+val validate_session
+  :  ?owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
+  -> t
+  -> Worker.session
+  -> (unit, Worker.error) result
+
+(** A sampled read error retains the acknowledged interest. This outlet returns
+    only the exact registered handle planned by this ticket, never a fabricated one. *)
+val observation_handle : view -> 'a Worker.observed ticket -> 'a Worker.observation option
+
+val observation_error : view -> 'a Worker.observation -> Worker.error option
+val observed : view -> 'a Worker.observation -> 'a Worker.observed option
+
+(** The business owner reports causal read creation, then application to its UI
+    (or explicit consumer retirement). A read failure retains its window. Tokens
+    bind one application attempt and reject callbacks from prior retries. *)
+val owns_change_batch : view -> Worker.change_batch -> bool
+
+val change_application_started : view -> Worker.change_batch -> bool
+val change_application_ready : view -> Worker.change_batch -> bool
+val change_application_error : view -> Worker.change_batch -> Worker.error option
+val equal_view : view -> view -> bool
+
+type shutdown_state =
+  | Active
+  | Draining
+  | Stopped
+  | Shutdown_failed of Worker.error
+
+val shutdown_state : view -> shutdown_state
+
+(** Equality includes not-ready/retry/revocation, all request/observation/asset/
+    handoff facts and empty residents/no selection/local_deletion transitions.
+    Confirmed applies only to its exact still-current presentation; focus change
+    retains the durable receipt as Committed_pending_presentation for later readback.
+    Reply storage and notice queues are bounded; retired callers must release or
+    consume their entries. Durable intent outcome survives request ticket disposal. *)
+
+(** Registration metadata is independent of sampled data success. It retains
+    cleanup ownership through error/cancellation; it grants no live data authority.
+    Forget disposes an Observe reply only; Cancel retires its logical interest.
+    Full cleanup waits for external Capacity_available. Internal Drain advances
+    bounded new work without busy-retrying refused resources. Terminal cleanup
+    failures remain observable until explicit Cancel/Release retries them. *)
+type event =
+  | Worker_bound of Worker.binding
+  | Retry_bootstrap
+  | Binding_invalidated of Worker.binding
+  | Admitted :
+      'a ticket * Journal_worker_ids.Worker.request_id
+      -> event
+  | Admission_refused : 'a ticket * Worker.admission_error -> event
+  | Admission_failed : 'a ticket * Worker.error -> event
+  | Bootstrap_admitted of
+      Worker.binding * Journal_worker_ids.Worker.request_id
+  | Bootstrap_not_admitted of Worker.binding * Worker.admission_error
+  | Binding_release_completed of Worker.binding * (unit, Worker.error) result
+  | Binding_release_not_admitted of Worker.binding * Worker.admission_error
+  | Capacity_available
+  | Shutdown_requested
+  | Bootstrap_received of Worker.binding * Worker.bootstrap_state
+  | Completed : 'a ticket * 'a Worker.reply -> event
+  | Projection_received of Worker.projection
+  | Changefeed_notice of
+      Worker.changefeed_notice
+      * Journal_worker_ids.Worker.push_sequence
+  | Change_application_retired of change_application
+  | Change_consumer_expanded of
+      change_application * Worker.Uuid.t * Worker.Uuid.t Rrbvec.t
+  | Change_consumer_applied of
+      change_application * Worker.Uuid.t * (unit, Worker.error) result
+  | Change_consumer_retired of change_application * Worker.Uuid.t
+  | Observation_registered :
+      'a Worker.observed ticket * 'a Worker.observation * Worker.observation_epoch
+      -> event
+  | Observation_release_completed of
+      Worker.session * Worker.request_id * (unit, Worker.error) result
+  | Observation_release_not_admitted of
+      Worker.session * Worker.request_id * Worker.admission_error
+  | Observation_notice of Worker.observation_notice
+  | Observation_notices_failed of Worker.binding * Worker.error
+  | Observation_received : 'a Worker.observed -> event
+  | Import_source_reconciled of Worker.import_source_proof
+  | Import_source_proof_returned of Worker.import_source_proof
+  | Asset_received of Worker.asset_notice * Journal_worker_ids.Worker.push_sequence
+  | Cancel : 'a ticket -> event
+  | Forget : 'a ticket -> event
+  | Release : 'a Worker.observation -> event
+  | Observation_returned : 'a Worker.observation -> event
+  | File_lease_returned of Worker.file_lease
+  | Observation_finalize_completed of Worker.session * Worker.request_id * (unit,Worker.error)result
+  | Observation_finalize_not_admitted of Worker.session * Worker.request_id * Worker.admission_error
+  | Legacy_handoff_completed of Worker.handoff_id * (unit,Worker.error)result
+  | Handoff_completed of Worker.handoff_id * Worker.handoff_state
+  | Handoff_applied of Worker.handoff_id * Worker.request_id * Journal_worker_ids.Worker.request_id * (unit,Worker.error)result
+  | Handoff_apply_admitted of Worker.handoff_id * Worker.request_id * Journal_worker_ids.Worker.request_id
+  | Handoff_apply_rejected of Worker.handoff_id * Worker.request_id * Worker.error
+  | Handoff_apply_not_admitted of Worker.handoff_id * Worker.request_id * Worker.admission_error
+  | Handoff_confirm_admitted of Worker.handoff_id * Worker.request_id * Journal_worker_ids.Worker.request_id
+  | Handoff_confirm_not_admitted of Worker.handoff_id * Worker.request_id * Worker.admission_error
+  | Handoff_confirmed of Worker.handoff_id * Worker.request_id * Journal_worker_ids.Worker.request_id option * (bool,Worker.error)result
+  | Drain
+
+(* Return means no presentation consumer retains the capability. It is not an
+    I/O ACK: failed/in-flight cleanup and metadata finalization stay owned until
+    their matching real completions. Cleanup retries remain possible while owned. *)
+(** Cleanup identity allocated by Core before sending a replacement. It records
+    an obligation, not successful registration. Runner may inspect it but cannot
+    construct or retarget it; cancellation can clean up even if no handle arrived. *)
+type asset_demand_registration = private
+  { consumer : Worker.asset_consumer
+  ; round : Worker.request_id
+  }
+
+(** Only Core creates instructions. Interpreters may pattern-match them but cannot
+    attach a ticket to another request with the same result type. *)
+type instruction = private
+  | Bootstrap
+  | Release_binding of Worker.binding
+  | Release_observation_registration of Worker.session * Worker.request_id
+  | Finalize_observation_registration of Worker.session * Worker.request_id
+  | Release_asset_demand_registration of unit ticket * asset_demand_registration
+  | Finalize_asset_demand of unit ticket * asset_demand_registration
+  | Bind_replacement
+  | Send : 'a ticket * Worker.session * 'a Worker.request -> instruction
+  | Cancel_request : 'a ticket -> instruction
+  | Quiesce of Worker.handoff_plan
+  | Consume_handoff of Worker.handoff_receipt * Worker.request_id
+  | Confirm_handoff of Worker.handoff_receipt * Worker.request_id
+  | Publish of view
+  | Schedule_drain
+
+(** The next state and its instructions are one Core-produced transition.
+    Private fields prevent recombining state from one transition with another's
+    instructions; the host must still apply each transition serially, once. *)
+type transition = private
+  { next : t
+  ; instructions : instruction list
+  }
+
+(** Host supplies a fresh client identity for pure counters; durable mutation IDs
+    are independent. Worker_bound enters Awaiting_baseline and schedules Bootstrap.
+    Retry never reuses a revoked registration. A checked live Binding_invalidated
+    fact retires old authority and awaits real unregister ACK before replacement;
+    a replacement bootstrap rejecting this user remains visible, without an
+    automatic retry loop. Ready/Projection is applied as one
+    version before admitting Open sessions; all older binding callbacks (including
+    not-ready/failure states without a projection) are ignored, even on the same
+    unchanged mailbox incarnation.
+    request below returns its indexed ticket to the initiating caller directly;
+    Send acceptance is tracked by runner, not assumed by the pure transition.
+
+    Cancel requests cooperative stop, not rollback or forgetting ownership. Forget
+    retires presentation of the result; runner retains the actual in-flight
+    Mailbox association until its terminal. The coordinator retains orphan
+    leases/observations and durable unknown/committed outcomes until safely
+    reconciled. Cancel racing Observe/Acquire cannot leak a resource. Release is
+    encoded with a unit ticket, retried until ACK; late updates cannot reactivate
+    it. A query error never unregisters an interest or ACKs a change window.
+
+    prepare_host_change immediately fences affected scopes, queues Quiesce and
+    waits for its exact matching handoff result; unrelated resident execution may
+    continue. Only one host handoff is active; overlap gets an explicit failure,
+    not replacement of its cleanup ledger. Runtime identity and owner checks remain
+    required beyond GADT result correspondence. All input-derived batches contain
+    fewer than 1000 instructions; remaining work is retained and Schedule_drain
+    posts Drain on a later turn. Callbacks only queue events, never call step
+    recursively. No new/legacy owner may both consume one terminal response. *)
+val step : t -> event -> transition
+
+(** Pure admission planning. Apply exactly the returned transition to this state
+    before planning another operation; host serializes this with step. The caller
+    obtains the precise typed ticket even for identical concurrent queries, then
+    executes instructions through the runner. No existential ticket recovery,
+    inference from instruction order or unchecked cast is required. A planning
+    refusal sends nothing; Worker queue refusal is a typed Not_admitted reply. *)
+val request
+  :  t
+  -> Worker.session
+  -> 'a Worker.request
+  -> ('a ticket * transition, Worker.error) result
+
+type mutation_reconciliation =
+  | Submission_ticket of Worker.submission_outcome ticket
+  | Confirmation_ticket of Worker.confirmation ticket
+
+(** Explicit business retry keeps the immutable intent. A known commit returns
+    Confirmation_ticket; an unknown outcome uses Submission_ticket for that same
+    intent. The current presentation is checked before either request is planned.
+    Consumers handle the operation-specific result, not arbitrary lifecycle states. *)
+val reconcile_mutation
+  : t -> presentation:Worker.presentation -> Worker.durable_intent
+  -> (mutation_reconciliation * transition, Worker.error) result
+
+type mutation_settlement =
+  | Acknowledgement of unit ticket
+  | Reconciliation of mutation_reconciliation
+
+(** Retry an applied consumer's cleanup. A current confirmation/known rejection
+    needs ACK only after that exact presentation consumed its canonical DTOs;
+    an older applied presentation first requires canonical readback. *)
+val settle_applied_mutation
+  : t -> presentation:Worker.presentation -> applied_presentation:Worker.presentation -> Worker.durable_intent
+  -> (mutation_settlement * transition, Worker.error) result
+
+(** Start application of an actually delivered batch. An active successful
+    attempt cannot be replaced by a duplicate pull; an explicit retry after a
+    failure gets a new token. The root itself is applied only after its UI state. *)
+val begin_change_application
+  :  t
+  -> Worker.change_batch
+  -> root:Worker.Uuid.t
+  -> (change_application * transition, Worker.error) result
+
+(** Queue a business read against its exact host execution identity while the
+    first registered baseline is pending. This does not construct a session:
+    only a matching Open resident from that baseline may issue Send. Account or
+    graph-generation replacement fails the ticket; cancellation before Send
+    settles locally. The supplied byte/item ceilings are reduced to verified
+    capability limits before making the sealed budget. *)
+val plan_query
+  :  t
+  -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
+  -> maximum_items:int
+  -> maximum_bytes:int
+  -> 'a Worker.query
+  -> ('a ticket * transition, Worker.error) result
+
+(** A logical dependency read retains its ticket on pre-admission Full and only
+    retries after external Capacity_available. Cancellation/revocation still
+    retires the request; other refusals remain visible. *)
+val plan_query_when_available
+  :  t
+  -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
+  -> maximum_items:int
+  -> maximum_bytes:int
+  -> 'a Worker.query
+  -> ('a ticket * transition, Worker.error) result
+
+(** With legacy_pending the ordinary admission/presentation fence is immediate,
+    while Quiesce waits for the exact Legacy_handoff_completed ACK. The pure owner
+    pins execution identity while waiting, then chooses the serialized current
+    baseline version only if that original owner remains valid. A stale ACK cannot
+    unlock a later round. No effect-runner closure chooses the target.
+
+    Return the exact correlation ID to the host. Overlap returns
+    Host_change_in_progress without replacing the active handoff/cleanup ledger.
+    Retry allocates a new ID; late prior ACKs cannot complete it. Applying the
+    returned transition is serialized with request and step. Outcome queries use
+    this ID, never just a graph UUID or the most recent unrelated handoff.
+    Awaiting_baseline/Bootstrap_not_ready/Bootstrap_failed and absence of an Open
+    resident do not forbid prepare using the verified logical host binding. Worker
+    checks independent resource/local-copy identity and generations; an unreachable
+    owner or unprovable identity stays pending or fails explicitly, never fake Safe.
+    Host ordinary deletion/auth/catalog/confirmation policies still apply. *)
+val prepare_host_change
+  :  ?legacy_pending:bool
+  -> t
+  -> Worker.host_change
+  -> (Worker.handoff_id * transition, Worker.error) result
+
+(** Admit one consume attempt from the current Safe frame. Applying is not an
+    ACK. Only the exact attempt and admitted Mailbox terminal ACK publishes Host_change_applied and removes
+    the graph-level gate; its original executions remain permanently retired. *)
+val authorize_host_change:t -> Worker.handoff_receipt -> (transition,Worker.error)result
+
+(** A new round requires real binding release after a definitely unconsumed action. *)
+val handoff_restartable:view -> Worker.handoff_id -> bool

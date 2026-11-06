@@ -180,12 +180,14 @@ module Asset : sig
         }
 end
 
+type account_scope = Logseq_sync_pure_reducer.Core.account_scope
 type asset_scope = Logseq_sync_pure_reducer.Core.graph_scope
 
 type asset_notice = Logseq_db_worker_pure_reducer.Core.asset_notice =
   | Asset_availability of
       { consumer : string
       ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; descriptor : Logseq_db_types.Asset_descriptor.t
       ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
       }
   | Asset_demand_accepted of string
@@ -216,8 +218,93 @@ type local_copy_request =
   ; account_generation : int
   }
 
+type coordination_baseline =
+  { registration : int64
+  ; baseline : Logseq_db_worker.coordination_snapshot
+  ; authority_user : string option option
+  ; limits : Worker_pure_data.capability_limits
+  }
+
+type coordination_update =
+  | Coordination_snapshot of coordination_baseline
+  | Coordination_revoked of int64 * string
+
+val coordination_network : coordination_baseline -> asset_scope -> sync_phase option
+
+type observation_invalidation =
+  { registration_id : int64
+  ; owner : timeline_scope
+  ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+  ; epoch : int64
+  }
+
+type observation_signal =
+  | Observation_invalidated of observation_invalidation
+  | Observations_resync
 type request =
-  | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
+  | Coordination_prepare_host_change of Logseq_db_worker.host_plan
+  | Coordination_confirm_host_change of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
+  | Coordination_apply_host_change of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
+  | Coordination_quiesce_writers of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_recover_import_inputs of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       after:int64 option;maximum_items:int;maximum_bytes:int}
+  | Coordination_confirm_import_input of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;input:string}
+  | Coordination_acknowledge_import_input of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;input:string;prepared:string}
+  | Coordination_import of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       source:Logseq_db_types.Asset_import.t}
+  | Coordination_finalize_asset_demand of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
+  | Coordination_finalize_observation of
+      {registration:int64;owner:timeline_scope;observation_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_asset_demand of
+      {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       consumer:string;priority:Logseq_sync_pure_reducer.Asset_transfer.priority;
+       assets:Logseq_db_types.Asset_descriptor.t list}
+  | Coordination_release_asset_demand of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
+  | Coordination_observe of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      ; read : Worker_pure_read.packed_query
+      }
+  | Coordination_refresh_observation of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      }
+  | Coordination_release_observation of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      }
+  | Register_coordination of int64
+  | Release_coordination of int64
+  | Coordination_query of
+      { registration : int64; owner : timeline_scope; request_id : Logseq_db_types.Graph_types.Uuid.t; read : Worker_pure_read.packed_query }
+  | Coordination_acknowledge_changes of
+      { registration : int64; owner : timeline_scope; request_id : Logseq_db_types.Graph_types.Uuid.t; batch : Worker_pure_read.change_batch }
+  | Coordination_mutation of
+      { registration : int64; owner : timeline_scope;
+        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : Logseq_db_worker_contract.Worker_pure_mutation.durable_intent }
+  | Coordination_confirm of
+      { registration : int64; owner : timeline_scope; presentation : int64;
+        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : Logseq_db_worker_contract.Worker_pure_mutation.durable_intent;
+        original : string * string * string; read : Worker_pure_read.packed_query }
+  | Coordination_recover_mutations of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        after:int64 option; maximum_items:int; maximum_bytes:int }
+  | Coordination_acknowledge_mutation of
+      { registration:int64; owner:timeline_scope; presentation:int64;
+        request_id:Logseq_db_types.Graph_types.Uuid.t; intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent;
+        original:(string * string * string) option }
   | Get_graph_state_at of timeline_scope
   | Asset_command_at of timeline_scope * asset_command
   | Import_asset_at of timeline_scope * Logseq_db_types.Asset_import.t
@@ -228,7 +315,6 @@ type request =
       ; source : Logseq_db_types.Asset_import.t
       }
   | Client_command of client_command
-  | Graph_request of Logseq_db_worker.Protocol.request
   | Get_graph_state
   | Asset_command of
       { graph_generation : int
@@ -248,22 +334,79 @@ type request =
       }
 
 type response =
+  | Coordination_host_prepared of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
+  | Coordination_host_confirmed of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt * bool
+  | Coordination_host_applied of Logseq_db_types.Graph_types.Uuid.t
+  | Coordination_writers_quiesced of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_import_inputs_recovered of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       page:Logseq_db_types.Asset_import.Recovery.page}
+  | Coordination_import_input_confirmed of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       input:Logseq_db_types.Asset_import.Recovery.item option}
+  | Coordination_import_input_acknowledged of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_imported of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       result:(Logseq_db_worker.import_receipt,string)result}
+  | Coordination_asset_demand_finalized of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
+  | Coordination_observation_finalized of
+      {registration:int64;owner:timeline_scope;observation_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_asset_demand_accepted of {request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_asset_demand_released of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
+  | Coordination_mutations_recovered of
+      { request_id:Logseq_db_types.Graph_types.Uuid.t;
+        page:Logseq_db_worker_contract.Worker_pure_mutation.recovery_page }
+  | Coordination_mutation_acknowledged of {request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_confirmed of
+      {registration:int64;owner:timeline_scope;presentation:int64;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       answer:Worker_pure_read.answer}
+  | Coordination_query_revoked of
+      {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_queried of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        answer:Worker_pure_read.answer }
+  | Coordination_changes_acknowledged of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        result:(Worker_pure_read.change_ack,Worker_pure_read.error)result }
+  | Coordination_observed of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; epoch : int64
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      ; answer : Worker_pure_read.answer
+      }
+  | Coordination_observation_released of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      }
+  | Coordination_mutation_result of
+      { request_id : Logseq_db_types.Graph_types.Uuid.t;
+        outcome : Logseq_db_worker_contract.Worker_pure_mutation.outcome }
+  | Coordination_registered of coordination_baseline
+  | Coordination_released of int64
   | Local_copy_inspected of local_copy_request * (local_copy_presence, string) result
   | Local_copy_deleted of local_copy_request * (unit, string) result
   | Asset_imported of (Logseq_db_worker.import_receipt, string) result
   | Client_command_completed
   | Asset_file of (string * string) option
-  | Graph_response of Logseq_db_worker.Protocol.response
   | Graph_state of Logseq_db_worker.graph_state
 
 type asset_notice_batch
 
 type push =
-  | Graph_pushes of (asset_scope * Logseq_db_worker.Protocol.push) list
+  | Coordination_observations of observation_signal Rrbvec.t
+  | Coordination_updates of coordination_update list
+  | Graph_pushes of (asset_scope * Worker_pure_data.changefeed_signal) list
   | Graph_states of (asset_scope * Logseq_db_worker.graph_state) list
   | Session_states of (asset_scope * state) list
   | Asset_notices of asset_notice_batch
-  | Graph_push of Logseq_db_worker.Protocol.push
+  | Graph_push of Worker_pure_data.changefeed_signal
   | Client_state_changed of state
   | Need_id_token of token_request
   | Bootstrap_progress of bootstrap_progress
@@ -283,7 +426,9 @@ val asset_topic : Journal_worker_ids.Worker.Push_topic.t
 val asset_notices : push -> (asset_scope * asset_notice) list
 
 (** Worker topic merge policy. Snapshot topics replace; independent asset facts
-    survive together, up to 4096 distinct pending facts. *)
+    survive together, up to 4096 distinct pending facts. Observation invalidations
+    retain each binding/ID's greatest epoch up to 512 entries; overflow emits an
+    explicit resync wake-up instead of silently dropping an interest. *)
 val coalesce_push : topic:Journal_worker_ids.Worker.push_topic -> push -> push -> push
 
 type dependencies
@@ -294,6 +439,10 @@ val dependencies
   -> secrets:Logseq_sync_effect_runner.Effect_runner.secrets
   -> crypto:Logseq_sync_effect_runner.Effect_runner.crypto
   -> dependencies
+
+(** Pure cleanup routing for the Mailbox's exactly-once unpublished success.
+    Returns only the actual result's lease and owner, never the lookup handle. *)
+val discarded_asset_retain : request -> response -> (asset_scope * string) option
 
 val create
   :  dependencies:dependencies

@@ -53,9 +53,9 @@ let create
   if not (canonical_absolute_path application_support_directory)
   then Error "application_support_directory must be a bounded canonical absolute path"
   else if
-    response_budget_bytes <= 0 || response_budget_bytes > Protocol.maximum_response_bytes
+    response_budget_bytes <= 0 || response_budget_bytes > Worker_pure_data.maximum_response_bytes
   then Error "response_budget_bytes is outside the protocol bounds"
-  else if default_page_size <= 0 || default_page_size > Protocol.maximum_page_size
+  else if default_page_size <= 0 || default_page_size > Worker_pure_data.maximum_page_size
   then Error "default_page_size is outside the protocol bounds"
   else
     Result.map

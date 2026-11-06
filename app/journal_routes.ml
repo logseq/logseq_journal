@@ -383,10 +383,10 @@ let open_detail t ~block_id ~request_generation =
 let open_favorite
       t
       ~request_generation
-      (item : Logseq_db_worker.Protocol.v2_favorite_item)
+      (item : Worker_pure_data.favorite_item)
   =
   match item.target with
-  | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } ->
+  | Worker_pure_data.V2_favorite_page { uuid; _ } | Worker_pure_data.V2_favorite_block { uuid; _ } ->
     let block_id = Logseq_db_types.Graph_types.Uuid.to_string uuid in
     ( open_detail t ~block_id ~request_generation
     , Some
@@ -468,6 +468,46 @@ let map_details t ~f =
        | _ -> t)
     t.owners
     t
+;;
+
+let child_consumed t command ~detail ~draft =
+  let found,accepted=Owners.fold(fun _ view (found,accepted)->
+    let owner=match view with Detail_view{detail;_}->Some detail
+      | Detail_loading_view{staged_detail;_}->staged_detail|_->None in
+    match owner with Some owner when Journal_detail.has_child_request owner command ->true,accepted && detail owner
+      | _->found,accepted) t.owners (false,true) in
+  let found,accepted=Drafts.fold(fun _ owner(found,accepted)->
+    if Journal_detail.retained_has_child_request owner.composer command then true,accepted && draft owner.composer
+    else found,accepted) t.drafts (found,accepted) in
+  found && accepted
+;;
+let has_child_request t command = child_consumed t command ~detail:(fun _->true) ~draft:(fun _->true)
+let preview_child_created t ~command ~child ~parent ~error =
+  let drafts=Drafts.map(fun draft->
+    let composer=Journal_detail.preview_retained_child draft.composer ~command ~child ~parent ~error in
+    if composer==draft.composer then draft else {draft with composer})t.drafts in
+  map_details {t with drafts} ~f:(fun detail->Journal_detail.preview_child_created detail ~command ~child ~parent ~error)
+;;
+let preview_child_failure t ~command ~message =
+  let drafts=Drafts.map(fun draft->
+    let composer=Journal_detail.preview_retained_failure draft.composer ~command ~message in
+    if composer==draft.composer then draft else {draft with composer})t.drafts in
+  map_details {t with drafts} ~f:(fun detail->Journal_detail.preview_child_failure detail ~command ~message)
+;;
+let child_projection_applied t ~command ~child ~parent ~error =
+  child_consumed t command
+    ~detail:(fun detail->Journal_detail.child_projection_applied detail ~command ~child ~parent ~error)
+    ~draft:(fun draft->Journal_detail.retained_projection_applied draft ~command ~child ~parent ~error)
+;;
+let child_failure_applied t ~command ~message = child_consumed t command
+  ~detail:(fun detail->Journal_detail.child_failure_applied detail ~command ~message)
+  ~draft:(fun draft->Journal_detail.retained_failure_applied draft ~command ~message)
+;;
+let release_rejected_child t ~command ~message =
+  let drafts=Drafts.map(fun draft->
+    let composer=Journal_detail.release_rejected_retained draft.composer ~command ~message in
+    if composer==draft.composer then draft else {draft with composer})t.drafts in
+  map_details {t with drafts} ~f:(fun detail->Journal_detail.release_rejected_child detail ~command ~message)
 ;;
 
 let apply_detail_response t ~request_generation projection =
@@ -588,6 +628,14 @@ let apply_child_failure t ~block_id ~message =
   let t = if drafts = t.drafts then t else { t with drafts } in
   map_details t ~f:(fun detail ->
     fst (Journal_detail.step detail (Append_failed (block_id, message))))
+;;
+
+let await_child_confirmation t ~block_id =
+  let drafts=Drafts.map(fun draft->
+    let composer=Journal_detail.await_retained_confirmation draft.composer ~block_id in
+    if composer==draft.composer then draft else {draft with composer})t.drafts in
+  let t=if drafts==t.drafts then t else {t with drafts}in
+  map_details t ~f:(fun detail->Journal_detail.await_child_confirmation detail ~block_id)
 ;;
 
 let accept_path t path =
@@ -755,7 +803,7 @@ let commit_delete t ~block_id =
 ;;
 
 module Favorites = struct
-  module P = Logseq_db_worker.Protocol
+  module Hidden = Set.Make (String)
   module G = Logseq_db_types.Graph_types
 
   type event =
@@ -767,7 +815,8 @@ module Favorites = struct
         { first_index : int
         ; last_exclusive : int
         }
-    | Loaded of Journal_graph_request.favorites_request * P.v2_favorites_result
+    | Loaded of
+        Journal_graph_request.favorites_request * Journal_worker_coordination.Worker_api.favorites
     | Failed of Journal_graph_request.favorites_request * bool * string
 
   type t =
@@ -777,12 +826,12 @@ module Favorites = struct
     ; active : bool
     ; dirty : bool
     ; initialized : bool
-    ; items : P.v2_favorite_item list
-    ; hidden_targets : string list
-    ; cursor : G.Cursor.t option
+    ; items : Worker_pure_data.favorite_item Rrbvec.t
+    ; hidden_targets : Hidden.t
+    ; cursor : Journal_graph_request.favorites_cursor option
     ; pending : Journal_graph_request.favorites_request option
     ; error : string option
-    ; staging : P.v2_favorite_item list option
+    ; staging : Worker_pure_data.favorite_item Rrbvec.t option
     ; refresh_count : int
     }
 
@@ -793,8 +842,8 @@ module Favorites = struct
     ; active = false
     ; dirty = true
     ; initialized = false
-    ; items = []
-    ; hidden_targets = []
+    ; items = Rrbvec.empty
+    ; hidden_targets = Hidden.empty
     ; cursor = None
     ; pending = None
     ; error = None
@@ -806,12 +855,12 @@ module Favorites = struct
   let revision t = t.revision
 
   let visible_items t =
-    List.filter
-      (fun (item : P.v2_favorite_item) ->
+    Rrbvec.filter
+      (fun (item : Worker_pure_data.favorite_item) ->
          match item.target with
-         | V2_favorite_page _ -> true
-         | V2_favorite_block { uuid; _ } ->
-           not (List.mem (G.Uuid.to_string uuid) t.hidden_targets))
+         | Worker_pure_data.V2_favorite_page _ -> true
+         | Worker_pure_data.V2_favorite_block { uuid; _ } ->
+           not (Hidden.mem (G.Uuid.to_string uuid) t.hidden_targets))
       t.items
   ;;
 
@@ -839,7 +888,11 @@ module Favorites = struct
 
   let refresh t =
     request
-      { t with dirty = false; staging = Some []; refresh_count = List.length t.items }
+      { t with
+        dirty = false
+      ; staging = Some Rrbvec.empty
+      ; refresh_count = Rrbvec.length t.items
+      }
       None
   ;;
 
@@ -852,7 +905,7 @@ module Favorites = struct
     then t, []
     else if t.dirty || not t.initialized
     then refresh t
-    else if t.cursor <> None && visible_items t = []
+    else if t.cursor <> None && Rrbvec.is_empty (visible_items t)
     then request t t.cursor
     else t, []
   ;;
@@ -861,11 +914,14 @@ module Favorites = struct
     | Select active -> start_if_needed { t with active }
     | Invalidate -> start_if_needed { t with dirty = true }
     | Hide_target id ->
-      if List.mem id t.hidden_targets
+      if Hidden.mem id t.hidden_targets
       then t, []
       else (
         let next =
-          { t with hidden_targets = id :: t.hidden_targets; revision = t.revision + 1 }
+          { t with
+            hidden_targets = Hidden.add id t.hidden_targets
+          ; revision = t.revision + 1
+          }
         in
         start_if_needed next)
     | Retry -> if t.pending = None then refresh t else t, []
@@ -875,7 +931,7 @@ module Favorites = struct
         t.active
         && t.pending = None
         && t.error = None
-        && last_exclusive + 12 >= List.length visible
+        && last_exclusive + 12 >= Rrbvec.length visible
       then (
         match t.cursor with
         | None -> t, []
@@ -883,15 +939,15 @@ module Favorites = struct
       else t, []
     | Loaded (completed, result) when current t completed ->
       let pending = None in
-      let staged = Option.value t.staging ~default:t.items @ result.items in
+      let staged = Rrbvec.append_list (Option.value t.staging ~default:t.items) result.items in
       let needs_continuation =
         match t.staging with
-        | Some _ -> List.length staged < max 1 t.refresh_count
+        | Some _ -> Rrbvec.length staged < max 1 t.refresh_count
         | None -> result.items = []
       in
-      let t = { t with pending; cursor = result.next_cursor } in
-      if needs_continuation && result.next_cursor <> None
-      then request { t with staging = Some staged } result.next_cursor
+      let t = { t with pending; cursor = result.next } in
+      if needs_continuation && result.next <> None
+      then request { t with staging = Some staged } result.next
       else (
         let t =
           { t with
@@ -911,3 +967,50 @@ module Favorites = struct
     | Loaded _ | Failed _ -> t, []
   ;;
 end
+
+let child_chain t ~command =
+  let active=Owners.to_seq t.owners |> Seq.find_map(fun(_,view)->match view with
+    | Detail_view{detail;_}|Detail_loading_view{staged_detail=Some detail;_}->Journal_detail.child_chain detail ~command
+    | _->None) in
+  match active with Some _->active|None->Drafts.to_seq t.drafts |> Seq.find_map(fun(_,draft)->
+    Journal_detail.retained_child_chain draft.composer ~command)
+let retain_child_chain t ~command chain =
+  let drafts=Drafts.fold(fun key draft drafts->
+    let composer=Journal_detail.retain_retained_child_chain draft.composer ~command chain in
+    if composer==draft.composer then drafts else Drafts.add key {draft with composer} drafts)
+    t.drafts t.drafts in
+  let t=if drafts==t.drafts then t else {t with drafts} in
+  map_details t ~f:(fun detail->Journal_detail.retain_child_chain detail ~command chain)
+;;
+
+let observation_missing t ~entry_id ~request_generation ~block_id =
+  match Owners.find_opt entry_id t.owners with
+  | Some view when view_generation view=request_generation && view_block_id view=Some block_id ->
+    let t=retain_owner t entry_id in
+    {t with owners=Owners.add entry_id (Missing_detail_view{block_id;request_generation;draft_owner=Some entry_id})t.owners}
+  | _->t
+;;
+let observation_recover t ~entry_id ~request_generation ~block_id =
+  match Owners.find_opt entry_id t.owners with
+  | Some (Missing_detail_view _|Failed_detail_view _) as found
+    when Option.fold ~none:false ~some:(fun view->view_generation view=request_generation && view_block_id view=Some block_id) found ->
+    {t with next_session=Int64.succ t.next_session;
+      owners=Owners.add entry_id(Detail_loading_view{block_id;request_generation;session_number=t.next_session;
+        draft_owner=Some entry_id;loading_indicator=false;staged_detail=None})t.owners}
+  | _->t
+;;
+
+let pending_child_submissions t =
+  let remember submissions ((command:Journal_graph_projection.create_child),chain) =
+    match Drafts.find_opt command.Journal_graph_projection.mutation_id submissions with
+    |Some((previous:Journal_graph_projection.create_child),_) when previous.status_intent_revision>=command.status_intent_revision->submissions
+    |_->Drafts.add command.mutation_id(command,chain)submissions in
+  let submissions=Owners.fold(fun _ view submissions->
+    let pending=match view with
+      |Detail_view{detail;_}|Detail_loading_view{staged_detail=Some detail;_}->Journal_detail.pending_submission detail
+      |_->None in
+    Option.fold ~none:submissions ~some:(remember submissions)pending)t.owners Drafts.empty in
+  let submissions=Drafts.fold(fun _ draft submissions->
+    Option.fold ~none:submissions ~some:(remember submissions)
+      (Journal_detail.retained_pending_submission draft.composer))t.drafts submissions in
+  Drafts.fold(fun _ submission out->Rrbvec.push_back out submission)submissions Rrbvec.empty

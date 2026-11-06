@@ -14,12 +14,12 @@ let account ?(generation = 1) user_id : Sync.account_scope =
 
 module Sync_runner = Logseq_sync_effect_runner.Effect_runner
 
-let asset_io_runner ?on_asset_diagnostic ?(token_failure = "test must not use network") ~env ~sw ~support ~post () =
+let asset_io_runner ?(fork=(fun ~sw:_ task->task())) ?on_asset_diagnostic ?(token_failure = "test must not use network") ~env ~sw ~support ~post () =
   let module R = Sync_runner in
   let dependencies =
     R.dependencies
       ~runtime:
-        (R.runtime ~fork:(fun ~sw:_ task -> task ()) ~sleep:(fun _ -> ()) |> Result.get_ok)
+        (R.runtime ~fork ~sleep:(fun _ -> ()) |> Result.get_ok)
       ~transport:
         (R.transport
            ~tls_authenticator:(R.system_tls_authenticator () |> Result.get_ok)
@@ -455,7 +455,7 @@ let test_sync_and_publish_instructions_are_not_reduced_recursively () =
           |> Result.get_ok
         in
         let sync_runner =
-          Runner.sync_runner
+          Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture")
             ~submit:(fun runner_effect -> submitted := runner_effect :: !submitted)
             ~shutdown:(fun () -> ())
             ()
@@ -507,20 +507,12 @@ let test_sync_and_publish_instructions_are_not_reduced_recursively () =
         Runner.shutdown runner)))
 ;;
 
+let asset_sync_config () =
+  let limits=Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024 ~submission_batch_size:1 |> Result.get_ok in
+  Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits |> Result.get_ok
+;;
 let admitted_asset_state graph_id =
-  let limits =
-    Sync.limits
-      ~maximum_response_bytes:1024
-      ~maximum_artifact_bytes:1024
-      ~submission_batch_size:1
-    |> Result.get_ok
-  in
-  let initial =
-    Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits
-    |> Result.get_ok
-    |> Sync.initial
-    |> Result.get_ok
-  in
+  let initial=Sync.initial(asset_sync_config()) |> Result.get_ok in
   let graph : Sync.graph =
     { graph_id
     ; name = "Upload checkpoint fixture"
@@ -561,17 +553,24 @@ let admitted_asset_state graph_id =
 ;;
 
 type asset_bridge_fixture =
-  { runner : Runner.t
+  { sw:Eio.Switch.t
+  ; runner : Runner.t
   ; context : Sync.asset_context
   ; support : string
-  ; gate : (Sync.asset_output -> bool) -> deliver_first:bool -> unit Eio.Promise.t
-  ; deliver_held : unit -> unit
+  ; gate : ?hold_callback:bool -> (Sync.asset_output -> bool) -> deliver_first:bool -> unit Eio.Promise.t
+  ; deliver_held : ?keep_gate:bool -> unit -> unit
+  ; hold_asset_barrier : unit -> unit Eio.Promise.t
+  ; deliver_asset_barriers : unit -> unit
+  ; set_asset_current : (Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool) -> unit
+  ; on_sync_fence : (int64 * Sync.effect_scope -> unit) -> unit
+  ; on_asset_completed : (Logseq_sync_pure_reducer.Asset_transfer.event -> unit) -> unit
   ; held_path : string option ref
   ; actions : Sync.asset_action list ref
+  ; fixture_result : Sync.asset_action -> Sync.asset_result
   ; fixture_asset : Sync.asset_action -> Sync.asset_value
   }
 
-let with_asset_bridge run =
+let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
   T.with_managed (fun fixture ->
     Eio_main.run (fun env ->
       Eio.Switch.run (fun sw ->
@@ -582,6 +581,8 @@ let with_asset_bridge run =
         in
         let admitted, context = admitted_asset_state graph_id in
         let state = ref admitted in
+        let worker_state=ref(Core.initial(Core.config ~worker:fixture.config ~sync:(asset_sync_config())) |> Result.get_ok) in
+        let on_sync_fence=ref(fun (_:int64*Sync.effect_scope)->()) in
         let active_runner = ref None in
         let io_runner = ref None in
         let actions = ref [] in
@@ -589,7 +590,15 @@ let with_asset_bridge run =
         let held = Queue.create () in
         let held_path = ref None in
         let fixture_output = ref None in
+        let barrier_handler=ref(fun (_:int64)->false) in
+        let asset_current=ref(fun (_:Logseq_sync_pure_reducer.Asset_transfer.ticket)->false) in
+        let asset_completed=ref(fun (_:Logseq_sync_pure_reducer.Asset_transfer.event)->()) in
         let post = function
+          | Core.Sync_event((Sync.IO_fence_requested _|Sync.IO_fence_completed _)as event)->
+            (match event with Sync.IO_fence_requested(id,scope)-> !on_sync_fence(id,scope)|_->());
+            let transition=Core.step !worker_state(Core.Sync_event event) in
+            worker_state:=transition.next;
+            List.iter(Runner.submit(Option.get !active_runner))transition.effects
           | Core.Sync_event event ->
             (match event with
              | Sync.Asset_requested request -> actions := request.action :: !actions
@@ -611,11 +620,14 @@ let with_asset_bridge run =
                 | Sync.Publish _ -> ()
                 | Sync.Delegate _ -> Alcotest.fail "unexpected bridge graph effect")
               transition.effects
+          | Core.Asset_completed(_,event)-> !asset_completed event
+          | Core.Asset_cleanup_barrier token->if not(!barrier_handler token) then Runner.submit(Option.get !active_runner)(Core.Asset_cleanup_barrier_reached token)
           | _ -> ()
         in
         io_runner
         := Some
              (asset_io_runner
+                ~fork:(fun ~sw task->if asynchronous_io then Eio.Fiber.fork ~sw task else task())
                 ~on_asset_diagnostic:(fun ~scope ~operation ~request_operation detail ->
                   Runner.report_asset_diagnostic (Option.get !active_runner)
                     ~scope ~operation ~request_operation detail)
@@ -624,7 +636,7 @@ let with_asset_bridge run =
                 ~support:fixture.config.application_support_directory
                 ~post:(fun event -> post (Core.Sync_event event)) ());
         let sync_runner =
-          Runner.sync_runner
+          Runner.sync_runner ~retire_account:(Sync_runner.retire_account (Option.get !io_runner))
             ~submit:(fun runnable -> Sync_runner.submit (Option.get !io_runner) runnable)
             ~shutdown:(fun () -> Sync_runner.shutdown (Option.get !io_runner))
             ()
@@ -632,7 +644,9 @@ let with_asset_bridge run =
         let dependencies =
           Runner.dependencies
             ~runtime:
-              (Runner.runtime ~fork:(fun ~sw:_ task -> task ()) ~sleep:(fun _ -> ())
+              (Runner.runtime
+                ~fork:(fun ~sw task -> if asynchronous then Eio.Fiber.fork ~sw task else task ())
+                ~sleep:(fun seconds->if asynchronous then Eio.Time.sleep(Eio.Stdenv.clock env)seconds)
                |> Result.get_ok)
             ~config:fixture.config
             ~overlay:fixture.overlay
@@ -647,12 +661,12 @@ let with_asset_bridge run =
             ~post
             ~recovery_current:(fun _ -> false)
             ~upload_current:(fun _ -> false)
-            ~asset_current:(fun _ -> false)
+            ~asset_current:(fun ticket -> !asset_current ticket)
           |> Result.get_ok
         in
         active_runner := Some runner;
         let serial = ref 0 in
-        let fixture_asset action =
+        let fixture_result action =
           incr serial;
           fixture_output := None;
           post
@@ -662,8 +676,10 @@ let with_asset_bridge run =
                   ; operation = "fixture:" ^ string_of_int !serial
                   ; action
                   }));
-          Option.get !fixture_output |> Result.get_ok
+          while !fixture_output=None do Eio.Fiber.yield() done;
+          Option.get !fixture_output
         in
+        let fixture_asset action=fixture_result action |> Result.get_ok in
         let path_of_output (output : Sync.asset_output) =
           match output.result with
           | Ok (Sync.Asset_staged { file; _ }) ->
@@ -675,43 +691,60 @@ let with_asset_bridge run =
           | Ok (Sync.Asset_retained (Some (_, path))) -> Some path
           | _ -> None
         in
-        let gate predicate ~deliver_first =
+        let gate ?(hold_callback=false) predicate ~deliver_first =
           let reached, resolve = Eio.Promise.create () in
-          let never, _ = Eio.Promise.create () in
+          let callback_done, callback_resolve = Eio.Promise.create () in
           (output_handler
            := fun output ->
                 if not (predicate output)
                 then false
                 else (
                   held_path := path_of_output output;
-                  Queue.add (output, deliver_first) held;
+                  Queue.add (output, deliver_first,callback_resolve) held;
                   if deliver_first
                   then Runner.submit runner (Core.Deliver_asset_result output);
-                  Eio.Promise.resolve resolve ();
-                  if deliver_first then Eio.Promise.await never;
+                  ignore(Eio.Promise.try_resolve resolve ():bool);
+                  if deliver_first || hold_callback then Eio.Promise.await callback_done;
                   true));
           reached
         in
-        let deliver_held () =
-          (output_handler := fun _ -> false);
+        let deliver_held ?(keep_gate=false) () =
+          if not keep_gate then (output_handler := fun _ -> false);
           Queue.iter
-            (fun (output, delivered) ->
+            (fun (output, delivered,callback_resolve) ->
                if not delivered
-               then Runner.submit runner (Core.Deliver_asset_result output))
+               then Runner.submit runner (Core.Deliver_asset_result output);
+               ignore(Eio.Promise.try_resolve callback_resolve():bool))
             held;
           Queue.clear held
         in
+        let held_barriers=Queue.create() in
+        let hold_asset_barrier ()=
+          let reached,resolve=Eio.Promise.create() in
+          barrier_handler:=(fun token->Queue.add token held_barriers;
+            ignore(Eio.Promise.try_resolve resolve():bool);true);
+          reached in
+        let deliver_asset_barriers ()=
+          barrier_handler:=(fun _->false);
+          Queue.iter(fun token->Runner.submit runner(Core.Asset_cleanup_barrier_reached token))held_barriers;
+          Queue.clear held_barriers in
         Fun.protect
           ~finally:(fun () -> Runner.shutdown runner)
           (fun () ->
              run
-               { runner
+               { sw;runner
                ; context
                ; support = fixture.config.application_support_directory
                ; gate
                ; deliver_held
+               ; hold_asset_barrier
+               ; deliver_asset_barriers
+               ; set_asset_current=(fun callback->asset_current:=callback)
+               ; on_sync_fence=(fun callback->on_sync_fence:=callback)
+               ; on_asset_completed=(fun callback->asset_completed:=callback)
                ; held_path
                ; actions
+               ; fixture_result
                ; fixture_asset
                }))))
 ;;
@@ -786,11 +819,412 @@ let cancelled_stage_output deliver_first () =
       Logseq_db_storage.Asset_upload_store.read db ~operation:source.operation
       |> Result.get_ok
     in
+    let namespace=Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
+      ~origin:fixture.context.scope.account.managed_sync_origin ~user:fixture.context.scope.account.user_id
+      ~graph:fixture.context.scope.graph_id in
+    let reserved=Logseq_db_storage.Asset_upload_store.Inputs.read db
+      ~owner:{namespace;origin=Uri.to_string fixture.context.scope.account.managed_sync_origin;account=fixture.context.scope.account.user_id;graph=fixture.context.scope.graph_id} ~operation:source.operation |> Result.get_ok in
+    let expected=Logseq_db_types.Asset_import.Pure_intent.create ~namespace source |> Result.get_ok in
+    Alcotest.(check bool) "canceled staging retains complete durable Unknown input" true
+      (Option.exists(fun(row:Logseq_db_storage.Asset_upload_store.Inputs.record)->row.prepared=None && row.evidence=None
+        && Logseq_db_types.Asset_import.Pure_intent.encode row.input=Logseq_db_types.Asset_import.Pure_intent.encode expected)reserved);
     ignore (Sqlite3.db_close db);
     Alcotest.(check bool)
       "cancel before staging acceptance persists no import"
       true
       (durable = None))
+;;
+
+(* Only this actual interpreter can establish that source recovery opens an
+   existing SQLite file read-only and never stages, acquires, or replays work. *)
+let test_import_input_readonly_recovery_and_proof_ack () =
+  with_asset_bridge(fun fixture->
+    let module P=Logseq_db_types.Asset_import.Pure_intent in
+    let module W=Logseq_db_worker_contract.Worker_pure_mutation in
+    let scope=fixture.context.scope in
+    let store=Filename.concat fixture.support "asset-upload-intents.sqlite" in
+    let recover()=Runner.recover_import_inputs fixture.runner ~scope ~after:None ~maximum_items:2
+      ~maximum_bytes:32768 ~current:(fun()->true) |> Result.get_ok in
+    let empty=recover() in
+    Alcotest.(check bool) "absent readonly recovery is complete empty" true(empty.items=[] && empty.next=None);
+    Alcotest.(check bool) "readonly recovery cannot create store or schema" false(Sys.file_exists store);
+    let source=picker_import fixture.support 970 in
+    let namespace=W.namespace_for_owner ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id in
+    let input=P.create ~namespace source |> Result.get_ok |> P.encode in
+    Alcotest.(check bool) "readonly lookup of absent complete input is None" true
+      (Runner.confirm_import_input fixture.runner ~scope ~input ~current:(fun()->true)=Ok None);
+    Alcotest.(check bool) "readonly lookup cannot create store" false(Sys.file_exists store);
+    ignore(Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok);
+    let actions= !(fixture.actions) and modified=(Unix.stat store).st_mtime in
+    let page=recover() in
+    let row=match page.items with [row]->row|_->Alcotest.fail "missing complete prepared source recovery" in
+    Alcotest.(check string) "original complete input bytes preserved" input row.input;
+    let proof=Option.get row.prepared in
+    Alcotest.(check bool) "prepared input proof initially pending" false row.acknowledged;
+    Alcotest.(check bool) "actual readonly reopen retains original evidence" true
+      (Runner.confirm_import_input fixture.runner ~scope ~input ~current:(fun()->true)=Ok(Some row));
+    Alcotest.(check bool) "readonly recovery leaves store mtime unchanged" true((Unix.stat store).st_mtime=modified);
+    Alcotest.(check bool) "readonly recovery does no staging/lease/transport work" true(actions= !(fixture.actions));
+    Alcotest.(check bool) "stale caller cannot ACK original source" true
+      (Result.is_error(Runner.acknowledge_import_input fixture.runner ~scope ~input ~prepared:proof ~current:(fun()->false)));
+    Alcotest.(check bool) "forged evidence cannot ACK original source" true
+      (Result.is_error(Runner.acknowledge_import_input fixture.runner ~scope ~input ~prepared:(proof^" ") ~current:(fun()->true)));
+    Runner.acknowledge_import_input fixture.runner ~scope ~input ~prepared:proof ~current:(fun()->true) |> Result.get_ok;
+    let done_=recover() in
+    Alcotest.(check bool) "ACK removes only pending recovery membership" true(done_.items=[] && done_.next=None);
+    let saved=Runner.confirm_import_input fixture.runner ~scope ~input ~current:(fun()->true) |> Result.get_ok |> Option.get in
+    Alcotest.(check bool) "ACK retains original canonical bytes and proof" true(saved.input=input && saved.prepared=Some proof && saved.acknowledged))
+;;
+
+let test_worker_sync_io_fence_correlates_real_child () =
+  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
+    let source=picker_import fixture.support 950 in
+    let reached=fixture.gate ~hold_callback:true
+      (fun output->match output.Sync.request.action with Sync.Stage_asset_file _->true|_->false)
+      ~deliver_first:false in
+    Eio.Fiber.first
+      (fun()->ignore(Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true));
+        Alcotest.fail "held source unexpectedly finished")
+      (fun()->Eio.Promise.await reached);
+    let outcome=ref None and request=ref None in
+    fixture.on_sync_fence(fun value->request:=Some value);
+    let scope=Sync.effect_scope_of_graph fixture.context.scope in
+    Eio.Fiber.fork ~sw:fixture.sw(fun()->outcome:=Some(Runner.await_sync_io fixture.runner ~scope));
+    while !request=None do Eio.Fiber.yield() done;
+    let id,actual_scope=Option.get !request in
+    let wrong={actual_scope with graph_generation=Some 9999} in
+    Runner.submit fixture.runner(Core.Sync_io_fence_reached(id,wrong,Ok()));
+    Runner.submit fixture.runner(Core.Sync_io_fence_reached(Int64.succ id,actual_scope,Ok()));
+    for _=1 to 20 do Eio.Fiber.yield() done;
+    let premature= !outcome<>None in
+    fixture.deliver_held();
+    while !outcome=None do Eio.Fiber.yield() done;
+    Alcotest.(check bool) "wrong scope/ID and canceled parent cannot fake I/O ACK" false premature;
+    Alcotest.(check bool) "actual Sync and Worker callback outlets settle exact fence" true(!outcome=Some(Ok()));
+    Runner.shutdown fixture.runner;
+    Alcotest.(check bool) "stopped Worker cannot mint an I/O ACK" true
+      (Result.is_error(Runner.await_sync_io fixture.runner ~scope)))
+;;
+
+let test_sync_io_fence_joins_nonasset_callback () =
+  T.with_managed(fun fixture->Eio_main.run(fun env->Eio.Switch.run(fun sw->
+    let reached,reached_resolve=Eio.Promise.create() and release,release_resolve=Eio.Promise.create() in
+    let fenced=ref None in
+    let runner=asset_io_runner ~env ~sw ~support:fixture.config.application_support_directory
+      ~fork:(fun ~sw task->Eio.Fiber.fork ~sw task)
+      ~post:(function
+        |Sync.Runner_completed _->ignore(Eio.Promise.try_resolve reached_resolve():bool);Eio.Promise.await release
+        |Sync.IO_fence_completed(id,_,outcome) when id=1L->fenced:=Some outcome
+        |_->())() in
+    Fun.protect ~finally:(fun()->ignore(Eio.Promise.try_resolve release_resolve():bool);Sync_runner.shutdown runner)(fun()->
+      let limits=Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024 ~submission_batch_size:1 |> Result.get_ok in
+      let state=Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits |> Result.get_ok |> Sync.initial |> Result.get_ok in
+      let state=(Sync.step state(Sync.Sign_in_requested{account_generation=0;presentation_generation=0})).next in
+      let authenticated=Sync.step state(Sync.Account_authenticated{user_id=Some "user-1"}) in
+      let request=List.find_map(function Sync.Run(Sync.Request(_,Sync.Fetch_catalog _) as request)->Some request|_->None)authenticated.effects |> Option.get in
+      Sync_runner.submit runner request;
+      Eio.Promise.await reached;
+      let scope:Sync.effect_scope={account_generation=None;graph_generation=None;connection_generation=None;
+        presentation_generation=None;lifecycle_generation=None} in
+      let barrier=Sync.step authenticated.next(Sync.IO_fence_requested(1L,scope)) in
+      List.iter(function Sync.Run instruction->Sync_runner.submit runner instruction|_->())barrier.effects;
+      for _=1 to 20 do Eio.Fiber.yield() done;
+      let premature= !fenced<>None in
+      ignore(Eio.Promise.try_resolve release_resolve():bool);
+      while !fenced=None do Eio.Fiber.yield() done;
+      Alcotest.(check bool) "generic Sync callback belongs to its actual I/O fence" false premature;
+      Alcotest.(check bool) "generic Sync callback completion settles fence" true(!fenced=Some(Ok()))))))
+;;
+
+let test_scope_close_keeps_live_staged_lease () =
+  with_asset_bridge(fun fixture->
+    let source=picker_import fixture.support 960 in
+    let staged=match fixture.fixture_asset(Sync.Stage_asset_file
+      {operation=source.operation;file_type=source.file_type;source_file=source.source_file})with
+      |Sync.Asset_staged value->value.file|_->Alcotest.fail "scope close fixture staging" in
+    let lease,path=match fixture.fixture_asset(Sync.Retain_staged_file staged)with
+      |Sync.Asset_retained(Some value)->value|_->Alcotest.fail "scope close fixture lease" in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file staged));
+    let closed=fixture.fixture_result Sync.Close_asset_scope in
+    let prematurely_unlinked=not(Sys.file_exists path) in
+    let released=fixture.fixture_result(Sync.Release_asset_file lease) in
+    let retried=fixture.fixture_result Sync.Close_asset_scope in
+    Alcotest.(check bool) "live native lease prevents successful close ACK" true(Result.is_error closed);
+    Alcotest.(check bool) "failed close preserves actual retained staged bytes" false prematurely_unlinked;
+    Alcotest.(check bool) "original handle still has actual release authority" true(released=Ok Sync.Asset_unit);
+    Alcotest.(check bool) "last checked release settles retired bytes" false(Sys.file_exists path);
+    Alcotest.(check bool) "close retries after physical lease release" true(retried=Ok Sync.Asset_unit))
+;;
+
+(* Physical cache/lease ownership is outside Core.step; exercise the real Sync
+   storage owner through the Worker interpreter, not an injected successful ACK. *)
+let test_host_scope_settlement_preserves_live_lease () =
+  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
+    let source=picker_import fixture.support 961 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
+    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let first=Runner.settle_host_scope fixture.runner ~scope:fixture.context.scope in
+    Alcotest.(check bool) "actual live lease prevents host settlement" true(Result.is_error first);
+    Alcotest.(check bool) "failed settlement preserves retained bytes" true(Sys.file_exists path);
+    let released=Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease in
+    Alcotest.(check bool) "original release succeeds behind admission fence" true(released=Ok());
+    let second=Runner.settle_host_scope fixture.runner ~scope:fixture.context.scope in
+    Alcotest.(check bool) "host settlement succeeds only after actual release" true(second=Ok());
+    Alcotest.(check bool) "settled retired file is removed" false(Sys.file_exists path))
+;;
+
+(* The bounded actor queue is outside Core.step. Fill it inside the registered
+   snapshot callback before automatic host follow-up; the consumer must not wait
+   for itself to make room. All data and account identities are isolated. *)
+(* Migrated existing physical after-listen initial-snapshot race. The public Db
+   owner executes the real read/cleanup; only unrelated Sync transport is absent. *)
+let test_observation_release_waits_for_initial_snapshot () =
+  let module Db=Logseq_db_worker in
+  let module Fixture=Test_support in
+  let module Read=Worker_pure_read in
+  let module F=Read.For_worker in
+  let require condition message=Alcotest.(check bool)message true condition in
+  T.with_managed(fun fixture->
+    ignore(Fixture.seed_mirror fixture.config.application_support_directory);
+    Eio_main.run(fun env->Eio.Switch.run(fun sw->
+      let worker=ref None in
+      let post event=Option.iter(fun db->Db.post db(Core.Sync_event event))!worker in
+      let graph:Sync.graph={graph_id=Fixture.graph_uuid;name="Observation snapshot fixture";
+        schema={major=65;minor=33;exact=true};encrypted=false}in
+      let sync_runner=Runner.sync_runner ~retire_account:(fun ~account:_->Ok()) ~shutdown:(fun()->())
+        ~submit:(function
+          |Sync.Request(ticket,Sync.Load_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok(Some
+             (Sync.catalog_cache ~user_id:"fixture-user" ~graphs:[graph] ~selected_graph:(Some graph.graph_id))))))
+          |Sync.Request(ticket,Sync.Save_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok())))
+          |Sync.Asset_io(ticket,request)->let value=match request.Sync.action with
+            |Sync.Prune_asset_staging _->Sync.Asset_pruned 0
+            |Close_asset_scope|Release_asset_file _|Release_staged_file _|Cancel_asset_operation _->Sync.Asset_unit
+            |_->failwith "Unexpected asset operation in observation fixture"in
+            post(Sync.Runner_completed(Sync.Asset_completion(ticket,Ok value)))
+          |_->())()in
+      let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
+        ~runtime:(Runner.runtime ~fork:(fun ~sw task->Eio.Fiber.fork ~sw task)
+          ~sleep:(Eio.Time.sleep(Eio.Stdenv.clock env)) |> Result.get_ok) ~publish:(fun _->()) |> Result.get_ok in
+      let db=Db.create ~sw ~config:(Core.config ~worker:fixture.config ~sync:(asset_sync_config()))
+        ~runner_dependencies:dependencies |> Result.get_ok in
+      worker:=Some db;
+      Fun.protect ~finally:(fun()->Db.shutdown db)(fun()->
+        let latest=ref None in
+        ignore(Db.register_coordination db ~registration:801L ~notify:(fun value->latest:=Some value) |> Result.get_ok);
+        post(Sync.Restore_local_account{user_id="fixture-user"});
+        Eio.Time.with_timeout_exn(Eio.Stdenv.clock env)3.(fun()->
+          while not(Option.exists(fun(snapshot:Db.coordination_snapshot)->
+            List.exists(fun(_,state)->state.Db.phase=Db.Graph_open)snapshot.state.residents)!latest)
+          do Eio.Fiber.yield()done);
+        let snapshot=Option.get !latest in
+        let scope,_=List.find(fun(_,state)->state.Db.phase=Db.Graph_open)snapshot.state.residents in
+        let owner=Option.get snapshot.state.sync.selected in
+        let binding=F.binding ~serial:801L ~incarnation:(Read.worker_incarnation
+          ~runtime_epoch:(Journal_worker_ids.Runtime.Epoch.of_int64 29000L)
+          ~worker_generation:Journal_worker_ids.Worker.Generation.one)
+          ~origin:(Uri.to_string scope.Sync.account.managed_sync_origin) ~user:scope.account.user_id in
+        let limits:Worker_pure_data.capability_limits={response_budget_bytes=fixture.config.response_budget_bytes;
+          outbox_max_records=4096;outbox_max_bytes=8388608;change_max_items=256;change_max_bytes=65536;
+          dispatcher_capacity=256;wire_batch_max_bytes=262144}in
+        let session=F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation
+          ~lifecycle:scope.account.lifecycle_generation ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits in
+        (* Slot reconstruction is performed by the physical snapshot reader,
+           not Core.step, so exercise it through the existing public Db fixture. *)
+        let missing=Fixture.mutation_uuid 29001 in
+        let lookup=Read.Asset_descriptors [missing; missing] in
+        let lookup_read=F.pack_query
+          (Read.read_budget session ~maximum_items:2 ~maximum_bytes:16384 |> Result.get_ok) lookup in
+        let lookup_id=Fixture.mutation_uuid 29002 in
+        let _,lookup_answer=Db.register_observation db ~registration:801L ~id:lookup_id
+          ~scope ~read:lookup_read ~current:(fun()->true) ~notify:(fun ~epoch:_->()) |> Result.get_ok in
+        require (match lookup_answer with
+          | Read.Query_answer(_,Read.Asset_descriptors _,Ok value)->value.items=[None;None]
+          | _->false) "physical snapshot keeps every repeated missing asset slot";
+        require (Db.release_observation db ~registration:801L ~id:lookup_id ~scope=Ok())
+          "exact lookup observation releases";
+        let read=F.pack_query(Read.read_budget session ~maximum_items:1 ~maximum_bytes:16384 |> Result.get_ok)Read.Graph_info in
+    let entered, enter = Eio.Promise.create ()
+    and gate, release_gate = Eio.Promise.create () in
+    let result, resolve_result = Eio.Promise.create ()
+    and released, resolve_released = Eio.Promise.create () in
+    let calls = ref 0
+    and notifications = ref 0 in
+    let current () =
+      incr calls;
+      if !calls = 2
+      then (
+        Eio.Promise.resolve enter ();
+        Eio.Promise.await gate);
+      true
+    in
+    let id=Fixture.mutation_uuid 29000 in
+    let await promise =
+      let deadline = Unix.gettimeofday () +. 3. in
+      while Eio.Promise.peek promise = None && Unix.gettimeofday () < deadline do
+        Eio.Fiber.yield ()
+      done;
+      match Eio.Promise.peek promise with
+      | Some value -> value
+      | None -> failwith "physical observation race timed out"
+    in
+    Fun.protect
+      ~finally:(fun () -> ignore (Eio.Promise.try_resolve release_gate () : bool))
+      (fun () ->
+         Eio.Fiber.fork ~sw (fun () ->
+           let value =
+             Db.register_observation
+               db
+               ~registration:801L
+               ~id
+               ~scope
+               ~read
+               ~current
+               ~notify:(fun ~epoch:_ -> incr notifications)
+           in
+           Eio.Promise.resolve resolve_result value);
+         await entered;
+         Eio.Fiber.fork ~sw (fun () ->
+           let value =
+             Db.release_observation
+               db
+               ~registration:801L
+               ~id
+               ~scope
+           in
+           Eio.Promise.resolve resolve_released value);
+         for _ = 1 to 8 do
+           Eio.Fiber.yield ()
+         done;
+         require
+           (Eio.Promise.peek released = None)
+           "release ACK preceded initial snapshot settlement";
+         Eio.Promise.resolve release_gate ();
+         require
+           (match await result with
+            | Error _ -> true
+            | _ -> false)
+           "cancelled registration returned a readable observation";
+         require (await released = Ok ()) "physical release did not acknowledge cleanup";
+         require
+           (!notifications = 0)
+           "initial registration resurrected a retired callback";
+         require
+           (match
+              Db.register_observation
+                db
+                ~registration:801L
+                ~id
+                ~scope
+                ~read
+                ~current:(fun () -> true)
+                ~notify:(fun ~epoch:_ -> incr notifications)
+            with
+            | Error _ -> true
+            | _ -> false)
+           "retired registration ID was physically allocated again")
+      ))))
+;;
+
+let test_host_followup_survives_full_actor_queue () =
+  T.with_managed(fun fixture->Eio_main.run(fun env->Eio.Switch.run(fun sw->
+    let module Db=Logseq_db_worker in
+    let worker=ref None in
+    let post event=Option.iter(fun worker->Db.post worker(Core.Sync_event event))!worker in
+    let sync_runner=Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture") ~shutdown:(fun()->()) ~submit:(function
+      |Sync.Request(ticket,Sync.Load_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok None)))
+      |Sync.Await_io(id,scope)->post(Sync.IO_fence_completed(id,scope,Ok()))
+      |_->())() in
+    let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
+      ~runtime:(Runner.runtime ~fork:(fun ~sw task->Eio.Fiber.fork ~sw task)
+        ~sleep:(Eio.Time.sleep(Eio.Stdenv.clock env)) |> Result.get_ok) ~publish:(fun _->()) |> Result.get_ok in
+    let db=Db.create ~sw ~config:(Core.config ~worker:fixture.config ~sync:(asset_sync_config()))
+      ~runner_dependencies:dependencies |> Result.get_ok in
+    worker:=Some db;
+    Fun.protect ~finally:(fun()->Db.shutdown db)(fun()->
+      let latest=ref None and armed=ref false and filled=ref false in
+      let notify (snapshot:Db.coordination_snapshot)=
+        latest:=Some snapshot;
+        if !armed && not !filled && snapshot.state.sync.account=None then (
+          filled:=true;
+          for _=1 to 256 do Db.post db(Core.Set_foreground false) done;
+          Eio.Fiber.fork ~sw(fun()->post(Sync.Restore_local_account{user_id="host-queue-next"}))) in
+      ignore(Db.register_coordination db ~registration:79L ~notify |> Result.get_ok);
+      post(Sync.Restore_local_account{user_id="host-queue-old"});
+      Eio.Time.with_timeout_exn(Eio.Stdenv.clock env) 2.(fun()->
+        while not(Option.exists(fun(snapshot:Db.coordination_snapshot)->snapshot.state.sync.account<>None)!latest)do Eio.Fiber.yield()done;
+        let snapshot=Option.get !latest in
+        let owner=Option.get snapshot.state.sync.account in
+        let plan:Db.host_plan={version=snapshot.version;registration=79L;owner;
+          id=Logseq_db_types.Graph_types.Uuid.of_string "10000000-0000-4000-8000-000000079079" |> Result.get_ok;
+          change=Core.Host_handoff.Replace_account;expected=Rrbvec.empty} in
+        let receipt=Db.prepare_host_change db plan |> Result.get_ok in
+        ignore(Db.apply_host_change db receipt |> Result.get_ok);
+        armed:=true;post(Sync.Account_authenticated{user_id=None});
+        while not(Option.exists(fun(snapshot:Db.coordination_snapshot)->
+          Option.exists(fun(account:Sync.account_scope)->account.user_id="host-queue-next")snapshot.state.sync.account)!latest)
+        do Eio.Fiber.yield()done;
+        Alcotest.(check bool) "consumer drains full queue across internal follow-up" true !filled)))))
+;;
+
+let test_asset_io_barrier_does_not_block_serial_submit () =
+  T.with_managed(fun fixture->Eio_main.run(fun env->Eio.Switch.run(fun sw->
+    let tasks=Queue.create() and events=ref [] in
+    let runner=asset_io_runner ~env ~sw ~support:fixture.config.application_support_directory
+      ~fork:(fun ~sw:_ task->Queue.add task tasks) ~post:(fun event->events:=event::!events)() in
+    Fun.protect ~finally:(fun()->Sync_runner.shutdown runner)(fun()->
+      let graph_id=Logseq_db_types.Graph_types.Uuid.of_string "22000000-0000-4000-8000-000000000001" |> Result.get_ok in
+      let initial,context=admitted_asset_state graph_id in
+      let source=picker_import fixture.config.application_support_directory 980 in
+      let issue state operation action=
+        let transition=Sync.step state(Sync.Asset_requested{scope=context.scope;operation;action}) in
+        let instruction=List.find_map(function Sync.Run instruction->Some instruction|_->None)transition.effects |> Option.get in
+        transition.next,instruction in
+      let pending,stage=issue initial "actual-stage-before-barrier"
+        (Sync.Stage_asset_file{operation=source.operation;file_type=source.file_type;source_file=source.source_file}) in
+      Sync_runner.submit runner stage;
+      let barrier_state,barrier=issue pending "actual-io-barrier" Sync.Await_asset_operations in
+      let returned=ref false in
+      Eio.Fiber.fork ~sw(fun()->Sync_runner.submit runner barrier;returned:=true);
+      Eio.Fiber.yield();
+      let blocked=not !returned in
+      let later_source=picker_import fixture.config.application_support_directory 990 in
+      let _,later=issue barrier_state "later-unrelated-stage"
+        (Sync.Stage_asset_file{operation=later_source.operation;file_type=later_source.file_type;source_file=later_source.source_file}) in
+      Sync_runner.submit runner later;
+      (Queue.take tasks)(); (* actual first source finishes; later source stays queued *)
+      let barrier_finished=ref false in
+      if not(Queue.is_empty tasks) then (
+        let task=Queue.take tasks in
+        Eio.Fiber.fork ~sw(fun()->task();barrier_finished:=true));
+      for _=1 to 4 do Eio.Fiber.yield() done;
+      let joined_later=not !barrier_finished in
+      while not(Queue.is_empty tasks)do (Queue.take tasks)() done;
+      while not !returned || not !barrier_finished do Eio.Fiber.yield() done;
+      Alcotest.(check bool) "Await submit must leave the serial callback consumer free" false blocked;
+      Alcotest.(check bool) "barrier cannot capture later unrelated I/O" false joined_later;
+      Alcotest.(check bool) "actual asset owner still reports completion" true(List.length !events>=3)))))
+;;
+
+let test_writer_fence_joins_actual_canceled_asset_callback () =
+  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
+    let source=picker_import fixture.support 970 in
+    let reached=fixture.gate ~hold_callback:true
+      (fun output->match output.Sync.request.action with Sync.Stage_asset_file _->true|_->false)
+      ~deliver_first:false in
+    Eio.Fiber.first
+      (fun()->ignore(Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true));
+        Alcotest.fail "held actual staging callback unexpectedly returned")
+      (fun()->Eio.Promise.await reached);
+    let outcome=ref None in
+    Eio.Fiber.fork ~sw:fixture.sw (fun()->
+      outcome:=Some(Runner.quiesce_writers fixture.runner ~scope:fixture.context.scope));
+    for _=1 to 20 do Eio.Fiber.yield() done;
+    let premature= !outcome<>None in
+    fixture.deliver_held();
+    while !outcome=None do Eio.Fiber.yield() done;
+    Alcotest.(check bool) "actual canceled Sync task callback must finish before writer ACK" false premature;
+    Alcotest.(check bool) "actual child callback allows writer barrier" true(!outcome=Some(Ok())))
 ;;
 
 let test_cancelled_retained_output () =
@@ -838,6 +1272,234 @@ let test_cancelled_retained_output () =
       (Sys.file_exists path))
 ;;
 
+let test_checked_release_exact_physical_completion () =
+  with_asset_bridge(fun fixture->
+    let source=picker_import fixture.support 60 in
+    ignore(Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun()->true) |> Result.get_ok);
+    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope
+      ~operation:source.operation |> Option.get in
+    let wrong_scope={fixture.context.scope with graph_generation=fixture.context.scope.graph_generation+1} in
+    Alcotest.(check bool) "cancelled scoped release is not ACK" true
+      (Result.is_error(Runner.release_asset_file_checked fixture.runner ~scope:wrong_scope ~handle:lease));
+    Alcotest.(check bool) "old scope release leaves staged original intact" true (Sys.file_exists path);
+    let reached=fixture.gate (fun output->match output.Sync.request.action with
+      | Sync.Release_asset_file handle->handle=lease | _->false) ~deliver_first:false in
+    let completed=ref None in
+    Eio.Fiber.both
+      (fun()->completed:=Some(Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease))
+      (fun()->Eio.Promise.await reached;
+        Alcotest.(check bool) "release ACK waits for actual owner completion" true (!completed=None);
+        fixture.deliver_held());
+    Alcotest.(check bool) "exact physical release completes" true (!completed=Some(Ok()));
+    Runner.shutdown fixture.runner;
+    Alcotest.(check bool) "stopped runner cannot acknowledge release" true
+      (Result.is_error(Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease)))
+;;
+
+let test_checked_release_storage_retry () =
+  with_asset_bridge(fun fixture->
+    let source=picker_import fixture.support 80 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun()->true) |> Result.get_ok in
+    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope
+      ~operation:source.operation |> Option.get in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let directory=Filename.dirname path in
+    Unix.chmod directory 0o500;
+    Fun.protect ~finally:(fun()->Unix.chmod directory 0o700)(fun()->
+      Alcotest.(check bool) "physical staging cleanup failure is not a release ACK" true
+        (Result.is_error(Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease));
+      Alcotest.(check bool) "failed release retains its bytes" true(Sys.file_exists path));
+    Alcotest.(check bool) "same exact handle can settle after storage recovers" true
+      (Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease=Ok());
+    Alcotest.(check bool) "successful retry actually removes retired staging" false(Sys.file_exists path))
+;;
+
+let test_discarded_retain_retries_real_storage_cleanup () =
+  with_asset_bridge ~asynchronous:true(fun fixture->
+    let source=picker_import fixture.support 81 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun()->true) |> Result.get_ok in
+    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope
+      ~operation:source.operation |> Option.get in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let directory=Filename.dirname path in
+    Unix.chmod directory 0o500;
+    Fun.protect ~finally:(fun()->Unix.chmod directory 0o700)(fun()->
+      Runner.abandon_asset_file fixture.runner ~scope:fixture.context.scope ~handle:lease;
+      Alcotest.(check int) "discard retains failed physical cleanup" 1(Runner.unsettled_orphan_retains fixture.runner);
+      Alcotest.(check bool) "pending failed cleanup preserves its bytes" true(Sys.file_exists path);
+      Alcotest.(check bool) "failed orphan cleanup gates new retain" true
+        (Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation=None));
+    let deadline=Unix.gettimeofday()+.2. in
+    while Runner.unsettled_orphan_retains fixture.runner>0 && Unix.gettimeofday()<deadline do
+      Eio.Fiber.yield()
+    done;
+    Alcotest.(check int) "actual background ACK settles the obligation" 0(Runner.unsettled_orphan_retains fixture.runner);
+    Alcotest.(check bool) "actual retry removes the retired staging bytes" false(Sys.file_exists path))
+;;
+
+(* The public pure cleanup owner correctly queues both releases. Its state cannot
+   reproduce the interpreter's job finishing before queued physical IO starts. *)
+let test_asset_cleanup_snapshot_joins_queued_release () =
+  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
+    let source=picker_import fixture.support 87 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
+    let retain()=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get |> fst in
+    let first=retain() and second=retain() in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let second_reached,resolve_second=Eio.Promise.create() in
+    let reached=fixture.gate(fun output->match output.Sync.request.action with
+      | Sync.Release_asset_file handle when handle=first->true
+      | Sync.Release_asset_file handle when handle=second->Eio.Promise.resolve resolve_second();true
+      | _->false) ~deliver_first:false in
+    let release handle=Runner.submit fixture.runner(Core.Run_asset(fixture.context,
+      Logseq_sync_pure_reducer.Asset_transfer.Release_handle handle)) in
+    release first;
+    Eio.Promise.await reached;
+    release second;
+    let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
+    let completed=ref None in
+    Eio.Fiber.both
+      (fun()->completed:=Some(Runner.await_asset_cleanup fixture.runner snapshot))
+      (fun()->fixture.deliver_held ~keep_gate:true();
+        Eio.Promise.await second_reached;
+        Alcotest.(check bool) "queued physical release has not returned an ACK" true(!completed=None);
+        fixture.deliver_held());
+    Alcotest.(check bool) "queued real release is joined before settlement ACK" true(!completed=Some(Ok()));
+    Alcotest.(check int) "both original resource releases are settled" 0(Runner.unsettled_orphan_retains fixture.runner))
+;;
+
+let test_asset_cleanup_snapshot_joins_physical_release () =
+  with_asset_bridge ~asynchronous:true(fun fixture->
+    let source=picker_import fixture.support 82 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
+    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let reached=fixture.gate(fun output->match output.Sync.request.action with
+      | Sync.Release_asset_file handle->handle=lease|_->false) ~deliver_first:false in
+    Runner.submit fixture.runner(Core.Run_asset(fixture.context,Logseq_sync_pure_reducer.Asset_transfer.Release_handle lease));
+    let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
+    let completed=ref None in
+    Eio.Fiber.both
+      (fun()->completed:=Some(Runner.await_asset_cleanup fixture.runner snapshot))
+      (fun()->Eio.Promise.await reached;
+        Alcotest.(check bool) "settlement waits for actual checked release result" true(!completed=None);
+        fixture.deliver_held());
+    Alcotest.(check bool) "joined physical cleanup ACK" true(!completed=Some(Ok()));
+    Alcotest.(check bool) "retired actual staging bytes were removed" false(Sys.file_exists path))
+;;
+
+let test_asset_cleanup_ignores_later_unrelated_work () =
+  with_asset_bridge ~asynchronous:true(fun fixture->
+    let module Transfer=Logseq_sync_pure_reducer.Asset_transfer in
+    let asset=Logseq_db_types.Asset_descriptor.create ~uuid:(Logseq_db_types.Graph_types.Uuid.of_string "22000000-0000-4000-8000-000000000085" |> Result.get_ok)
+      ~source:(Managed None) ~current_checksum:(Some(String.make 64 'a')) ~size:None ~dimensions:None |> Result.get_ok in
+    let transfer=Transfer.create(Transfer.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:0 |> Result.get_ok)
+      ~scope:fixture.context.scope ~online:true ~unlocked:true in
+    let _,work=Transfer.step transfer(Replace{consumer="cancel-before-unrelated";priority=Foreground;assets=[asset]}) in
+    let lookup=List.find_map(function Transfer.Check_cache ticket->Some ticket|_->None)work |> Option.get in
+    let reached=fixture.hold_asset_barrier() in
+    Runner.submit fixture.runner(Core.Run_asset(fixture.context,Transfer.Cancel(Lookup lookup)));
+    let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
+    let source=picker_import fixture.support 85 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
+    let lease,_=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let physical=fixture.gate(fun output->match output.Sync.request.action with Sync.Release_asset_file handle->handle=lease|_->false) ~deliver_first:false in
+    let completed=ref None in
+    Eio.Fiber.both
+      (fun()->completed:=Some(Runner.await_asset_cleanup fixture.runner snapshot))
+      (fun()->Eio.Promise.await reached;
+        Runner.submit fixture.runner(Core.Run_asset(fixture.context,Transfer.Release_handle lease));
+        Eio.Promise.await physical;
+        fixture.deliver_asset_barriers();
+        for _=0 to 9 do Eio.Fiber.yield() done;
+        let unrelated= !completed=Some(Ok()) in
+        fixture.deliver_held();
+        Alcotest.(check bool) "later unrelated cleanup cannot join an earlier consumer ACK" true unrelated))
+;;
+
+let test_asset_cleanup_joins_queued_result_child () =
+  with_asset_bridge ~asynchronous:true(fun fixture->
+    let module Transfer=Logseq_sync_pure_reducer.Asset_transfer in
+    let source=picker_import fixture.support 86 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
+    ignore(fixture.fixture_asset(Sync.Publish_staged_asset{asset=prepared.asset;version=prepared.version;file=prepared.staged_file}));
+    let asset=Logseq_db_types.Asset_descriptor.create ~uuid:prepared.asset ~source:(Managed(Some prepared.version))
+      ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+    let transfer=Transfer.create(Transfer.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:0 |> Result.get_ok)
+      ~scope:fixture.context.scope ~online:true ~unlocked:true in
+    let active,work=Transfer.step transfer(Replace{consumer="queued-result-child";priority=Foreground;assets=[asset]}) in
+    let active=ref active in
+    fixture.set_asset_current(fun ticket->Transfer.ticket_current !active ticket);
+    let received,received_resolve=Eio.Promise.create() in
+    fixture.on_asset_completed(fun event->Eio.Promise.resolve received_resolve event);
+    List.iter(fun instruction->match instruction with Transfer.Check_cache _->Runner.submit fixture.runner(Core.Run_asset(fixture.context,instruction))|_->())work;
+    let result=Eio.Promise.await received in
+    let released,cancel=Transfer.step !active(Release "queued-result-child") in
+    active:=released;
+    let barrier=fixture.hold_asset_barrier() in
+    List.iter(fun instruction->match instruction with Transfer.Cancel _->Runner.submit fixture.runner(Core.Run_asset(fixture.context,instruction))|_->())cancel;
+    let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
+    let physical=fixture.gate(fun output->match output.Sync.request.action with Sync.Release_asset_file _->true|_->false) ~deliver_first:false in
+    let completed=ref None in
+    Eio.Fiber.both
+      (fun()->completed:=Some(Runner.await_asset_cleanup fixture.runner snapshot))
+      (fun()->Eio.Promise.await barrier;
+        let stale,children=Transfer.step !active result in active:=stale;
+        List.iter(fun instruction->match instruction with Transfer.Release_handle _->Runner.submit fixture.runner(Core.Run_asset(fixture.context,instruction))|_->())children;
+        Eio.Promise.await physical;
+        fixture.deliver_asset_barriers();
+        for _=0 to 9 do Eio.Fiber.yield() done;
+        let waiting= !completed=None in
+        fixture.deliver_held();
+        Alcotest.(check bool) "queued successful result's actual release child joins cancellation" true waiting);
+    Alcotest.(check bool) "exact causal resource ACK settles after real child IO" true(!completed=Some(Ok())))
+;;
+
+let test_asset_cleanup_stop_does_not_wait_for_lost_io () =
+  with_asset_bridge ~asynchronous:true(fun fixture->
+    let source=picker_import fixture.support 84 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
+    let lease,_=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let reached=fixture.gate(fun output->match output.Sync.request.action with
+      | Sync.Release_asset_file handle->handle=lease|_->false) ~deliver_first:false in
+    Runner.submit fixture.runner(Core.Run_asset(fixture.context,Logseq_sync_pure_reducer.Asset_transfer.Release_handle lease));
+    let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
+    let completed=ref None in
+    Eio.Fiber.both
+      (fun()->completed:=Some(Runner.await_asset_cleanup fixture.runner snapshot))
+      (fun()->Eio.Promise.await reached;Runner.shutdown fixture.runner;
+        for _=0 to 9 do Eio.Fiber.yield() done;
+        let returned=Option.exists Result.is_error !completed in
+        fixture.deliver_held();
+        Alcotest.(check bool) "stopped cleanup reports failure without waiting for lost callback" true returned))
+;;
+
+let test_asset_cleanup_snapshot_retains_physical_failure () =
+  with_asset_bridge ~asynchronous:true(fun fixture->
+    let source=picker_import fixture.support 83 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
+    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let directory=Filename.dirname path in
+    Unix.chmod directory 0o500;
+    Fun.protect ~finally:(fun()->Unix.chmod directory 0o700)(fun()->
+      Runner.submit fixture.runner(Core.Run_asset(fixture.context,Logseq_sync_pure_reducer.Asset_transfer.Release_handle lease));
+      let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
+      Alcotest.(check bool) "a failed physical resource cannot produce settlement ACK" true
+        (Result.is_error(Runner.await_asset_cleanup fixture.runner snapshot));
+      Alcotest.(check bool) "failure retains actual bytes" true(Sys.file_exists path));
+    let deadline=Unix.gettimeofday()+.2. in
+    while Runner.unsettled_orphan_retains fixture.runner>0 && Unix.gettimeofday()<deadline do Eio.Fiber.yield() done;
+    let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
+    Alcotest.(check bool) "settlement succeeds only after actual recovery" true(Runner.await_asset_cleanup fixture.runner snapshot=Ok());
+    Alcotest.(check bool) "recovered settlement removed actual bytes" false(Sys.file_exists path))
+;;
+
 let test_db_shutdown_accepts_late_staging_completion () =
   let module Db = Logseq_db_worker in
   T.with_managed (fun fixture ->
@@ -873,7 +1535,7 @@ let test_db_shutdown_accepts_late_staging_completion () =
         in
         io_runner := Some (asset_io_runner ~env ~sw ~support ~post ());
         let sync_runner =
-          Runner.sync_runner
+          Runner.sync_runner ~retire_account:(Sync_runner.retire_account (Option.get !io_runner))
             ~submit:(function
               | Sync.Request (ticket, Sync.Fetch_catalog _) ->
                 Db.post
@@ -1091,7 +1753,7 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
                 ~support:fixture.config.application_support_directory
                 ~post:(fun event -> post (Core.Sync_event event)) ());
         let sync_runner =
-          Runner.sync_runner
+          Runner.sync_runner ~retire_account:(Sync_runner.retire_account (Option.get !io_runner))
             ~submit:(fun runner_effect ->
               (match runner_effect with
                | Sync.Asset_io (_, { action = Sync.Stage_asset_file _; _ }) ->
@@ -1293,12 +1955,11 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
              ~operation:source.operation
            = None);
         Runner.release_asset_file runner ~scope ~handle:lease;
+        Alcotest.(check bool) "same operation cannot replace its complete original source" true
+          (Result.is_error(Runner.prepare_import runner ~context
+            {source with source_file="picker-no-longer-available"} ~current:(fun()->true)));
         let duplicate =
-          Runner.prepare_import
-            runner
-            ~context
-            { source with source_file = "picker-no-longer-available" }
-            ~current:(fun () -> true)
+          Runner.prepare_import runner ~context source ~current:(fun () -> true)
           |> Result.get_ok
         in
         Alcotest.(check bool)
@@ -1380,8 +2041,8 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
         let completion = List.find_map (function Core.Asset_completed (_, event) -> Some event | _ -> None) !posted |> Option.get in
         let _, work = Transfer.step transfer completion in
         let failures = List.filter_map (function
-          | Transfer.Notify {consumer;asset;availability=Failed _ as availability} ->
-            Some (Core.Asset_availability {consumer;asset;availability})
+          | Transfer.Notify {consumer;asset;descriptor;availability=Failed _ as availability} ->
+            Some (Core.Asset_availability {consumer;asset;descriptor;availability})
           | _ -> None) work in
         Alcotest.(check int) "real terminal failure notifies both consumers" 2 (List.length failures);
         List.iter (fun notice ->
@@ -1621,7 +2282,7 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false)
       let destructive_requests = ref 0 in
       let published = ref [] and blocked_states = ref None in
       let post event = Db.post (Option.get !worker) (Core.Sync_event event) in
-      let sync_runner = Runner.sync_runner ~submit:(function
+      let sync_runner = Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture") ~submit:(function
         | Sync.Request (ticket, Sync.Load_catalog _) ->
           post (Sync.Runner_completed (Sync.Completion (ticket, Ok None)))
         | Sync.Request (ticket, Sync.Save_catalog _) ->
@@ -2050,7 +2711,7 @@ let test_authoritative_rejection_diagnostics kind () =
         and connection = ref None in
         let post event = Queue.add event events in
         let sync_runner =
-          Runner.sync_runner
+          Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture")
             ~shutdown:(fun () -> ())
             ~submit:(function
               | Sync.Request (ticket, Sync.Fetch_catalog _) ->
@@ -2289,27 +2950,27 @@ let test_authoritative_rejection_diagnostics kind () =
                  ((Core.view !state).sync.snapshot.applied_server_t = Some (cursor 0L));
                (match kind with
                 | `Integrity ->
-                  let module P = Logseq_db_worker.Protocol in
-                  drive
-                    (Core.Graph_request
-                       { id = Core.request_id_of_int64 3L
-                       ; request =
-                           { P.api_version = P.api_version
-                           ; request_id =
-                               G.Uuid.of_string "94000000-0000-4000-8000-000000000710"
-                               |> Result.get_ok
-                           ; command = P.V2_inspect_admission
-                           }
-                       });
+                  let module Read=Worker_pure_read in
+                  let module F=Read.For_worker in
+                  let scope=List.hd(Core.graph_scopes !state) in
+                  let binding=F.binding ~serial:1L ~incarnation:(Read.worker_incarnation
+                    ~runtime_epoch:(Journal_worker_ids.Runtime.Epoch.of_int64 1L)
+                    ~worker_generation:(Journal_worker_ids.Worker.Generation.of_int64 1L))
+                    ~origin:(Uri.to_string scope.account.managed_sync_origin) ~user:scope.account.user_id in
+                  let owner:Sync.timeline_scope={startup={account_generation=scope.account.account_generation;
+                    presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;graph_generation=scope.graph_generation}in
+                  let limits:Worker_pure_data.capability_limits={response_budget_bytes=fixture.config.response_budget_bytes;
+                    outbox_max_records=4096;outbox_max_bytes=8388608;change_max_items=4096;change_max_bytes=1048576;
+                    dispatcher_capacity=256;wire_batch_max_bytes=262144}in
+                  let session=F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation
+                    ~lifecycle:scope.account.lifecycle_generation ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits in
+                  let budget=Read.read_budget session ~maximum_items:1 ~maximum_bytes:limits.response_budget_bytes|>Result.get_ok in
+                  drive(Core.Graph_request_for_scope{scope;id=Core.request_id_of_int64 3L;
+                    read=F.pack_query budget Read.Admission});
                   let active =
                     List.find_map
                       (function
-                        | Core.Reply
-                            ( _
-                            , P.V2_response
-                                { outcome = V2_admission_outcome { active_records; _ }
-                                ; _
-                                } ) -> Some active_records
+                        |Core.Reply(_,Read.Query_answer(_,Read.Admission,Ok inspection))->Some inspection.active_records
                         | _ -> None)
                       !emitted
                     |> Option.get
@@ -2443,7 +3104,30 @@ let () =
         ] )
     ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
-      , [ Alcotest.test_case
+      , [ Alcotest.test_case "readonly import input recovery and exact proof ACK" `Quick test_import_input_readonly_recovery_and_proof_ack
+        ; Alcotest.test_case "initial observation snapshot joins real release" `Quick test_observation_release_waits_for_initial_snapshot
+        ; Alcotest.test_case "host internal followup survives full actor queue" `Quick test_host_followup_survives_full_actor_queue
+        ; Alcotest.test_case "host scope settlement preserves real lease" `Quick test_host_scope_settlement_preserves_live_lease
+        ; Alcotest.test_case "Worker Sync IO fence correlates actual child" `Quick test_worker_sync_io_fence_correlates_real_child
+        ; Alcotest.test_case "Sync IO fence joins nonasset callback" `Quick test_sync_io_fence_joins_nonasset_callback
+        ; Alcotest.test_case "scope close keeps live staged lease" `Quick test_scope_close_keeps_live_staged_lease
+        ; Alcotest.test_case "asset IO barrier submit stays nonblocking" `Quick test_asset_io_barrier_does_not_block_serial_submit
+        ; Alcotest.test_case "writer fence joins actual canceled asset callback" `Quick test_writer_fence_joins_actual_canceled_asset_callback
+        ; Alcotest.test_case "asset cleanup joins queued result child" `Quick test_asset_cleanup_joins_queued_result_child
+        ; Alcotest.test_case "asset cleanup ignores later unrelated work" `Quick test_asset_cleanup_ignores_later_unrelated_work
+        ; Alcotest.test_case "asset cleanup stop returns failure" `Quick test_asset_cleanup_stop_does_not_wait_for_lost_io
+        ; Alcotest.test_case "asset cleanup snapshot retains physical failure" `Quick test_asset_cleanup_snapshot_retains_physical_failure
+        ; Alcotest.test_case "asset cleanup snapshot joins queued release" `Quick test_asset_cleanup_snapshot_joins_queued_release
+        ; Alcotest.test_case "asset cleanup snapshot joins physical release" `Quick test_asset_cleanup_snapshot_joins_physical_release
+        ; Alcotest.test_case "discarded retain retries actual storage cleanup" `Quick
+            test_discarded_retain_retries_real_storage_cleanup
+        ; Alcotest.test_case
+            "checked release preserves storage failure for same-handle retry" `Quick
+            test_checked_release_storage_retry
+        ; Alcotest.test_case
+            "checked release awaits exact physical completion" `Quick
+            test_checked_release_exact_physical_completion
+        ; Alcotest.test_case
             "cancel queued staging output"
             `Quick
             (cancelled_stage_output false)

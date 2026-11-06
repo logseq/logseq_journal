@@ -1,8 +1,24 @@
-module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Asset = Logseq_db_types.Asset_descriptor
-module Protocol = Logseq_db_worker.Protocol
 
 type ticket
+
+module Worker = Journal_worker_coordination.Worker_api
+module Coordination = Journal_worker_coordination.Worker_pure_coordinator
+
+type demand_registration = Worker.asset_demand Coordination.ticket * Worker.asset_demand option
+
+type read_result
+
+type 'a read_ticket
+
+type read_request = private
+  | Read :
+      { ticket : 'a read_ticket
+      ; maximum_items : int
+      ; query : 'a Worker.query
+      ; outcome : 'a -> read_result
+      }
+      -> read_request
 
 type item =
   { token : string
@@ -19,15 +35,41 @@ type view =
 
 type t
 
+(** A fixed typed read port. It returns admission synchronously and delivers
+    the read result on a later turn of the existing serial App event entrance.
+    Transport IDs and continuation construction stay with the coordinator SDK. *)
 val create
-  :  send:(ticket option -> Service.request -> bool)
+  :  release_file:(Worker.file_lease -> bool)
+  -> release_consumer:(demand_registration -> bool)
+  -> ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
+  -> ?read_retired:(Logseq_db_types.Graph_types.Uuid.t -> unit)
+  -> read:(read_request -> bool)
+  -> demand:(graph_generation:int -> name:string -> Worker.asset_priority -> Asset.t list -> Worker.asset_demand Coordination.ticket option)
+  -> acquire:(ticket -> Worker.asset_file -> bool)
+  -> retry_asset:(graph_generation:int -> Worker.Uuid.t -> bool)
   -> changed:(string -> view -> unit)
+  -> unit
   -> t
 
+(** Business read identities include queued and accepted reads; resource leases
+    are excluded. Planning is reported before a possible synchronous refusal. *)
+val owns_read : t -> Logseq_db_types.Graph_types.Uuid.t -> bool
+
+(** Logical presentation association only; physical ownership stays in Core. *)
+val receive_file:t -> ticket -> Worker.file_lease option -> unit
+
+val receive_read : t -> read_result -> bool
+val reject_read : t -> 'a read_ticket -> unit
+(** Retire only imported preview leases owned by a replaced coordinator binding.
+    Keep ordinary display owners and rediscover visible roots after real rebind. *)
+val retire_coordinated_previews:t -> unit
+val retire_coordinated_resources:t -> unit
+val bind_coordinated_resources:t -> Worker.binding -> unit
+val resume_coordinated_previews:t -> unit
 val reset : t -> graph_generation:int option -> unit
 
 (** Visibility belongs to a retained presentation. Shared roots and assets are
-    released after their last owner leaves; omitting [owner] uses one legacy owner. *)
+    released after their last owner leaves; omitting [owner] uses one default owner. *)
 val root_visible : ?owner:string -> t -> root:string -> bool -> unit
 
 val retain_visible_roots : ?owner:string -> t -> string list -> unit
@@ -47,19 +89,33 @@ val preview_visible
 
 val next : t -> root:string -> unit
 val retry : ?owner:string -> t -> root:string -> asset:string -> unit
-val observe_response : t -> Protocol.response -> unit
-
-(** Register a successfully admitted current-scope query before its response.
-    Observations retire their registration and cannot overwrite newer facts. *)
-val observe_request : t -> Protocol.request -> unit
 
 val forget_request : t -> Logseq_db_types.Graph_types.Uuid.t -> unit
-val changes : t -> Protocol.v2_change_window list -> unit
+val changes : t -> Worker_pure_data.change_window list -> unit
 val resync : t -> unit
-val receive : t -> ticket -> Service.response -> unit
-val reject : t -> ticket -> unit
-val notice : t -> Service.asset_scope -> Service.asset_notice -> unit
+val notice : t -> Worker.asset_notice -> unit
+val demand_backpressured : ?ticket:Worker.asset_demand Coordination.ticket -> t -> string -> unit
 val pump : t -> unit
-val imported : t -> current:bool -> Logseq_db_worker.import_receipt -> unit
-
+val imported : t -> current:bool -> Worker.imported -> unit
 val idle : t -> bool
+
+(** Observe the original accepted spec query and value without a transport envelope.
+    Facts do not consume enumeration or its sealed continuation. *)
+val observe_query
+  : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> 'a Worker.query -> unit
+val observe_query_result
+  : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> 'a Worker.query -> 'a -> unit
+
+(** Exact business correlation, independent of Worker transport IDs. *)
+val read_request_id : read_request -> Logseq_db_types.Graph_types.Uuid.t
+
+(** Failed visible interests remain obligations of a repeated Changes attempt,
+    even when their error view did not change and no new read was planned. *)
+val change_application_error : t -> Worker_pure_data.change_window list -> string option
+
+(** Only failed DTO/dependency reads, excluding download/lease/import status. An
+    actual queued listing retry remains an obligation rather than a final error. *)
+val projection_read_error : t -> root:string -> string option
+
+(** Retain a checked acknowledgement only for the still-owned replacement ticket. *)
+val receive_demand : t -> Worker.asset_demand Coordination.ticket -> Worker.asset_demand -> bool

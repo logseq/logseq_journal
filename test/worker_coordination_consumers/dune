@@ -1,0 +1,6 @@
+(library
+ (name worker_coordination_consumers)
+ (modules consumer)
+ (libraries rrbvec logseq_journal.worker_coordination
+  logseq_db_worker.typed_data
+  journal_app_business))

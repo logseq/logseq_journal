@@ -2,7 +2,7 @@ module R = Journal_media_runtime
 module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module A = Logseq_db_types.Asset_descriptor
 module G = Logseq_db_types.Graph_types
-module P = Logseq_db_worker.Protocol
+module Read = Worker_pure_read
 
 let check condition message = if not condition then failwith message
 
@@ -10,40 +10,112 @@ let uuid n =
   G.Uuid.of_string (Printf.sprintf "89000000-0000-4000-8000-%012d" n) |> Result.get_ok
 ;;
 
+module W = Journal_worker_coordination.Worker_api
+
+type outgoing = Read of R.read_request | Command : R.ticket option * 'a W.request -> outgoing
+
+let commands queue = Queue.to_seq queue |> Seq.filter_map (function
+  | Command _ as command -> Some command | Read _ -> None)
+;;
+
+let take_command queue = match Queue.take queue with
+  | Command _ as command -> command
+  | Read _ -> failwith "expected a resource command"
+;;
+
+let take_read queue = match Queue.take queue with
+  | Read request -> request
+  | Command _ -> failwith "expected a typed read"
+;;
+
+module Resources=Coordination_test_fixture.Resources
+let resource_source=Resources.create ~graph:(uuid 3) ~graph_generation:1 8100L
+let producer=lazy(resource_source.Resources.issuer,resource_source.session)
+
+type resource_ports =
+  { demand : graph_generation:int -> name:string -> W.asset_priority -> A.t list -> W.asset_demand R.Coordination.ticket option
+  ; acquire : R.ticket -> W.asset_file -> bool
+  ; release_file : W.file_lease -> bool
+  ; release_consumer : R.demand_registration -> bool
+  ; retry_asset : graph_generation:int -> W.Uuid.t -> bool }
+
+let resource_ports sent accepted =
+  let submit request=if accepted() then (Queue.add request sent;true)else false in
+  {demand=(fun ~graph_generation ~name priority assets -> if not(accepted())then None else
+     Option.map(fun ticket->
+       let consumer=W.asset_consumer resource_source.session ~name |> Result.get_ok in
+       Queue.add(Command(None,W.Replace_asset_demand(consumer,priority,assets)))sent;ticket)
+       (Resources.demand_ticket resource_source ~graph_generation ~name priority assets));
+   acquire=(fun ticket file->submit(Command(Some ticket,W.Acquire_asset_file file)));
+   release_file=(fun file->submit(Command(None,W.Release_file file)));
+   release_consumer=(fun (ticket,demand)->match demand with
+     |Some demand->submit(Command(None,W.Release_asset_demand demand))
+     |None->if accepted() then (Resources.cancel_demand resource_source ticket;true)else false);
+   retry_asset=(fun ~graph_generation asset->graph_generation=resource_source.scope.graph_generation && submit(Command(None,W.Retry_asset asset)))}
+
+let consumer_name consumer =
+  Hashtbl.to_seq resource_source.Resources.demands |> Seq.find_map(fun(name,(actual,_,_))->
+    if W.equal_asset_consumer consumer actual then Some name else None) |> Option.get
+
+let take_acquire sent = match take_command sent with
+  |Command(Some ticket,W.Acquire_asset_file file)->ticket,file
+  |_->failwith "expected an original typed file acquisition"
+
+let file_reply runtime (ticket,file) handle path =
+  R.receive_file runtime ticket (Some(Resources.lease resource_source file ~handle ~path))
+
+let acquisition_handle (_,file) =
+  let module I=(val resource_source.issuer:Worker_effect_authority.ISSUER) in
+  match I.request resource_source.session ~request_id:(W.request_id(Resources.id resource_source))(W.Acquire_asset_file file) with
+  |Ok(S.Acquire_asset_file{handle;_})->handle
+  |_->failwith "actual acquire factory rejected its original capability"
+
+let released_handle = function
+  |Command(_,W.Release_file lease)->
+    let module I=(val resource_source.issuer:Worker_effect_authority.ISSUER) in
+    (match I.request (W.file_lease_session lease) ~request_id:(W.request_id(Resources.id resource_source))(W.Release_file lease) with
+     |Ok(S.Release_asset_file{handle;_})->Some handle|_->failwith "actual release factory rejected its original lease")
+  |_->None
+
+let answer runtime (R.Read request as original) produce =
+  let issuer, session = Lazy.force producer in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
+  let budget = W.read_budget session ~maximum_items:request.maximum_items
+    ~maximum_bytes:65536 |> Result.get_ok in
+  let operation = W.Query (budget, request.query) in
+  let id = R.read_request_id original in
+  let response=match I.request session ~request_id:(W.request_id id)operation|>Result.get_ok with
+    |S.Coordination_query source->S.Coordination_queried{registration=source.registration;owner=source.owner;
+      request_id=source.request_id;answer=produce source.read}
+    |_->failwith "Media fixture did not issue the original query"in
+  match I.reply session ~request_id:(W.request_id id)operation response with
+  | Ok (W.Answered (Ok value)) -> ignore (R.receive_read runtime (request.outcome value))
+  | _ -> failwith "fixture response did not decode to the spec query value"
+;;
+
+let reject_read runtime (R.Read request) = R.reject_read runtime request.ticket
+
+let reply runtime request ?next_cursor items =
+  answer runtime request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("p") ~items:(items) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors ids->let listing=Result.get_ok value in F.answer budget query (Ok(F.asset_lookup_result ~generation:listing.generation ~projection_revision:listing.projection_revision ~items:(List.map(fun uuid->List.find_opt(fun descriptor->Read.Uuid.equal uuid descriptor.Logseq_db_types.Asset_descriptor.uuid) listing.items)ids))) |_->failwith "Synthetic sample query family mismatch"))
+;;
+
 let test_equal_media_notices_keep_effects () =
   let sent = Queue.create () in
   let changes = ref [] in
   let runtime =
     R.create
-      ~send:(fun ticket request ->
-        Queue.add (ticket, request) sent;
-        true)
-      ~changed:(fun root view -> changes := (root, view) :: !changes)
+      ~read:(fun request -> Queue.add (Read request) sent; true)
+      ~demand:(resource_ports sent (fun()->true)).demand
+      ~acquire:(resource_ports sent (fun()->true)).acquire
+      ~release_file:(resource_ports sent (fun()->true)).release_file
+      ~release_consumer:(resource_ports sent (fun()->true)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()->true)).retry_asset
+      ~changed:(fun root view -> changes := (root, view) :: !changes) ()
   in
   R.reset runtime ~graph_generation:(Some 1);
   let root = G.Uuid.to_string (uuid 1) in
   R.root_visible runtime ~root true;
-  let ticket, request = Queue.take sent in
-  let request_id =
-    match request with
-    | S.Graph_request query -> query.request_id
-    | _ -> failwith "visible root must send its initial metadata query"
-  in
-  R.receive
-    runtime
-    (Option.get ticket)
-    (Graph_response
-       (P.V2_response
-          { api_version = 2
-          ; request_id
-          ; outcome =
-              V2_assets_outcome
-                { generation = "g"
-                ; projection_revision = "p"
-                ; items = []
-                ; next_cursor = None
-                }
-          }));
+  reply runtime (take_read sent) [];
   changes := [];
   for _ = 1 to 10 do
     R.root_visible runtime ~root true
@@ -60,6 +132,43 @@ let test_equal_media_notices_keep_effects () =
     "graph reset must clear the old root presentation even when it was empty"
 ;;
 
+let coordinated_read_retirement accepted () =
+  let planned = ref []
+  and retired = ref [] in
+  let runtime =
+    R.create
+      ~read_planned:(fun id -> planned := id :: !planned)
+      ~read_retired:(fun id -> retired := id :: !retired)
+      ~read:(fun request ->
+        check
+          (List.mem (R.read_request_id request) !planned)
+          "read callback ran before causal planning";
+        accepted)
+      ~demand:(resource_ports (Queue.create()) (fun()->true)).demand
+      ~acquire:(resource_ports (Queue.create()) (fun()->true)).acquire
+      ~release_file:(resource_ports (Queue.create()) (fun()->true)).release_file
+      ~release_consumer:(resource_ports (Queue.create()) (fun()->true)).release_consumer
+      ~retry_asset:(resource_ports (Queue.create()) (fun()->true)).retry_asset
+      ~changed:(fun _ _ -> ())
+      ()
+  in
+  R.reset runtime ~graph_generation:(Some 1);
+  let root = G.Uuid.to_string (uuid 1) in
+  R.root_visible runtime ~root true;
+  let id = List.hd !planned in
+  check (R.owns_read runtime id) "queued/accepted read lost its business identity";
+  if accepted
+  then R.reset runtime ~graph_generation:(Some 2)
+  else R.root_visible runtime ~root false;
+  check (not (R.owns_read runtime id)) "retired view retained its read ownership";
+  check
+    (List.mem id !retired)
+    "explicit business retirement did not settle its causal consumer";
+  let before = !retired in
+  R.pump runtime;
+  check (!retired = before) "a pruned request was retired again on a later pump"
+;;
+
 let () = test_equal_media_notices_keep_effects ()
 
 let () =
@@ -68,29 +177,24 @@ let () =
   let changes = ref 0 in
   let runtime =
     R.create
-      ~send:(fun ticket request ->
-        Queue.add (ticket, request) sent;
-        true)
+      ~read:(fun request -> Queue.add (Read request) sent; true)
+      ~demand:(resource_ports sent (fun()->true)).demand
+      ~acquire:(resource_ports sent (fun()->true)).acquire
+      ~release_file:(resource_ports sent (fun()->true)).release_file
+      ~release_consumer:(resource_ports sent (fun()->true)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()->true)).retry_asset
       ~changed:(fun root view ->
         incr changes;
-        Hashtbl.replace views root view)
+        Hashtbl.replace views root view) ()
   in
   R.reset runtime ~graph_generation:(Some 1);
   let root = G.Uuid.to_string (uuid 1) in
   R.root_visible runtime ~root true;
   check (not (Queue.is_empty sent)) "visible root must query its rendered assets";
-  let token, request = Queue.take sent in
-  let query =
-    match request with
-    | S.Graph_request
-        ({ command =
-             P.V2_list_assets
-               { recursive = false; roots = [ u ]; limit = 16; cursor = None }
-         ; _
-         } as query)
-      when u = uuid 1 -> query
-    | _ -> failwith "media query must be direct and bounded"
-  in
+  let query = take_read sent in
+  check (match query with R.Read { maximum_items = 16;
+      query = W.Assets { recursive = false; roots = [ u ]; after = None }; _ }
+      when u = uuid 1 -> true | _ -> false) "media query must be direct and bounded";
   let asset =
     A.create
       ~uuid:(uuid 2)
@@ -103,21 +207,7 @@ let () =
       ~dimensions:(Some (100, 50))
     |> Result.get_ok
   in
-  R.receive
-    runtime
-    (Option.get token)
-    (Graph_response
-       (P.V2_response
-          { api_version = 2
-          ; request_id = query.request_id
-          ; outcome =
-              V2_assets_outcome
-                { generation = "g"
-                ; projection_revision = "p"
-                ; items = [ asset ]
-                ; next_cursor = None
-                }
-          }));
+  reply runtime query [ asset ];
   check (Queue.is_empty sent) "metadata alone cannot request binary download";
   check
     (List.length (Hashtbl.find views root).items = 1)
@@ -127,70 +217,35 @@ let () =
     ~root
     ~asset:(List.hd (Hashtbl.find views root).items).token
     true;
-  let _, request = Queue.take sent in
-  let consumer =
-    match request with
-    | S.Asset_command
-        { command =
-            Replace_asset_demand { consumer; priority = Foreground; assets = [ _ ] }
-        ; _
-        } -> consumer
-    | _ -> failwith "visible media demand must be foreground"
-  in
-  let scope : S.asset_scope =
-    { account =
-        { managed_sync_origin = Uri.of_string "https://sync.example"
-        ; user_id = "u"
-        ; account_generation = 1
-        ; presentation_generation = 1
-        ; lifecycle_generation = 1L
-        }
-    ; graph_id = uuid 3
-    ; graph_generation = 1
-    }
-  in
+  let consumer=match take_command sent with
+    |Command(_,W.Replace_asset_demand(consumer,W.Foreground,[_]))->consumer_name consumer
+    |_->failwith "visible media demand must be foreground" in
+  let scope=resource_source.Resources.scope in
   let before_waiting = !changes in
-  R.notice
-    runtime
-    scope
-    (Asset_availability { consumer; asset = asset.uuid; availability = Queued });
+  R.notice runtime (Resources.notice resource_source (S.Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Queued }));
   check
     (!changes = before_waiting)
     "equal waiting availability must not republish the pending presentation";
-  R.notice
-    runtime
-    scope
-    (Asset_availability { consumer; asset = asset.uuid; availability = Ready "cached" });
-  let token, request = Queue.take sent in
-  check
-    (match request with
-     | S.Acquire_asset_file { handle = "cached"; _ } -> true
-     | _ -> false)
+  R.notice runtime (Resources.notice resource_source (S.Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "cached" }));
+  let acquisition=take_acquire sent in
+  check(acquisition_handle acquisition="cached")
     "readiness retains the file";
-  R.receive
-    runtime
-    (Option.get token)
-    (Asset_file (Some ("retained", "/cache/image.png")));
+  file_reply runtime acquisition "retained" "/cache/image.png";
   check
     ((List.hd (Hashtbl.find views root).items).presentation
      = Journal_media.File "/cache/image.png")
     "native view receives retained path";
   let before_ready_duplicate = !changes in
-  R.notice
-    runtime
-    scope
-    (Asset_availability { consumer; asset = asset.uuid; availability = Ready "cached" });
+  R.notice runtime (Resources.notice resource_source (S.Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "cached" }));
   check
     (!changes = before_ready_duplicate)
     "duplicate readiness must not republish a retained file";
   check (Queue.is_empty sent) "duplicate readiness must not reacquire the retained file";
   R.reset runtime ~graph_generation:None;
-  let requests = Queue.to_seq sent |> List.of_seq |> List.map snd in
+  let requests = commands sent |> List.of_seq in
   check
     (List.exists
-       (function
-         | S.Release_asset_file { handle = "retained"; _ } -> true
-         | _ -> false)
+       (fun command->released_handle command=Some "retained")
        requests)
     "navigation reset releases file";
   Queue.clear sent;
@@ -200,12 +255,14 @@ let () =
     ; graph_generation = 1
     ; scope
     ; target = uuid 1
-    ; asset
+    ; asset=(A.create ~uuid:asset.uuid ~source:asset.source
+        ~current_checksum:(Some(String.make 64 'a')) ~size:asset.size ~dimensions:asset.dimensions |> Result.get_ok)
     ; file_type = "png"
     ; preview = Some ("local-lease", "/staged/import.bin")
     }
   in
-  R.imported runtime ~current:true receipt;
+  let imported=Resources.imported resource_source receipt in
+  R.imported runtime ~current:true imported;
   check (Queue.is_empty sent) "explicit import must not query or download";
   check
     (List.exists
@@ -214,7 +271,7 @@ let () =
        (Hashtbl.find views root).items)
     "imported file appears immediately";
   let before_duplicate = !changes in
-  R.imported runtime ~current:true receipt;
+  R.imported runtime ~current:true imported;
   check
     (!changes = before_duplicate)
     "duplicate import must not republish the same file presentation";
@@ -222,22 +279,18 @@ let () =
   R.reset runtime ~graph_generation:None;
   check
     (List.exists
-       (function
-         | _, S.Release_asset_file { handle = "local-lease"; _ } -> true
-         | _ -> false)
-       (Queue.to_seq sent |> List.of_seq))
+       (fun command->released_handle command=Some "local-lease")
+       (commands sent |> List.of_seq))
     "reset releases staged preview";
   Queue.clear sent;
   R.imported
     runtime
     ~current:false
-    { receipt with preview = Some ("late-lease", "/staged/late.bin") };
+    (Resources.imported resource_source {receipt with preview=Some("late-lease","/staged/late.bin")});
   check
     (List.exists
-       (function
-         | _, S.Release_asset_file { handle = "late-lease"; _ } -> true
-         | _ -> false)
-       (Queue.to_seq sent |> List.of_seq))
+       (fun command->released_handle command=Some "late-lease")
+       (commands sent |> List.of_seq))
     "late import receipt releases its lease"
 ;;
 
@@ -249,13 +302,13 @@ let test_preview_reference_when_requests_are_full () =
   let views = Hashtbl.create 2 in
   let runtime =
     R.create
-      ~send:(fun ticket request ->
-        if !full
-        then false
-        else (
-          Queue.add (ticket, request) sent;
-          true))
-      ~changed:(fun root view -> Hashtbl.replace views root view)
+      ~read:(fun request -> if !full then false else (Queue.add (Read request) sent; true))
+      ~demand:(resource_ports sent (fun()->not !full)).demand
+      ~acquire:(resource_ports sent (fun()->not !full)).acquire
+      ~release_file:(resource_ports sent (fun()->not !full)).release_file
+      ~release_consumer:(resource_ports sent (fun()->not !full)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()->not !full)).retry_asset
+      ~changed:(fun root view -> Hashtbl.replace views root view) ()
   in
   let asset =
     A.create
@@ -269,58 +322,20 @@ let test_preview_reference_when_requests_are_full () =
       ~dimensions:None
     |> Result.get_ok
   in
-  let scope : S.asset_scope =
-    { account =
-        { managed_sync_origin = Uri.of_string "https://sync.example"
-        ; user_id = "u"
-        ; account_generation = 1
-        ; presentation_generation = 1
-        ; lifecycle_generation = 1L
-        }
-    ; graph_id = uuid 3
-    ; graph_generation = 1
-    }
-  in
   R.reset runtime ~graph_generation:(Some 1);
   let metadata root =
     R.root_visible ~owner:"row" runtime ~root true;
-    let ticket, request = Queue.take sent in
-    let request_id =
-      match request with
-      | S.Graph_request query -> query.request_id
-      | _ -> assert false
-    in
-    R.receive
-      runtime
-      (Option.get ticket)
-      (Graph_response
-         (P.V2_response
-            { api_version = 2
-            ; request_id
-            ; outcome =
-                V2_assets_outcome
-                  { generation = "g"
-                  ; projection_revision = "p"
-                  ; items = [ asset ]
-                  ; next_cursor = None
-                  }
-            }));
+    reply runtime (take_read sent) [ asset ];
     (List.hd (Hashtbl.find views root).items).token
   in
   let root = G.Uuid.to_string (uuid 1) in
   let token = metadata root in
   R.asset_visible ~owner:"row" runtime ~root ~asset:token true;
   Queue.clear sent;
-  R.notice
-    runtime
-    scope
-    (Asset_availability
-       { consumer = token; asset = asset.uuid; availability = Ready "cached" });
-  let ticket, _ = Queue.take sent in
-  R.receive
-    runtime
-    (Option.get ticket)
-    (Asset_file (Some ("preview-file", "/cache/image.png")));
+  R.notice runtime (Resources.notice resource_source (S.Asset_availability
+       { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" }));
+  let acquisition=take_acquire sent in
+  file_reply runtime acquisition "preview-file" "/cache/image.png";
   let pressure_root = G.Uuid.to_string (uuid 4) in
   let pressure_token = metadata pressure_root in
   full := true;
@@ -337,10 +352,8 @@ let test_preview_reference_when_requests_are_full () =
   full := false;
   R.pump runtime;
   let release_count () =
-    Queue.to_seq sent
-    |> Seq.filter (function
-      | _, S.Release_asset_file { handle = "preview-file"; _ } -> true
-      | _ -> false)
+    commands sent
+    |> Seq.filter (fun command->released_handle command=Some "preview-file")
     |> Seq.length
   in
   check (release_count () = 0) "draining pressure must keep the preview file";
@@ -360,40 +373,23 @@ let fixture () =
   let admitted = ref true in
   let runtime =
     R.create
-      ~send:(fun ticket request ->
-        if !admitted
-        then (
-          Queue.add (ticket, request) sent;
-          true)
-        else false)
-      ~changed:(fun root view -> Hashtbl.replace views root view)
+      ~read:(fun request -> if !admitted then (Queue.add (Read request) sent; true) else false)
+      ~demand:(resource_ports sent (fun()-> !admitted)).demand
+      ~acquire:(resource_ports sent (fun()-> !admitted)).acquire
+      ~release_file:(resource_ports sent (fun()-> !admitted)).release_file
+      ~release_consumer:(resource_ports sent (fun()-> !admitted)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()-> !admitted)).retry_asset
+      ~changed:(fun root view -> Hashtbl.replace views root view) ()
   in
   R.reset runtime ~graph_generation:(Some 1);
   runtime, sent, views, admitted
 ;;
 
 let take_metadata sent =
-  let rec take () =
-    match Queue.take sent with
-    | Some ticket, S.Graph_request ({ command = P.V2_list_assets _; _ } as query) ->
-      ticket, query.request_id, query.command
-    | _ -> take ()
-  in
+  let rec take () = match Queue.take sent with
+    | Read (R.Read { query = W.Assets _; _ } as request) -> request
+    | _ -> take () in
   take ()
-;;
-
-let reply runtime (ticket, request_id, _) ?next_cursor items =
-  R.receive
-    runtime
-    ticket
-    (S.Graph_response
-       (P.V2_response
-          { api_version = 2
-          ; request_id
-          ; outcome =
-              V2_assets_outcome
-                { generation = "g"; projection_revision = "p"; items; next_cursor }
-          }))
 ;;
 
 let media_asset n =
@@ -425,32 +421,16 @@ let raw_block ?(refs = []) ?(properties = []) n parent : G.block =
   }
 ;;
 
-let block_response block =
-  P.V2_response
-    { api_version = 2
-    ; request_id = uuid 999
-    ; outcome =
-        V2_block_outcome
-          (V2_present_block
-             { value =
-                 { block
-                 ; task_status = None
-                 ; rendered_page_title = "Page"
-                 ; tag_titles = []
-                 }
-             ; revision = "r"
-             })
-    }
+let block_value block : Worker_pure_data.block_lookup =
+  Worker_pure_data.V2_present_block
+    { value = { block; task_status = None; rendered_page_title = "Page"; tag_titles = [] }
+    ; revision = "r" }
 ;;
 
 let observe runtime (block : G.block) =
-  R.observe_request
-    runtime
-    { api_version = 2
-    ; request_id = uuid 999
-    ; command = P.V2_get_outline_block { block = block.G.uuid; revision = None }
-    };
-  R.observe_response runtime (block_response block)
+  let query = W.Outline_block { uuid = block.uuid; revision = None } in
+  R.observe_query runtime ~request_id:(uuid 999) query;
+  R.observe_query_result runtime ~request_id:(uuid 999) query (block_value block)
 ;;
 
 let raw_page recycled : G.page =
@@ -467,42 +447,20 @@ let raw_page recycled : G.page =
 ;;
 
 let reply_page runtime sent recycled =
-  let ticket, request = Queue.take sent in
-  match ticket, request with
-  | Some ticket, S.Graph_request { request_id; command = P.V2_get_page { page; _ }; _ }
-    when page = uuid 900 ->
-    R.receive
-      runtime
-      ticket
-      (S.Graph_response
-         (P.V2_response
-            { api_version = 2
-            ; request_id
-            ; outcome =
-                V2_page_outcome
-                  (V2_present_page { page = raw_page recycled; revision = "p" })
-            }))
-  | _ -> failwith "page liveness must use one bounded owned get_page"
+  match take_read sent with
+  | (R.Read { query = W.Page { uuid = page; _ }; _ } as request) when page = uuid 900 ->
+    answer runtime request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page = raw_page recycled; revision = "p" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+  | _ -> failwith "page liveness must use one bounded owned Page query"
 ;;
 
 let reply_block runtime sent (block : G.block) =
-  let ticket, request = Queue.take sent in
-  match ticket, request with
-  | ( Some ticket
-    , S.Graph_request { request_id; command = P.V2_get_outline_block { block = uuid; _ }; _ } )
-    when uuid = block.G.uuid ->
-    let outcome =
-      match block_response block with
-      | P.V2_response { outcome; _ } -> outcome
-    in
-    R.receive
-      runtime
-      ticket
-      (S.Graph_response (P.V2_response { api_version = 2; request_id; outcome }))
-  | _ -> failwith "holder/liveness must use its owned bounded get_outline_block"
+  match take_read sent with
+  | (R.Read { query = W.Outline_block { uuid; _ }; _ } as request) when uuid = block.G.uuid ->
+    answer runtime request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((block_value block)) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+  | _ -> failwith "holder/liveness must use its owned bounded Outline_block query"
 ;;
 
-let window ?(structures = []) blocks : P.v2_change_window =
+let window ?(structures = []) blocks : Worker_pure_data.change_window =
   { id = "change"
   ; predecessor = "before"
   ; successor = "after"
@@ -525,37 +483,19 @@ let membership_change runtime n target =
 ;;
 
 let reply_missing runtime sent n =
-  let ticket, request = Queue.take sent in
-  match ticket, request with
-  | Some ticket, S.Graph_request { request_id; command = P.V2_get_outline_block { block; _ }; _ }
-    when block = uuid n ->
-    R.receive
-      runtime
-      ticket
-      (S.Graph_response
-         (P.V2_response
-            { api_version = 2
-            ; request_id
-            ; outcome =
-                V2_block_outcome (V2_missing_block { uuid = block; revision = "deleted" })
-            }))
+  match take_read sent with
+  | (R.Read { query = W.Outline_block { uuid = block; _ }; _ } as request) when block = uuid n ->
+    answer runtime request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = block; revision = "deleted" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
   | _ -> failwith "deletion must complete its owned bounded block lookup"
 ;;
 
 let list_reads sent =
-  Queue.to_seq sent
-  |> Seq.filter (function
-    | _, S.Graph_request { command = P.V2_list_assets _; _ } -> true
-    | _ -> false)
-  |> Seq.length
+  Queue.to_seq sent |> Seq.filter (function
+    | Read (R.Read { query = W.Assets _; _ }) -> true | _ -> false) |> Seq.length
 ;;
 
 let file_commands sent =
-  Queue.to_seq sent
-  |> Seq.filter (function
-    | _, (S.Asset_command _ | Acquire_asset_file _ | Release_asset_file _) -> true
-    | _ -> false)
-  |> Seq.length
+  commands sent |> Seq.length
 ;;
 
 let run_cases cases =
@@ -575,7 +515,9 @@ let run_cases cases =
 
 let () =
   run_cases
-    [ ( "stale initial holder facts refill without poisoning the root"
+    [ ("queued coordinated read retires on Hide",coordinated_read_retirement false)
+    ; ("accepted coordinated read retires on reset",coordinated_read_retirement true)
+    ; ( "stale initial holder facts refill without poisoning the root"
       , fun () ->
           let r, q, v, _ = fixture () in
           let root = G.Uuid.to_string (uuid 1) in
@@ -691,25 +633,10 @@ let () =
           let token = (List.hd (Hashtbl.find v root).items).token in
           R.asset_visible r ~root ~asset:token true;
           Queue.clear q;
-          let scope : S.asset_scope =
-            { account =
-                { managed_sync_origin = Uri.of_string "https://sync.example"
-                ; user_id = "u"
-                ; account_generation = 1
-                ; presentation_generation = 1
-                ; lifecycle_generation = 1L
-                }
-            ; graph_id = uuid 900
-            ; graph_generation = 1
-            }
-          in
-          R.notice
-            r
-            scope
-            (Asset_availability
-               { consumer = token; asset = asset.uuid; availability = Ready "cached" });
-          let ticket, _ = Queue.take q in
-          R.receive r (Option.get ticket) (Asset_file (Some ("held", "/cache/held")));
+          R.notice r (Resources.notice resource_source (S.Asset_availability
+               { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" }));
+          let acquisition=take_acquire q in
+          file_reply r acquisition "held" "/cache/held";
           change r [ 1 ];
           check
             (Queue.is_empty q)
@@ -729,7 +656,7 @@ let () =
           let change =
             { (window
                  ~structures:
-                   [ P.V2_children_interest (uuid 900); V2_page_tree_interest (uuid 900) ]
+                   [ Worker_pure_data.V2_children_interest (uuid 900); Worker_pure_data.V2_page_tree_interest (uuid 900) ]
                  [ 80 ])
               with
               page_uuids = [ uuid 900 ]
@@ -767,21 +694,13 @@ let () =
       , fun () ->
           let r, q, _, _ = fixture () in
           seed r q 1 [];
-          R.observe_request
-            r
-            { P.api_version = 2
-            ; request_id = uuid 998
-            ; command = P.V2_get_outline_block { block = uuid 1; revision = None }
-            };
+          R.observe_query r ~request_id:(uuid 998) (W.Outline_block { uuid = uuid 1; revision = None });
           for n = 10000 to 14100 do
             change r [ n ]
           done;
-          let answer =
-            match block_response (raw_block ~refs:[ uuid 70 ] 1 900) with
-            | P.V2_response response ->
-              P.V2_response { response with request_id = uuid 998 }
-          in
-          R.observe_response r answer;
+          R.observe_query_result r ~request_id:(uuid 998)
+            (W.Outline_block { uuid = uuid 1; revision = None })
+            (block_value (raw_block ~refs:[ uuid 70 ] 1 900));
           change r [ 70 ];
           check
             (list_reads q = 1)
@@ -798,48 +717,61 @@ let () =
           change r [ 60 ];
           reply_missing r q 60;
           check (list_reads q = 1) "new parent deletion still selects moved root" )
-    ; ( "dependency failure stays visible until explicit Retry"
+    ; ( "dependency failure recovers once without user Retry"
       , fun () ->
-          let r, q, v, _ = fixture () in
-          observe r (raw_block 1 60);
-          loaded r q (G.Uuid.to_string (uuid 1)) [];
-          change r [ 80 ];
-          let ticket, request = Queue.take q in
-          (match ticket, request with
-           | Some ticket, S.Graph_request { command = P.V2_get_outline_block { block; _ }; _ }
-             when block = uuid 60 -> R.reject r ticket
+          let r,q,v,_=fixture() in
+          observe r(raw_block 1 60); loaded r q(G.Uuid.to_string(uuid 1))[];
+          change r[80];
+          (match take_read q with
+           | (R.Read { query = W.Outline_block { uuid = block; _ }; _ } as request)
+             when block=uuid 60 -> reject_read r request
            | _ -> failwith "missing ancestor must have one owned fact read");
-          let root = G.Uuid.to_string (uuid 1) in
-          check
-            (Option.is_some (Hashtbl.find v root).error)
-            "failed dependency lookup is visible";
-          R.pump r;
-          change r [ 81 ];
-          check
-            (Queue.is_empty q)
-            "unrelated changes cannot automatically retry failed dependency lookup";
-          R.retry r ~root ~asset:"";
-          check (not (Queue.is_empty q)) "explicit Retry can retry the dependency lookup"
+          check(not(Queue.is_empty q)) "first dependency failure must recover in the background";
+          let attempts=ref 0 in
+          while not(Queue.is_empty q) && !attempts<8 do
+            let request=take_read q in incr attempts;reject_read r request
+          done;
+          check(Queue.is_empty q) "persistent dependency failures entered an automatic loop";
+          let root=G.Uuid.to_string(uuid 1) in
+          check(Option.is_some(Hashtbl.find v root).error) "persistent dependency error disappeared";
+          change r[81];R.pump r;
+          check(Queue.is_empty q) "unrelated changes replayed exhausted dependency recovery"
+      )
+    ; ( "cached facts cannot reset a failed dependency budget"
+      , fun () ->
+          let r,q,_,_=fixture() in
+          seed r q 1 [];
+          observe r(raw_block 1 900);
+          let fact_reads=ref 0 and listings=ref 0 in
+          for _=1 to 3 do
+            change r[1];
+            let attempts=ref 0 in
+            while not(Queue.is_empty q) && !attempts<20 do
+              incr attempts;
+              match Queue.take q with
+              | Read (R.Read { query = W.Outline_block _; _ } as request) ->
+                incr fact_reads; reject_read r request
+              | Read (R.Read { query = W.Assets _; _ } as request) ->
+                incr listings; reply r request []
+              | _ -> ()
+            done;
+            check(Queue.is_empty q) "cached dependency recovery did not terminate"
+          done;
+          (* Each reapplication can request its root, but a successful asset
+             listing cannot grant another dependency recovery on old facts. *)
+          check(!fact_reads>=2 && !fact_reads<=3 && !listings=1) "cached old facts restarted failed dependency recovery"
       )
     ; ( "late owned raw response cannot revert reference facts"
       , fun () ->
           let r, q, _, _ = fixture () in
           seed r q 1 [];
-          let request id =
-            { P.api_version = 2
-            ; request_id = uuid id
-            ; command = P.V2_get_outline_block { block = uuid 1; revision = None }
-            }
-          in
-          let answer id refs =
-            match block_response (raw_block ~refs 1 900) with
-            | P.V2_response response ->
-              P.V2_response { response with request_id = uuid id }
-          in
-          R.observe_request r (request 997);
-          R.observe_request r (request 998);
-          R.observe_response r (answer 998 [ uuid 71 ]);
-          R.observe_response r (answer 997 [ uuid 70 ]);
+          let query = W.Outline_block { uuid = uuid 1; revision = None } in
+          R.observe_query r ~request_id:(uuid 997) query;
+          R.observe_query r ~request_id:(uuid 998) query;
+          R.observe_query_result r ~request_id:(uuid 998) query
+            (block_value (raw_block ~refs:[ uuid 71 ] 1 900));
+          R.observe_query_result r ~request_id:(uuid 997) query
+            (block_value (raw_block ~refs:[ uuid 70 ] 1 900));
           change r [ 70 ];
           check (list_reads q = 0) "older owned response cannot restore removed ref";
           change r [ 71 ];
@@ -848,26 +780,20 @@ let () =
       , fun () ->
           let r, q, _, _ = fixture () in
           seed r q 1 [];
-          R.observe_response r (block_response (raw_block ~refs:[ uuid 70 ] 1 900));
+          R.observe_query_result r ~request_id:(uuid 999)
+            (W.Outline_block { uuid = uuid 1; revision = None })
+            (block_value (raw_block ~refs:[ uuid 70 ] 1 900));
           change r [ 70 ];
           check (list_reads q = 0) "only registered current-scope facts are accepted" )
     ; ( "unrelated change does not stale in-flight root facts"
       , fun () ->
           let r, q, _, _ = fixture () in
           seed r q 1 [];
-          R.observe_request
-            r
-            { P.api_version = 2
-            ; request_id = uuid 998
-            ; command = P.V2_get_outline_block { block = uuid 1; revision = None }
-            };
+          R.observe_query r ~request_id:(uuid 998) (W.Outline_block { uuid = uuid 1; revision = None });
           change r [ 80 ];
-          let answer =
-            match block_response (raw_block ~refs:[ uuid 70 ] 1 900) with
-            | P.V2_response response ->
-              P.V2_response { response with request_id = uuid 998 }
-          in
-          R.observe_response r answer;
+          R.observe_query_result r ~request_id:(uuid 998)
+            (W.Outline_block { uuid = uuid 1; revision = None })
+            (block_value (raw_block ~refs:[ uuid 70 ] 1 900));
           change r [ 70 ];
           check
             (list_reads q = 1)
@@ -949,21 +875,11 @@ let () =
           loaded r q (G.Uuid.to_string (uuid 1)) [];
           (* Drain only dependency lookups, never manufacture a list-assets answer. *)
           let answer () =
-            let ticket, request = Queue.take q in
-            match ticket, request with
-            | ( Some ticket
-              , S.Graph_request { request_id; command = P.V2_get_outline_block { block; _ }; _ } )
+            match take_read q with
+            | (R.Read { query = W.Outline_block { uuid = block; _ }; _ } as request)
               when block = uuid 60 ->
-              let value =
-                match block_response (raw_block 60 61) with
-                | P.V2_response { outcome; _ } -> outcome
-              in
-              R.receive
-                r
-                ticket
-                (S.Graph_response
-                   (P.V2_response { api_version = 2; request_id; outcome = value }))
-            | _ -> failwith "unknown ancestor requires a public bounded get_outline_block"
+              answer r request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((block_value (raw_block 60 61))) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+            | _ -> failwith "unknown ancestor requires a bounded Outline_block query"
           in
           if Queue.is_empty q then change r [ 61 ];
           answer ();
@@ -978,7 +894,7 @@ let () =
             r
             [ window
                 ~structures:
-                  [ P.V2_children_interest (uuid 900); V2_children_interest (uuid 60) ]
+                  [ Worker_pure_data.V2_children_interest (uuid 900); Worker_pure_data.V2_children_interest (uuid 60) ]
                 [ 1 ]
             ];
           check (list_reads q = 1) "move rebuilds one matching root" )
@@ -1009,21 +925,15 @@ let () =
           check (list_reads q = 0) "last owner hide retires requests never admitted";
           R.root_visible r ~root:(G.Uuid.to_string (uuid 1)) true;
           check (list_reads q = 1) "reactivation starts exactly one first page" )
-    ; ( "metadata failure requires explicit Retry"
+    ; ( "metadata failure recovers once without user Retry"
       , fun () ->
-          let r, q, v, _ = fixture () in
-          seed r q 1 [];
-          membership_change r 1 70;
-          let ticket, _, _ = take_metadata q in
-          R.reject r ticket;
-          let root = G.Uuid.to_string (uuid 1) in
-          R.root_visible r ~root true;
-          R.pump r;
-          check
-            (list_reads q = 0 && Option.is_some (Hashtbl.find v root).error)
-            "failed membership stays failed without automatic retry";
-          R.retry r ~root ~asset:"";
-          check (list_reads q = 1) "explicit Retry starts one metadata read" )
+          let r,q,v,_=fixture() in seed r q 1[];membership_change r 1 70;
+          let request=take_metadata q in reject_read r request;
+          check(list_reads q=1) "first metadata failure did not recover automatically";
+          let request=take_metadata q in reject_read r request;
+          let root=G.Uuid.to_string(uuid 1) in R.root_visible r ~root true;R.pump r;
+          check(list_reads q=0 && Option.is_some(Hashtbl.find v root).error)
+            "persistent metadata error was hidden or retried indefinitely" )
     ; ( "scope reset rejects late membership"
       , fun () ->
           let r, q, v, _ = fixture () in
@@ -1039,7 +949,7 @@ let () =
             ((List.hd (Hashtbl.find v (G.Uuid.to_string (uuid 1))).items).asset.uuid
              = uuid 3)
             "scope reset rejects old membership" )
-    ; ( "successful File survives descriptor and resync"
+    ; ( "successful File survives same-content metadata and resync"
       , fun () ->
           let r, q, v, _ = fixture () in
           let descriptor c =
@@ -1048,10 +958,10 @@ let () =
               ~source:
                 (Managed
                    (Some
-                      (A.version ~checksum:(String.make 64 c) ~file_type:"png"
+                      (A.version ~checksum:(String.make 64 'a') ~file_type:"png"
                        |> Result.get_ok)))
               ~current_checksum:None
-              ~size:None
+              ~size:(Some(Int64.of_int(Char.code c)))
               ~dimensions:None
             |> Result.get_ok
           in
@@ -1061,25 +971,10 @@ let () =
           let token = (List.hd (Hashtbl.find v root).items).token in
           R.asset_visible r ~root ~asset:token true;
           Queue.clear q;
-          let scope : S.asset_scope =
-            { account =
-                { managed_sync_origin = Uri.of_string "https://sync.example"
-                ; user_id = "u"
-                ; account_generation = 1
-                ; presentation_generation = 1
-                ; lifecycle_generation = 1L
-                }
-            ; graph_id = uuid 900
-            ; graph_generation = 1
-            }
-          in
-          R.notice
-            r
-            scope
-            (Asset_availability
-               { consumer = token; asset = asset.uuid; availability = Ready "cached" });
-          let ticket, _ = Queue.take q in
-          R.receive r (Option.get ticket) (Asset_file (Some ("held", "/cache/held")));
+          R.notice r (Resources.notice resource_source (S.Asset_availability
+               { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" }));
+          let acquisition=take_acquire q in
+          file_reply r acquisition "held" "/cache/held";
           observe r (raw_block ~refs:[ asset.uuid ] 1 900);
           change r [ 2 ];
           check
@@ -1109,11 +1004,8 @@ let () =
             ((Hashtbl.find v root).items = [])
             "holder ref removal removes successful membership";
           check
-            (Queue.to_seq q
-             |> Seq.exists (fun (_, request) ->
-               match request with
-               | S.Release_asset_file { handle = "held"; _ } -> true
-               | _ -> false))
+            (commands q
+             |> Seq.exists (fun command->released_handle command=Some "held"))
             "real membership removal releases the retained File lease" )
     ]
 ;;
@@ -1125,25 +1017,17 @@ let test_import_handoff preview =
   and views = Hashtbl.create 1 in
   let runtime =
     R.create
-      ~send:(fun ticket request ->
-        Queue.add (ticket, request) sent;
-        true)
-      ~changed:(fun root view -> Hashtbl.replace views root view)
+      ~read:(fun request -> Queue.add (Read request) sent; true)
+      ~demand:(resource_ports sent (fun()->true)).demand
+      ~acquire:(resource_ports sent (fun()->true)).acquire
+      ~release_file:(resource_ports sent (fun()->true)).release_file
+      ~release_consumer:(resource_ports sent (fun()->true)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()->true)).retry_asset
+      ~changed:(fun root view -> Hashtbl.replace views root view) ()
   in
   R.reset runtime ~graph_generation:(Some 1);
   let root = G.Uuid.to_string (uuid 1) in
-  let scope : S.asset_scope =
-    { account =
-        { managed_sync_origin = Uri.of_string "https://fixture.invalid"
-        ; user_id = "fixture"
-        ; account_generation = 1
-        ; presentation_generation = 1
-        ; lifecycle_generation = 1L
-        }
-    ; graph_id = uuid 3
-    ; graph_generation = 1
-    }
-  in
+  let scope=resource_source.Resources.scope in
   let asset =
     A.create
       ~uuid:(uuid 2)
@@ -1163,35 +1047,15 @@ let test_import_handoff preview =
     ; preview = Some ("staged-lease", "/staged/original.png")
     }
   in
-  R.imported runtime ~current:true receipt;
+  let imported=Resources.imported resource_source receipt in
+  R.imported runtime ~current:true imported;
   R.root_visible runtime ~root true;
-  let ticket, request = Queue.take sent in
-  let request_id =
-    match request with
-    | S.Graph_request q -> q.request_id
-    | _ -> failwith "query"
-  in
-  R.receive
-    runtime
-    (Option.get ticket)
-    (Graph_response
-       (P.V2_response
-          { api_version = 2
-          ; request_id
-          ; outcome =
-              V2_assets_outcome
-                { generation = "g"
-                ; projection_revision = "p"
-                ; items = [ asset ]
-                ; next_cursor = None
-                }
-          }));
-  let requests = Queue.to_seq sent |> List.of_seq in
+  reply runtime (take_read sent) [ asset ];
+  let requests = commands sent |> List.of_seq in
   let consumer =
     List.find_map
       (function
-        | _, S.Asset_command { command = S.Replace_asset_demand { consumer; _ }; _ } ->
-          Some consumer
+        | Command(_,W.Replace_asset_demand(consumer,_,_))->Some(consumer_name consumer)
         | _ -> None)
       requests
   in
@@ -1212,26 +1076,15 @@ let test_import_handoff preview =
   if preview = `Multiple then show "detail";
   Queue.clear sent;
   let consumer = Option.get consumer in
-  R.notice
-    runtime
-    scope
-    (Asset_availability
-       { consumer; asset = asset.uuid; availability = Ready "normal-cache" });
-  let ticket, request = Queue.take sent in
-  check
-    (match request with
-     | S.Acquire_asset_file _ -> true
-     | _ -> false)
+  R.notice runtime (Resources.notice resource_source (S.Asset_availability
+       { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "normal-cache" }));
+  let acquisition=take_acquire sent in
+  check (W.asset_file_asset(snd acquisition)=asset.uuid)
     "normal file is acquired";
-  R.receive
-    runtime
-    (Option.get ticket)
-    (Asset_file (Some ("normal-lease", "/cache/original.png")));
+  file_reply runtime acquisition "normal-lease" "/cache/original.png";
   let release_count () =
-    Queue.to_seq sent
-    |> Seq.filter (function
-      | _, S.Release_asset_file { handle = "staged-lease"; _ } -> true
-      | _ -> false)
+    commands sent
+    |> Seq.filter (fun command->released_handle command=Some "staged-lease")
     |> Seq.length
   in
   let preview_is_retained () =
@@ -1276,10 +1129,8 @@ let test_import_handoff preview =
       "pending local image keeps its type after handoff");
   check
     (List.exists
-       (function
-         | _, S.Release_asset_file { handle = "staged-lease"; _ } -> true
-         | _ -> false)
-       (Queue.to_seq sent |> List.of_seq))
+       (fun command->released_handle command=Some "staged-lease")
+       (commands sent |> List.of_seq))
     "normal acquisition releases staged preview";
   check (release_count () = 1) "handoff or final preview close releases its lease once";
   Queue.clear sent;
@@ -1287,10 +1138,8 @@ let test_import_handoff preview =
   check
     (not
        (List.exists
-          (function
-            | _, S.Release_asset_file { handle = "staged-lease"; _ } -> true
-            | _ -> false)
-          (Queue.to_seq sent |> List.of_seq)))
+          (fun command->released_handle command=Some "staged-lease")
+          (commands sent |> List.of_seq)))
     "handoff releases staged preview only once"
 ;;
 
@@ -1310,24 +1159,16 @@ let () =
   and views = Hashtbl.create 1 in
   let runtime =
     R.create
-      ~send:(fun ticket request ->
-        Queue.add (ticket, request) sent;
-        true)
-      ~changed:(fun root view -> Hashtbl.replace views root view)
+      ~read:(fun request -> Queue.add (Read request) sent; true)
+      ~demand:(resource_ports sent (fun()->true)).demand
+      ~acquire:(resource_ports sent (fun()->true)).acquire
+      ~release_file:(resource_ports sent (fun()->true)).release_file
+      ~release_consumer:(resource_ports sent (fun()->true)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()->true)).retry_asset
+      ~changed:(fun root view -> Hashtbl.replace views root view) ()
   in
   R.reset runtime ~graph_generation:(Some 1);
-  let scope : S.asset_scope =
-    { account =
-        { managed_sync_origin = Uri.of_string "https://fixture.invalid"
-        ; user_id = "fixture"
-        ; account_generation = 1
-        ; presentation_generation = 1
-        ; lifecycle_generation = 1L
-        }
-    ; graph_id = uuid 3
-    ; graph_generation = 1
-    }
-  in
+  let scope=resource_source.Resources.scope in
   let asset =
     A.create
       ~uuid:(uuid 2)
@@ -1347,6 +1188,7 @@ let () =
     ; preview = Some ("cancelled-preview", "/staged/original.png")
     }
   in
+  let imported=Resources.imported resource_source receipt in
   let root = G.Uuid.to_string receipt.target in
   let notice =
     S.Upload_status
@@ -1357,21 +1199,19 @@ let () =
       ; status = Cancelled
       }
   in
-  R.imported runtime ~current:true receipt;
-  R.notice runtime { scope with graph_id = uuid 90 } notice;
+  R.imported runtime ~current:true imported;
+  R.notice runtime (Resources.notice (Resources.create ~graph:(uuid 90) ~graph_generation:1 8190L) notice);
   check
     (List.length (Hashtbl.find views root).items = 1 && Queue.is_empty sent)
     "foreign scope cannot cancel imported preview";
-  R.notice runtime scope notice;
+  R.notice runtime (Resources.notice resource_source notice);
   check ((Hashtbl.find views root).items = []) "cancelled unpublished preview disappears";
   check
     (List.exists
-       (function
-         | _, S.Release_asset_file { handle = "cancelled-preview"; _ } -> true
-         | _ -> false)
-       (Queue.to_seq sent |> List.of_seq))
+       (fun command->released_handle command=Some "cancelled-preview")
+       (commands sent |> List.of_seq))
     "cancellation releases its staged preview";
   Queue.clear sent;
-  R.notice runtime scope notice;
+  R.notice runtime (Resources.notice resource_source notice);
   check (Queue.is_empty sent) "duplicate cancellation releases no second lease"
 ;;

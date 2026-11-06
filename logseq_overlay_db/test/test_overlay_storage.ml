@@ -1010,8 +1010,8 @@ let mirror_preparation_cancel_and_commit_replay () =
       match Database.open_ ~sw dependencies inspection ~graph_name:"Busy synthetic mirror" with
       | Error Ownership_conflict -> ()
       | _ -> Alcotest.fail "preparation did not hold exclusive ownership"));
-    Database.cancel_mirror_deletion prepared;
-    Database.cancel_mirror_deletion prepared;
+    ignore(Database.cancel_mirror_deletion_checked prepared |> T.require_ok ~behavior);
+    ignore(Database.cancel_mirror_deletion_checked prepared |> T.require_ok ~behavior);
     Alcotest.(check bool) "cancel retains canonical mirror" true (Sys.file_exists database_path);
     Alcotest.(check bool) "cancelled preparation cannot commit" true
       (Result.is_error (Database.commit_mirror_deletion prepared));

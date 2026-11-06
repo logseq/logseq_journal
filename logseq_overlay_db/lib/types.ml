@@ -295,6 +295,13 @@ type block_tree =
   ; children : block_tree list
   }
 
+type append_node =
+  { uuid : Graph.block_uuid
+  ; title : string
+  ; task_status : Graph.Uuid.t option
+  ; children : append_node Rrbvec.t
+  }
+
 type asset_metadata =
   { version : Logseq_db_types.Asset_descriptor.version
   ; replace_reference : Graph.Uuid.t option
@@ -323,6 +330,13 @@ type local_mutation =
       ; tree : block_tree
       ; parent : Graph.Uuid.t
       ; asset : asset_metadata option
+      }
+  | Append_journal of
+      { mutation_id : Graph.Uuid.t
+      ; page : Graph.page_uuid
+      ; title : string
+      ; journal_day : int
+      ; root : append_node
       }
   | Delete_blocks of
       { mutation_id : Graph.Uuid.t
@@ -459,6 +473,7 @@ let sync_token_to_string value = value
 type outliner_operation =
   | Save_block_operation
   | Insert_blocks_operation
+  | Append_journal_operation
   | Delete_blocks_operation
   | Create_journal_page_operation
   | Set_task_status_operation
@@ -478,6 +493,7 @@ let remote_won_proof
   let operation_code =
     match operation with
     | Save_block_operation -> 0
+    | Append_journal_operation -> 8
     | Insert_blocks_operation -> 1
     | Delete_blocks_operation -> 2
     | Create_journal_page_operation -> 3
@@ -529,6 +545,7 @@ let remote_won_proof_earliest_conflict_cursor (_, _, _, _, value, _, _) = value
 let remote_won_proof_operation (_, _, _, _, _, value, _) =
   match value with
   | 0 -> Save_block_operation
+  | 8 -> Append_journal_operation
   | 1 -> Insert_blocks_operation
   | 2 -> Delete_blocks_operation
   | 3 -> Create_journal_page_operation

@@ -93,7 +93,7 @@ let test_package_metadata root =
     ; "(modules server_cursor types database)"
     ; "(virtual_modules server_cursor types database)"
     ; "(default_implementation logseq_overlay_db_impl)"
-    ; "(libraries eio logseq_db_types)"
+    ; "(libraries eio logseq_db_types rrbvec)"
     ];
   require_text
     root
@@ -103,6 +103,13 @@ let test_package_metadata root =
     ; "\"logseq_db_storage\" {= \"0.1.0\"}"
     ; "\"eio\" {= \"1.2\"}"
     ]
+;;
+
+let test_durable_intent_owner root =
+  require_text root "logseq_overlay_db/spec/database.mli"
+    ["type local_intent";"type intent_resolution";"val persist_local_intent";
+     "val commit_local_intent";"val inspect_local_intent";"val pending_local_intents";
+     "val acknowledge_local_intent";"val acknowledge_rejected_local_intent"]
 ;;
 
 let test_canonical_modules root =
@@ -393,6 +400,7 @@ let () =
   then failwith "usage: logseq_overlay_db_boundary_test REPOSITORY_ROOT INSTALL_MANIFEST";
   let root = Sys.argv.(1) in
   test_package_metadata root;
+  test_durable_intent_owner root;
   test_canonical_modules root;
   test_public_boundary root;
   test_persistence_codec_ownership root;

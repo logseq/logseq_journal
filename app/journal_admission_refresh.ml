@@ -1,10 +1,10 @@
 type observation =
   | Unavailable
   | Loading
-  | Available of Logseq_db_worker.Protocol.v2_admission_inspection
+  | Available of Worker_pure_data.admission_inspection
 
 type result =
-  | Inspected of Logseq_db_worker.Protocol.v2_admission_inspection
+  | Inspected of Worker_pure_data.admission_inspection
   | Inspection_unavailable
 
 type directive =

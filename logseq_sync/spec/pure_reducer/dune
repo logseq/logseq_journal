@@ -4,4 +4,4 @@
  (modules core sync_protocol asset_transfer)
  (virtual_modules core sync_protocol asset_transfer)
  (default_implementation logseq_sync_pure_reducer_impl)
- (libraries logseq_db_types logseq_overlay_db uri))
+ (libraries logseq_db_types logseq_overlay_db rrbvec uri))

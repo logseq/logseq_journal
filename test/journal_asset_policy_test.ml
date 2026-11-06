@@ -227,7 +227,7 @@ let read_count ins =
        ins)
 ;;
 
-let first_root (ticket : P.ticket) =
+let first_root (ticket : _ P.ticket) =
   match ticket.query with
   | Recent_roots { cursor = None; _ } | Favorite_roots None -> true
   | _ -> false
@@ -351,39 +351,69 @@ let config_and_disabled () =
   check (ins = []) "old graph owner cannot escape scope replacement"
 ;;
 
+module Runtime = Journal_asset_runtime
+module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
+module Read = Worker_pure_read
+module W = Journal_worker_coordination.Worker_api
+
+type outgoing = Read of Runtime.read_request | Command : 'a W.request -> outgoing
+
+let request_id (Runtime.Read request) = request.request_id
+module Resources=Coordination_test_fixture.Resources
+let resources=Resources.create ~graph:(uuid 3) ~graph_generation:1 8200L
+let producer=lazy(resources.Resources.issuer,resources.session)
+let demand_port sent ~graph_generation ~name priority assets =
+  Option.map(fun ticket->
+    let consumer=W.asset_consumer resources.session ~name |> Result.get_ok in
+    Queue.add(Command(W.Replace_asset_demand(consumer,priority,assets)))sent;ticket)
+    (Resources.demand_ticket resources ~graph_generation ~name priority assets)
+let release_port sent (ticket,demand)=
+  (match demand with
+   |Some demand->Queue.add(Command(W.Release_asset_demand demand))sent
+   |None->Resources.cancel_demand resources ticket);true
+let consumer_name consumer=Hashtbl.to_seq resources.Resources.demands |>Seq.find_map(fun(name,(actual,_,_))->
+  if W.equal_asset_consumer consumer actual then Some name else None) |>Option.get
+
+let respond r (Runtime.Read request) produce =
+  check (Runtime.owns_read r request.request_id) "runtime must retain the terminal owner";
+  let issuer, session = Lazy.force producer in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
+  let budget = W.read_budget session ~maximum_items:request.maximum_items
+    ~maximum_bytes:65536 |> Result.get_ok in
+  let operation = W.Query (budget, request.query) in
+  let id = W.request_id request.request_id in
+  let response=match I.request session ~request_id:id operation|>Result.get_ok with
+    |Service.Coordination_query source->Service.Coordination_queried{registration=source.registration;owner=source.owner;
+      request_id=source.request_id;answer=produce source.read}
+    |_->failwith "Asset fixture did not issue the original query"in
+  match I.reply session ~request_id:id operation response with
+  | Ok (W.Answered (Ok value)) ->
+    check (Runtime.receive_read r ~request_id:request.request_id (request.outcome value))
+      "runtime must retain the typed terminal owner"
+  | Ok (W.Answered (Error _)) -> Runtime.reject r ~request_id:request.request_id
+  | _ -> failwith "invalid typed fixture completion"
+;;
+
 (* Runtime, unlike Policy, owns accepted Worker request IDs and queued IO. *)
 let runtime_same_configuration () =
   let module R = Journal_asset_runtime in
-  let module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service in
-  let module Wire = Logseq_db_worker.Protocol in
+  let module Read = Worker_pure_read in
   let sent = Queue.create () in
   let r =
     R.create
-      ~send:(fun q ->
-        Queue.add q sent;
-        true)
-      ~changed:(fun _ _ _ -> ())
+      ~read:(fun request -> Queue.add (Read request) sent; true)
+      ~demand:(demand_port sent)
+      ~release_consumer:(release_port sent)
+      ~changed:(fun _ _ _ -> ()) ()
   in
   R.refresh r ~graph_generation:1 ~today:20260301 ~settings:P.default_settings;
   let first = Queue.take sent in
   Queue.clear sent;
   R.refresh r ~graph_generation:1 ~today:20260301 ~settings:P.default_settings;
   check (Queue.is_empty sent) "adapter must retain tickets on unchanged lifecycle refresh";
-  let request_id =
-    match first with
-    | S.Graph_request q -> q.request_id
-    | _ -> assert false
-  in
-  let accepted =
-    R.receive
-      r
-      (Wire.V2_response
-         { api_version = 2
-         ; request_id
-         ; outcome = V2_journals_outcome { items = []; next_cursor = None }
-         })
-  in
-  check accepted "adapter must not swallow still-owned response on same configuration"
+  let request = match first with Read request -> request | _ -> assert false in
+  respond r request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+
 ;;
 
 let completed_favorites () =
@@ -508,9 +538,6 @@ let selected_burst () =
   check (ins = []) "followup settles without recursive restarts"
 ;;
 
-module Runtime = Journal_asset_runtime
-module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
-module Wire = Logseq_db_worker.Protocol
 
 let block n parent page refs =
   G.
@@ -527,47 +554,19 @@ let block n parent page refs =
     }
 ;;
 
-let present (block : G.block) =
-  Wire.V2_block_outcome
-    (V2_present_block
-       { value =
-           { block; task_status = None; rendered_page_title = "page"; tag_titles = [] }
-       ; revision = "r"
-       })
+let block_value (block : G.block) : Worker_pure_data.block_lookup =
+  Worker_pure_data.V2_present_block
+    {value={block;task_status=None;rendered_page_title="page";tag_titles=[]};revision="r"}
 ;;
 
-let respond r request_id outcome =
-  let response = Wire.V2_response { api_version = 2; request_id; outcome } in
-  check (Runtime.receive r response) "runtime must retain the terminal owner"
-;;
+let present block = (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((block_value block)) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")
 
 let raw r n (block : G.block) =
-  let request =
-    Wire.
-      { api_version = 2
-      ; request_id = uuid n
-      ; command = V2_get_outline_block { block = block.uuid; revision = None }
-      }
-  in
-  Runtime.observe_request r request;
-  Runtime.observe_response
-    r
-    (V2_response
-       { api_version = 2; request_id = request.request_id; outcome = present block })
+  let query = W.Outline_block { uuid = block.uuid; revision = None } in
+  Runtime.observe_query r ~request_id:(uuid n) query;
+  Runtime.observe_query_result r ~request_id:(uuid n) query (block_value block)
 ;;
 
-let runtime_scope : Service.asset_scope =
-  { account =
-      { managed_sync_origin = Uri.of_string "https://sync.example"
-      ; user_id = "u"
-      ; account_generation = 1
-      ; presentation_generation = 1
-      ; lifecycle_generation = 1L
-      }
-  ; graph_id = uuid 3
-  ; graph_generation = 1
-  }
-;;
 
 let runtime_fixture
       ?(favorite_block = false)
@@ -580,10 +579,10 @@ let runtime_fixture
   let sent = Queue.create () in
   let r =
     Runtime.create
-      ~send:(fun request ->
-        Queue.add request sent;
-        true)
-      ~changed
+      ~read:(fun request -> Queue.add (Read request) sent; true)
+      ~demand:(demand_port sent)
+      ~release_consumer:(release_port sent)
+      ~changed ()
   in
   Runtime.refresh
     r
@@ -592,58 +591,46 @@ let runtime_fixture
     ~settings:(P.settings ~recent_days:0 |> Result.get_ok);
   let take () =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> failwith "expected graph read"
   in
   let roots = take () in
   respond
     r
-    roots.request_id
-    (Wire.V2_favorites_outcome
-       { favorites_page = Some (uuid 9)
-       ; generation = "g"
-       ; projection_revision = "r"
-       ; next_cursor = None
-       ; items =
-           [ { membership_uuid = uuid 10
+    roots
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.favorites ~favorites_page:(Some (uuid 9)) ~generation:("g") ~projection_revision:("r") ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None)) ~items:([ { membership_uuid = uuid 10
              ; membership_order = "a0"
              ; membership_revision = "r"
              ; target =
                  (if favorite_block
                   then
-                    V2_favorite_block
+                    Worker_pure_data.V2_favorite_block
                       { uuid = uuid 2
                       ; title = "block"
                       ; task_status = None
                       ; revision = "r"
                       }
-                  else V2_favorite_page { uuid = uuid 1; title = "page"; revision = "r" })
+                  else Worker_pure_data.V2_favorite_page { uuid = uuid 1; title = "page"; revision = "r" })
              }
-           ]
-       });
+           ])) in match query with |Read.Favorites _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
   while not (Queue.is_empty sent) do
     match Queue.take sent with
-    | Service.Asset_command { command = Replace_asset_demand { consumer; _ }; _ } ->
+    | Command(W.Replace_asset_demand(bound,_,_)) ->
+      let consumer=consumer_name bound in
       initial_demand consumer;
-      Runtime.notice r runtime_scope (Asset_demand_accepted consumer)
-    | Service.Graph_request request ->
-      (match request.command with
-       | Wire.V2_list_assets _ ->
+      Runtime.notice r (Resources.notice resources(Service.Asset_demand_accepted consumer))
+    | Read request ->
+      (match request with
+       | Runtime.Read { query = W.Assets _; _ } ->
          respond
            r
-           request.request_id
-           (V2_assets_outcome
-              { generation = "g"
-              ; projection_revision = "r"
-              ; items = initial_assets
-              ; next_cursor = None
-              })
-       | V2_get_page { page; _ } ->
+           request
+           ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:(initial_assets) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors ids->let listing=Result.get_ok value in F.answer budget query (Ok(F.asset_lookup_result ~generation:listing.generation ~projection_revision:listing.projection_revision ~items:(List.map(fun uuid->List.find_opt(fun descriptor->Read.Uuid.equal uuid descriptor.Logseq_db_types.Asset_descriptor.uuid) listing.items)ids))) |_->failwith "Synthetic sample query family mismatch"))
+       | Runtime.Read { query = W.Page { uuid = page; _ }; _ } ->
          respond
            r
-           request.request_id
-           (V2_page_outcome
-              (V2_present_page
+           request
+           ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page
                  { page =
                      G.
                        { uuid = page
@@ -657,16 +644,16 @@ let runtime_fixture
                        ; recycled = false
                        }
                  ; revision = "r"
-                 }))
-       | V2_get_outline_block { block = target; _ } ->
+                 })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+       | Runtime.Read { query = W.Outline_block { uuid = target; _ }; _ } ->
          respond
            r
-           request.request_id
+           request
            (if G.Uuid.equal target (uuid 2)
             then present (block 2 root_parent 1 [])
             else if G.Uuid.equal target (uuid 3)
             then present (block 3 1 1 [])
-            else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
+            else (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = target; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
        | _ -> failwith "unexpected initial dependency")
     | _ -> ()
   done;
@@ -674,8 +661,7 @@ let runtime_fixture
 ;;
 
 let window n uuids interests =
-  Wire.
-    { id = string_of_int n
+  Worker_pure_data.{ id = string_of_int n
     ; predecessor = "r"
     ; successor = "next"
     ; block_uuids = List.map uuid uuids
@@ -688,10 +674,13 @@ let runtime_unconfigured_changes after_shutdown () =
   let sent = Queue.create () in
   let r =
     Runtime.create
-      ~send:(fun request -> Queue.add request sent; true)
-      ~changed:(fun _ _ _ -> ())
+      ~read:(fun request -> Queue.add (Read request) sent; true)
+      ~demand:(demand_port sent)
+      ~release_consumer:(release_port sent)
+      ~changed:(fun _ _ _ -> ()) ()
   in
-  if after_shutdown then (
+  if after_shutdown
+  then (
     Runtime.refresh
       r
       ~graph_generation:1
@@ -703,15 +692,9 @@ let runtime_unconfigured_changes after_shutdown () =
      configuration has admitted any recursive root or attachment consumer. *)
   raw r 600 (block 200 1 1 []);
   for n = 1 to 4 do
-    let request =
-      Wire.
-        { api_version = 2
-        ; request_id = uuid (600 + n)
-        ; command = V2_get_outline_block { block = uuid n; revision = None }
-        }
-    in
-    Runtime.observe_request r request;
-    Runtime.forget_request r ~request_id:request.request_id
+    let id = uuid (600+n) in
+    Runtime.observe_query r ~request_id:id (W.Outline_block{uuid=uuid n;revision=None});
+    Runtime.forget_request r ~request_id:id
   done;
   Runtime.changes r [ window 1 [ 1; 2; 3; 4 ] [] ];
   Runtime.pump r;
@@ -720,7 +703,7 @@ let runtime_unconfigured_changes after_shutdown () =
     "unconfigured offline owner must not duplicate Graph reference target reads";
   Runtime.changes
     r
-    [ { (window 2 [] [ Wire.V2_children_interest (uuid 99) ]) with
+    [ { (window 2 [] [ Worker_pure_data.V2_children_interest (uuid 99) ]) with
         page_uuids = [ uuid 98 ]
       }
     ];
@@ -737,10 +720,10 @@ let runtime_title_only () =
   Runtime.changes r [ window 1 [ 2 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
-  respond r request.request_id (present { original with title = "edited" });
+  respond r request (present { original with title = "edited" });
   check (Queue.is_empty sent) "title-only raw delta must not issue an offline asset query"
 ;;
 
@@ -753,14 +736,13 @@ let runtime_unknown_unrelated () =
       incr rounds;
       check (!rounds <= 4) "unknown unrelated holder lookup must terminate";
       match Queue.take sent with
-      | Service.Graph_request
-          ({ command = Wire.V2_get_outline_block { block = target; _ }; _ } as request) ->
+      | Read (Runtime.Read { query = W.Outline_block { uuid = target; _ }; _ } as request) ->
         respond
           r
-          request.request_id
+          request
           (if G.Uuid.equal target (uuid 99)
            then present (block 99 98 98 [])
-           else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
+           else (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = target; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
       | _ -> failwith "55 unknown unrelated deltas must not issue an asset/index read"
     done
   done
@@ -772,41 +754,40 @@ let runtime_refs_delta () =
   Runtime.changes r [ window 1 [ 2 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
-  respond r request.request_id (present (block 2 1 1 [ 50 ]));
+  respond r request (present (block 2 1 1 [ 50 ]));
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
   check
-    (match request.command with
-     | V2_list_assets { roots; recursive = true; cursor = None; _ } -> roots = [ uuid 1 ]
+    (match request with
+     | Runtime.Read { query = W.Assets { roots; recursive = true; after = None }; _ } -> roots = [ uuid 1 ]
      | _ -> false)
     "raw ref insertion reads only the matching offline batch";
   respond
     r
-    request.request_id
-    (V2_assets_outcome
-       { generation = "g"; projection_revision = "r"; items = []; next_cursor = None });
+    request
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors ids->let listing=Result.get_ok value in F.answer budget query (Ok(F.asset_lookup_result ~generation:listing.generation ~projection_revision:listing.projection_revision ~items:(List.map(fun uuid->List.find_opt(fun descriptor->Read.Uuid.equal uuid descriptor.Logseq_db_types.Asset_descriptor.uuid) listing.items)ids))) |_->failwith "Synthetic sample query family mismatch"));
   check (Queue.is_empty sent) "raw ref replacement settles"
 ;;
 
 let runtime_sibling_structure () =
   let r, sent = runtime_fixture () in
   raw r 600 (block 2 1 1 []);
-  Runtime.changes r [ window 1 [] [ Wire.V2_children_interest (uuid 98) ] ];
+  Runtime.changes r [ window 1 [] [ Worker_pure_data.V2_children_interest (uuid 98) ] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
   respond
     r
-    request.request_id
-    (V2_block_outcome (V2_missing_block { uuid = uuid 98; revision = "r" }));
+    request
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = uuid 98; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
   check
     (Queue.is_empty sent)
     "unrelated unknown children scope point read never becomes an offline assets/index \
@@ -819,30 +800,30 @@ let runtime_unknown_ancestor () =
   Runtime.changes r [ window 1 [ 4 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
   respond
     r
-    request.request_id
-    (V2_block_outcome (V2_missing_block { uuid = uuid 4; revision = "r" }));
+    request
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = uuid 4; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
   let fresh =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> failwith "changed ancestor must follow its pre-change query"
   in
   respond
     r
-    fresh.request_id
-    (V2_block_outcome (V2_missing_block { uuid = uuid 4; revision = "r" }));
+    fresh
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = uuid 4; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> failwith "unknown ancestor deletion must replace its dependent root batch"
   in
   check
-    (match request.command with
-     | V2_list_assets { roots; cursor = None; _ } -> roots = [ uuid 2 ]
+    (match request with
+     | Runtime.Read { query = W.Assets { roots; after = None; _ }; _ } -> roots = [ uuid 2 ]
      | _ -> false)
     "ancestor liveness has a precise favorite-root dependency"
 ;;
@@ -851,60 +832,45 @@ let runtime_late_fact () =
   let r, sent = runtime_fixture () in
   let old = block 2 1 1 [] in
   raw r 600 old;
-  let late_request =
-    Wire.
-      { api_version = 2
-      ; request_id = uuid 601
-      ; command = V2_get_outline_block { block = uuid 2; revision = None }
-      }
-  in
-  Runtime.observe_request r late_request;
+  let query = W.Outline_block { uuid=uuid 2;revision=None } in
+  Runtime.observe_query r ~request_id:(uuid 601) query;
   Runtime.changes r [ window 1 [ 2 ] [] ];
-  Runtime.observe_response
-    r
-    (V2_response
-       { api_version = 2; request_id = late_request.request_id; outcome = present old });
+  Runtime.observe_query_result r ~request_id:(uuid 601) query (block_value old);
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
-  respond r request.request_id (present (block 2 1 1 [ 50 ]));
+  respond r request (present (block 2 1 1 [ 50 ]));
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> failwith "late pre-change fact must not consume the dirty owner"
   in
   check
-    (match request.command with
-     | V2_list_assets _ -> true
+    (match request with
+     | Runtime.Read { query = W.Assets _; _ } -> true
      | _ -> false)
     "new membership survives a late old raw completion"
 ;;
 
 let runtime_known_asset_immutable () =
   let r, sent = runtime_fixture () in
-  let request =
-    Wire.
-      { api_version = 2
-      ; request_id = uuid 600
-      ; command = V2_get_asset_descriptors { assets = [ uuid 50 ] }
-      }
-  in
-  Runtime.observe_request r request;
-  Runtime.observe_response
-    r
-    (V2_response
-       { api_version = 2
-       ; request_id = request.request_id
-       ; outcome =
-           V2_assets_outcome
-             { generation = "g"
-             ; projection_revision = "r"
-             ; items = [ asset 50 ]
-             ; next_cursor = None
-             }
-       });
+  let query = W.Asset_descriptors [ uuid 50 ] in
+  let id = uuid 600 in
+  Runtime.observe_query r ~request_id:id query;
+  let issuer,session=Lazy.force producer in
+  let module I=(val issuer : Worker_effect_authority.ISSUER) in
+  let budget=W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok in
+  let operation=W.Query(budget,query) in
+  let response=match I.request session ~request_id:(W.request_id id)operation|>Result.get_ok with
+    |Service.Coordination_query source->Service.Coordination_queried{registration=source.registration;owner=source.owner;
+      request_id=source.request_id;answer=Read.For_worker.answer budget query(Ok(Read.For_worker.asset_lookup_result
+        ~generation:"g" ~projection_revision:"r" ~items:[Some(asset 50)]))}
+    |_->failwith "descriptor fixture changed its query"in
+  let value=match I.reply session ~request_id:(W.request_id id) operation response with
+    | Ok(W.Answered(Ok value))->value|_->failwith "invalid descriptor fixture" in
+  Runtime.observe_query_result r ~request_id:id query value;
   Runtime.changes r [ window 1 [ 50 ] [] ];
   check
     (Queue.is_empty sent)
@@ -916,14 +882,13 @@ let runtime_real_capture_sibling () =
   for n = 1 to 55 do
     Runtime.changes
       r
-      [ Wire.
-          { id = string_of_int n
+      [ Worker_pure_data.{ id = string_of_int n
           ; predecessor = "r"
           ; successor = "next"
           ; block_uuids = [ uuid 7 ]
           ; page_uuids = [ uuid 1 ]
           ; structure_interests =
-              [ V2_children_interest (uuid 1); V2_page_tree_interest (uuid 1) ]
+              [ Worker_pure_data.V2_children_interest (uuid 1); Worker_pure_data.V2_page_tree_interest (uuid 1) ]
           }
       ];
     let rounds = ref 0 in
@@ -931,14 +896,13 @@ let runtime_real_capture_sibling () =
       incr rounds;
       check (!rounds <= 2) "Capture dependency point reads remain bounded";
       match Queue.take sent with
-      | Service.Graph_request ({ command = V2_get_outline_block _; _ } as request) ->
-        respond r request.request_id (present (block 7 1 1 []))
-      | Service.Graph_request ({ command = V2_get_page { page; _ }; _ } as request) ->
+      | Read (Runtime.Read { query = W.Outline_block _; _ } as request) ->
+        respond r request (present (block 7 1 1 []))
+      | Read (Runtime.Read { query = W.Page { uuid = page; _ }; _ } as request) ->
         respond
           r
-          request.request_id
-          (V2_page_outcome
-             (V2_present_page
+          request
+          ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page
                 { page =
                     G.
                       { uuid = page
@@ -952,7 +916,7 @@ let runtime_real_capture_sibling () =
                       ; recycled = false
                       }
                 ; revision = "r"
-                }))
+                })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
       | _ ->
         failwith
           "55 actual Capture page/tree windows must not reread a sibling favorite \
@@ -967,35 +931,33 @@ let runtime_registry_capacity () =
     runtime_fixture ~changed:(fun _ _ favorites -> status := favorites.P.enumeration) ()
   in
   for n = 1000 to 5199 do
-    Runtime.observe_request
-      r
-      Wire.
-        { api_version = 2
-        ; request_id = uuid n
-        ; command = V2_get_outline_block { block = uuid 99; revision = None }
-        }
+    Runtime.observe_query r ~request_id:(uuid n)
+      (W.Outline_block{uuid=uuid 99;revision=None})
   done;
   check
     (!status = P.Failed)
     "4096 accepted nonterminal registrations expose capacity failure";
+  check(Runtime.projection_read_error r<>None)
+    "shared DTO ownership capacity failure has no read application error";
   check (Queue.is_empty sent) "capacity failure cannot trigger an unbounded rescan";
   Runtime.resync r;
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
   respond
     r
-    request.request_id
-    (V2_favorites_outcome
-       { favorites_page = Some (uuid 9)
-       ; generation = "g"
-       ; projection_revision = "r"
-       ; items = []
-       ; next_cursor = None
-       });
+    request
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.favorites ~favorites_page:(Some (uuid 9)) ~generation:("g") ~projection_revision:("r") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Favorites _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
   check (Queue.is_empty sent) "bounded registry preserves real resync terminal ownership"
+;;
+
+let runtime_unconfigured_shared_capacity () =
+  let runtime=Runtime.create ~read:(fun _->true) ~demand:(fun ~graph_generation:_ ~name:_ _ _->failwith "unconfigured fixture emitted a demand") ~release_consumer:(fun _->failwith "unconfigured fixture released a consumer") ~changed:(fun _ _ _->()) () in
+  for n=1 to 4200 do raw runtime (10000+n) (block n 9999 9999 []) done;
+  check(Runtime.projection_read_error runtime=None)
+    "unconfigured shared DTO cache overflow invented an offline ACK consumer"
 ;;
 
 let dependency_capacity_status () =
@@ -1049,10 +1011,10 @@ let runtime_reference_order () =
   Runtime.changes r [ window 1 [ 2 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
-  respond r request.request_id (present (block 2 1 1 [ 51; 50 ]));
+  respond r request (present (block 2 1 1 [ 51; 50 ]));
   check (Queue.is_empty sent) "reference membership order cannot renew offline demand"
 ;;
 
@@ -1064,41 +1026,23 @@ let runtime_hidden_holder_fanout () =
   let queried = ref false in
   while not (Queue.is_empty sent) do
     match Queue.take sent with
-    | Service.Graph_request
-        ({ command = V2_get_outline_block { block = target; _ }; _ } as request) ->
+    | Read (Runtime.Read { query = W.Outline_block { uuid = target; _ }; _ } as request) ->
       respond
         r
-        request.request_id
+        request
         (if G.Uuid.equal target (uuid 50)
          then present (block 50 99 99 [])
          else if G.Uuid.equal target (uuid 2)
          then present (block 2 1 1 [ 50 ])
-         else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
-    | Service.Graph_request ({ command = V2_list_assets { roots; _ }; _ } as request) ->
+         else (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = target; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+    | Read (Runtime.Read { query = W.Assets { roots; _ }; _ } as request) ->
       queried := roots = [ uuid 1 ];
       respond
         r
-        request.request_id
-        (V2_assets_outcome
-           { generation = "g"
-           ; projection_revision = "r"
-           ; items = [ asset 50 ]
-           ; next_cursor = None
-           })
-    | Service.Asset_command { command = Replace_asset_demand { consumer; _ }; _ } ->
-      Runtime.notice
-        r
-        { account =
-            { managed_sync_origin = Uri.of_string "https://sync.example"
-            ; user_id = "u"
-            ; account_generation = 1
-            ; presentation_generation = 1
-            ; lifecycle_generation = 1L
-            }
-        ; graph_id = uuid 3
-        ; graph_generation = 1
-        }
-        (Asset_demand_accepted consumer)
+        request
+        ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([ asset 50 ]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors ids->let listing=Result.get_ok value in F.answer budget query (Ok(F.asset_lookup_result ~generation:listing.generation ~projection_revision:listing.projection_revision ~items:(List.map(fun uuid->List.find_opt(fun descriptor->Read.Uuid.equal uuid descriptor.Logseq_db_types.Asset_descriptor.uuid) listing.items)ids))) |_->failwith "Synthetic sample query family mismatch"))
+    | Command(W.Replace_asset_demand(bound,_,_)) ->
+      Runtime.notice r (Resources.notice resources(Service.Asset_demand_accepted(consumer_name bound)))
     | _ -> ()
   done;
   check
@@ -1131,18 +1075,18 @@ let runtime_truncated_membership () =
   Runtime.changes r [ window 1 [ 2 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
-  respond r request.request_id (present holder);
+  respond r request (present holder);
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> failwith "truncated membership cannot prove unchanged hidden references"
   in
   check
-    (match request.command with
-     | V2_list_assets { roots; cursor = None; _ } -> roots = [ uuid 1 ]
+    (match request with
+     | Runtime.Read { query = W.Assets { roots; after = None; _ }; _ } -> roots = [ uuid 1 ]
      | _ -> false)
     "truncated owned holder refresh selects only its offline batch"
 ;;
@@ -1183,33 +1127,31 @@ let runtime_unknown_old_parent () =
     [ window
         1
         [ 4 ]
-        [ V2_children_interest (uuid 3)
-        ; V2_children_interest (uuid 7)
-        ; V2_page_tree_interest (uuid 1)
+        [ Worker_pure_data.V2_children_interest (uuid 3)
+        ; Worker_pure_data.V2_children_interest (uuid 7)
+        ; Worker_pure_data.V2_page_tree_interest (uuid 1)
         ]
     ];
   let queried = ref false in
   while not (Queue.is_empty sent) do
     match Queue.take sent with
-    | Service.Graph_request
-        ({ command = V2_get_outline_block { block = target; _ }; _ } as request) ->
+    | Read (Runtime.Read { query = W.Outline_block { uuid = target; _ }; _ } as request) ->
       respond
         r
-        request.request_id
+        request
         (if G.Uuid.equal target (uuid 4)
          then present (block 4 7 1 [])
          else if G.Uuid.equal target (uuid 3)
          then present (block 3 2 1 [])
-         else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
-    | Service.Graph_request ({ command = V2_list_assets { roots; _ }; _ } as request) ->
+         else (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = target; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+    | Read (Runtime.Read { query = W.Assets { roots; _ }; _ } as request) ->
       queried := roots = [ uuid 2 ];
       respond
         r
-        request.request_id
-        (V2_assets_outcome
-           { generation = "g"; projection_revision = "r"; items = []; next_cursor = None })
-    | Service.Asset_command { command = Release_asset_demand consumer; _ } ->
-      released := Some consumer = !old
+        request
+        ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors ids->let listing=Result.get_ok value in F.answer budget query (Ok(F.asset_lookup_result ~generation:listing.generation ~projection_revision:listing.projection_revision ~items:(List.map(fun uuid->List.find_opt(fun descriptor->Read.Uuid.equal uuid descriptor.Logseq_db_types.Asset_descriptor.uuid) listing.items)ids))) |_->failwith "Synthetic sample query family mismatch"))
+    | Command(W.Release_asset_demand bound) ->
+      released := Some(consumer_name(W.asset_demand_consumer bound)) = !old
     | _ -> ()
   done;
   check
@@ -1226,17 +1168,248 @@ let runtime_dependency_failure rejected () =
   Runtime.changes r [ window 1 [ 99 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
   if rejected
-  then Runtime.reject r ~request_id:request.request_id
+  then Runtime.reject r ~request_id:(request_id request)
   else
-    respond r request.request_id (V2_failed { code = "storage"; message = "unavailable" });
+    respond r request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in F.answer budget query (Error(Read.Service_failed (("storage")^": "^("unavailable"))))));
   check
     (!status = P.Failed && Queue.is_empty sent)
     "owned dependency failure must expose Failed without retrying or preserving false \
      completeness"
+;;
+
+let repeated_cursor_fails () =
+  let cursor n = n, "opaque" in
+  let state, instructions = refresh P.empty in
+  let first = read Favorites instructions in
+  let state, instructions = P.step state (Roots_loaded (first, [], Some (cursor 1))) in
+  check
+    (P.progress state Favorites = Enumerating)
+    "new empty More was treated as complete";
+  let second = read Favorites instructions in
+  let failed, instructions = P.step state (Roots_loaded (second, [], Some (cursor 1))) in
+  check
+    (P.progress failed Favorites = Failed && instructions = [])
+    "repeated catalog More must fail without another Read";
+  let state, instructions = P.step state (Roots_loaded (second, [], Some (cursor 2))) in
+  let third = read Favorites instructions in
+  let failed, instructions = P.step state (Roots_loaded (third, [], Some (cursor 1))) in
+  check
+    (P.progress failed Favorites = Failed && instructions = [])
+    "cyclic catalog More must fail";
+  let state, instructions = refresh P.empty in
+  let state, instructions =
+    P.step state (Roots_loaded (read Favorites instructions, [ uuid 1 ], None))
+  in
+  let state, instructions =
+    P.step
+      state
+      (Assets_loaded (read Favorites instructions, [ asset 2 ], Some (cursor 1)))
+  in
+  let consumer, _ = demand instructions in
+  let state, instructions = P.step state (Demand_accepted consumer) in
+  let failed, instructions =
+    P.step
+      state
+      (Assets_loaded (read Favorites instructions, [ asset 2 ], Some (cursor 1)))
+  in
+  check (P.progress failed Favorites = Failed) "repeated asset More must fail";
+  check
+    (not
+       (List.exists
+          (function
+            | P.Read _ | Demand _ -> true
+            | Release _ -> false)
+          instructions))
+    "repeated asset More created a new consumer or Read"
+;;
+
+(* The pure scan owns continuations and lifecycle decisions; this generator
+   supplies equality-comparable payloads without access to any cursor decoder. *)
+let deferred_read_identity () =
+  let s,ins=refresh P.empty in
+  let s,ins=P.step s (Roots_loaded(read Favorites ins,[uuid 1],None)) in
+  let ticket=read Favorites ins in
+  let awaiting,ins,dependencies=P.step_with_dependencies s (Assets_loaded(ticket,[asset 2],Some cursor)) in
+  let consumer,_=demand ins in
+  check (List.exists(fun (d:_ P.read_dependency)->d.ticket=ticket && d.after_demand=Some consumer)dependencies)
+    "deferred More lost the exact source before its parent completed";
+  let paused,_,joined=P.step_with_dependencies awaiting (Backpressure consumer) in
+  check (joined=dependencies) "backpressure changed the deferred read identity";
+  check(P.completed_deferred_reads awaiting (Backpressure consumer)=[])
+    "backpressure completed the deferred consumer";
+  check(P.completed_deferred_reads paused (Demand_accepted consumer)=dependencies)
+    "accepted demand failed to complete its exact deferred consumer";
+  let same,_=refresh paused in
+  check (P.read_dependencies same=P.read_dependencies paused) "same config retired deferred read";
+  let untouched,_,joined=P.step_with_dependencies paused (Demand_accepted "old-consumer") in
+  check (joined=[] && P.read_dependencies untouched=P.read_dependencies paused)
+    "unowned demand notice re-associated a read";
+  let reading,ins,joined=P.step_with_dependencies paused (Demand_accepted consumer) in
+  let next=read Favorites ins in
+  check (List.exists(fun (d:_ P.read_dependency)->d.ticket=next && d.after_demand=None)joined)
+    "accepted demand did not expand into its actual next read";
+  let final,ins=P.step reading (Assets_loaded(next,[asset 3],None)) in
+  let final_consumer,_=demand ins in
+  check (not(List.exists(fun (d:_ P.read_dependency)->d.ticket.reason=Favorites)(P.read_dependencies final)))
+    "final download demand unnecessarily blocks a read ACK";
+  let dirty,_,joined=P.step_with_dependencies final (Index_changed Favorites) in
+  check (List.exists(fun (d:_ P.read_dependency)->d.after_demand=Some final_consumer)joined)
+    "coalesced index work behind demand lost its cause";
+  let closed,_=P.step dirty Shutdown in
+  check (P.read_dependencies closed=[]) "shutdown retained causal read work";
+  let late,ins=P.step closed (Demand_accepted final_consumer) in
+  check (ins=[] && P.read_dependencies late=[]) "old demand revived a closed scan"
+;;
+
+let opaque_cursor_properties () =
+  let snapshot state =
+    ( P.offline state Recent
+    , P.offline state Favorites
+    , List.of_seq (P.roots state Recent)
+    , List.of_seq (P.roots state Favorites)
+    , P.read_dependencies state )
+  in
+  let run seed actions =
+    let state = ref P.empty
+    and tickets = ref []
+    and consumers = ref [] in
+    let record instructions =
+      List.iter
+        (function
+          | P.Read ticket -> tickets := ticket :: !tickets
+          | Demand { consumer; _ } -> consumers := consumer :: !consumers
+          | Release _ -> ())
+        instructions
+    in
+    let apply event =
+      let before = snapshot !state in
+      let next, instructions, dependencies = P.step_with_dependencies !state event in
+      let repeated, again, repeated_dependencies = P.step_with_dependencies !state event in
+      check (snapshot !state = before) "pure scan mutated a previous state";
+      check
+        (snapshot next = snapshot repeated && instructions = again && dependencies=repeated_dependencies)
+        "pure scan is nondeterministic";
+      let ordinary,ordinary_instructions=P.step !state event in
+      check(snapshot ordinary=snapshot next && ordinary_instructions=instructions)
+        "causal planning changed policy transport decisions";
+      state := next;
+      record instructions;
+      check(List.length(P.read_dependencies next)<=2) "causal work exceeds the two configured reasons";
+      List.iter(fun (dependency:_ P.read_dependency)->
+        check(List.mem dependency.ticket !tickets) "causal work fabricated a source ticket";
+        Option.iter(fun consumer->check(List.mem consumer !consumers)
+          "deferred work fabricated a resource demand")dependency.after_demand)
+        (P.read_dependencies next);
+      match event with
+      | P.Roots_loaded _ | Assets_loaded _ | Read_failed _ ->
+        let duplicate, extra = P.step !state event in
+        check
+          (extra = [] && snapshot duplicate = snapshot !state)
+          "read terminal consumed twice"
+      | _ -> ()
+    in
+    apply
+      (Refresh { graph_generation = 1; today = 20260301; settings = P.default_settings });
+    List.iteri
+      (fun index action ->
+         let picked () =
+           if action mod 3=0 then
+             List.find_map(fun (d:_ P.read_dependency)->if d.after_demand=None then Some d.ticket else None)(P.read_dependencies !state)
+           else List.nth_opt !tickets (action mod max 1 (List.length !tickets))
+         in
+         match action mod 11 with
+         | 0 | 1 | 2 ->
+           Option.iter
+             (fun ticket ->
+                let next =
+                  if action mod 3 = 0
+                  then None
+                  else Some (seed, index, "sealed-by-data-owner")
+                in
+                match ticket.P.query with
+                | Recent_roots _ | Favorite_roots _ ->
+                  apply
+                    (Roots_loaded
+                       ( ticket
+                       , (if action mod 2 = 0 then [] else [ uuid (index + 1) ])
+                       , next ))
+                | Assets _ ->
+                  apply
+                    (Assets_loaded
+                       ( ticket
+                       , (if action mod 2 = 0 then [] else [ asset (index + 1) ])
+                       , next )))
+             (picked ())
+         | 3 -> Option.iter (fun ticket -> apply (Read_failed ticket)) (picked ())
+         | 4 -> apply Resync
+         | 5 ->
+           let retired = !tickets in
+           apply Shutdown;
+           apply
+             (Refresh
+                { graph_generation = index + 2
+                ; today = 20260301
+                ; settings = P.default_settings
+                });
+           List.iter
+             (fun ticket ->
+                let before = snapshot !state in
+                let next, instructions = P.step !state (Read_failed ticket) in
+                check
+                  (instructions = [] && snapshot next = before)
+                  "old graph response revived retired scan")
+             retired
+         | 6 ->
+           Option.iter
+             (fun consumer -> apply (Demand_accepted consumer))
+             (List.nth_opt !consumers 0)
+         | 7 -> apply Capacity_available
+         | 8 -> apply(Index_changed Favorites)
+         | 9 -> apply(Roots_changed[uuid(index+1)])
+         | _ -> Option.iter(fun consumer->apply(Backpressure consumer))(List.nth_opt !consumers 0))
+      actions
+  in
+  let failed seed actions =
+    try
+      run seed actions;
+      false
+    with
+    | _ -> true
+  in
+  let rec shrink seed actions width =
+    if width = 0
+    then actions
+    else (
+      let rec seek offset =
+        if offset >= List.length actions
+        then shrink seed actions (width / 2)
+        else (
+          let candidate =
+            List.filteri
+              (fun index _ -> index < offset || index >= offset + width)
+              actions
+          in
+          if failed seed candidate then shrink seed candidate width else seek (offset + 1))
+      in
+      seek 0)
+  in
+  for seed = 1 to 200 do
+    let random = Random.State.make [| 0xA55E; seed |] in
+    let actions = List.init 64 (fun _ -> Random.State.int random 10000) in
+    try run seed actions with
+    | error ->
+      let minimal = shrink seed actions 32 in
+      failwith
+        (Printf.sprintf
+           "opaque cursor seed=%d trace=[%s]: %s"
+           seed
+           (String.concat ";" (List.map string_of_int minimal))
+           (Printexc.to_string error))
+  done
 ;;
 
 let () =
@@ -1250,7 +1423,10 @@ let () =
        | exn ->
          incr failed;
          Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn))
-    [ "runtime never configured changes", runtime_unconfigured_changes false
+    [ "deferred read identity and resource-independent final page", deferred_read_identity
+    ; "repeated and cyclic opaque More", repeated_cursor_fails
+    ; "opaque cursor 200 seeded traces and shrinking", opaque_cursor_properties
+    ; "runtime never configured changes", runtime_unconfigured_changes false
     ; "runtime shutdown changes", runtime_unconfigured_changes true
     ; "runtime unknown old parent", runtime_unknown_old_parent
     ; "runtime dependency reject", runtime_dependency_failure true
@@ -1262,6 +1438,7 @@ let () =
     ; "immutable pending residency", pending_preserves_ready
     ; "runtime actual Capture sibling", runtime_real_capture_sibling
     ; "runtime accepted registry capacity", runtime_registry_capacity
+    ; "unconfigured shared DTO capacity has no ACK consumer", runtime_unconfigured_shared_capacity
     ; "dependency capacity preserves lease", dependency_capacity_status
     ; "immutable paginated index diff", index_pagination
     ; "runtime unknown ancestor", runtime_unknown_ancestor

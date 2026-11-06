@@ -51,9 +51,9 @@ type sync_worker_result =
 type _ runner_request =
   | Execute_request :
       { database : database_handle
-      ; request : Logseq_db_worker_contract.Protocol.request
+      ; read : Worker_pure_read.packed_query
       }
-      -> Logseq_db_worker_contract.Protocol.response runner_request
+      -> Worker_pure_read.answer runner_request
   | Close_database : database_handle -> unit runner_request
   | Handle_sync_worker_effect :
       Logseq_sync_pure_reducer.Core.worker_effect
@@ -64,7 +64,7 @@ type effect_error = Logseq_db_worker_contract.Error.t
 
 type runner_completion =
   | Execute_request_completed of
-      ticket * (Logseq_db_worker_contract.Protocol.response, effect_error) result
+      ticket * (Worker_pure_read.answer, effect_error) result
   | Close_database_completed of ticket * (unit, effect_error) result
   | Sync_worker_effect_completed of ticket * (sync_worker_result, effect_error) result
 
@@ -72,6 +72,7 @@ type asset_notice =
   | Asset_availability of
       { consumer : string
       ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; descriptor : Logseq_db_types.Asset_descriptor.t
       ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
       }
   | Asset_demand_accepted of string
@@ -87,12 +88,12 @@ type asset_notice =
 
 type output =
   | Asset_notice of Logseq_sync_pure_reducer.Core.graph_scope * asset_notice
-  | Reply of request_id * Logseq_db_worker_contract.Protocol.response
-  | Graph_push of Logseq_db_worker_contract.Protocol.push
+  | Reply of request_id * Worker_pure_read.answer
+  | Graph_push of Worker_pure_data.changefeed_signal
   | Sync_output of Logseq_sync_pure_reducer.Core.output
   | Graph_state_changed of graph_state
   | Scoped_graph_state_changed of Logseq_sync_pure_reducer.Core.graph_scope * graph_state
-  | Scoped_graph_push of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
+  | Scoped_graph_push of Logseq_sync_pure_reducer.Core.graph_scope * Worker_pure_data.changefeed_signal
   | Diagnostic of string
 
 type upload_recovery_ticket = private
@@ -103,6 +104,8 @@ type upload_recovery_ticket = private
   }
 
 type instruction =
+  | Sync_io_fence_reached of int64 * Logseq_sync_pure_reducer.Core.effect_scope * (unit,string) result
+  | Asset_cleanup_barrier_reached of int64
   | Deliver_protected_result of Logseq_sync_pure_reducer.Core.protected_output
   | Deliver_asset_result of Logseq_sync_pure_reducer.Core.asset_output
   | Read_uploads of upload_recovery_ticket
@@ -143,6 +146,7 @@ val initial : config -> (state, create_error) result
 val view : state -> view
 
 type event =
+  | Asset_cleanup_barrier of int64
   | Upload_requested of
       { graph_generation : int
       ; operation : Logseq_db_types.Graph_types.Uuid.t
@@ -161,18 +165,18 @@ type event =
   | Graph_request_for_scope of
       { scope : Logseq_sync_pure_reducer.Core.graph_scope
       ; id : request_id
-      ; request : Logseq_db_worker_contract.Protocol.request
+      ; read : Worker_pure_read.packed_query
       }
-  | Projection_push_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
+  | Projection_push_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Worker_pure_data.changefeed_signal
   | Asset_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_sync_pure_reducer.Asset_transfer.event
   | Upload_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_types.Graph_types.Uuid.t * Asset_upload.event
   | Start
   | Graph_request of
       { id : request_id
-      ; request : Logseq_db_worker_contract.Protocol.request
+      ; read : Worker_pure_read.packed_query
       }
   | Sync_event of Logseq_sync_pure_reducer.Core.event
-  | Projection_push of Logseq_db_worker_contract.Protocol.push
+  | Projection_push of Worker_pure_data.changefeed_signal
   | Set_foreground of bool
   | Runner_completed of runner_completion
   | Shutdown
@@ -186,7 +190,7 @@ val step : state -> event -> transition
 
 val complete_execute
   :  runner_effect
-  -> (Logseq_db_worker_contract.Protocol.response, effect_error) result
+  -> (Worker_pure_read.answer, effect_error) result
   -> event option
 
 val asset_ticket_current : state -> Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
@@ -202,4 +206,288 @@ val import_context
 val graph_scopes : state -> Logseq_sync_pure_reducer.Core.graph_scope list
 
 val graph_state_for_scope : state -> Logseq_sync_pure_reducer.Core.graph_scope -> graph_state option
+
+type coordination_state =
+  { sync : Logseq_sync_pure_reducer.Core.coordination_state
+  ; residents : (Logseq_sync_pure_reducer.Core.graph_scope * graph_state) list
+  }
+val coordination_state : state -> coordination_state
 val import_context_for_scope : state -> Logseq_sync_pure_reducer.Core.graph_scope -> Logseq_sync_pure_reducer.Core.asset_context option
+
+(** Pure admission/epoch/tombstone ownership for real query subscriptions.
+    Physical listeners and snapshot leases remain with the effect owner. A
+    released logical ID cannot allocate later if Cancel overtook registration.
+    This registry never infers a physical release ACK. *)
+module Observation_registry : sig
+  type t
+
+  type decision =
+    | Start
+    | Existing
+    | Retired
+    | Full
+    | Mismatch
+    | Invalid
+
+  type release =
+    | Release
+    | Already_released
+    | Unknown
+    | Release_full
+    | Wrong_owner
+
+  val empty : t
+
+  val reserve
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+    -> read:Worker_pure_read.packed_query
+    -> t * decision
+
+  val release
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+    -> t * release
+
+  (** Fence an unallocated logical ID even after its graph owner has disappeared.
+      This cannot release a known live/closing resource or grant a graph fence. *)
+  val release_unallocated
+    : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> t * release
+
+  (** External completion after physical listener/read cleanup; only then is
+      its active-resource capacity reusable. *)
+  val released
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+    -> t
+
+  val advance
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> t * int64 option
+
+  val current
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> epoch:int64
+    -> bool
+
+  val scope
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> Logseq_sync_pure_reducer.Core.graph_scope option
+
+  val epoch
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> int64 option
+
+  (** Applied only after the unique Accepted creator has exited its actual
+      request Switch and discarded-result handling, including no-handler cancel.
+      This is not a physical cleanup ACK. *)
+  val creator_finished : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t -> t
+
+  (** Forget only after the caller consumed release success and returned its
+      capability. Existing entries require the original owner, creator completion
+      and physical settlement. Already absent is a non-allocating no-op; it grants
+      no release or host fence. Failures retain the same finalization obligation. *)
+  val finalize : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> t * (unit,string) result
+
+  val active : t -> int
+  val retained : t -> int
+
+  (** Authoritative monotonic registration retirement, only after its physical
+      listeners/read leases settled. Fences this and older creator callbacks;
+      resources of another registration retain their own cleanup ledger. *)
+  val retire_registration : t -> registration:int64 -> t
+end
+
+(** One registered changefeed consumer for one physical DB session.
+    Registered replacements require actual prior retirement.
+    An unapplied pull is retained verbatim until its exact ACK succeeds. *)
+module Changefeed_owner : sig
+  type t
+
+  type pull =
+    | Read
+    | Cached of Worker_pure_read.change_batch
+    | Refused
+
+  val empty : t
+  val unclaimed : t -> bool
+  val needs_resync : t -> bool
+  val claim : t -> registration:int64 -> t * bool
+
+  val pull
+    :  t
+    -> registration:int64
+    -> read:Worker_pure_read.packed_query
+    -> pull
+
+  val remember
+    :  t
+    -> registration:int64
+    -> read:Worker_pure_read.packed_query
+    -> Worker_pure_read.change_batch
+    -> (t, string) result
+
+  val may_ack : t -> registration:int64 -> generation:string -> through:string -> bool
+
+  val acknowledged
+    :  t
+    -> registration:int64
+    -> generation:string
+    -> through:string
+    -> t
+
+  (** Physical history has at most 256 windows and one maximum response's
+      conservative encoded-byte budget. False requires the I/O owner to discard
+      that history and publish resync; it does not acknowledge any consumer. *)
+  val retain_window : t -> encoded_bytes:int -> t * bool
+
+  val release_windows : t -> count:int -> encoded_bytes:int -> t
+  val invalidate : t -> t
+  val retire : t -> registration:int64 -> t
+end
+
+
+(** Cleanup ownership transferred by the real Mailbox's exactly-once discarded
+    success callback. Any unsettled physical release blocks new acquisition;
+    failure retains that obligation. Attempt tokens prevent an old ACK from settling a retry. No
+    clock, callback, transport or filesystem access occurs here. *)
+module Orphan_cleanup : sig
+  type resource = { scope : Logseq_sync_pure_reducer.Core.graph_scope; handle : string }
+  type t
+  type work
+  val empty : t
+  val count : t -> int
+  val acquisition_open : t -> bool
+  val track : t -> resource -> t
+  val next : t -> t * work option
+  val resource : work -> resource
+  val first_attempt : work -> bool
+  val retry_delay : work -> float
+  val completed : t -> work -> (unit,string) result -> t
+end
+
+(** Admission/tombstones for typed demand rounds on the existing Service. A
+    retired round cannot allocate later, even when release overtook Replace.
+    Physical settlement remains separate from command admission. *)
+module Demand_registry : sig
+  type t
+  type owner={registration:int64;scope:Logseq_sync_pure_reducer.Core.graph_scope;consumer:string}
+  type reservation=Start|Existing|Retired|Mismatch|Full|Invalid
+  type release=Release|Already_settled|Unknown|Mismatch|Full
+  val empty:t
+  val reserve:t -> owner -> priority:Logseq_sync_pure_reducer.Asset_transfer.priority
+    -> assets:Logseq_db_types.Asset_descriptor.t list -> t * reservation
+  val admitted:t -> owner -> bool
+  val retire:t -> owner -> t * release
+  val settled:t -> owner -> t
+  val pending:t -> registration:int64 -> owner Rrbvec.t
+  val creator_finished:t -> registration:int64 -> consumer:string -> t
+
+  (** Exact settled owner only; absent is a non-allocating idempotent no-op.
+      Completion of the creator alone does not settle a physical demand. *)
+  val finalize:t -> owner -> t * (unit,string) result
+
+  (** Permanently fences this and older registrations before pruning completed
+      tombstones. Unsettled resource owners remain pending. *)
+  val forget_settled:t -> registration:int64 -> t
+end
+
+(** Pure admission and completion ledger for physical graph operations. A fence
+    blocks that graph incarnation across focus/foreground changes. Finishing an
+    operation is an interpreter input after its actual I/O and callback posting.
+    Drained is only a writer fact: it grants no resource, deletion or host permit. *)
+module Writer_fence : sig
+  type t
+  type operation
+  type fence
+  type error = Fenced | Full
+  val empty : t
+  val admit : t -> Logseq_sync_pure_reducer.Core.graph_scope -> t * (operation,error) result
+  val admit_cleanup : t -> Logseq_sync_pure_reducer.Core.graph_scope -> t * (operation,error) result
+  val finish : t -> operation -> t
+  val freeze : t -> Logseq_sync_pure_reducer.Core.graph_scope -> t * (fence,error) result
+  val drained : t -> fence -> bool
+  val fenced : t -> Logseq_sync_pure_reducer.Core.graph_scope -> bool
+  val pending : t -> Logseq_sync_pure_reducer.Core.graph_scope -> int
+  val operation_id : operation -> int64
+  val same_incarnation : Logseq_sync_pure_reducer.Core.graph_scope -> Logseq_sync_pure_reducer.Core.graph_scope -> bool
+end
+
+(** Pure unregister roster. The first authoritative account stays immutable
+    through revocation/replacement. Physical retirement is ACKed only by callers
+    that actually settled the returned scopes and optional old account IO. *)
+module Registration_retirement : sig
+  type t
+  type plan={owner:Logseq_sync_pure_reducer.Core.account_scope option;
+    scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t;join_account:bool;blocked:bool}
+  val empty:t
+  val bind:t -> registration:int64 -> account:Logseq_sync_pure_reducer.Core.account_scope option -> (t,string)result
+  val observe:t -> registration:int64 option -> account:Logseq_sync_pure_reducer.Core.account_scope option -> t
+  val begin_release:t -> registration:int64 -> active_account:Logseq_sync_pure_reducer.Core.account_scope option
+    -> active_scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t
+    -> physical_scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t -> t * plan
+  val released:t -> registration:int64 -> t
+end
+
+(** Pure one-use host permission policy. External settlement inputs are supplied
+    only after actual I/O/resource owners have acknowledged. This model itself
+    performs no quiescence, callbacks, randomness, file inspection or deletion. *)
+module Host_handoff : sig
+  type mode=Normal|Force
+  type change=Close_graph of Logseq_db_types.Graph_types.Uuid.t
+    |Remove_graph of Logseq_db_types.Graph_types.Uuid.t * mode
+    |Replace_account|Stop_connection
+  type facts={authenticated:bool;version:int64;registration:int64 option;account:Logseq_sync_pure_reducer.Core.account_scope option;
+    scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t;catalog:Logseq_db_types.Graph_types.Uuid.t Rrbvec.t}
+  type request={version:int64;id:Logseq_db_types.Graph_types.Uuid.t;registration:int64;
+    owner:Logseq_sync_pure_reducer.Core.account_scope;change:change;
+    expected:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t;
+    captured:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t}
+  type t
+  type attempt
+  type receipt
+  type error=Busy|Retired|Mismatch|Owner_changed|Scopes_changed|Baseline_changed|Full|Missing_copy_witness|Not_settled
+  type phase=Preparing|Safe of receipt|Consumed of receipt|Failed of error
+  type admission=Start of attempt|Existing of phase|Refused of error
+  val empty:lifetime:Logseq_db_types.Graph_types.Uuid.t -> t
+  val capture:owner:Logseq_sync_pure_reducer.Core.account_scope -> change:change
+    -> Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t -> Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t
+  val prepare:t -> facts -> request -> t * admission
+  val observe:t -> facts -> t
+  val settled:t -> attempt -> copy_generation:Logseq_overlay_db.Types.mirror_generation option -> t
+  val failed:t -> attempt -> t
+  val released_registration:t -> int64 -> t * Logseq_db_types.Graph_types.Uuid.t option
+  val phase:t -> Logseq_db_types.Graph_types.Uuid.t -> phase option
+
+  (** Read-only exact original capability check. Only account replacement and
+      connection stop have no post-consumption physical action. Unavailable or
+      foreign rounds are errors, never evidence of absence. *)
+  val consumed:t -> receipt -> (bool,error)result
+  val consume:t -> facts -> receipt -> t * (change,error)result
+
+  (** Consuming is terminal for the capability but retains exclusivity until
+      the bound physical action finishes. A later prepare cannot overlap it. *)
+  val completed:t -> receipt -> t
+  val current:t -> (request * phase)option
+  val receipt_request:receipt -> request
+  val receipt_copy_generation:receipt -> Logseq_overlay_db.Types.mirror_generation option
+end
+
+val host_fence_blocks : state -> Logseq_db_types.Graph_types.Uuid.t -> bool
+val host_fence_active : state -> Logseq_sync_pure_reducer.Core.host_fence option

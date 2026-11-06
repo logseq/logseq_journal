@@ -9,6 +9,7 @@ homepage: "https://github.com/logseq/logseq_journal"
 bug-reports: "https://github.com/logseq/logseq_journal/issues"
 depends: [
   "rrbvec" {= "dev"}
+  "digestif" {>= "1.3.0"}
   "ocaml" {>= "5.5"}
   "dune" {= "3.23.1"}
   "ppx_deriving_yojson" {>= "3.9.1"}

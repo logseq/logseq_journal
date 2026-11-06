@@ -51,14 +51,8 @@ type create_child =
   ; source : string
   ; task_state : Journal_model.task_state
   ; status_confirmation : bool
+  ; status_intent_revision : int64
   ; creation_time : Journal_time.t
-  }
-
-type update_source =
-  { mutation_id : string
-  ; block_id : string
-  ; expected_revision : string
-  ; source : string
   }
 
 type set_task_state =
@@ -79,10 +73,34 @@ type feed_cursor =
   ; skipped_day : int option
   }
 
+type child_cursor =
+  { after :
+      Worker_pure_data.child_member
+        Journal_worker_coordination.Worker_api.continuation
+  ; maximum_items : int
+  }
+
+type root_cursor =
+  { session : Journal_worker_coordination.Worker_api.session
+  ; budget : Journal_worker_coordination.Worker_api.read_budget
+  ; maximum_items : int
+  ; page : Logseq_db_types.Graph_types.Uuid.t
+  ; epoch : int64
+  ; after :
+      Worker_pure_data.tree_member
+        Journal_worker_coordination.Worker_api.continuation
+        option
+  ; remaining : Worker_pure_data.tree_member Rrbvec.t
+  }
+
+type block_continuation =
+  | Root_tree_cursor of root_cursor
+  | Child_cursor of child_cursor
+
 type block_cursor =
   { after_sibling_order : string
   ; after_block_id : string
-  ; protocol_cursor : Graph.Cursor.t option
+  ; protocol_cursor : block_continuation option
   }
 
 type child_summary =
@@ -128,6 +146,11 @@ type detail =
 type block_member =
   { block : Graph.block
   ; revision : string
+  }
+
+type children_page =
+  { items : block_member list
+  ; continuation : child_cursor option
   }
 
 type tree_member =
@@ -291,19 +314,21 @@ let preview_children children =
 ;;
 
 let timeline_entry_page
+      ?root_continuation
       ?(tag_titles = fun _ -> [])
       ~page
       ~time_context
       (result : tree_member Graph.page_result)
   =
-  let cursor (block : Graph.block) =
+  if Option.is_some result.continuation then Error "Raw Tree continuations are not supported."
+  else let cursor (block : Graph.block) =
     Option.map
       (fun protocol_cursor ->
          { after_sibling_order = block.order
          ; after_block_id = Graph.Uuid.to_string block.uuid
          ; protocol_cursor = Some protocol_cursor
          })
-      result.continuation
+      (Option.map (fun cursor -> Root_tree_cursor cursor) root_continuation)
   in
   let roots =
     let children = Hashtbl.create 16 in
@@ -382,11 +407,35 @@ let timeline_entry_page
   project [] roots
 ;;
 
+let timeline_target_entry ~page ~time_context ~(root : tree_member) ~tag_titles children =
+  let preview =
+    Rrbvec.to_seq children
+    |> Seq.filter (fun (item : Worker_pure_data.child_member) ->
+      not (property_value_block item.value.block))
+    |> Seq.take 3
+    |> Seq.map (fun (item : Worker_pure_data.child_member) ->
+      { block = item.value.block; revision = item.revision; depth = 1 })
+    |> List.of_seq
+  in
+  timeline_entry_page
+    ~page
+    ~time_context
+    ~tag_titles
+    { Graph.items = root :: preview; continuation = None }
+  |> fun projected ->
+  Result.bind projected (fun result ->
+    match result.entries with
+    | [] -> Ok None
+    | entry :: _ ->
+      Journal_model.with_child_count entry.block ~child_count:(Rrbvec.length children)
+      |> Result.map (fun block -> Some { entry with block }))
+;;
+
 let project_detail
       ~project_block
       ~time_context
       ~(root : block_member)
-      (children : block_member Graph.page_result)
+      (children : children_page)
   =
   let child_count =
     List.length children.items + if Option.is_some children.continuation then 1 else 0
@@ -401,14 +450,20 @@ let project_detail
           ; children =
               { blocks = List.rev reversed
               ; continuation =
-                  (match reversed, children.continuation with
-                   | block :: _, Some protocol_cursor ->
+                  (match children.continuation with
+                   | Some cursor ->
+                     let order, id =
+                       match reversed with
+                       | block :: _ ->
+                         Journal_model.sibling_order block, Journal_model.id block
+                       | [] -> Journal_model.sibling_order root, Journal_model.id root
+                     in
                      Some
-                       { after_sibling_order = Journal_model.sibling_order block
-                       ; after_block_id = Journal_model.id block
-                       ; protocol_cursor = Some protocol_cursor
+                       { after_sibling_order = order
+                       ; after_block_id = id
+                       ; protocol_cursor = Some (Child_cursor cursor)
                        }
-                   | [], _ | _, None -> None)
+                   | None -> None)
               }
           }
       | (child : block_member) :: rest ->
@@ -429,14 +484,13 @@ let detail_on_page ~page ~time_context ~root children =
   project_detail ~project_block:(block_on_page ~page) ~time_context ~root children
 ;;
 
-let favorite (item : Logseq_db_worker.Protocol.v2_favorite_item) =
-  let module P = Logseq_db_worker.Protocol in
+let favorite (item : Worker_pure_data.favorite_item) =
   let id = Logseq_db_types.Graph_types.Uuid.to_string in
   let target, title, task_state =
     match item.target with
-    | P.V2_favorite_page { uuid; title; _ } ->
+    | Worker_pure_data.V2_favorite_page { uuid; title; _ } ->
       Page (id uuid), title, Journal_model.No_status
-    | V2_favorite_block { uuid; title; task_status; _ } ->
+    | Worker_pure_data.V2_favorite_block { uuid; title; task_status; _ } ->
       let status =
         Option.fold
           ~none:Journal_model.No_status

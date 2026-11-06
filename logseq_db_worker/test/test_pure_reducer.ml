@@ -1,24 +1,38 @@
 module Core = Logseq_db_worker_pure_reducer.Core
 module Sync = Logseq_sync_pure_reducer.Core
 module Config = Logseq_db_worker.Config
-module Protocol = Logseq_db_worker.Protocol
 
 let uuid value = Logseq_db_types.Graph_types.Uuid.of_string value |> Result.get_ok
+
+module Read=Worker_pure_read
+let observation_read (scope:Logseq_sync_pure_reducer.Core.graph_scope) registration query maximum_bytes =
+  let module F=Read.For_worker in
+  let limits:Worker_pure_data.capability_limits={response_budget_bytes=Worker_pure_data.maximum_response_bytes;
+    outbox_max_records=10000;outbox_max_bytes=10485760;change_max_items=256;change_max_bytes=1048576;dispatcher_capacity=256;wire_batch_max_bytes=1048576}in
+  let binding=F.binding ~serial:registration ~incarnation:(Read.worker_incarnation
+    ~runtime_epoch:(Journal_worker_ids.Runtime.Epoch.of_int64 1L) ~worker_generation:(Journal_worker_ids.Worker.Generation.of_int64 1L))
+    ~origin:(Uri.to_string scope.account.managed_sync_origin) ~user:scope.account.user_id in
+  let owner:Logseq_sync_pure_reducer.Core.timeline_scope={startup={account_generation=scope.account.account_generation;
+    presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;graph_generation=scope.graph_generation}in
+  let session=F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation ~lifecycle:scope.account.lifecycle_generation
+    ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits in
+  F.pack_query(F.read_budget ~owner:session ~maximum_items:1 ~maximum_bytes)query
+;;
 
 let worker_config () =
   Config.create
     ~application_support_directory:"/tmp/logseq-db-worker-reducer-contract"
     ~target:(Managed_sync { base_url = "https://api.logseq.io" })
     ~compatibility_profile:Logseq_65_33_or_newer
-    ~response_budget_bytes:Protocol.maximum_response_bytes
-    ~default_page_size:Protocol.default_page_size
+    ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+    ~default_page_size:Worker_pure_data.default_page_size
   |> Result.get_ok
 ;;
 
 let sync_config () =
   let limits =
     Sync.limits
-      ~maximum_response_bytes:Protocol.maximum_response_bytes
+      ~maximum_response_bytes:Worker_pure_data.maximum_response_bytes
       ~maximum_artifact_bytes:(1024 * 1024 * 1024)
       ~submission_batch_size:32
     |> Result.get_ok
@@ -44,13 +58,6 @@ let timeline_scope state : Sync.timeline_scope =
 let initial () = let s=raw_initial () in
   (Core.step s (Sync_event (Sync.Sign_in_requested (startup_scope s)))).next
 ;;
-let graph_info_request () =
-  Protocol.
-    { api_version
-    ; request_id = uuid "10000000-0000-4000-8000-000000000001"
-    ; command = V2_graph_info
-    }
-;;
 
 let test_managed_worker_starts_without_local_open () =
   let transition = Core.step (initial ()) Core.Start in
@@ -65,7 +72,9 @@ let test_managed_worker_starts_without_local_open () =
 let test_closed_graph_request_replies_once () =
   let id = Core.request_id_of_int64 1L in
   let transition =
-    Core.step (initial ()) (Core.Graph_request { id; request = graph_info_request () })
+    Core.step (initial ()) (Core.Graph_request { id; read=observation_read ({Sync.account={managed_sync_origin=Uri.of_string "https://api.logseq.io";user_id="user-1";
+      account_generation=1;presentation_generation=1;lifecycle_generation=1L};
+      graph_id=uuid "10000000-0000-4000-8000-000000000001";graph_generation=1}) 71L Read.Graph_info 16384 })
   in
   let replies =
     List.filter
@@ -79,6 +88,8 @@ let test_closed_graph_request_replies_once () =
         | Close_asset_scope _
         | Deliver_asset_result _
         | Deliver_protected_result _
+        | Sync_io_fence_reached _
+        | Asset_cleanup_barrier_reached _
         | Publish _ -> false)
       transition.effects
   in
@@ -215,9 +226,9 @@ let worker_open_graph () =
 
 let test_current_deletion_preserves_work_until_retirement () =
   let ready, scope = worker_open_graph () in
-  let request = graph_info_request () in
+  let read=observation_read scope 71L Read.Graph_info 16384 in
   let executing =
-    Core.step ready (Core.Graph_request { id = Core.request_id_of_int64 11L; request })
+    Core.step ready (Core.Graph_request { id = Core.request_id_of_int64 11L; read })
   in
   let completion =
     List.find_map
@@ -287,24 +298,13 @@ let test_current_deletion_preserves_work_until_retirement () =
     "close waits for executing work"
     false
     (has_close retiring.effects);
-  let edit =
-    { request with
-      Protocol.command =
-        Protocol.V2_save_block
-          { mutation_id = uuid "20000000-0000-4000-8000-000000000001"
-          ; block = uuid "30000000-0000-4000-8000-000000000001"
-          ; title = "Must not be saved after graph retirement admission"
-          ; preconditions = { blocks = []; pages = []; scopes = [] }
-          }
-    }
-  in
   let rejected =
     Core.step
       retiring.next
-      (Core.Graph_request { id = Core.request_id_of_int64 12L; request = edit })
+      (Core.Graph_request { id = Core.request_id_of_int64 12L; read })
   in
   Alcotest.(check bool)
-    "new editing receives a terminal reply and no execution"
+    "new reading receives a terminal reply and no execution"
     true
     (List.exists
        (function
@@ -1229,15 +1229,15 @@ let test_resident_worker_routes_by_scope () =
   let opened,first_scope,second_id=resident_worker_fixture () in
   Alcotest.(check int) "two independent DB scopes remain open" 2 (List.length (Core.graph_scopes opened));
   let second_scope=List.find (fun (scope:Sync.graph_scope)->scope.graph_id=second_id) (Core.graph_scopes opened) in
-  let request=graph_info_request () in
-  let started=Core.step opened (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 101L;request}) in
+  let read scope=observation_read scope 71L Read.Graph_info 16384 in
+  let started=Core.step opened (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 101L;read=read first_scope}) in
   let execution=List.find_map (function Core.Run_worker ((Core.Request (_,Execute_request _)) as instruction)->Some instruction | _->None) started.effects |> Option.get in
   let focused=Core.step started.next (Sync_event (Sync.Visible_graph_changed second_id)) in
-  let hidden=Core.step focused.next (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 102L;request}) in
+  let hidden=Core.step focused.next (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 102L;read=read first_scope}) in
   Alcotest.(check bool) "hidden request still targets first database" true
     (List.exists (function Core.Run_worker (Core.Request (_,Execute_request {database;_}))->
       Core.database_handle_id database="db-delete" | _->false) hidden.effects);
-  let second=Core.step hidden.next (Graph_request_for_scope {scope=second_scope;id=Core.request_id_of_int64 103L;request}) in
+  let second=Core.step hidden.next (Graph_request_for_scope {scope=second_scope;id=Core.request_id_of_int64 103L;read=read second_scope}) in
   Alcotest.(check bool) "visible request targets its own database" true
     (List.exists (function Core.Run_worker (Core.Request (_,Execute_request {database;_}))->
       Core.database_handle_id database="resident-" ^ Logseq_db_types.Graph_types.Uuid.to_string second_id | _->false) second.effects);
@@ -1305,16 +1305,1056 @@ let test_resident_worker_cold_restore_keeps_open_tickets () =
   List.iter(fun scope->
     Alcotest.(check bool) "each restored graph really opens" true
       (Option.fold ~none:false ~some:(fun(g:Core.graph_state)->g.phase=Core.Graph_open) (Core.graph_state_for_scope opened scope));
-    let read=Core.step opened (Graph_request_for_scope{scope;id=Core.request_id_of_int64 901L;request=graph_info_request()}) in
+    let read=Core.step opened (Graph_request_for_scope{scope;id=Core.request_id_of_int64 901L;read=observation_read scope 71L Read.Graph_info 16384}) in
     Alcotest.(check bool) "restored scope executes against its own DB" true
       (List.exists(function Core.Run_worker(Core.Request(_,Execute_request{database;_}))->
         Core.database_handle_id database="cached-" ^ Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id|_->false) read.effects)) (Core.graph_scopes opened)) [1;2;3]
 ;;
 
+let test_coordination_owner_snapshot () =
+  let opened,first,second=resident_worker_fixture () in
+  let before=Core.coordination_state opened in
+  Alcotest.(check int) "all resident identities" 2 (List.length before.residents);
+  Alcotest.(check bool) "account belongs to owner" true (Option.is_some before.sync.account);
+  List.iter (fun ((scope:Sync.graph_scope),state) ->
+    Alcotest.(check bool) "exact open lifetime" true
+      (state.Core.phase=Graph_open && state.generation=scope.Sync.graph_generation)) before.residents;
+  let switched=(Core.step opened (Sync_event (Sync.Visible_graph_changed second))).next in
+  let back=(Core.step switched (Sync_event (Sync.Visible_graph_changed first.graph_id))).next in
+  let after=Core.coordination_state back in
+  Alcotest.(check bool) "focus preserves execution scopes" true
+    (List.map fst before.residents=List.map fst after.residents);
+  Alcotest.(check bool) "selection follows current owner" true
+    (Option.map (fun (owner:Sync.timeline_scope)->owner.graph_id)
+       (Core.coordination_state switched).sync.selected=Some second
+     && Option.map (fun (owner:Sync.timeline_scope)->owner.graph_id)
+       after.sync.selected=Some first.graph_id);
+  let removed=(Core.step back (Sync_event (Sync.Resident_graphs_changed [first.graph_id]))).next in
+  let deleting=Core.step removed (Sync_event (Sync.Local_cache_deletion_requested second)) in
+  let current=Core.coordination_state deleting.next in
+  Alcotest.(check bool) "exact deletion target is visible" true
+    (Option.fold ~none:false ~some:(fun ((scope:Sync.graph_scope),_) ->
+      scope.graph_id=second) current.sync.deletion);
+  let empty=Core.coordination_state (raw_initial ()) in
+  Alcotest.(check bool) "empty bootstrap has no invented account" true
+    (empty.sync.account=None && empty.residents=[] && empty.sync.selected=None)
+;;
+
+let test_scoped_read_byte_budget () =
+  let opened,scope=worker_open_graph() in
+  let id=Core.request_id_of_int64 730L in
+  let run maximum_bytes=Core.step opened(Core.Graph_request_for_scope{
+    scope;id;read=observation_read scope 71L Read.Graph_info maximum_bytes})in
+  let valid=run 16384 in
+  Alcotest.(check bool) "scoped read preserves its byte bound" true
+    (List.exists(function Core.Run_worker(Core.Request(_,Core.Execute_request{read=Read.Read_query(budget,_);_}))->
+      Read.For_worker.read_budget_maximum_bytes budget=16384|_->false)valid.effects);
+  let Read.Read_query(source,_) = observation_read scope 71L Read.Graph_info 16384 in
+  List.iter(fun maximum_bytes->
+    Alcotest.(check bool) "public abstract budget rejects invalid byte bounds" true
+      (Result.is_error(Read.read_budget(Read.For_worker.read_budget_owner source)
+        ~maximum_items:1 ~maximum_bytes))) [0;-1;Worker_pure_data.maximum_response_bytes+1]
+
+;;
+
+let test_pure_read_page_bounds () =
+  let target=uuid "60000000-0000-4000-8000-000000000001" in
+  let day=Read.journal_day 20260901 |> Result.get_ok in
+  for count=1 to Worker_pure_data.maximum_page_size do
+    let check : type a. a Read.query -> unit = fun query->
+      let rec drain steps current=
+        if steps>10 then Alcotest.fail "pure page policy did not terminate";
+        match Read.smaller_page_size query current with
+        |None->Alcotest.(check int) "only a singleton is irreducible" 1 current
+        |Some next->
+          Alcotest.(check bool) "ordinary fetch bound strictly decreases" true(next>0 && next<current);
+          drain(steps+1)next
+      in drain 0 count in
+    check(Read.Journals{from_day=day;through_day=day;after=None;revision=Some "source-revision"});
+    check(Read.Block_summary{block=target;after=None});
+    check(Read.Children{parent=target;after=None});
+    check(Read.Child_members{parent=target;revision=Some "source-revision";after=None});
+    check(Read.Tree{page=target;maximum_depth=2;after=None;revision=Some "source-revision"});
+    check(Read.Favorites None);
+    check(Read.Task_statuses None);
+    check(Read.Assets{roots=[target];recursive=true;after=None});
+    check(Read.Changes{generation="source";after=None})
+  done;
+  let unpaged : type a. a Read.query -> unit=fun query->
+    Alcotest.(check bool) "unpaged query cannot be shortened" true(Read.smaller_page_size query 32=None)in
+  unpaged Read.Graph_info;unpaged Read.Admission;unpaged(Read.Journal day);
+  unpaged(Read.Page{uuid=target;revision=None});unpaged(Read.Outline_block{uuid=target;revision=None});
+  unpaged(Read.Asset_descriptors[target]);unpaged(Read.Task_status_definitions[target])
+
+;;
+
+let test_observation_registry () =
+  let module O = Core.Observation_registry in
+  let _, scope = worker_open_graph () in
+  let id = uuid "10000000-0000-4000-8000-000000007001" in
+  let reserve state scope query maximum_bytes =
+    O.reserve state ~registration:71L ~id ~scope ~read:(observation_read scope 71L query maximum_bytes)
+  in
+  let live, decision = reserve O.empty scope Read.Graph_info 16384 in
+  Alcotest.(check bool) "first query registration is admitted" true (decision = O.Start);
+  Alcotest.(check bool)
+    "initial observation epoch is live"
+    true
+    (O.current live ~registration:71L ~id ~epoch:0L);
+  let again, decision = reserve live scope Read.Graph_info 16384 in
+  Alcotest.(check bool)
+    "duplicate registration does not allocate"
+    true
+    (decision = O.Existing);
+  Alcotest.(check int) "only one active listener" 1 (O.active again);
+  let _, decision = reserve live scope Read.Admission 16384 in
+  Alcotest.(check bool)
+    "same ID cannot change query"
+    true
+    (decision = O.Mismatch || decision = O.Invalid);
+  let other = { scope with graph_generation = scope.graph_generation + 1 } in
+  let _, release = O.release live ~registration:71L ~id ~scope:other in
+  Alcotest.(check bool)
+    "foreign generation cannot retire listener"
+    true
+    (release = O.Wrong_owner);
+  let focused =
+    { scope with account = { scope.account with presentation_generation = 99 } }
+  in
+  let _, decision = reserve live focused Read.Graph_info 16384 in
+  Alcotest.(check bool)
+    "presentation focus does not replace execution"
+    true
+    (decision = O.Existing);
+  let changed, epoch = O.advance live ~registration:71L ~id in
+  Alcotest.(check (option int64)) "invalidation advances epoch" (Some 1L) epoch;
+  Alcotest.(check bool)
+    "old read cannot publish"
+    false
+    (O.current changed ~registration:71L ~id ~epoch:0L);
+  let retired, release = O.release changed ~registration:71L ~id ~scope in
+  Alcotest.(check bool) "release fences before IO ACK" true (release = O.Release);
+  Alcotest.(check int)
+    "capacity remains reserved before physical ACK"
+    1
+    (O.active retired);
+  let settled = O.released retired ~registration:71L ~id ~scope in
+  Alcotest.(check int) "only physical ACK makes capacity reusable" 0 (O.active settled);
+  let _, decision = reserve retired scope Read.Graph_info 16384 in
+  Alcotest.(check bool) "retired request cannot resurrect" true (decision = O.Retired);
+  let early, release = O.release O.empty ~registration:71L ~id ~scope in
+  Alcotest.(check bool)
+    "cancel before registration creates a fence"
+    true
+    (release = O.Unknown);
+  let _, decision = reserve early scope Read.Graph_info 16384 in
+  Alcotest.(check bool)
+    "registration after cancel cannot allocate"
+    true
+    (decision = O.Retired);
+  let scoped = O.retire_registration settled ~registration:71L in
+  Alcotest.(check int) "binding cleanup retires bounded tombstones" 0 (O.retained scoped)
+;;
+
+type observation_model =
+  | Fresh
+  | Opened of bool * int64
+  | Closing of bool
+  | Gone of bool
+
+let test_observation_registry_traces () =
+  let module O = Core.Observation_registry in
+  let _, scope = worker_open_graph () in
+  let other = { scope with graph_generation = scope.graph_generation + 1 } in
+  let focused =
+    { scope with account = { scope.account with presentation_generation = 99 } }
+  in
+  let id = uuid "10000000-0000-4000-8000-000000007002" in
+  let check trace condition message =
+    if not condition
+    then
+      Alcotest.failf
+        "minimal observation trace [%s]: %s"
+        (List.rev trace |> List.map string_of_int |> String.concat ",")
+        message
+  in
+  let verify trace state model =
+    let active =
+      match model with
+      | Opened _ | Closing _ -> 1
+      | Fresh | Gone _ -> 0
+    in
+    let retained = if model = Fresh then 0 else 1 in
+    check
+      trace
+      (O.active state = active && O.retained state = retained)
+      "bounded ownership/ACK accounting";
+    let epoch =
+      match model with
+      | Opened (_, epoch) -> epoch
+      | _ -> 0L
+    in
+    check
+      trace
+      (O.current state ~registration:71L ~id ~epoch
+       =
+       match model with
+       | Opened _ -> true
+       | _ -> false)
+      "retirement or exact epoch publication fence"
+  in
+  let step trace state model op =
+    let chosen = op = 1 || op = 3 || op = 6 in
+    let owner = if chosen then other else if op = 8 then focused else scope in
+    let model_owner =
+      match model with
+      | Opened (owner, _) | Closing owner | Gone owner -> Some owner
+      | Fresh -> None
+    in
+    let matches = model_owner = Some chosen in
+    let next, next_model =
+      match op with
+      | 0 | 1 | 8 ->
+        let next, actual =
+          O.reserve
+            state
+            ~registration:71L
+            ~id
+            ~scope:owner
+            ~read:(observation_read owner 71L Read.Graph_info 16384)
+        in
+        let expected =
+          match model with
+          | Fresh -> O.Start
+          | Opened _ when matches -> Existing
+          | (Closing _ | Gone _) when matches -> Retired
+          | _ -> Mismatch
+        in
+        check trace (actual = expected) "registration ownership or duplicate identity";
+        next, if model = Fresh then Opened (chosen, 0L) else model
+      | 2 | 3 ->
+        let next, actual = O.release state ~registration:71L ~id ~scope:owner in
+        let expected =
+          match model with
+          | Fresh -> O.Unknown
+          | (Opened _ | Closing _) when matches -> Release
+          | Gone _ when matches -> Already_released
+          | _ -> Wrong_owner
+        in
+        check trace (actual = expected) "release ordering or wrong-owner cleanup";
+        ( next
+        , (match model with
+           | Fresh -> Gone chosen
+           | Opened (owner, _) when matches -> Closing owner
+           | _ -> model) )
+      | 4 ->
+        let next, epoch = O.advance state ~registration:71L ~id in
+        let expected =
+          match model with
+          | Opened (_, epoch) -> Some (Int64.succ epoch)
+          | _ -> None
+        in
+        check trace (epoch = expected) "epoch advance after cancel or stale scope";
+        ( next
+        , (match model with
+           | Opened (owner, epoch) -> Opened (owner, Int64.succ epoch)
+           | _ -> model) )
+      | 5 | 6 ->
+        ( O.released state ~registration:71L ~id ~scope:owner
+        , (match model with
+           | Closing owner when matches -> Gone owner
+           | _ -> model) )
+      | 7 ->
+        let next, decision =
+          O.reserve
+            state
+            ~registration:71L
+            ~id
+            ~scope:owner
+            ~read:(observation_read owner 71L Read.Admission 0)
+        in
+        check trace (decision = O.Invalid) "invalid request allocated a listener";
+        next, model
+      | _ -> O.retire_registration state ~registration:70L, model
+    in
+    verify trace state model;
+    verify trace next next_model;
+    next, next_model
+  in
+  (* An older registration may finish retirement while current 71 is live.
+     A future unregistered ID is not a lifecycle completion from the owner.
+     First failure in these breadth-first histories is a shortest trace. *)
+  for length = 0 to 5 do
+    let rec walk trace state model remaining =
+      verify trace state model;
+      if remaining > 0
+      then
+        for op = 0 to 9 do
+          let trace = op :: trace in
+          let next, model = step trace state model op in
+          walk trace next model (remaining - 1)
+        done
+    in
+    walk [] O.empty Fresh length
+  done
+;;
+
+let test_single_graph_change_broadcast_keeps_scope () =
+  let state,scope=worker_open_graph () in
+  let push=Worker_pure_data.Resync_required {generation="g";reason="actual producer resync"} in
+  let result=Core.step state(Core.Projection_push_for_scope(scope,push)) in
+  Alcotest.(check bool) "one resident preserves its actual event scope" true
+    (List.exists(function Core.Publish(Core.Scoped_graph_push(actual,value))->actual=scope && value=push|_->false)result.effects)
+;;
+
+let test_changefeed_owner_properties () =
+  let module O=Core.Changefeed_owner in
+  let _,scope=worker_open_graph() in
+  let pull n=observation_read scope (Int64.of_int n) (Read.Changes{generation="g";after=None}) 16384 in
+  let response n=let Read.Read_query(budget,_)=pull n in
+    Read.For_worker.change_batch ~change_owner:(Read.For_worker.read_budget_owner budget) ~generation:"g"
+      ~from_exclusive:None ~through:"w1" ~next:None ~windows:[{Worker_pure_data.id="w1";
+        predecessor="p0";successor="p1";block_uuids=[];page_uuids=[];structure_interests=[]}] in
+  let run trace =
+    let state=ref O.empty and owner=ref 0 and pending=ref false and acked=ref false and resync=ref false in
+    let same n= !owner=n in
+    let verify ()=
+      if O.unclaimed !state<>(!owner=0) || O.needs_resync !state<> !resync then failwith "ownership/resync state mismatch";
+      List.iter(fun n->if O.may_ack !state ~registration:(Int64.of_int n) ~generation:"g" ~through:"w1"
+        <>(same n && (!pending || !acked)) then failwith "unknown or retired ACK was admitted") [71;72] in
+    List.iter(fun op->
+      let n=if op mod 2=0 then 71 else 72 in
+      let registration=Int64.of_int n in
+      (match op with
+       | 0|1 ->
+         let next,actual=O.claim !state ~registration in
+         let expected= !owner=0 || same n || (!owner<0 && n > - !owner) in
+         if actual<>expected then failwith "claim bypassed an active owner or reused a retired generation";
+         if expected && !owner<>n then (
+           if !owner<0 then (pending:=false;acked:=false;resync:=false);
+           owner:=n);
+         state:=next
+       | 2|3 ->
+         state:=O.retire !state ~registration;
+         if same n then(owner:= -n;pending:=false;acked:=false;resync:=false)
+       | 4|5 ->
+         let actual=O.remember !state ~registration ~read:(pull n) (response n) in
+         let expected=same n && not !pending in
+         if Result.is_ok actual<>expected then failwith "read allocation bypassed ownership or replaced unapplied data";
+         (match actual with Ok next->state:=next;pending:=true;resync:=false|_->())
+       | 6|7 ->
+         state:=O.acknowledged !state ~registration ~generation:"g" ~through:"w1";
+         if same n && (!pending || !acked) then(pending:=false;acked:=true)
+       | 8 -> state:=O.invalidate !state;pending:=false;acked:=false;resync:=true
+       | 9|10 ->
+         let n=if op=9 then 71 else 72 in
+         (match O.pull !state ~registration:(Int64.of_int n) ~read:(pull n) with
+          |O.Read when same n && not !pending->()
+          |Cached batch when same n && !pending && batch=response n->()
+          |Refused when not(same n)->()
+          |_->failwith "cached batch or original query identity changed")
+       | 11 -> if O.may_ack !state ~registration:71L ~generation:"g" ~through:"future" then failwith "future ACK invented proof"
+       | _ ->
+         let Read.Read_query(budget,_)=pull 72 in
+         let bad=Read.For_worker.change_batch ~change_owner:(Read.For_worker.read_budget_owner budget)
+           ~generation:"g" ~from_exclusive:None ~through:"w1" ~windows:[] ~next:None in
+         if Result.is_ok(O.remember !state ~registration:71L ~read:(pull 71) bad)
+         then failwith "foreign session became retained change evidence");verify()) trace in
+  let prefixes=[[0;4;9;6;6;2;1;5;10];[0;4;8;6;4;6];[1;5;2;0;3;0;4];[0;1;5;4;7;6;11;12]] in
+  for seed=0 to 199 do
+    let random=Random.State.make[|0xc4a6e;seed|] in
+    let trace=List.nth prefixes(seed mod List.length prefixes) @ List.init 100(fun _->Random.State.int random 13) in
+    let fails trace=try run trace;false with _->true in
+    if fails trace then (
+      let rec shrink trace size=if size=0 then trace else
+        let rec find start=if start>=List.length trace then shrink trace(size/2) else
+          let next=List.filteri(fun i _->i<start || i>=start+size)trace in
+          if fails next then shrink next size else find(start+1) in find 0 in
+      let reduced=shrink trace(max 1(List.length trace/2)) in
+      (try run reduced with error->Alcotest.failf "changefeed seed=%d minimal=[%s] %s" seed
+        (String.concat ","(List.map string_of_int reduced))(Printexc.to_string error)))
+  done
+;;
+
+let test_unallocated_observation_fence () =
+  let module O = Core.Observation_registry in
+  let _, scope = worker_open_graph () in
+  let owner : Logseq_sync_pure_reducer.Core.timeline_scope =
+    { startup =
+        { account_generation = scope.account.account_generation
+        ; presentation_generation = 0
+        }
+    ; graph_id = scope.graph_id
+    ; graph_generation = scope.graph_generation
+    }
+  in
+  let id = uuid "10000000-0000-4000-8000-000000007003" in
+  let closed, result = O.release_unallocated O.empty ~registration:71L ~id ~owner in
+  Alcotest.(check bool)
+    "unallocated ID receives an actual local fence"
+    true
+    (result = O.Unknown);
+  Alcotest.(check bool)
+    "no invented full graph owner"
+    true
+    (O.scope closed ~registration:71L ~id = None);
+  let focused =
+    { owner with startup = { owner.startup with presentation_generation = 99 } }
+  in
+  let _, result = O.release_unallocated closed ~registration:71L ~id ~owner:focused in
+  Alcotest.(check bool)
+    "focus does not change ID cleanup ownership"
+    true
+    (result = O.Already_released);
+  List.iter
+    (fun scope ->
+       let _, result =
+         O.reserve
+           closed
+           ~registration:71L
+           ~id
+           ~scope
+           ~read:(observation_read scope 71L Read.Graph_info 16384)
+       in
+       Alcotest.(check bool)
+         "canceled ID never allocates in old or new generation"
+         true
+         (result = O.Retired || result = O.Mismatch))
+    [ scope; { scope with graph_generation = scope.graph_generation + 1 } ];
+  let live, _ =
+    O.reserve
+      O.empty
+      ~registration:71L
+      ~id
+      ~scope
+      ~read:(observation_read scope 71L Read.Graph_info 16384)
+  in
+  let unchanged, result = O.release_unallocated live ~registration:71L ~id ~owner in
+  Alcotest.(check bool)
+    "unallocated cleanup cannot erase a physical registration"
+    true
+    (result = O.Wrong_owner && O.current unchanged ~registration:71L ~id ~epoch:0L)
+;;
+let test_observation_registry_capacity () =
+  let module O = Core.Observation_registry in
+  let _, scope = worker_open_graph () in
+  let id n = uuid (Printf.sprintf "10000000-0000-4000-8000-%012d" (10000 + n)) in
+  let reserve state n =
+    O.reserve
+      state
+      ~registration:71L
+      ~id:(id n)
+      ~scope
+      ~read:(observation_read scope 71L Read.Graph_info 16384)
+  in
+  let state = ref O.empty in
+  for n = 1 to 256 do
+    let next, result = reserve !state n in
+    if result <> O.Start then Alcotest.fail "active observation capacity shrank";
+    state := next
+  done;
+  let _, result = reserve !state 257 in
+  Alcotest.(check bool) "active capacity is bounded" true (result = O.Full);
+  let closing, _ = O.release !state ~registration:71L ~id:(id 1) ~scope in
+  let _, result = reserve closing 257 in
+  Alcotest.(check bool)
+    "unacknowledged physical cleanup retains capacity"
+    true
+    (result = O.Full);
+  let settled = O.released closing ~registration:71L ~id:(id 1) ~scope in
+  let _, result = reserve settled 257 in
+  Alcotest.(check bool) "physical ACK permits a fresh ID" true (result = O.Start);
+  state := O.empty;
+  for n = 1 to 8192 do
+    let next, result = O.release !state ~registration:71L ~id:(id n) ~scope in
+    if result <> O.Unknown then Alcotest.fail "cancel tombstone capacity shrank";
+    state := next
+  done;
+  Alcotest.(check int) "retired metadata has a fixed bound" 8192 (O.retained !state);
+  let _, result = reserve !state 8193 in
+  Alcotest.(check bool)
+    "overflow cannot silently drop cancellation fences"
+    true
+    (result = O.Full);
+  let _, result = O.release !state ~registration:71L ~id:(id 8193) ~scope in
+  Alcotest.(check bool)
+    "unknown cleanup cannot invent ACK on overflow"
+    true
+    (result = O.Release_full)
+;;
+let test_orphan_cleanup_retains_failed_release () =
+  let module O=Core.Orphan_cleanup in
+  let _,scope=worker_open_graph() in
+  let resource:O.resource={scope;handle="actual-retained-lease"} in
+  let tracked=O.track O.empty resource in
+  Alcotest.(check int) "one successful retain transfers exactly one cleanup" 1(O.count tracked);
+  Alcotest.(check bool) "unsettled first release gates further acquisition" false(O.acquisition_open tracked);
+  let running,work=O.next tracked in
+  let work=Option.get work in
+  Alcotest.(check bool) "first release reports its failure once" true(O.first_attempt work);
+  Alcotest.(check (float 0.0001)) "first release is immediate" 0.(O.retry_delay work);
+  Alcotest.(check bool) "release preserves exact physical owner" true(O.resource work=resource);
+  let duplicate=O.track running resource in
+  Alcotest.(check int) "duplicate live obligation is not a second retain" 1(O.count duplicate);
+  let failed=O.completed duplicate work(Error "physical release failed") in
+  Alcotest.(check int) "failed release retains cleanup" 1(O.count failed);
+  Alcotest.(check bool) "failed cleanup gates acquisition" false(O.acquisition_open failed);
+  let retrying,retry=O.next failed in
+  let retry=Option.get retry in
+  Alcotest.(check bool) "automatic retry does not repeat diagnostics" false(O.first_attempt retry);
+  Alcotest.(check (float 0.0001)) "pure retry policy yields bounded delay" 0.05(O.retry_delay retry);
+  let stale=O.completed retrying work(Ok()) in
+  Alcotest.(check int) "old ACK cannot settle new attempt" 1(O.count stale);
+  let done_=O.completed stale retry(Ok()) in
+  Alcotest.(check int) "actual retry ACK settles cleanup" 0(O.count done_);
+  Alcotest.(check bool) "settled cleanup permits acquisition" true(O.acquisition_open done_);
+  Alcotest.(check int) "duplicate completion is inert" 0(O.count(O.completed done_ retry(Ok())));
+  Alcotest.(check int) "pure transitions preserve prior state" 1(O.count tracked);
+  let other:O.resource={scope={scope with graph_generation=scope.graph_generation+1};handle=resource.handle} in
+  let run actions=
+    let state=ref(O.track(O.track O.empty resource)other) and settled=ref [] and stale=ref None in
+    List.iter(fun action->
+      let old= !state in let snapshot=Marshal.to_string old [] in
+      let running,work=O.next old in
+      let repeated,repeated_work=O.next old in
+      Alcotest.(check bool) "deterministic pure cleanup selection" true(running=repeated && work=repeated_work);
+      Alcotest.(check string) "selection preserves input" snapshot(Marshal.to_string old []);
+      match work with
+      | None->state:=running
+      | Some work->
+        let physical=O.resource work in
+        Alcotest.(check bool) "settled lease cannot be released twice" false(List.mem physical !settled);
+        let running=match !stale with None->running|Some previous->
+          let late=O.completed running previous(Ok()) in
+          Alcotest.(check bool) "stale ACK is inert" true(late=running);late in
+        let success=action mod 4=0 in
+        state:=O.completed running work(if success then Ok() else Error "storage unavailable");
+        stale:=Some work;
+        if success then settled:=physical::!settled;
+        Alcotest.(check int) "no obligation disappears without its exact physical ACK"
+          (2-List.length !settled)(O.count !state))actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | item::rest->remove(item::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xC1EA;seed|] in
+    let actions=List.init 80(fun _->Random.State.int random 32) in
+    if fails actions then Alcotest.failf "cleanup seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
+let test_demand_registry_retirement_requires_physical_settlement () =
+  let module R=Core.Demand_registry in
+  let _,scope=worker_open_graph() in
+  let owner:R.owner={registration=90L;scope;consumer="typed-synthetic-round"} in
+  let oversized=Logseq_db_types.Asset_descriptor.create ~uuid:scope.graph_id
+    ~source:(External(String.make(Worker_pure_data.maximum_response_bytes+1)'x'))
+    ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+  let unchanged,invalid=R.reserve R.empty owner ~priority:Foreground ~assets:[oversized] in
+  Alcotest.(check bool) "unbounded descriptor rejected before registry allocation" true
+    (invalid=R.Invalid && unchanged=R.empty);
+  let reserved,result=R.reserve R.empty owner ~priority:Foreground ~assets:[] in
+  Alcotest.(check bool) "first demand allocation admitted" true(result=R.Start);
+  let retired,result=R.retire reserved owner in
+  Alcotest.(check bool) "retirement requires actual cleanup" true(result=R.Release);
+  Alcotest.(check int) "retirement is not a physical ACK" 1(Rrbvec.length(R.pending retired ~registration:90L));
+  let _,result=R.reserve retired owner ~priority:Foreground ~assets:[] in
+  Alcotest.(check bool) "retired round cannot reallocate" true(result=R.Retired);
+  let wrong={owner with scope={scope with graph_generation=scope.graph_generation+1}} in
+  let unchanged,result=R.retire retired wrong in
+  Alcotest.(check bool) "cleanup cannot borrow a reopened owner" true(result=R.Mismatch && unchanged=retired);
+  let wrong_ack=R.settled retired wrong in
+  Alcotest.(check int) "wrong owner ACK retains original cleanup" 1(Rrbvec.length(R.pending wrong_ack ~registration:90L));
+  let completed=R.settled retired owner in
+  Alcotest.(check int) "actual exact settlement clears resource obligation" 0(Rrbvec.length(R.pending completed ~registration:90L));
+  let _,result=R.reserve completed owner ~priority:Foreground ~assets:[] in
+  Alcotest.(check bool) "settlement retains tombstone" true(result=R.Retired);
+  let unknown={owner with consumer="not-allocated-round"} in
+  let cancelled,result=R.retire R.empty unknown in
+  Alcotest.(check bool) "Cancel before allocation has a distinct proof" true(result=R.Unknown);
+  let _,result=R.reserve cancelled unknown ~priority:Foreground ~assets:[] in
+  Alcotest.(check bool) "late allocation cannot follow no-allocation cleanup" true(result=R.Retired)
+;;
+
+(* Legal creator/release completion orders through the real public registries.
+   The terminal publication boundary is tested separately in Journal_worker. *)
+let test_resource_registry_finalization () =
+  let module O=Core.Observation_registry in let module D=Core.Demand_registry in
+  let _,scope=worker_open_graph() in
+  let timeline:Logseq_sync_pure_reducer.Core.timeline_scope={
+    startup={account_generation=scope.account.account_generation;presentation_generation=scope.account.presentation_generation};
+    graph_id=scope.graph_id;graph_generation=scope.graph_generation} in
+  let observation=ref O.empty and demand=ref D.empty in
+  for n=1 to 8200 do
+    let id=uuid(Printf.sprintf "10000000-0000-4000-a000-%012d" n) in
+    let owner:D.owner={registration=92L;scope;consumer=Printf.sprintf "actual-round-%d" n} in
+    let next,decision=O.reserve !observation ~registration:92L ~id ~scope ~read:(observation_read scope 92L Read.Graph_info 16384) in
+    Alcotest.(check bool) "ordinary Detail never consumes a lifetime quota" true(decision=O.Start);
+    observation:=next;
+    let next,decision=D.reserve !demand owner ~priority:Foreground ~assets:[] in
+    Alcotest.(check bool) "ordinary media never consumes a lifetime quota" true(decision=D.Start);
+    demand:=next;
+    let creator ()=observation:=O.creator_finished !observation ~registration:92L ~id;
+      demand:=D.creator_finished !demand ~registration:92L ~consumer:owner.consumer in
+    let release ()=let next,_=O.release !observation ~registration:92L ~id ~scope in observation:=next;
+      let next,_=D.retire !demand owner in demand:=next in
+    let physical ()=observation:=O.released !observation ~registration:92L ~id ~scope;
+      demand:=D.settled !demand owner in
+    (match n mod 3 with
+     |0->creator();release();physical()
+     |1->release();creator();physical()
+     |_->release();physical();creator());
+    (* A real cancelled release can be retried before the caller sees its ACK. *)
+    release();physical();
+    let next,result=O.finalize !observation ~registration:92L ~id ~owner:timeline in
+    Alcotest.(check bool) "observation finalization joins both facts" true(result=Ok());observation:=next;
+    let next,result=D.finalize !demand owner in
+    Alcotest.(check bool) "demand finalization joins both facts" true(result=Ok());demand:=next;
+    Alcotest.(check int) "all old observation metadata retired" 0(O.retained !observation);
+    let repeated,result=O.finalize !observation ~registration:92L ~id ~owner:timeline in
+    Alcotest.(check bool) "finalization retry never allocates" true(result=Ok() && O.retained repeated=0);
+    let repeated,result=D.finalize !demand owner in
+    Alcotest.(check bool) "demand finalization retry is a no-op" true(result=Ok() && repeated= !demand)
+  done;
+  (* Accepted cancellation before allocation still has a unique actual creator
+     completion; cleanup can precede or follow it, but cannot forget it early. *)
+  List.iter(fun creator_first->
+    let id=uuid "10000000-0000-4000-a000-000000009999" in
+    let obs=ref O.empty in
+    if creator_first then obs:=O.creator_finished !obs ~registration:92L ~id;
+    let next,_=O.release_unallocated !obs ~registration:92L ~id ~owner:timeline in obs:=next;
+    if not creator_first then (
+      let _,decision=O.reserve !obs ~registration:92L ~id ~scope ~read:(observation_read scope 92L Read.Graph_info 16384) in
+      Alcotest.(check bool) "release overtaking a queued creator fences its allocation" true(decision=O.Retired);
+      obs:=O.creator_finished !obs ~registration:92L ~id);
+    let next,result=O.finalize !obs ~registration:92L ~id ~owner:timeline in
+    Alcotest.(check bool) "cancelled unallocated creator leaves no permanent record" true(result=Ok() && O.retained next=0))
+    [false;true]
+;;
+
+let test_demand_registry_properties () =
+  let module R=Core.Demand_registry in
+  let _,scope=worker_open_graph() in
+  let run actions=
+    let owners=Array.init 8(fun n->R.{registration=91L;scope;consumer="round-"^string_of_int n}) in
+    let states=Array.make 8 0 in (* 0 unallocated, 1 live, 2 retired, 3 physically settled *)
+    let registry=ref R.empty and closed=ref false in
+    List.iter(fun action->
+      let n=(action/6)mod 8 in let owner=owners.(n) in
+      let before= !registry in
+      let prior_count=Rrbvec.length(R.pending before ~registration:91L) in
+      (match action mod 6 with
+       | 0->let next,result=R.reserve before owner ~priority:Foreground ~assets:[] in
+         if !closed || states.(n)>=2 then Alcotest.(check bool) "retirement never reallocates" true(result=R.Retired)
+         else (Alcotest.(check bool) "valid exact round allocates once" true(result=(if states.(n)=0 then R.Start else R.Existing));states.(n)<-1);
+         registry:=next
+       | 1->let next,_=R.retire before owner in registry:=next;states.(n)<-(if states.(n)=0 then 3 else max 2 states.(n))
+       | 2->registry:=R.settled before owner;if states.(n)=2 then states.(n)<-3
+       | 3->let wrong={owner with scope={scope with graph_generation=scope.graph_generation+1}} in
+         registry:=R.settled before wrong;Alcotest.(check bool) "foreign ACK is inert" true(!registry=before)
+       | 4->registry:=R.forget_settled before ~registration:91L;closed:=true
+       | _->if states.(n)=1 then (let next,result=R.retire before {owner with scope={scope with graph_generation=scope.graph_generation+1}} in
+         Alcotest.(check bool) "foreign release is inert" true(result=R.Mismatch && next=before)));
+      let pending=R.pending !registry ~registration:91L in
+      Alcotest.(check int) "only exact physical settlement drops an allocated round"
+        (Array.fold_left(fun n state->n+(if state=1 || state=2 then 1 else 0))0 states)(Rrbvec.length pending);
+      Alcotest.(check int) "persistent prior registry unchanged" prior_count
+        (Rrbvec.length(R.pending before ~registration:91L)))actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | action::rest->remove(action::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xD3AD;seed|] in
+    let actions=[0;1;3;4;2;0] @ List.init 80(fun _->Random.State.int random 48) in
+    if fails actions then Alcotest.failf "demand registry seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
+let test_writer_fence_physical_completion () =
+  let module F=Core.Writer_fence in
+  let _,scope=worker_open_graph() in
+  let focus={scope with account={scope.account with presentation_generation=99;lifecycle_generation=99L}} in
+  let reopened={scope with graph_generation=scope.graph_generation+1} in
+  let state,first=F.admit F.empty scope in
+  let first=Result.get_ok first in
+  let state,second=F.admit state scope in
+  let second=Result.get_ok second in
+  let frozen,fence=F.freeze state scope in
+  let fence=Result.get_ok fence in
+  let frozen,cleanup=F.admit_cleanup frozen scope in
+  let cleanup=Result.get_ok cleanup in
+  Alcotest.(check bool) "freeze cannot assert physical completion" false(F.drained frozen fence);
+  let unchanged,denied=F.admit frozen focus in
+  Alcotest.(check bool) "focus/lifecycle change cannot bypass closed incarnation" true
+    (denied=Error F.Fenced && unchanged=frozen);
+  let elsewhere,accepted=F.admit frozen reopened in
+  Alcotest.(check bool) "new graph incarnation is independent" true(Result.is_ok accepted);
+  let partial=F.finish elsewhere first in
+  Alcotest.(check bool) "one completion does not settle another writer" false(F.drained partial fence);
+  Alcotest.(check bool) "duplicate completion is inert" true(F.finish partial first=partial);
+  let drained=F.finish (F.finish partial second) cleanup in
+  Alcotest.(check bool) "only actual captured writers must finish" true(F.drained drained fence);
+  Alcotest.(check bool) "previous immutable state still pending" false(F.drained frozen fence);
+  let _,same=F.freeze drained focus in
+  Alcotest.(check bool) "repeat fence keeps exact physical obligation" true(same=Ok fence)
+;;
+
+let test_writer_fence_properties () =
+  let module F=Core.Writer_fence in
+  let _,base=worker_open_graph() in
+  let run actions=
+    let scopes=Array.init 4(fun n->{base with graph_generation=base.graph_generation+n}) in
+    let blocked=Array.make 4 false and pending=Array.make 4 0 in
+    let operations=ref [] and fences=Array.make 4 None and state=ref F.empty in
+    List.iter(fun action->
+      let n=(action/5)mod 4 in
+      let scope=scopes.(n) and before= !state in
+      (match action mod 5 with
+       |0|1->let next,outcome=F.admit before scope in state:=next;
+         if blocked.(n) then Alcotest.(check bool) "fenced never admits" true(outcome=Error F.Fenced)
+         else (let token=Result.get_ok outcome in operations:=(token,n,false)::!operations;pending.(n)<-pending.(n)+1)
+       |2->let next,outcome=F.freeze before scope in state:=next;blocked.(n)<-true;fences.(n)<-Some(Result.get_ok outcome)
+       |_->(match List.find_opt(fun(_,owner,done_)->owner=n && (action mod 5=4 || not done_))!operations with
+         |None->()|Some(token,_,done_)->state:=F.finish before token;
+           if not done_ then pending.(n)<-pending.(n)-1;
+           operations:=List.map(fun(actual,owner,settled)->actual,owner,settled || actual=token)!operations));
+      Array.iteri(fun n _->Option.iter(fun fence->
+        Alcotest.(check bool) "matching completion set controls drain" (pending.(n)=0)(F.drained !state fence))fences.(n))scopes;
+      (* Retaining and rereading the prior persistent value must not mutate it. *)
+      let _=F.pending before scopes.(n) in ())actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function []->actions
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |action::rest->remove(action::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xF3AC;seed|] in
+    let actions=[0;0;2;3;4;3;0;5;7;8] @ List.init 80(fun _->Random.State.int random 20) in
+    if fails actions then Alcotest.failf "writer fence seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
+let test_host_gate_keeps_other_graph_live () =
+  let opened,first,second=resident_worker_fixture() in
+  let id=uuid "10000000-0000-4000-8000-000000079001" in
+  let owner=Option.get(Core.coordination_state opened).sync.account in
+  let fence:Sync.host_fence={id;owner;target=One_graph first.graph_id;captured_scopes=Rrbvec.singleton first;previous=None} in
+  let closed=Core.step opened(Sync_event(Sync.Host_fence_started fence)) in
+  Alcotest.(check bool) "host gate withdraws only target execution" true
+    (List.for_all(fun(scope:Sync.graph_scope)->scope.graph_id<>first.graph_id)(Core.graph_scopes closed.next)
+     && List.exists(fun(scope:Sync.graph_scope)->scope.graph_id=second)(Core.graph_scopes closed.next));
+  let blocked=Core.step closed.next(Sync_event(Sync.Graph_selected first.graph_id)) in
+  Alcotest.(check bool) "target cannot reopen during physical settlement" true
+    (not(List.exists(fun(scope:Sync.graph_scope)->scope.graph_id=first.graph_id)(Core.graph_scopes blocked.next)));
+  let configured=Core.step blocked.next(Sync_event(Sync.Resident_graphs_changed[first.graph_id;second])) in
+  Alcotest.(check bool) "configuration cannot bypass target gate" true
+    (not(List.exists(fun(scope:Sync.graph_scope)->scope.graph_id=first.graph_id)(Core.graph_scopes configured.next)));
+  let wrong=Core.step configured.next(Sync_event(Sync.Host_fence_released(uuid "10000000-0000-4000-8000-000000079099"))) in
+  Alcotest.(check bool) "foreign release cannot open target" true(Core.host_fence_blocks wrong.next first.graph_id);
+  let released=Core.step wrong.next(Sync_event(Sync.Host_fence_released id)) in
+  let reopened=Core.step released.next(Sync_event(Sync.Resident_graphs_changed[first.graph_id;second])) in
+  Alcotest.(check bool) "fresh execution only after exact fence release" true
+    (List.exists(fun(scope:Sync.graph_scope)->scope.graph_id=first.graph_id && scope.graph_generation>first.graph_generation)
+      (Core.graph_scopes reopened.next))
+;;
+
+let test_revoked_account_keeps_hidden_cleanup_owner () =
+  let opened,_,second=resident_worker_fixture() in
+  let hidden=List.find(fun(scope:Sync.graph_scope)->scope.graph_id=second)(Core.graph_scopes opened) in
+  let revoked=Core.step opened(Sync_event(Sync.Account_authenticated{user_id=None})) in
+  let release scope operation=Core.step revoked.next(Sync_event(Sync.Asset_requested
+    {scope;operation;action=Release_asset_file "original-hidden-preview"})) in
+  let released=release hidden "revoked-hidden-release" in
+  Alcotest.(check bool) "old hidden owner retains cleanup-only IO authority after auth revocation" true
+    (List.exists(function Core.Run_sync(Sync.Asset_io(_,{context;action=Release_asset_file "original-hidden-preview";_}))->
+      context.scope=hidden|_->false)released.effects);
+  let forged=release {hidden with graph_generation=hidden.graph_generation+100} "foreign-hidden-release" in
+  Alcotest.(check bool) "revocation never creates implicit authority for an unknown execution" false
+    (List.exists(function Core.Run_sync(Sync.Asset_io _)->true|_->false)forged.effects);
+  let acquire=Core.step revoked.next(Sync_event(Sync.Asset_requested
+    {scope=hidden;operation="revoked-hidden-acquire";action=Retain_asset_file "original-hidden-preview"})) in
+  Alcotest.(check bool) "retaining cleanup ownership does not restore old data/acquisition authority" false
+    (List.exists(function Core.Run_sync(Sync.Asset_io _)->true|_->false)acquire.effects)
+;;
+
+let test_host_deletion_private_resource_owner () =
+  let opened,first,_=resident_worker_fixture() in
+  let owner=Option.get(Core.coordination_state opened).sync.account in
+  let id=uuid "10000000-0000-4000-8000-000000079003" in
+  let fenced=Core.step opened(Sync_event(Sync.Host_fence_started{id;owner;target=One_graph first.graph_id;captured_scopes=Rrbvec.singleton first;previous=None})) in
+  let deleting=Core.step fenced.next(Sync_event(Sync.Local_cache_deletion_requested first.graph_id)) in
+  let request=List.find_map(function
+    |Core.Run_worker(Core.Request(_,Core.Handle_sync_worker_effect(Sync.Delete_mirror request)))->Some request|_->None)deleting.effects
+    |> Option.get in
+  let scope:Sync.graph_scope={account=request.account;graph_id=request.graph_id;graph_generation=0} in
+  let retirement=Sync.retirement_id_of_string "10000000-0000-4000-8000-000000079004" |> Result.get_ok in
+  let started=Core.step deleting.next(Sync_event(Sync.Asset_requested
+    {scope;operation="host-private-delete";action=Prepare_graph_asset_deletion retirement})) in
+  let ticket=List.find_map(function
+    |Core.Run_sync(Sync.Asset_io(ticket,{context;action=Prepare_graph_asset_deletion actual;_}))
+      when context.scope=scope && actual=retirement->Some ticket|_->None)started.effects in
+  Alcotest.(check bool) "private deletion resource request reaches its actual owner" true(Option.is_some ticket);
+  let deletion=Sync.asset_deletion_reference ~scope ~retirement in
+  let completed=Core.step started.next(Sync_event(Sync.Runner_completed(Sync.Asset_completion
+    (Option.get ticket,Ok(Sync.Asset_deletion_prepared deletion))))) in
+  Alcotest.(check bool) "private deletion result reaches original Worker waiter" true
+    (List.exists(function Core.Deliver_asset_result output->output.request.operation="host-private-delete"
+      && output.result=Ok(Sync.Asset_deletion_prepared deletion)|_->false)completed.effects)
+;;
+
+let test_account_host_gate_blocks_new_catalog_producer () =
+  let opened,_,_=resident_worker_fixture() in
+  let owner=Option.get(Core.coordination_state opened).sync.account in
+  let id=uuid "10000000-0000-4000-8000-000000079002" in
+  let closed=Core.step opened(Sync_event(Sync.Host_fence_started{id;owner;target=All_graphs;captured_scopes=Rrbvec.of_list(Core.graph_scopes opened);previous=None})) in
+  let startup=(Core.view closed.next).sync.snapshot.startup in
+  let refresh=Core.step closed.next(Sync_event(Sync.Catalog_refresh_requested
+    {account_generation=startup.account_generation;presentation_generation=startup.presentation_generation})) in
+  Alcotest.(check bool) "account handoff cannot start another catalog producer" false
+    (List.exists(function Core.Run_sync(Sync.Request(_,Sync.Fetch_catalog _))->true|_->false)refresh.effects)
+;;
+
+let test_host_handoff_single_use_and_reopen () =
+  let module H=Core.Host_handoff in
+  let _,scope=worker_open_graph() in
+  let facts:H.facts={authenticated=true;version=1L;registration=Some 91L;account=Some scope.account;
+    scopes=Rrbvec.singleton scope;catalog=Rrbvec.singleton scope.graph_id} in
+  let request:H.request={version=1L;id=uuid "10000000-0000-4000-8000-000000080001";registration=91L;
+    owner=scope.account;change=H.Close_graph scope.graph_id;expected=Rrbvec.singleton scope;captured=Rrbvec.singleton scope} in
+  let initial=H.empty ~lifetime:(uuid "10000000-0000-4000-8000-000000080000") in
+  let _,stale=H.prepare initial {facts with version=2L;scopes=Rrbvec.empty} request in
+  Alcotest.(check bool) "delayed prepare cannot cross a changed authoritative baseline" true(stale=H.Refused H.Baseline_changed);
+  let pending,outcome=H.prepare initial facts request in
+  let attempt=match outcome with H.Start attempt->attempt|_->Alcotest.fail "host prepare refused valid frame" in
+  Alcotest.(check bool) "prepare cannot manufacture Ready" true(H.phase pending request.id=Some H.Preparing);
+  let ready=H.settled pending attempt ~copy_generation:None in
+  let receipt=match H.phase ready request.id with Some(H.Safe receipt)->receipt|_->Alcotest.fail "actual settlement did not create receipt" in
+  let focus={facts with account=Some{scope.account with presentation_generation=99}} in
+  let consumed,result=H.consume ready focus receipt in
+  Alcotest.(check bool) "focus alone does not invalidate execution permission" true(result=Ok request.change);
+  Alcotest.(check bool) "late failed preparation cannot erase actual consumption" true
+    (H.phase(H.failed consumed attempt)request.id=Some(H.Consumed receipt));
+  Alcotest.(check bool) "same receipt cannot consume twice" true(Result.is_error(snd(H.consume consumed facts receipt)));
+  List.iter(fun change->
+    let account_request={request with change} in
+    let preparing,decision=H.prepare initial facts account_request in
+    let attempt=match decision with H.Start value->value|_->assert false in
+    let safe=H.settled preparing attempt ~copy_generation:None in
+    let receipt=match H.phase safe request.id with Some(H.Safe receipt)->receipt|_->assert false in
+    Alcotest.(check bool) "issued but unused original permission is absent" true(H.consumed safe receipt=Ok false);
+    let consumed,_=H.consume safe facts receipt in
+    Alcotest.(check bool) "same owner confirms actual consumption" true(H.consumed consumed receipt=Ok true);
+    Alcotest.(check bool) "actual owner completion retains original consumption evidence" true(H.consumed(H.completed consumed receipt)receipt=Ok true);
+    Alcotest.(check bool) "late failure cannot turn consumed readback into false" true
+      (H.consumed(H.failed consumed attempt)receipt=Ok true);
+    Alcotest.(check bool) "readback does not mutate prior safe state" true(H.consumed safe receipt=Ok false);
+    let failed=H.failed safe attempt in
+    Alcotest.(check bool) "known original never consumed can be confirmed false" true(H.consumed failed receipt=Ok false);
+    let released,_=H.released_registration safe request.registration in
+    Alcotest.(check bool) "retired or missing capability is not evidence of absence" true(Result.is_error(H.consumed released receipt));
+    Alcotest.(check bool) "foreign lifetime cannot confirm consumption" true
+      (Result.is_error(H.consumed(H.empty ~lifetime:(uuid "10000000-0000-4000-8000-000000080099"))receipt)))
+    [H.Replace_account;H.Stop_connection];
+  let next_request={request with id=uuid "10000000-0000-4000-8000-000000080003"} in
+  Alcotest.(check bool) "consumption keeps physical action exclusive until completed" true
+    (snd(H.prepare consumed facts next_request)=H.Refused H.Busy);
+  let completed=H.completed consumed receipt in
+  Alcotest.(check bool) "physical action completion permits a new round" true
+    (match snd(H.prepare completed facts next_request)with H.Start _->true|_->false);
+  let reopened={facts with scopes=Rrbvec.singleton{scope with graph_generation=scope.graph_generation+1}} in
+  let invalid=H.observe ready reopened in
+  let closed_again=H.observe invalid {facts with scopes=Rrbvec.empty} in
+  Alcotest.(check bool) "reopen then close cannot revive safe receipt" true(Result.is_error(snd(H.consume closed_again facts receipt)));
+  Alcotest.(check bool) "late physical result cannot revive invalid frame" true
+    (H.phase(H.settled closed_again attempt ~copy_generation:None)request.id=H.phase closed_again request.id);
+  let failed_while_running=H.observe pending reopened in
+  Alcotest.(check bool) "invalidated preparation still owns its actual in-flight settlement" true
+    (snd(H.prepare failed_while_running facts next_request)=H.Refused H.Busy);
+  let failed_but_finished=H.settled failed_while_running attempt ~copy_generation:None in
+  Alcotest.(check bool) "actual end permits a retry without reviving old receipt" true
+    (match snd(H.prepare failed_but_finished facts next_request)with H.Start _->true|_->false);
+  let foreign=H.empty ~lifetime:(uuid "10000000-0000-4000-8000-000000080099") in
+  Alcotest.(check bool) "foreign Worker lifetime cannot consume receipt" true(Result.is_error(snd(H.consume foreign facts receipt)));
+  let remove={request with id=uuid "10000000-0000-4000-8000-000000080002";change=H.Remove_graph(scope.graph_id,H.Force)} in
+  let pending,outcome=H.prepare initial facts remove in
+  let attempt=match outcome with H.Start attempt->attempt|_->assert false in
+  let invalid=H.settled pending attempt ~copy_generation:None in
+  Alcotest.(check bool) "remove needs actual exclusive local-copy witness" true
+    (match H.phase invalid remove.id with Some(H.Failed _)->true|_->false);
+  (* This is only a pure external physical-ACK input; storage tests establish
+     actual release. Removing a consumed permission must never rerun its action. *)
+  let generation=Logseq_overlay_db.Types.Mirror_generation.of_string "mirror-generation:v1:pure-held-copy" |> Result.get_ok in
+  let safe=H.settled pending attempt ~copy_generation:(Some generation) in
+  let receipt=match H.phase safe remove.id with Some(H.Safe value)->value|_->assert false in
+  let consumed,_=H.consume safe facts receipt in
+  let released,retired=H.released_registration consumed request.registration in
+  Alcotest.(check bool) "checked unregister can retire consumed removal cleanup" true(retired=Some remove.id);
+  Alcotest.(check bool) "released consumed removal is never an action retry" true(Result.is_error(snd(H.consume released facts receipt)))
+;;
+
+let test_host_handoff_properties () =
+  let module H=Core.Host_handoff in
+  let _,scope=worker_open_graph() in
+  let run actions=
+    let facts=ref H.{authenticated=true;version=1L;registration=Some 92L;account=Some scope.account;
+      scopes=Rrbvec.singleton scope;catalog=Rrbvec.singleton scope.graph_id} in
+    let state=ref(H.empty ~lifetime:(uuid "10000000-0000-4000-8000-000000081000")) in
+    let attempts=ref [] and receipts=ref [] and serial=ref 0 and active=ref None and registration=ref 92L in
+    List.iter(fun action->
+      let before= !state in
+      let before_active= !active in
+      let before_phase=Option.bind before_active(H.phase before) in
+      (match action mod 8 with
+       |0|1->incr serial;
+         let request:H.request={version=(!facts).version;id=uuid(Printf.sprintf "10000000-0000-4000-8000-%012d" (81000+ !serial));registration=Option.value (!facts).registration ~default:!registration;
+           owner=Option.value (!facts).account ~default:scope.account;change=(match action/8 mod 3 with 0->H.Close_graph scope.graph_id|1->H.Replace_account|_->H.Stop_connection);expected=(!facts).scopes;
+           captured=(!facts).scopes} in
+         let next,outcome=H.prepare before !facts request in state:=next;
+         (match outcome with H.Start ticket->attempts:=ticket::!attempts;active:=Some request.id|_->())
+       |2->(match !attempts with []->()|ticket::_->state:=H.settled before ticket ~copy_generation:None)
+       |3->(match Option.bind !active(H.phase before)with Some(H.Safe receipt)->receipts:=receipt::!receipts;
+         let next,outcome=H.consume before !facts receipt in state:=next;
+         if Result.is_ok outcome then (
+           (match H.receipt_request receipt with {change=(H.Replace_account|Stop_connection);_}->
+             Alcotest.(check bool) "generated consumed fact survives delayed failed settlement" true
+               (H.consumed(H.failed next(List.hd !attempts))receipt=Ok true)
+            |_->());
+           Alcotest.(check bool) "successful consume is permanently single-use" true
+             (Result.is_error(snd(H.consume next !facts receipt)));state:=H.completed next receipt;active:=None)
+         |_->())
+       |4->let next={scope with graph_generation=scope.graph_generation+1+action} in
+         facts:={!facts with scopes=Rrbvec.singleton next};state:=H.observe before !facts
+       |5->facts:={!facts with scopes=Rrbvec.empty};state:=H.observe before !facts
+       |6->
+         registration:=Int64.succ !registration;
+         facts:={!facts with registration=(if action mod 2=0 then None else Some !registration)};
+         state:=H.observe before !facts;
+         (match H.current !state with
+          |Some(request,_)->let next,retired=H.released_registration !state request.registration in
+            state:=next;if retired<>None then active:=None
+          |_->())
+       |_->(match !receipts with []->()|receipt::_->
+         let next,result=H.consume before !facts receipt in
+         Alcotest.(check bool) "retained old receipt never consumes another round" true(Result.is_error result);state:=next));
+      Alcotest.(check bool) "previous immutable host state unchanged" true
+        (Option.bind before_active(H.phase before)=before_phase);
+      (match before_phase,Option.bind !active(H.phase !state)with
+       |Some(H.Failed _),Some(H.Safe _)->Alcotest.fail "stale I/O revived failed handoff"|_->()))actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function []->actions
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |action::rest->remove(action::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x4A6D;seed|] in
+    let actions=[0;2;4;5;2;3;0;2;3;7] @ List.init 80(fun _->Random.State.int random 64) in
+    if fails actions then Alcotest.failf "host handoff seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
+let test_registration_retirement_keeps_original_authority () =
+  let module R=Core.Registration_retirement in
+  let _,scope=worker_open_graph() in
+  let replacement={scope with graph_generation=scope.graph_generation+1} in
+  let foreign={scope with account={scope.account with user_id="other";account_generation=scope.account.account_generation+1}} in
+  let initial=R.bind R.empty ~registration:91L ~account:None |> Result.get_ok in
+  let owned=R.observe initial ~registration:(Some 91L) ~account:(Some scope.account) in
+  let changed=R.observe owned ~registration:(Some 91L) ~account:(Some foreign.account) in
+  let pending,plan=R.begin_release changed ~registration:91L ~active_account:(Some foreign.account)
+    ~active_scopes:(Rrbvec.singleton foreign) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign;scope]) in
+  Alcotest.(check bool) "retirement keeps its first authoritative account" true(plan.owner=Some scope.account);
+  Alcotest.(check bool) "revocation joins old actual account IO" true plan.join_account;
+  Alcotest.(check int) "physical roster is exact, deduplicated and excludes other account" 2(Rrbvec.length plan.scopes);
+  let _,warm=R.begin_release owned ~registration:91L ~active_account:(Some scope.account)
+    ~active_scopes:(Rrbvec.singleton replacement) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign]) in
+  Alcotest.(check bool) "warm binding retirement does not join active account producers" false warm.join_account;
+  Alcotest.(check bool) "warm binding does not close current graph incarnation" true
+    (Rrbvec.length warm.scopes=1 && Core.Writer_fence.same_incarnation(Rrbvec.nth warm.scopes 0)scope);
+  let reopened={scope.account with account_generation=scope.account.account_generation+1} in
+  let _,blocked=R.begin_release owned ~registration:91L ~active_account:(Some reopened)
+    ~active_scopes:Rrbvec.empty ~physical_scopes:(Rrbvec.singleton scope) in
+  Alcotest.(check bool) "old cleanup cannot purge a newer live logical account" true blocked.blocked;
+  Alcotest.(check int) "conflicted old cleanup performs no physical close" 0(Rrbvec.length blocked.scopes);
+  let pending=R.observe pending ~registration:(Some 91L) ~account:(Some foreign.account) in
+  let _,retry=R.begin_release pending ~registration:91L ~active_account:None
+    ~active_scopes:Rrbvec.empty ~physical_scopes:(Rrbvec.singleton scope) in
+  Alcotest.(check bool) "unacknowledged cleanup retains original retirement owner" true(retry.owner=Some scope.account);
+  let settled=R.released pending ~registration:91L in
+  Alcotest.(check bool) "released registration cannot bind another owner" true
+    (Result.is_error(R.bind settled ~registration:91L ~account:(Some foreign.account)));
+  let _,duplicate=R.begin_release settled ~registration:91L ~active_account:None
+    ~active_scopes:Rrbvec.empty ~physical_scopes:(Rrbvec.singleton foreign) in
+  Alcotest.(check bool) "duplicate unregister cannot adopt later physical ownership" true
+    (duplicate.owner=None && Rrbvec.length duplicate.scopes=0)
+;;
+
+let test_registration_retirement_properties () =
+  let module R=Core.Registration_retirement in
+  let _,scope=worker_open_graph() in
+  let replacement={scope with graph_generation=scope.graph_generation+1} in
+  let foreign={scope with account={scope.account with user_id="foreign";account_generation=scope.account.account_generation+1}} in
+  let reopened={scope.account with account_generation=scope.account.account_generation+1} in
+  let run actions=
+    let state=ref(R.bind R.empty ~registration:91L ~account:None |> Result.get_ok
+      |> fun state->R.observe state ~registration:(Some 91L) ~account:(Some scope.account)) in
+    let acknowledged=ref false in
+    List.iter(fun action->
+      let active=match action mod 4 with 0->Some scope.account|1->Some reopened|2->Some foreign.account|_->None in
+      let before= !state in
+      let _,original=R.begin_release before ~registration:91L ~active_account:active
+        ~active_scopes:(Rrbvec.singleton replacement) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign;scope]) in
+      (match action mod 8 with
+       |0->state:=R.observe before ~registration:(Some 91L) ~account:(Some foreign.account)
+       |1->state:=R.observe before ~registration:(Some 91L) ~account:None
+       |2|5|6->let next,_=R.begin_release before ~registration:91L ~active_account:active
+         ~active_scopes:(Rrbvec.singleton replacement) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign;scope]) in state:=next
+       |3->state:=R.released before ~registration:91L;acknowledged:=true
+       |4->state:=R.observe before ~registration:(Some 92L) ~account:(Some foreign.account)
+       |_->if !acknowledged then Alcotest.(check bool) "stale bind rejected" true
+         (Result.is_error(R.bind before ~registration:91L ~account:(Some foreign.account))));
+      let _,plan=R.begin_release !state ~registration:91L ~active_account:active
+        ~active_scopes:(Rrbvec.singleton replacement) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign;scope]) in
+      Alcotest.(check bool) "original owner never retargets" true
+        (if !acknowledged then plan.owner=None else plan.owner=Some scope.account);
+      Alcotest.(check bool) "active replacement and foreign namespace never close" true
+        (Rrbvec.fold_left(fun valid actual->valid && Core.Writer_fence.same_incarnation actual scope)true plan.scopes);
+      if plan.blocked then Alcotest.(check int) "blocked retirement emits no physical close" 0(Rrbvec.length plan.scopes);
+      let _,unchanged=R.begin_release before ~registration:91L ~active_account:active
+        ~active_scopes:(Rrbvec.singleton replacement) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign;scope]) in
+      Alcotest.(check bool) "prior pure state remains immutable" true(original=unchanged))actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec drop prefix=function []->actions
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |head::rest->drop(head::prefix)rest in drop [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x524547;seed|] in
+    let actions=[2;0;2;1;5;2;4;3;0;2;7;2] @ List.init 80(fun _->Random.State.int random 128) in
+    if fails actions then Alcotest.failf "registration retirement seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
-    [ ( "resident graphs", [Alcotest.test_case "cold cached membership opens every DB" `Quick test_resident_worker_cold_restore_keeps_open_tickets;
+    [ ("registration retirement",[Alcotest.test_case "original account and physical roster" `Quick test_registration_retirement_keeps_original_authority;
+        Alcotest.test_case "100 shrinking owner and ACK traces" `Quick test_registration_retirement_properties]);
+      ( "resident graphs", [
+        Alcotest.test_case "single graph broadcast identity" `Quick test_single_graph_change_broadcast_keeps_scope;
+        Alcotest.test_case "generated changefeed owner/ACK traces" `Quick test_changefeed_owner_properties;
+        Alcotest.test_case "unallocated observation fence" `Quick test_unallocated_observation_fence;
+        Alcotest.test_case "coordination owner snapshot" `Quick test_coordination_owner_snapshot;
+        Alcotest.test_case "cold cached membership opens every DB" `Quick test_resident_worker_cold_restore_keeps_open_tickets;
         Alcotest.test_case "scope routes and delayed replies survive focus" `Quick test_resident_worker_routes_by_scope;
         Alcotest.test_case "all removals and logout detach each graph" `Quick test_resident_worker_closes_every_scope;
         Alcotest.test_case "shutdown closes every resident database" `Quick test_resident_worker_shutdown_closes_all_databases])
@@ -1356,6 +2396,15 @@ let () =
             `Quick
             test_asset_manual_retry_is_unlimited
         ] )
+    ; ( "host handoff",[Alcotest.test_case "revoked hidden resource cleanup owner" `Quick test_revoked_account_keeps_hidden_cleanup_owner; Alcotest.test_case "private deletion resource owner" `Quick test_host_deletion_private_resource_owner; Alcotest.test_case "account gate blocks catalog producer" `Quick test_account_host_gate_blocks_new_catalog_producer; Alcotest.test_case "target gate preserves other execution" `Quick test_host_gate_keeps_other_graph_live; Alcotest.test_case "single-use and reopen witness" `Quick test_host_handoff_single_use_and_reopen; Alcotest.test_case "generated owner/late result traces" `Quick test_host_handoff_properties])
+    ; ( "writer fence",[Alcotest.test_case "only physical completion drains" `Quick test_writer_fence_physical_completion; Alcotest.test_case "generated scoped fence traces" `Quick test_writer_fence_properties])
+    ; ( "typed demand registry",[Alcotest.test_case "generated owner retirement traces" `Quick test_demand_registry_properties; Alcotest.test_case "retirement and exact settlement" `Quick test_demand_registry_retirement_requires_physical_settlement; Alcotest.test_case "resource history finalization" `Quick test_resource_registry_finalization])
+    ; ( "orphan resource cleanup",[Alcotest.test_case "failed release and stale attempt ACK" `Quick test_orphan_cleanup_retains_failed_release])
+    ; ( "observation registry", [Alcotest.test_case "registration cancellation epoch and owner" `Quick test_observation_registry;
+          Alcotest.test_case "exhaustive shortest lifecycle traces" `Quick test_observation_registry_traces;
+          Alcotest.test_case "active ACK and tombstone capacities" `Quick test_observation_registry_capacity] )
+    ; ( "read budget", [Alcotest.test_case "scoped byte budget" `Quick test_scoped_read_byte_budget;
+          Alcotest.test_case "pure bounded page planning" `Quick test_pure_read_page_bounds])
     ; ( "managed lifecycle"
       , [ Alcotest.test_case "local restore IO failures terminate loading" `Quick test_local_restore_worker_failures_are_terminal
         ; Alcotest.test_case

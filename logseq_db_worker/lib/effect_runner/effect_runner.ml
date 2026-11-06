@@ -1,3 +1,4 @@
+module Read = Worker_pure_read
 (* Secondary warnings must preserve the operation result and finish cleanup. *)
 let report_warning message =
   try output_string stderr message; flush stderr with _ -> ()
@@ -7,7 +8,6 @@ module Upload = Logseq_db_worker_pure_reducer.Asset_upload
 module Core = Logseq_db_worker_pure_reducer.Core
 module Database = Logseq_overlay_db.Database
 module Overlay = Logseq_overlay_db.Types
-module Protocol = Logseq_db_worker_contract.Protocol
 module Graph = Logseq_db_types.Graph_types
 module Sync = Logseq_sync_pure_reducer.Core
 module Transit = Transit_core.Json
@@ -311,6 +311,7 @@ type runtime =
 type sync_runner =
   { submit : Sync.runner_effect -> unit
   ; shutdown : unit -> unit
+  ; retire_account : account:Sync.account_scope -> (unit,string)result
   }
 
 type dependencies =
@@ -325,8 +326,8 @@ type dependency_error = Invalid_dependency of string
 type create_error = Invalid_create of string
 
 type waiter =
-  { request : Protocol.request
-  ; resolve : Protocol.response Eio.Promise.u
+  { read : Read.packed_query
+  ; resolve : Read.answer Eio.Promise.u
   }
 
 type asset_waiter =
@@ -353,12 +354,13 @@ type protected_waiter =
   }
 
 type change_window =
-  { id : string
+  { encoded_bytes : int
+  ; id : string
   ; predecessor : string
   ; successor : string
   ; block_uuids : Graph.block_uuid list
   ; page_uuids : Graph.page_uuid list
-  ; structure_interests : Protocol.v2_structure_interest list
+  ; structure_interests : Worker_pure_data.structure_interest list
   }
 
 type database_session =
@@ -369,7 +371,39 @@ type database_session =
   ; mutable next_window : int
   ; mutable acknowledged_through : string
   ; mutable windows : change_window Rrbvec.t
+  ; mutable changefeed : Core.Changefeed_owner.t
   }
+
+type observation_result = (int64 * Worker_pure_read.answer, string) result
+
+type observation_slot =
+  { registration : int64
+  ; logical_id : Graph.Uuid.t
+  ; observation_scope : Sync.graph_scope
+  ; database_id : string
+  ; read : Worker_pure_read.packed_query
+  ; current : unit -> bool
+  ; notify : epoch:int64 -> unit
+  ; initial : observation_result Eio.Promise.t
+  ; initial_resolve : observation_result Eio.Promise.u
+  ; mutable subscription : Database.subscription option
+  ; mutable closing : bool
+  ; mutable work : int
+  ; mutable idle : unit Eio.Promise.t * unit Eio.Promise.u
+  }
+
+type asset_cleanup_job=
+  {cleanup_id:int64;cleanup_scope:Sync.graph_scope;finished:unit Eio.Promise.t;
+   mutable children:asset_cleanup_job Rrbvec.t}
+type asset_cleanup_snapshot={snapshot_scope:Sync.graph_scope;snapshot_jobs:asset_cleanup_job Rrbvec.t}
+type writer_job={writer_operation:Core.Writer_fence.operation;writer_scope:Sync.graph_scope;
+  writer_finished:unit Eio.Promise.t;writer_resolve:unit Eio.Promise.u}
+module Cleanup_ids=Set.Make(Int64)
+
+type host_copy={mutable copy_handoff:Graph.Uuid.t;copy_registration:int64;copy_owner:Sync.account_scope;
+  copy_graph:Graph.Uuid.t;copy_retirement:Sync.retirement_id;
+  copy_preparation:Database.prepared_mirror_deletion;copy_generation:Overlay.mirror_generation;
+  mutable copy_bound:Sync.mirror_deletion option}
 
 type t =
   { sw : Eio.Switch.t
@@ -387,6 +421,25 @@ type t =
   ; recovery_current : Core.upload_recovery_ticket -> bool
   ; upload_current : Upload.ticket -> bool
   ; asset_current : Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
+  ; observation_slots : (int64 * Graph.Uuid.t, observation_slot) Hashtbl.t
+  ; mutable observation_registry : Core.Observation_registry.t
+  ; mutable orphan_cleanup : Core.Orphan_cleanup.t
+  ; mutable orphan_cleanup_running : bool
+  ; mutable next_asset_cleanup : int64
+  ; mutable next_asset_barrier : int64
+  ; asset_cleanup_jobs : (int64,asset_cleanup_job) Hashtbl.t
+  ; asset_cleanup_barriers : (int64,unit Eio.Promise.u) Hashtbl.t
+  ; sync_io_waiters : (int64,Sync.effect_scope * (unit,string)result Eio.Promise.u)Hashtbl.t
+  ; cancelled_asset_jobs : (Logseq_sync_pure_reducer.Asset_transfer.ticket,asset_cleanup_job)Hashtbl.t
+  ; asset_result_sources : ((Sync.graph_scope*string),Logseq_sync_pure_reducer.Asset_transfer.ticket)Hashtbl.t
+  ; asset_cleanup_stopped : unit Eio.Promise.t * unit Eio.Promise.u
+  ; resource_cleanup_owners : ((Sync.graph_scope * string),asset_cleanup_job) Hashtbl.t
+  ; resource_release_waiters : ((Sync.graph_scope * string),unit Eio.Promise.u list) Hashtbl.t
+  ; mutable writer_fence : Core.Writer_fence.t
+  ; writer_jobs : (int64,writer_job)Hashtbl.t
+  ; resource_scopes : (Sync.graph_scope,unit)Hashtbl.t
+  ; failed_database_closes : (string,Core.effect_error)Hashtbl.t
+  ; durable_slots : Eio.Semaphore.t
   ; databases : (string, database_session) Hashtbl.t
   ; inspections : (string, Database.mirror_inspection) Hashtbl.t
   ; waiters : (int64, waiter) Hashtbl.t
@@ -398,11 +451,12 @@ type t =
   ; mutable stopped : bool
   ; mutable latest_snapshot : Sync.snapshot option
   ; mutable authorized_graphs : Authorized_graphs.t
+  ; mutable host_copy : host_copy option
   ; mutable deletion_owner : Sync.mirror_deletion option
   }
 
 let runtime ~fork ~sleep = Ok { fork; sleep }
-let sync_runner ~submit ~shutdown () = { submit; shutdown }
+let sync_runner ~submit ~shutdown ~retire_account () = { submit; shutdown;retire_account }
 
 let dependencies ~runtime ~config ~overlay ~sync_runner ~publish =
   Ok { runtime; config; overlay; sync_runner; publish }
@@ -425,6 +479,25 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; upload_staging_lock = Eio.Mutex.create ()
     ; staging_reconciled = []
     ; local_imports = Hashtbl.create 32
+    ; observation_slots = Hashtbl.create 32
+    ; observation_registry = Core.Observation_registry.empty
+    ; orphan_cleanup = Core.Orphan_cleanup.empty
+    ; orphan_cleanup_running = false
+    ; next_asset_cleanup = 0L
+    ; next_asset_barrier = 0L
+    ; asset_cleanup_jobs = Hashtbl.create 16
+    ; asset_cleanup_barriers = Hashtbl.create 16
+    ; sync_io_waiters = Hashtbl.create 4
+    ; cancelled_asset_jobs = Hashtbl.create 16
+    ; asset_result_sources = Hashtbl.create 16
+    ; asset_cleanup_stopped = Eio.Promise.create ()
+    ; resource_cleanup_owners = Hashtbl.create 16
+    ; resource_release_waiters = Hashtbl.create 16
+    ; writer_fence = Core.Writer_fence.empty
+    ; writer_jobs = Hashtbl.create 32
+    ; resource_scopes = Hashtbl.create 16
+    ; failed_database_closes = Hashtbl.create 4
+    ; durable_slots = Eio.Semaphore.make 8
     ; databases = Hashtbl.create 4
     ; inspections = Hashtbl.create 4
     ; waiters = Hashtbl.create 32
@@ -436,6 +509,7 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; stopped = false
     ; latest_snapshot = None
     ; authorized_graphs = Authorized_graphs.empty
+    ; host_copy = None
     ; deletion_owner = None
     }
 ;;
@@ -463,6 +537,7 @@ let with_upload_store t action =
 ;;
 
 let asset_request t ~scope action =
+  Hashtbl.replace t.resource_scopes scope ();
   let operation = "worker-asset:" ^ Int64.to_string t.next_asset_operation in
   t.next_asset_operation <- Int64.succ t.next_asset_operation;
   { Sync.scope; operation; action }
@@ -611,6 +686,28 @@ let asset_unit ?(on_failure = fun _ -> ()) ?on_diagnostic t ~scope action =
     Error "Unexpected asset completion"
 ;;
 
+let reserve_writer ?(cleanup=false) t scope =
+  if t.stopped then Error "The Worker stopped before graph operation admission." else
+  let next,outcome=(if cleanup then Core.Writer_fence.admit_cleanup else Core.Writer_fence.admit) t.writer_fence scope in
+  t.writer_fence<-next;
+  Result.map_error(function Core.Writer_fence.Fenced->"The graph incarnation is quiescing."
+    |Full->"Graph operation capacity is full.")outcome
+  |> Result.map(fun writer_operation->
+    let writer_finished,writer_resolve=Eio.Promise.create() in
+    let job={writer_operation;writer_scope=scope;writer_finished;writer_resolve} in
+    Hashtbl.replace t.resource_scopes scope ();
+    Hashtbl.add t.writer_jobs(Core.Writer_fence.operation_id writer_operation)job;job)
+;;
+let finish_writer t job =
+  t.writer_fence<-Core.Writer_fence.finish t.writer_fence job.writer_operation;
+  Hashtbl.remove t.writer_jobs(Core.Writer_fence.operation_id job.writer_operation);
+  ignore(Eio.Promise.try_resolve job.writer_resolve():bool)
+;;
+let with_writer t scope action =
+  Result.bind(reserve_writer t scope)(fun job->
+    Fun.protect ~finally:(fun()->finish_writer t job) action)
+;;
+
 let with_staging_lock t action =
   Eio.Mutex.lock t.upload_staging_lock;
   Fun.protect
@@ -623,6 +720,56 @@ let with_staging_lock t action =
        | exception error ->
          t.staging_reconciled <- [];
          raise error)
+;;
+
+let local_retirement_account_directory t (account : Sync.account_scope) =
+  let identity = Digest.to_hex (Digest.string
+    (Uri.to_string account.managed_sync_origin ^ "\000" ^ account.user_id)) in
+  Filename.concat t.dependencies.config.application_support_directory
+    (Filename.concat "logseq-db-worker/local-copy-retirements" identity)
+;;
+
+let account_input_namespaces t (account : Sync.account_scope) =
+  let graph_directories path graphs =
+    let directory = try Ok (Some (Unix.opendir path)) with
+      | Unix.Unix_error (Unix.ENOENT,_,_) -> Ok None
+      | error -> Error (Printexc.to_string error) in
+    Result.bind directory (function None -> Ok graphs | Some directory ->
+      Fun.protect ~finally:(fun () -> Unix.closedir directory) (fun () ->
+        let rec collect graphs =
+          match Unix.readdir directory with
+          | entry ->
+            (match Graph.Uuid.of_string entry with
+             | Error _ -> collect graphs
+             | Ok graph ->
+               let stat = Unix.lstat (Filename.concat path entry) in
+               if stat.st_kind=Unix.S_DIR
+               then collect (Authorized_graphs.add (Graph.Uuid.to_string graph) graphs)
+               else collect graphs)
+          | exception End_of_file -> Ok graphs in
+        try collect graphs with error -> Error (Printexc.to_string error))) in
+  let mirrors = Filename.concat t.dependencies.config.application_support_directory
+    "logseq-db-worker/synced-graphs" in
+  let (let*) = Result.bind in
+  let* graphs = graph_directories mirrors Authorized_graphs.empty in
+  (* A committed mirror rename can precede source-input cleanup. Its existing
+     retirement directory still supplies the graph identity, including Unknown. *)
+  let* graphs = graph_directories (Filename.concat mirrors ".mirror-deletions") graphs in
+  let* graphs = graph_directories (local_retirement_account_directory t account) graphs in
+  Ok (Authorized_graphs.to_seq graphs |> Rrbvec.of_seq |> Rrbvec.map (fun graph ->
+    Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
+      ~origin:account.managed_sync_origin ~user:account.user_id
+      ~graph:(Graph.Uuid.of_string graph |> Result.get_ok)))
+;;
+
+let cleanup_account_uploads ?(wait=true) t (account : Sync.account_scope) =
+  let cleanup () = Result.bind (account_input_namespaces t account) (fun input_namespaces ->
+    with_upload_store t (fun db -> Logseq_db_storage.Asset_upload_store.delete_account db
+      ~origin:(Uri.to_string account.managed_sync_origin) ~account:account.user_id ~input_namespaces:(Rrbvec.to_seq input_namespaces))) in
+  if wait then with_staging_lock t cleanup
+  else if Eio.Mutex.try_lock t.upload_staging_lock then
+    Fun.protect ~finally:(fun () -> Eio.Mutex.unlock t.upload_staging_lock) cleanup
+  else Error "Account attachment preparation has not settled."
 ;;
 
 let reconcile_staging t (scope : Sync.graph_scope) ~current =
@@ -866,17 +1013,6 @@ let effect_error message =
     |> Result.get_ok
 ;;
 
-let failure request code message =
-  Protocol.failed ~request_id:request.Protocol.request_id (worker_error ~code message)
-;;
-
-let response request outcome =
-  Protocol.V2_response
-    { api_version = Protocol.api_version
-    ; request_id = request.Protocol.request_id
-    ; outcome
-    }
-;;
 
 let task_status_to_protocol = function
   | Overlay.Status_uuid uuid -> uuid
@@ -886,7 +1022,7 @@ let task_status_to_protocol = function
 let task_status_of_protocol uuid = Overlay.Status_uuid uuid
 
 let block_record ?(tag_titles = []) (value : Overlay.block_record)
-  : Protocol.v2_block_record
+  : Worker_pure_data.block_record
   =
   { block = value.block
   ; task_status = Option.map task_status_to_protocol value.task_status
@@ -896,13 +1032,13 @@ let block_record ?(tag_titles = []) (value : Overlay.block_record)
 ;;
 
 let revision_scope_to_protocol = function
-  | Overlay.Children_revision parent -> Protocol.V2_children_revision parent
+  | Overlay.Children_revision parent -> Worker_pure_data.V2_children_revision parent
 ;;
 
-let structure_interest_to_protocol = function
-  | Overlay.Children_interest parent -> Protocol.V2_children_interest parent
-  | Page_tree_interest page -> V2_page_tree_interest page
-  | Journal_index_interest -> V2_journal_index_interest
+let structure_interest_to_data = function
+  | Overlay.Children_interest parent -> Worker_pure_data.V2_children_interest parent
+  | Page_tree_interest page -> Worker_pure_data.V2_page_tree_interest page
+  | Journal_index_interest -> Worker_pure_data.V2_journal_index_interest
 ;;
 
 let resync_reason = function
@@ -925,22 +1061,26 @@ let publish_projection_change t session = function
     if not (String.equal generation session.generation)
     then (
       session.generation <- generation;
+      session.changefeed<-Core.Changefeed_owner.invalidate session.changefeed;
       session.windows <- Rrbvec.empty;
       session.next_window <- 1;
       session.acknowledged_through <- "change-window:v1:0");
     let id = Printf.sprintf "change-window:v1:%d" session.next_window in
     session.next_window <- session.next_window + 1;
-    session.windows
-    <- Rrbvec.push_back
-         session.windows
-         { id
-         ; predecessor = Overlay.Projection_revision.to_string before_revision
-         ; successor = Overlay.Projection_revision.to_string after_revision
-         ; block_uuids
-         ; page_uuids
-         ; structure_interests =
-             List.map structure_interest_to_protocol structure_interests
-         };
+    let window:Worker_pure_data.change_window=
+      {id;predecessor=Overlay.Projection_revision.to_string before_revision;
+       successor=Overlay.Projection_revision.to_string after_revision;block_uuids;page_uuids;
+       structure_interests=List.map structure_interest_to_data structure_interests} in
+    (* Retention owns the complete physical window and its generation, not an
+       RPC response. Count that artifact directly, before admitting the window. *)
+    let encoded_bytes=String.length(Yojson.Safe.to_string(`Assoc
+      ["generation",`String generation;"window",Worker_pure_data.change_window_to_yojson window])) in
+    let retained,keep=Core.Changefeed_owner.retain_window session.changefeed ~encoded_bytes in
+    session.changefeed<-retained;
+    if keep then session.windows<-Rrbvec.push_back session.windows
+      {encoded_bytes;id;predecessor=window.predecessor;successor=window.successor;
+       block_uuids;page_uuids;structure_interests=window.structure_interests}
+    else (session.windows<-Rrbvec.empty;session.acknowledged_through<-id);
     (try
        report_warning ("journal-timeline: " ^ Yojson.Safe.to_string (`Assoc
          [ "stage", `String "worker-change-window"; "generation", `String generation
@@ -954,22 +1094,19 @@ let publish_projection_change t session = function
      with _ -> ());
     t.post
       (Core.Projection_push_for_scope
-         (session.graph_scope, Protocol.V2_changes_available
-            { api_version = Protocol.api_version; generation; through = id }))
+         (session.graph_scope, if keep then Worker_pure_data.Changes_available {generation=generation;through=id}
+          else Worker_pure_data.Resync_required {generation=generation;reason="changeHistoryRetentionExceeded"}))
   | Overlay.Projection_resync_required { generation; reason; _ } ->
     let generation = Overlay.Generation.to_string generation in
     if not (String.equal generation session.generation) then session.next_window <- 1;
     session.generation <- generation;
+    session.changefeed<-Core.Changefeed_owner.invalidate session.changefeed;
     session.windows <- Rrbvec.empty;
     session.acknowledged_through
     <- Printf.sprintf "change-window:v1:%d" (session.next_window - 1);
     t.post
       (Core.Projection_push_for_scope
-         (session.graph_scope, Protocol.V2_resync_required_push
-            { api_version = Protocol.api_version
-            ; generation
-            ; reason = resync_reason reason
-            }))
+         (session.graph_scope, Worker_pure_data.Resync_required {generation=generation;reason=resync_reason reason}))
 ;;
 
 let report_current_graph t (scope : Sync.graph_scope) code =
@@ -1063,6 +1200,83 @@ let publish_asset_notice t scope notice output =
   if failed then Option.iter (publish_scoped_asset_detail t scope) detail
 ;;
 
+let observation_work_start slot =
+  if slot.work = 0 then slot.idle <- Eio.Promise.create ();
+  slot.work <- slot.work + 1
+;;
+
+let observation_work_finish slot =
+  slot.work <- slot.work - 1;
+  if slot.work = 0 then ignore (Eio.Promise.try_resolve (snd slot.idle) () : bool)
+;;
+
+let close_observation t slot =
+  slot.closing <- true;
+  Option.iter Database.unlisten slot.subscription;
+  slot.subscription <- None;
+  if slot.work > 0 then Eio.Promise.await (fst slot.idle);
+  Hashtbl.remove t.observation_slots (slot.registration, slot.logical_id)
+;;
+
+let observation_scope t ~registration ~id =
+  Core.Observation_registry.scope t.observation_registry ~registration ~id
+;;
+
+let release_observation t ~registration ~id ~scope =
+  let next, decision =
+    Core.Observation_registry.release t.observation_registry ~registration ~id ~scope
+  in
+  t.observation_registry <- next;
+  match decision with
+  | Wrong_owner -> Error "Observation cleanup owner mismatch"
+  | Release_full -> Error "Observation cleanup storage is full"
+  | Release | Already_released | Unknown ->
+    Option.iter
+      (close_observation t)
+      (Hashtbl.find_opt t.observation_slots (registration, id));
+    t.observation_registry
+    <- Core.Observation_registry.released t.observation_registry ~registration ~id ~scope;
+    Ok ()
+;;
+
+let observation_creator_finished t ~registration ~id =
+  t.observation_registry<-Core.Observation_registry.creator_finished t.observation_registry ~registration ~id
+;;
+let finalize_observation t ~registration ~id ~owner =
+  let next,result=Core.Observation_registry.finalize t.observation_registry ~registration ~id ~owner in
+  t.observation_registry<-next;result
+;;
+
+let retire_observation_registration t ~registration =
+  t.observation_registry<-Core.Observation_registry.retire_registration t.observation_registry ~registration
+;;
+
+let release_unallocated_observation t ~registration ~id ~owner =
+  if Hashtbl.mem t.observation_slots (registration, id)
+  then Error "Known observation requires physical cleanup with its stored owner"
+  else (
+    let next, result =
+      Core.Observation_registry.release_unallocated
+        t.observation_registry
+        ~registration
+        ~id
+        ~owner
+    in
+    t.observation_registry <- next;
+    match result with
+    | Unknown | Already_released -> Ok ()
+    | _ -> Error "Unallocated observation cleanup was refused")
+;;
+
+let release_observations_checked t ~registration =
+  let slots=Hashtbl.to_seq_values t.observation_slots
+    |> Seq.filter(fun slot->slot.registration=registration) |> Rrbvec.of_seq in
+  Rrbvec.fold_left(fun result slot->
+    let released=release_observation t ~registration ~id:slot.logical_id ~scope:slot.observation_scope in
+    match result with Error _->result|Ok()->released)(Ok())slots
+;;
+let release_observations t ~registration=ignore(release_observations_checked t ~registration)
+;;
 let close_database_by_id ?scope t database_id =
   let scope = match scope with
     | Some _ -> scope
@@ -1071,6 +1285,16 @@ let close_database_by_id ?scope t database_id =
   match Hashtbl.find_opt t.databases database_id with
   | None -> Ok ()
   | Some session ->
+    let slots=Hashtbl.to_seq_values t.observation_slots
+      |> Seq.filter (fun slot->slot.database_id=database_id) |> List.of_seq in
+    let released=List.fold_left(fun result slot->
+      let next=release_observation t ~registration:slot.registration
+        ~id:slot.logical_id ~scope:slot.observation_scope in
+      match result with Error _->result|Ok()->next)(Ok())slots in
+    Result.bind(Result.map_error effect_error released)(fun()->
+    match Hashtbl.find_opt t.failed_database_closes database_id with
+    |Some error->Error error
+    |None->
     Database.unlisten session.subscription;
     let result = Database.close session.database in
     (match result with
@@ -1090,12 +1314,14 @@ let close_database_by_id ?scope t database_id =
            t.dependencies.publish (Core.Diagnostic(D.signal_prefix ^ D.encode detail))
          | _ -> ()) scope;
        report_warning "journal: operation=closeDatabase code=cleanupPending\n");
-    Hashtbl.remove t.databases database_id;
-    Hashtbl.filter_map_inplace (fun _ id -> if id=database_id then None else Some id) t.attachments;
-    (match t.attached with Some (id,_) when id=database_id -> t.attached <- None | _ -> ());
+    (match result with
+     |Error error->Hashtbl.replace t.failed_database_closes database_id(close_error error)
+     |Ok()->Hashtbl.remove t.databases database_id);
+    if Result.is_ok result then Hashtbl.filter_map_inplace (fun _ id -> if id=database_id then None else Some id) t.attachments;
+    (match t.attached with Some (id,_) when id=database_id && Result.is_ok result -> t.attached <- None | _ -> ());
     Result.map_error
       close_error
-      result
+      result)
 ;;
 
 let close_attached t =
@@ -1107,10 +1333,10 @@ let close_attached t =
 ;;
 
 let overlay_scope_of_protocol = function
-  | Protocol.V2_children_scope parent -> Overlay.Children_revision parent
+  | Worker_pure_data.V2_children_scope parent -> Overlay.Children_revision parent
 ;;
 
-let parse_preconditions (value : Protocol.v2_preconditions) =
+let parse_preconditions (value : Worker_pure_data.preconditions) =
   let rec blocks reversed = function
     | [] -> Ok (List.rev reversed)
     | (uuid, revision) :: rest ->
@@ -1140,532 +1366,229 @@ let parse_preconditions (value : Protocol.v2_preconditions) =
         |> Result.map_error (fun _ -> "duplicate write precondition"))))
 ;;
 
-let rec block_tree (value : Protocol.v2_block_tree) : Overlay.block_tree =
+let rec block_tree (value : Worker_pure_data.block_tree) : Overlay.block_tree =
   { uuid = value.uuid
   ; title = value.title
   ; children = List.map block_tree value.children
   }
 ;;
 
-let local_mutation = function
-  | Protocol.V2_set_asset_reference { mutation_id; block; previous; asset; preconditions }
-    ->
-    Ok (preconditions, Overlay.Set_asset_reference { mutation_id; block; previous; asset })
-  | Protocol.V2_save_block { mutation_id; block; title; preconditions } ->
-    Ok (preconditions, Overlay.Save_block { mutation_id; block; title })
-  | V2_insert_blocks { mutation_id; parent; roots = [ root ]; preconditions } ->
-    Ok
-      ( preconditions
-      , Overlay.Insert_blocks
-          { mutation_id; parent; tree = block_tree root; asset = None } )
-  | V2_insert_blocks _ -> Error "insertBlocks requires exactly one root"
-  | V2_delete_blocks { mutation_id; root; preconditions } ->
-    Ok (preconditions, Overlay.Delete_blocks { mutation_id; root })
-  | V2_create_journal_page { mutation_id; page; journal_day; title; preconditions } ->
-    Ok
-      ( preconditions
-      , Overlay.Create_journal_page { mutation_id; page; journal_day; title } )
-  | V2_set_task_status { mutation_id; block; status; preconditions } ->
-    Ok
-      ( preconditions
-      , Overlay.Set_task_status
-          { mutation_id; block; status = task_status_of_protocol status } )
-  | V2_clear_task_status { mutation_id; block; preconditions } ->
-    Ok (preconditions, Overlay.Clear_task_status { mutation_id; block })
-  | V2_graph_info
-  | V2_inspect_admission
-  | V2_get_asset_descriptors _
-  | V2_list_assets _
-  | V2_list_task_statuses _
-  | V2_get_task_status_definitions _
-  | V2_list_favorites _
-  | V2_list_journals _
-  | V2_get_page _
-  | V2_get_outline_block _
-  | V2_get_outline_block_summary _
-  | V2_get_children _
-  | V2_get_page_tree _
-  | V2_pull_changes _
-  | V2_ack_changes _ -> Error "not a local mutation"
+let rec append_node (node:Worker_pure_data.append_node) : Overlay.append_node =
+  {uuid=node.block_id;title=node.title;task_status=node.task_status;children=Rrbvec.map append_node node.children}
+;;
+
+let journal_append_title format day =
+  Option.get(Logseq_db_types.Journal_title.for_journal_day ~pattern:format day)
+;;
+
+let local_mutation ?append_title intent =
+  let module Mutation=Logseq_db_worker_contract.Worker_pure_mutation in
+  let mutation_id=Mutation.mutation_id intent in
+  match intent with
+  |Mutation.Append_intent append->
+    let value=Mutation.append_parameters append in
+    let journal_day=Logseq_db_worker_contract.Worker_pure_day.value value.day in
+    let title=Option.value append_title ~default:(journal_append_title None journal_day)in
+    Worker_pure_data.{blocks=[];pages=[];scopes=[]},Overlay.Append_journal
+      {mutation_id;page=value.page;journal_day;title;root=append_node value.root}
+  |Mutation.Mutation_intent mutation->match Mutation.mutation_command mutation with
+    |Mutation.Save_block{block;title;preconditions}->preconditions,Overlay.Save_block{mutation_id;block;title}
+    |Insert_blocks{parent;roots;preconditions}->
+      (* The sealed intent admits exactly one bounded root. *)
+      preconditions,Overlay.Insert_blocks{mutation_id;parent;tree=block_tree(List.hd roots);asset=None}
+    |Delete_blocks{root;preconditions}->preconditions,Overlay.Delete_blocks{mutation_id;root}
+    |Create_journal{page;day;title;preconditions}->preconditions,Overlay.Create_journal_page
+      {mutation_id;page;journal_day=Logseq_db_worker_contract.Worker_pure_day.value day;title}
+    |Set_task_status{block;status;preconditions}->preconditions,Overlay.Set_task_status
+      {mutation_id;block;status=task_status_of_protocol status}
+    |Clear_task_status{block;preconditions}->preconditions,Overlay.Clear_task_status{mutation_id;block}
+    |Set_asset_reference{block;previous;asset;preconditions}->preconditions,Overlay.Set_asset_reference
+      {mutation_id;block;previous;asset}
 ;;
 
 let local_status = function
-  | Overlay.Applied -> Protocol.V2_applied
-  | No_change -> V2_no_change
-  | Already_applied -> V2_already_applied
+  | Overlay.Applied -> Worker_pure_data.V2_applied
+  | No_change -> Worker_pure_data.V2_no_change
+  | Already_applied -> Worker_pure_data.V2_already_applied
 ;;
 
-let committed_outcome (commit : Overlay.local_commit) =
-  Protocol.V2_mutation_committed
-    { mutation_id = commit.mutation_id
-    ; status = local_status commit.status
-    ; generation = Overlay.Generation.to_string commit.generation
-    ; before_projection_revision =
-        Overlay.Projection_revision.to_string commit.before_projection_revision
-    ; after_projection_revision =
-        Overlay.Projection_revision.to_string commit.after_projection_revision
-    }
+let commit_proof (commit:Overlay.local_commit)=
+  Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit
+    ~mutation_id:commit.mutation_id ~status:(local_status commit.status)
+    ~generation:(Overlay.Generation.to_string commit.generation)
+    ~before:(Overlay.Projection_revision.to_string commit.before_projection_revision)
+    ~after:(Overlay.Projection_revision.to_string commit.after_projection_revision)
 ;;
 
-let execute_mutation database request command =
-  match local_mutation command with
-  | Error message -> failure request Unsupported_semantics message
-  | Ok (raw_preconditions, mutation) ->
-    (match parse_preconditions raw_preconditions with
-     | Error message -> failure request Conflict message
-     | Ok expected ->
-       (match Database.commit_local database ~expected mutation with
-        | Error error -> Protocol.failed ~request_id:request.Protocol.request_id (local_commit_error error)
-        | Ok (Overlay.Local_existing (Overlay.Existing_applied commit)) ->
-          response request (committed_outcome commit)
-        | Ok (Local_existing _) ->
-          failure request Conflict "The mutation ID already has a terminal outcome."
-        | Ok (Local_committed commit) -> response request (committed_outcome commit)))
+let mutation_owner_matches (scope:Sync.graph_scope) intent =
+  let module Mutation=Logseq_db_worker_contract.Worker_pure_mutation in
+  Mutation.namespace intent=Mutation.namespace_for_owner ~origin:scope.account.managed_sync_origin
+    ~user:scope.account.user_id ~graph:scope.graph_id
 ;;
 
-let inspect_admission database request =
-  match Database.inspect_admission database with
-  | Error _ -> failure request Closed_session "Admission information is unavailable."
-  | Ok inspection ->
-    response
-      request
-      (Protocol.V2_admission_outcome
-         { active_records = inspection.active_records
-         ; active_bytes = inspection.active_bytes
-         ; protected_wire_bytes = inspection.protected_wire_bytes
-         ; retained_origin_evidence_bytes = inspection.retained_origin_evidence_bytes
-         ; maximum_records = inspection.maximum_records
-         ; maximum_bytes = inspection.maximum_bytes
-         })
-;;
-
-let read_failure ?code request error =
-  let fail default message = failure request (Option.value code ~default) message in
-  let safe_message reason source =
-    Logseq_db_types.Failure_diagnostic.of_source
-      ~operation:"workerOperation"
-      ~reason
-      source
-    |> Logseq_db_types.Failure_diagnostic.message
-  in
+let typed_read_error ?code error =
+  let fail code message = Read.Db_error(Logseq_db_worker_contract.Error.create ~code ~message ~details:[] |> Result.get_ok) in
+  let safe reason source=Logseq_db_types.Failure_diagnostic.of_source ~operation:"workerOperation" ~reason source
+    |> Logseq_db_types.Failure_diagnostic.message in
   match error with
-  | Overlay.Stale_read_cursor ->
-    fail Stale_read_cursor "The read continuation is no longer current."
-  | Invalid_read_request source -> fail Invalid_request (safe_message "invalidRequest" source)
-  | Read_limit_exceeded ->
-    fail Response_too_large "The read exceeded its resource limit."
-  | Database_closed | Snapshot_released | Snapshot_generation_invalidated ->
-    fail Closed_session "The read snapshot is no longer available."
-  | Fatal_read_state source -> fail Corrupt_storage (safe_message "fatalState" source)
+  |Overlay.Stale_read_cursor->(match code with
+    |None->Read.Stale_read "The read continuation is no longer current."
+    |Some code->fail code "The read continuation is no longer current.")
+  |Invalid_read_request source->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Invalid_request) (safe "invalidRequest" source)
+  |Read_limit_exceeded->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Response_too_large) "The read exceeded its resource limit."
+  |Database_closed|Snapshot_released|Snapshot_generation_invalidated->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Closed_session) "The read snapshot is no longer available."
+  |Fatal_read_state source->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Corrupt_storage) (safe "fatalState" source)
 ;;
 
-let read_snapshot ~on_enrichment_error database request command =
-  match Database.current_snapshot database with
-  | Error _ -> failure request Closed_session "The graph snapshot is unavailable."
-  | Ok snapshot ->
-    Fun.protect
-      ~finally:(fun () -> Database.release_snapshot snapshot)
-      (fun () ->
-         let query_evidence query ?target items has_continuation =
-           try
-             let version = Database.snapshot_version snapshot in
-             let fields =
-               [ "stage", `String "worker-query"; "query", `String query
-               ; "request", `String (Graph.Uuid.to_string request.request_id)
-               ; "generation", `String (Overlay.Generation.to_string version.generation)
-               ; "projection", `String (Overlay.Projection_revision.to_string version.projection_revision)
-               ; "itemCount", `Int (List.length items)
-               ; "items", `List (List.take 16 items |> List.map (fun u -> `String (Graph.Uuid.to_string u)))
-               ; "hasContinuation", `Bool has_continuation
-               ; "truncated", `Bool (List.length items > 16)
-               ] @ Option.fold ~none:[] ~some:(fun u -> ["target", `String (Graph.Uuid.to_string u)]) target in
-             report_warning ("journal-timeline: " ^ Yojson.Safe.to_string (`Assoc fields) ^ "\n")
-           with _ -> ()
-         in
-         let page_read_evidence result uuid =
-           try
-             let version = Database.snapshot_version snapshot in
-             report_warning
-               ("journal-page-read: "
-                ^ Yojson.Safe.to_string
-                    (`Assoc
-                       [ "result", `String result
-                       ; "request", `String (Graph.Uuid.to_string request.request_id)
-                       ; "target", `String (Graph.Uuid.to_string uuid)
-                       ; "generation", `String (Overlay.Generation.to_string version.generation)
-                       ; "projection", `String
-                           (Overlay.Projection_revision.to_string version.projection_revision)
-                       ])
-                ^ "\n")
-           with _ -> ()
-         in
-         let titles = Hashtbl.create 16 in
-         let block_record (value : Overlay.block_record) =
-           let missing =
-             List.filter
-               (fun uuid -> not (Hashtbl.mem titles (Graph.Uuid.to_string uuid)))
-               value.block.tags
-           in
-           if missing <> []
-           then (
-             match Database.get_pages snapshot missing with
-             | Ok pages ->
-               List.iter
-                 (function
-                   | Overlay.Present_page { value; _ } ->
-                     Hashtbl.replace
-                       titles
-                       (Graph.Uuid.to_string value.page.uuid)
-                       (Some value.page.title)
-                   | Overlay.Missing_page { uuid; _ } ->
-                     Hashtbl.replace titles (Graph.Uuid.to_string uuid) None)
-                 pages
-             | Error _ -> on_enrichment_error ());
-           let tag_titles =
-             List.filter_map
-               (fun uuid ->
-                  Option.join (Hashtbl.find_opt titles (Graph.Uuid.to_string uuid)))
-               value.block.tags
-           in
-           block_record ~tag_titles value
-         in
-         match command with
-         | Protocol.V2_graph_info ->
-           (match Database.graph_info snapshot with
-            | Error error -> read_failure ~code:Corrupt_storage request error
-            | Ok info ->
-              let limits = info.Overlay.limits in
-              response
-                request
-                (Protocol.V2_graph_info_outcome
-                   { graph_uuid = info.graph_uuid
-                   ; graph_name = info.graph_name
-                   ; schema = info.schema
-                   ; admission_facts = info.admission_facts
-                   ; journal_title_format = info.journal_title_format
-                   ; limits =
-                       { response_budget_bytes = limits.response_budget_bytes
-                       ; outbox_max_records = limits.outbox_max_records
-                       ; outbox_max_bytes = limits.outbox_max_bytes
-                       ; change_max_items = limits.change_max_items
-                       ; change_max_bytes = limits.change_max_bytes
-                       ; dispatcher_capacity = limits.dispatcher_capacity
-                       ; wire_batch_max_bytes = limits.wire_batch_max_bytes
-                       }
-                   ; generation = Overlay.Generation.to_string info.version.generation
-                   ; projection_revision =
-                       Overlay.Projection_revision.to_string
-                         info.version.projection_revision
-                   }))
-         | V2_inspect_admission ->
-           failure request Invalid_request "The command is not a snapshot read."
-         | V2_list_task_statuses { limit; cursor } ->
-           (match Database.get_task_statuses snapshot ~limit ~cursor with
-            | Error error -> read_failure request error
-            | Ok result ->
-              response
-                request
-                (Protocol.V2_task_statuses_outcome
-                   { property_uuid = result.property_uuid
-                   ; default_status = result.default_status
-                   ; items = result.items
-                   ; next_cursor = result.next_cursor
-                   }))
-         | V2_get_task_status_definitions { statuses } ->
-           (match Database.get_task_status_definitions snapshot statuses with
-            | Error error -> read_failure request error
-            | Ok result ->
-              response request (Protocol.V2_task_status_definitions_outcome result))
-         | V2_list_favorites { limit; cursor } ->
-           (match Database.get_favorites snapshot ~limit ~cursor with
-            | Error error -> read_failure request error
-            | Ok result ->
-              let items =
-                List.map
-                  (fun (item : Overlay.favorite_item) ->
-                     let target =
-                       match item.target with
-                       | Overlay.Favorite_page { uuid; title; revision } ->
-                         Protocol.V2_favorite_page
-                           { uuid
-                           ; title
-                           ; revision = Overlay.Page_state_revision.to_string revision
-                           }
-                       | Overlay.Favorite_block { uuid; title; task_status; revision } ->
-                         Protocol.V2_favorite_block
-                           { uuid
-                           ; title
-                           ; task_status = Option.map task_status_to_protocol task_status
-                           ; revision = Overlay.Block_state_revision.to_string revision
-                           }
-                     in
-                     Protocol.
-                       { membership_uuid = item.membership_uuid
-                       ; membership_order = item.membership_order
-                       ; membership_revision =
-                           Overlay.Block_state_revision.to_string item.membership_revision
-                       ; target
-                       })
-                  result.items
-              in
-              response
-                request
-                (Protocol.V2_favorites_outcome
-                   { favorites_page = result.favorites_page
-                   ; generation = Overlay.Generation.to_string result.version.generation
-                   ; projection_revision =
-                       Overlay.Projection_revision.to_string
-                         result.version.projection_revision
-                   ; items
-                   ; next_cursor = result.next_cursor
-                   }))
-         | V2_get_asset_descriptors { assets } ->
-           (match Database.get_asset_descriptors snapshot assets with
-            | Error error -> read_failure request error
-            | Ok items ->
-              let version = Database.snapshot_version snapshot in
-              response
-                request
-                (Protocol.V2_assets_outcome
-                   { items
-                   ; next_cursor = None
-                   ; generation = Overlay.Generation.to_string version.generation
-                   ; projection_revision =
-                       Overlay.Projection_revision.to_string version.projection_revision
-                   }))
-         | V2_list_assets { recursive; roots; limit; cursor } ->
-           (match
-              Database.get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor
-            with
-            | Error error -> read_failure request error
-            | Ok result ->
-              let version = Database.snapshot_version snapshot in
-              response
-                request
-                (Protocol.V2_assets_outcome
-                   { items = result.assets
-                   ; next_cursor = result.next_cursor
-                   ; generation = Overlay.Generation.to_string version.generation
-                   ; projection_revision =
-                       Overlay.Projection_revision.to_string version.projection_revision
-                   }))
-         | V2_list_journals { from_day; through_day; limit; cursor; _ } ->
-           (match
-              Database.get_journals snapshot ~from_day ~through_day ~limit ~cursor
-            with
-            | Error error -> read_failure request error
-            | Ok result ->
-              query_evidence "journals"
-                (List.map (fun (item : Overlay.journal_item) -> item.page.page.uuid) result.items)
-                (Option.is_some result.next_cursor);
-              let items =
-                result.items
-                |> List.map (fun (item : Overlay.journal_item) ->
-                  Protocol.
-                    { page = item.page.page
-                    ; journal_day = item.journal_day
-                    ; revision = Overlay.Page_state_revision.to_string item.revision
-                    })
-              in
-              response
-                request
-                (Protocol.V2_journals_outcome { items; next_cursor = result.next_cursor }))
-         | V2_get_page { page; _ } ->
-           (match Database.get_pages snapshot [ page ] with
-            | Ok [ Overlay.Present_page { value; revision } ] ->
-              page_read_evidence "present" value.page.uuid;
-              response
-                request
-                (Protocol.V2_page_outcome
-                   (V2_present_page
-                      { page = value.page
-                      ; revision = Overlay.Page_state_revision.to_string revision
-                      }))
-            | Ok [ Missing_page { uuid; revision } ] ->
-              page_read_evidence "missing" uuid;
-              response
-                request
-                (Protocol.V2_page_outcome
-                   (V2_missing_page
-                      { uuid; revision = Overlay.Page_state_revision.to_string revision }))
-            | Error error -> read_failure ~code:Corrupt_storage request error
-            | Ok _ -> failure request Corrupt_storage "The page lookup failed.")
-         | V2_get_outline_block { block; _ } ->
-           (match Database.get_outline_blocks snapshot [ block ] with
-            | Ok [ Overlay.Present_block { value; revision } ] ->
-              response
-                request
-                (Protocol.V2_block_outcome
-                   (V2_present_block
-                      { value = block_record value
-                      ; revision = Overlay.Block_state_revision.to_string revision
-                      }))
-            | Ok [ Missing_block { uuid; revision } ] ->
-              response
-                request
-                (Protocol.V2_block_outcome
-                   (V2_missing_block
-                      { uuid; revision = Overlay.Block_state_revision.to_string revision }))
-            | Error error -> read_failure ~code:Corrupt_storage request error
-            | Ok _ -> failure request Corrupt_storage "The block lookup failed.")
-         | V2_get_outline_block_summary { block; limit; cursor } ->
-           let version = Database.snapshot_version snapshot in
-           let summary lookup page scope_revision items next_cursor =
-             response
-               request
-               (Protocol.V2_block_summary_outcome
-                  { lookup
-                  ; page
-                  ; scope_revision
-                  ; items
-                  ; next_cursor
-                  ; generation = Overlay.Generation.to_string version.generation
-                  ; projection_revision =
-                      Overlay.Projection_revision.to_string version.projection_revision
-                  })
-           in
-           if limit < 1 || limit > Protocol.maximum_page_size
-           then failure request Invalid_request "Invalid block summary limit."
-           else (
-             match Database.get_outline_blocks snapshot [ block ] with
-             | Ok [ Overlay.Missing_block { uuid; revision } ] ->
-               summary
-                 (V2_missing_block
-                    { uuid; revision = Overlay.Block_state_revision.to_string revision })
-                 None
-                 ""
-                 []
-                 None
-             | Ok [ Overlay.Present_block { value; revision } ] ->
-               let lookup =
-                 Protocol.V2_present_block
-                   { value = block_record value
-                   ; revision = Overlay.Block_state_revision.to_string revision
-                   }
-               in
-               (match Database.get_pages snapshot [ value.block.page ] with
-                | Ok [ Overlay.Present_page { value = page; revision } ] ->
-                  let page =
-                    Some
-                      (Protocol.V2_present_page
-                         { page = page.page
-                         ; revision = Overlay.Page_state_revision.to_string revision
-                         })
-                  in
-                  (match
-                     Database.get_structure
-                       snapshot
-                       (Overlay.Children { parent = block; limit; cursor })
-                   with
-                   | Ok
-                       (Overlay.Children_result { scope_revision; items; next_cursor; _ })
-                     ->
-                     summary
-                       lookup
-                       page
-                       (Overlay.Scope_revision.to_string scope_revision)
-                       (List.map
-                          (fun (item : Overlay.child_member) ->
-                             Protocol.
-                               { value = block_record item.block
-                               ; revision =
-                                   Overlay.Block_state_revision.to_string item.revision
-                               })
-                          items)
-                       next_cursor
-                   | Error error -> read_failure request error
-                   | Ok (Page_tree_result _) ->
-                     failure
-                       request
-                       Invalid_request
-                       "The target children query returned a page tree.")
-                | Ok [ Missing_page { uuid; revision } ] ->
-                  summary
-                    lookup
-                    (Some
-                       (V2_missing_page
-                          { uuid
-                          ; revision = Overlay.Page_state_revision.to_string revision
-                          }))
-                    ""
-                    []
-                    None
-                | Error error -> read_failure ~code:Corrupt_storage request error
-                | Ok _ ->
-                  failure request Corrupt_storage "The target page lookup failed.")
-             | Error error -> read_failure request error
-             | Ok _ -> failure request Corrupt_storage "The target block lookup failed.")
-         | V2_get_children { parent; limit; cursor; _ } ->
-           (match
-              Database.get_structure snapshot (Overlay.Children { parent; limit; cursor })
-            with
-            | Ok
-                (Overlay.Children_result
-                   { parent; revision_scope; scope_revision; items; next_cursor }) ->
-              query_evidence "children" ~target:parent
-                (List.map (fun (item : Overlay.child_member) -> item.block.block.uuid) items)
-                (Option.is_some next_cursor);
-              response
-                request
-                (Protocol.V2_children_outcome
-                   { parent
-                   ; revision_scope = revision_scope_to_protocol revision_scope
-                   ; scope_revision = Overlay.Scope_revision.to_string scope_revision
-                   ; items =
-                       List.map
-                         (fun (item : Overlay.child_member) ->
-                            Protocol.
-                              { value = block_record item.Overlay.block
-                              ; revision =
-                                  Overlay.Block_state_revision.to_string item.revision
-                              })
-                         items
-                   ; next_cursor
-                   })
-            | Error error -> read_failure request error
-            | Ok (Page_tree_result _) ->
-              failure request Invalid_request "The children query returned a page tree.")
-         | V2_get_page_tree { page; maximum_depth; limit; cursor; _ } ->
-           (match
-              Database.get_structure
-                snapshot
-                (Overlay.Page_tree { page; maximum_depth; limit; cursor })
-            with
-            | Ok (Overlay.Page_tree_result { page; maximum_depth; items; next_cursor }) ->
-              query_evidence "page-tree" ~target:page
-                (List.map (fun (item : Overlay.tree_member) -> item.block.block.uuid) items)
-                (Option.is_some next_cursor);
-              response
-                request
-                (Protocol.V2_page_tree_outcome
-                   { page
-                   ; maximum_depth
-                   ; items =
-                       List.map
-                         (fun (item : Overlay.tree_member) ->
-                            Protocol.
-                              { value = block_record item.Overlay.block
-                              ; revision =
-                                  Overlay.Block_state_revision.to_string item.revision
-                              ; depth = item.depth
-                              ; parent = item.parent
-                              })
-                         items
-                   ; next_cursor
-                   })
-            | Error error -> read_failure request error
-            | Ok (Children_result _) ->
-              failure request Invalid_request "The page-tree query returned children.")
-         | V2_set_asset_reference _
-         | V2_save_block _
-         | V2_insert_blocks _
-         | V2_delete_blocks _
-         | V2_create_journal_page _
-         | V2_set_task_status _
-         | V2_clear_task_status _
-         | V2_pull_changes _
-         | V2_ack_changes _ ->
-           failure request Invalid_request "The command is not a snapshot read.")
+(* A single pinned snapshot supplies each canonical value, including enrichment
+   and every summary member. Changes retain their separate physical owner. *)
+let read_typed
+  : type a. ?snapshot:Database.snapshot -> ?release_snapshot:bool
+    -> maximum_bytes:int -> changes:(generation:string -> after:string option -> limit:int -> (Read.change_batch,Read.error)result)
+    -> on_enrichment_error:(unit -> unit) -> Database.t -> Read.read_budget -> a Read.query -> (a,Read.error)result
+  = fun ?snapshot ?(release_snapshot=true) ~maximum_bytes ~changes ~on_enrichment_error database budget query ->
+  let module F=Read.For_worker in
+  let owner=F.read_budget_owner budget in
+  let limit=F.read_budget_maximum_items budget in
+  let next cursor=Option.map(fun cursor->F.continuation ~owner ~budget ~key:(Read.query_key budget query) ~cursor)cursor in
+  let fail code message=Error(Read.Db_error(Logseq_db_worker_contract.Error.create ~code ~message ~details:[] |> Result.get_ok)) in
+  let checked value=Result.bind value(fun value->Result.map(fun()->value)(Read.validate_value owner budget query value)) in
+  let fit read =
+    let rec loop limit=match read limit with
+      |Ok value when Read.encoded_value_bytes query value>min maximum_bytes(F.read_budget_maximum_bytes budget)->
+        (match Read.smaller_page_size query limit with
+         |Some next->loop next|None->Error Read.Response_budget_exceeded)
+      |value->checked value in
+    loop limit in
+  let with_snapshot read =
+    match (match snapshot with Some value->Ok value|None->Database.current_snapshot database) with
+    |Error _->fail Closed_session "The graph snapshot is unavailable."
+    |Ok snapshot->Fun.protect ~finally:(fun()->if release_snapshot then Database.release_snapshot snapshot)(fun()->
+      let exception Enrichment_failed of Read.error in
+      let titles=Hashtbl.create 16 in
+      let record (value:Overlay.block_record)=
+        let missing=List.filter(fun uuid->not(Hashtbl.mem titles(Graph.Uuid.to_string uuid)))value.block.tags in
+        if missing<>[] then (match Database.get_pages snapshot missing with
+          |Error error->on_enrichment_error();raise(Enrichment_failed(typed_read_error error))
+          |Ok pages->List.iter(function
+            |Overlay.Present_page{value;_}->Hashtbl.replace titles(Graph.Uuid.to_string value.page.uuid)(Some value.page.title)
+            |Missing_page{uuid;_}->Hashtbl.replace titles(Graph.Uuid.to_string uuid)None)pages);
+        let tag_titles=List.filter_map(fun uuid->Option.join(Hashtbl.find_opt titles(Graph.Uuid.to_string uuid)))value.block.tags in
+        block_record ~tag_titles value in
+      try fit (read snapshot record) with Enrichment_failed error->Error error) in
+  Result.bind(Read.checked_query owner budget query)(fun cursor->(
+    let page_lookup = function
+      |Overlay.Present_page{value;revision}->Worker_pure_data.V2_present_page{page=value.page;revision=Overlay.Page_state_revision.to_string revision}
+      |Missing_page{uuid;revision}->V2_missing_page{uuid;revision=Overlay.Page_state_revision.to_string revision} in
+    let block_lookup record = function
+      |Overlay.Present_block{value;revision}->Worker_pure_data.V2_present_block{value=record value;revision=Overlay.Block_state_revision.to_string revision}
+      |Missing_block{uuid;revision}->V2_missing_block{uuid;revision=Overlay.Block_state_revision.to_string revision} in
+    match query with
+    |Read.Changes{generation;after}->fit (fun limit->changes ~generation ~after ~limit)
+    |Admission->checked(match Database.inspect_admission database with
+      |Error _->fail Closed_session "Admission information is unavailable."
+      |Ok value->Ok Worker_pure_data.{active_records=value.active_records;active_bytes=value.active_bytes;
+        protected_wire_bytes=value.protected_wire_bytes;retained_origin_evidence_bytes=value.retained_origin_evidence_bytes;
+        maximum_records=value.maximum_records;maximum_bytes=value.maximum_bytes})
+    |Graph_info->with_snapshot (fun snapshot _ _->match Database.graph_info snapshot with
+      |Error error->Error(typed_read_error ~code:Corrupt_storage error)
+      |Ok info->let limits=info.Overlay.limits in Ok(F.graph_info ~graph_uuid:info.graph_uuid ~graph_name:info.graph_name
+        ~schema:info.schema ~admission_facts:info.admission_facts ~journal_title_format:info.journal_title_format
+        ~limits:Worker_pure_data.{response_budget_bytes=limits.response_budget_bytes;outbox_max_records=limits.outbox_max_records;
+          outbox_max_bytes=limits.outbox_max_bytes;change_max_items=limits.change_max_items;change_max_bytes=limits.change_max_bytes;
+          dispatcher_capacity=limits.dispatcher_capacity;wire_batch_max_bytes=limits.wire_batch_max_bytes}
+        ~generation:(Overlay.Generation.to_string info.version.generation)
+        ~projection_revision:(Overlay.Projection_revision.to_string info.version.projection_revision)))
+    |Journal day->with_snapshot (fun snapshot _ _->
+      let day=F.journal_day_value day in match Database.get_journals snapshot ~from_day:day ~through_day:day ~limit:1 ~cursor:None with
+      |Error error->Error(typed_read_error error)
+      |Ok{items=[];next_cursor=None}->Ok None
+      |Ok{items=[item];next_cursor=None} when item.journal_day=day->Ok(Some(F.page ~data:item.page.page ~revision:(Overlay.Page_state_revision.to_string item.revision)))
+      |Ok _->Error(Read.Protocol_mismatch "Response does not match the typed query"))
+    |Journals{from_day;through_day;_}->with_snapshot (fun snapshot _ limit->
+      Database.get_journals snapshot ~from_day:(F.journal_day_value from_day) ~through_day:(F.journal_day_value through_day) ~limit ~cursor
+      |> Result.map_error typed_read_error
+      |> Result.map(fun (result:Overlay.journal_list_result)->F.slice ~items:(List.map(fun(item:Overlay.journal_item)->Worker_pure_data.{page=item.page.page;
+        journal_day=item.journal_day;revision=Overlay.Page_state_revision.to_string item.revision})result.items) ~next:(next result.next_cursor)))
+    |Page{uuid;_}->with_snapshot (fun snapshot _ _->match Database.get_pages snapshot[uuid]with
+      |Error error->Error(typed_read_error ~code:Corrupt_storage error)
+      |Ok[value]->Ok(page_lookup value)
+      |Ok _->fail Corrupt_storage "The page lookup failed.")
+    |Outline_block{uuid;_}->with_snapshot (fun snapshot record _->match Database.get_outline_blocks snapshot[uuid]with
+      |Error error->Error(typed_read_error ~code:Corrupt_storage error)
+      |Ok[value]->Ok(block_lookup record value)
+      |Ok _->fail Corrupt_storage "The block lookup failed.")
+    |Block_summary{block;_}->with_snapshot(fun snapshot record limit->
+      let version=Database.snapshot_version snapshot in
+      let summary lookup page scope_revision items next_cursor=Ok(F.block_summary ~lookup ~page ~scope_revision ~items ~next:(next next_cursor)
+        ~generation:(Overlay.Generation.to_string version.generation) ~projection_revision:(Overlay.Projection_revision.to_string version.projection_revision))in
+      match Database.get_outline_blocks snapshot[block]with
+      |Error error->Error(typed_read_error error)
+      |Ok[Overlay.Missing_block _ as value]->summary(block_lookup record value)None "" [] None
+      |Ok[Present_block{value;_}as original]->
+        let lookup=block_lookup record original in
+        (match Database.get_pages snapshot[value.block.page]with
+         |Error error->Error(typed_read_error ~code:Corrupt_storage error)
+         |Ok[Missing_page _ as page]->summary lookup(Some(page_lookup page))""[]None
+         |Ok[Present_page _ as page]->
+           (match Database.get_structure snapshot(Overlay.Children{parent=block;limit;cursor})with
+            |Error error->Error(typed_read_error error)
+            |Ok(Page_tree_result _)->fail Invalid_request "The target children query returned a page tree."
+            |Ok(Children_result{scope_revision;items;next_cursor;_})->summary lookup(Some(page_lookup page))
+              (Overlay.Scope_revision.to_string scope_revision)
+              (List.map(fun(item:Overlay.child_member)->Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision})items)next_cursor)
+         |Ok _->fail Corrupt_storage "The target page lookup failed.")
+      |Ok _->fail Corrupt_storage "The target block lookup failed.")
+    |Children{parent;_}->with_snapshot(fun snapshot record limit->
+      match Database.get_structure snapshot(Overlay.Children{parent;limit;cursor})with
+      |Error error->Error(typed_read_error error)
+      |Ok(Page_tree_result _)->fail Invalid_request "The children query returned a page tree."
+      |Ok(Children_result{items;next_cursor;_})->Ok(F.slice
+        ~items:(List.map(fun(item:Overlay.child_member)->F.block ~data:(record item.block) ~revision:(Overlay.Block_state_revision.to_string item.revision))items)
+        ~next:(next next_cursor)))
+    |Child_members{parent;_}->with_snapshot(fun snapshot record limit->
+      match Database.get_structure snapshot(Overlay.Children{parent;limit;cursor})with
+      |Error error->Error(typed_read_error error)
+      |Ok(Page_tree_result _)->fail Invalid_request "The children query returned a page tree."
+      |Ok(Children_result{parent;revision_scope;scope_revision;items;next_cursor})->Ok(F.children ~parent
+        ~revision_scope:(revision_scope_to_protocol revision_scope) ~scope_revision:(Overlay.Scope_revision.to_string scope_revision)
+        ~items:(List.map(fun(item:Overlay.child_member)->Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision})items)
+        ~next:(next next_cursor)))
+    |Tree{page;maximum_depth;_}->with_snapshot(fun snapshot record limit->
+      match Database.get_structure snapshot(Overlay.Page_tree{page;maximum_depth;limit;cursor})with
+      |Error error->Error(typed_read_error error)
+      |Ok(Children_result _)->fail Invalid_request "The page-tree query returned children."
+      |Ok(Page_tree_result{items;next_cursor;_})->Ok(F.slice
+        ~items:(List.map(fun(item:Overlay.tree_member)->Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision;
+          depth=item.depth;parent=item.parent})items) ~next:(next next_cursor)))
+    |Favorites _->with_snapshot(fun snapshot _ limit->
+      Database.get_favorites snapshot ~limit ~cursor |>Result.map_error typed_read_error |>Result.map(fun (result:Overlay.favorites_result)->
+        let items=List.map(fun(item:Overlay.favorite_item)->
+          let target=match item.target with
+            |Overlay.Favorite_page{uuid;title;revision}->Worker_pure_data.V2_favorite_page{uuid;title;revision=Overlay.Page_state_revision.to_string revision}
+            |Favorite_block{uuid;title;task_status;revision}->V2_favorite_block{uuid;title;task_status=Option.map task_status_to_protocol task_status;
+              revision=Overlay.Block_state_revision.to_string revision}in
+          Worker_pure_data.{membership_uuid=item.membership_uuid;membership_order=item.membership_order;
+            membership_revision=Overlay.Block_state_revision.to_string item.membership_revision;target})result.items in
+        F.favorites ~favorites_page:result.favorites_page ~items ~next:(next result.next_cursor)
+          ~generation:(Overlay.Generation.to_string result.version.generation) ~projection_revision:(Overlay.Projection_revision.to_string result.version.projection_revision)))
+    |Task_statuses _->with_snapshot(fun snapshot _ limit->
+      Database.get_task_statuses snapshot ~limit ~cursor |>Result.map_error typed_read_error |>Result.map(fun (result:Overlay.task_status_catalog_result)->
+        F.task_status_catalog ~property_uuid:result.property_uuid ~default_status:result.default_status ~items:result.items ~next:(next result.next_cursor)))
+    |Task_status_definitions ids->with_snapshot(fun snapshot _ _->Database.get_task_status_definitions snapshot ids |>Result.map_error typed_read_error)
+    |Asset_descriptors ids->with_snapshot(fun snapshot _ _->
+      Database.get_asset_descriptors snapshot ids |>Result.map_error typed_read_error |>Result.map(fun items->
+        let module Asset_ids=Map.Make(Graph.Uuid) in
+        let descriptors=List.fold_left (fun found descriptor->
+          Asset_ids.add descriptor.Logseq_db_types.Asset_descriptor.uuid descriptor found)
+          Asset_ids.empty items in
+        let items=List.map (fun uuid->Asset_ids.find_opt uuid descriptors) ids in
+        let version=Database.snapshot_version snapshot in F.asset_lookup_result ~items
+          ~generation:(Overlay.Generation.to_string version.generation) ~projection_revision:(Overlay.Projection_revision.to_string version.projection_revision)))
+    |Assets{recursive;roots;_}->with_snapshot(fun snapshot _ limit->
+      Database.get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor |>Result.map_error typed_read_error |>Result.map(fun (result:Database.asset_page)->
+        let version=Database.snapshot_version snapshot in F.asset_listing ~items:result.assets ~next:(next result.next_cursor)
+          ~generation:(Overlay.Generation.to_string version.generation) ~projection_revision:(Overlay.Projection_revision.to_string version.projection_revision))) : (a,Read.error)result))
 ;;
 
 let index_after session cursor =
@@ -1685,103 +1608,469 @@ let index_after session cursor =
       session.windows)
 ;;
 
-let cursor_resync session request reason =
-  response
-    request
-    (Protocol.V2_resync_required { generation = session.generation; reason })
+let pull_typed_changes session owner ~generation ~after ~limit =
+  if generation<>session.generation then Error(Read.Resync_required "generationChanged") else
+  let start=match after with None->Some 0|Some cursor->index_after session cursor in
+  match start with
+  |None->Error(Read.Resync_required "changeCursorUnavailable")
+  |Some start->
+    let available=Rrbvec.length session.windows-start in
+    let count=min limit available in
+    let windows=Rrbvec.subvec session.windows start(start+count) |> Option.get in
+    let through=match Rrbvec.peek_back_opt windows with
+      |Some window->window.id|None->Option.value after ~default:session.acknowledged_through in
+    let items=Rrbvec.fold_right(fun(window:change_window) rest->Worker_pure_data.{id=window.id;
+      predecessor=window.predecessor;successor=window.successor;block_uuids=window.block_uuids;
+      page_uuids=window.page_uuids;structure_interests=window.structure_interests}::rest)windows [] in
+    Ok(Read.For_worker.change_batch ~change_owner:owner ~generation ~from_exclusive:after ~through
+      ~windows:items ~next:(if count<available then Some through else None))
 ;;
 
-let pull_changes session request generation after limit =
-  if not (String.equal generation session.generation)
-  then cursor_resync session request "generationChanged"
-  else (
-    let start =
-      match after with
-      | None -> Some 0
-      | Some cursor -> index_after session cursor
+let observation_alive t slot = (not t.stopped) && (not slot.closing) && slot.current ()
+
+let sample_observation ?snapshot t slot =
+  Fun.protect
+    ~finally:(fun () -> Option.iter Database.release_snapshot snapshot)
+    (fun () ->
+       match Hashtbl.find_opt t.databases slot.database_id with
+       | None -> Error "Observation graph is no longer attached"
+       | Some session ->
+         if not (observation_alive t slot)
+         then Error "Observation execution was retired"
+         else (
+           let Read.Read_query(budget,query)=slot.read in
+           let owner=Read.For_worker.read_budget_owner budget in
+           let response=Read.For_worker.answer budget query (read_typed ?snapshot
+             ~release_snapshot:(Option.is_none snapshot) ~maximum_bytes:t.dependencies.config.response_budget_bytes
+             ~changes:(pull_typed_changes session owner) ~on_enrichment_error:(fun()->()) session.database budget query) in
+           if observation_alive t slot
+           then Ok response
+           else Error "Observation execution was retired"))
+;;
+
+let invalidate_observation t slot _change =
+  if observation_alive t slot
+  then (
+    let next, epoch =
+      Core.Observation_registry.advance
+        t.observation_registry
+        ~registration:slot.registration
+        ~id:slot.logical_id
     in
-    match start with
-    | None -> cursor_resync session request "changeCursorUnavailable"
-    | Some start ->
-      let available = Rrbvec.length session.windows - start in
-      let count = min (max 0 limit) available in
-      let selected = Rrbvec.subvec session.windows start (start + count) |> Option.get in
-      let through =
-        match Rrbvec.peek_back_opt selected with
-        | Some window -> window.id
-        | None -> Option.value after ~default:session.acknowledged_through
-      in
-      let next = if count < available then Some through else None in
-      response
-        request
-        (Protocol.V2_changes
-           { generation
-           ; from_exclusive = after
-           ; through
-           ; next
-           ; windows =
-               Rrbvec.fold_right
-                 (fun (window : change_window) rest ->
-                    Protocol.
-                      { id = window.id
-                      ; predecessor = window.predecessor
-                      ; successor = window.successor
-                      ; block_uuids = window.block_uuids
-                      ; page_uuids = window.page_uuids
-                      ; structure_interests = window.structure_interests
-                      }
-                    :: rest)
-                 selected
-                 []
-           }))
+    t.observation_registry <- next;
+    Option.iter (fun epoch -> slot.notify ~epoch) epoch)
 ;;
 
-let acknowledge_changes session request generation through =
-  if not (String.equal generation session.generation)
-  then cursor_resync session request "generationChanged"
+let register_observation
+      t
+      ~registration
+      ~id
+      ~scope
+      ~read
+      ~current
+      ~notify
+  =
+  if
+    t.stopped
+    || (not (current ()))
+  then Error "Observation execution is not current"
   else (
-    match index_after session through with
-    | None -> cursor_resync session request "changeCursorUnavailable"
-    | Some start ->
-      session.windows
-      <- Rrbvec.subvec session.windows start (Rrbvec.length session.windows) |> Option.get;
-      session.acknowledged_through <- through;
-      response request (Protocol.V2_changes_acknowledged { generation; through }))
+    let next, decision =
+      Core.Observation_registry.reserve
+        t.observation_registry
+        ~registration
+        ~id
+        ~scope
+        ~read
+    in
+    t.observation_registry <- next;
+    match decision with
+    | Existing ->
+      (match Hashtbl.find_opt t.observation_slots (registration, id) with
+       | Some slot ->
+         Eio.Promise.await slot.initial
+       | None -> Error "Observation allocation is unavailable")
+    | Retired | Mismatch | Full | Invalid -> Error "Observation registration was refused"
+    | Start ->
+      (match Hashtbl.find_opt t.attachments scope with
+       | None ->
+         ignore (release_observation t ~registration ~id ~scope);
+         Error "Observation graph is no longer attached"
+       | Some database_id ->
+         let initial, initial_resolve = Eio.Promise.create () in
+         let slot =
+           { registration
+           ; logical_id = id
+           ; observation_scope = scope
+           ; database_id
+           ; read
+           ; current
+           ; notify
+           ; initial
+           ; initial_resolve
+           ; subscription = None
+           ; closing = false
+           ; work = 0
+           ; idle = Eio.Promise.create ()
+           }
+         in
+         Hashtbl.add t.observation_slots (registration, id) slot;
+         observation_work_start slot;
+         let result = ref (Error "Observation registration interrupted") in
+         Eio.Cancel.protect (fun () ->
+           Fun.protect
+             ~finally:(fun () ->
+               if slot.closing
+               then (
+                 Option.iter Database.unlisten slot.subscription;
+                 slot.subscription <- None);
+               observation_work_finish slot;
+               (match !result with
+                | Error _ -> ignore (release_observation t ~registration ~id ~scope)
+                | Ok _ -> ());
+               ignore (Eio.Promise.try_resolve slot.initial_resolve !result : bool))
+             (fun () ->
+                (result
+                 := try
+                      match Hashtbl.find_opt t.databases database_id with
+                      | None -> Error "Observation graph is no longer attached"
+                      | Some session ->
+                        (match Database.listen session.database with
+                         | Error _ -> Error "Observation listener could not register"
+                         | Ok (subscription, snapshot) ->
+                           slot.subscription <- Some subscription;
+                           (match sample_observation ~snapshot t slot with
+                            | Error _ as error -> error
+                            | Ok response ->
+                              (match
+                                 Database.activate_subscription
+                                   subscription
+                                   ~notify:(invalidate_observation t slot)
+                               with
+                               | Error _ -> Error "Observation replay could not activate"
+                               | Ok () -> Ok (0L, response))))
+                    with
+                    | _ -> Error "Observation registration failed");
+                !result))))
 ;;
-
-let execute_database ~on_enrichment_error session ~response_budget_bytes request =
-  match request.Protocol.command with
-  | Protocol.V2_pull_changes { generation; after; limit } ->
-    pull_changes session request generation after limit
-  | V2_ack_changes { generation; through } ->
-    acknowledge_changes session request generation through
-  | V2_inspect_admission -> inspect_admission session.database request
-  | ( V2_set_asset_reference _
-    | V2_save_block _
-    | V2_insert_blocks _
-    | V2_delete_blocks _
-    | V2_create_journal_page _
-    | V2_set_task_status _
-    | V2_clear_task_status _ ) as command ->
-    execute_mutation session.database request command
-  | command ->
-    let result = read_snapshot ~on_enrichment_error session.database request command in
-    let budget = min response_budget_bytes Protocol.maximum_response_bytes in
-    if Protocol.encoded_response_bytes result <= budget
-    then result
-    else
-      failure
-        request
-        Response_too_large
-        "The encoded read response exceeded its byte limit."
+let refresh_observation t ~registration ~id ~scope =
+  match Hashtbl.find_opt t.observation_slots (registration, id) with
+  | None -> Error "Observation registration is not active"
+  | Some slot ->
+    let _, decision =
+      Core.Observation_registry.reserve
+        t.observation_registry
+        ~registration
+        ~id
+        ~scope
+        ~read:slot.read
+    in
+    if decision <> Core.Observation_registry.Existing
+    then Error "Observation owner mismatch"
+    else (
+      let initial = Eio.Promise.await slot.initial in
+      match initial with
+      | Error _ as error -> error
+      | Ok _ when not (observation_alive t slot) ->
+        Error "Observation execution was retired"
+      | Ok _ ->
+        let next, epoch =
+          Core.Observation_registry.advance t.observation_registry ~registration ~id
+        in
+        t.observation_registry <- next;
+        (match epoch with
+         | None -> Error "Observation epoch is unavailable"
+         | Some epoch ->
+           observation_work_start slot;
+           Fun.protect
+             ~finally:(fun () -> observation_work_finish slot)
+             (fun () ->
+                let outcome =
+                  sample_observation t slot
+                in
+                match outcome with
+                | Ok response
+                  when Core.Observation_registry.current
+                         t.observation_registry
+                         ~registration
+                         ~id
+                         ~epoch -> Ok (epoch, response)
+                | Ok _ -> Error "Observation read was superseded"
+                | Error _ as error -> error)))
 ;;
-
 let sync_result ?event ?(lifecycle = Core.Lifecycle_unchanged) () =
   Core.{ event; lifecycle }
 ;;
 
 let attached_session t scope =
   Option.bind (Hashtbl.find_opt t.attachments scope) (Hashtbl.find_opt t.databases)
+;;
+
+let retire_changefeed t ~registration =
+  Hashtbl.iter(fun _ session->session.changefeed<-Core.Changefeed_owner.retire session.changefeed ~registration) t.databases
+;;
+let execute_typed_read t session (Read.Read_query(budget,query) as read) =
+  let owner=Read.For_worker.read_budget_owner budget in
+  let registration=Read.For_worker.binding_serial(Read.For_worker.session_binding owner) in
+  let execute : type a. a Read.query -> (a,Read.error)result = fun query ->
+    if not(Read.matches_asset_scope owner session.graph_scope) then Error Read.Revoked_session
+    else match Read.validate_query owner budget query with
+    |Error error->Error error
+    |Ok()->
+      let changes ~generation ~after ~limit = pull_typed_changes session owner ~generation ~after ~limit in
+      let perform ()=read_typed ~maximum_bytes:t.dependencies.config.response_budget_bytes ~changes
+        ~on_enrichment_error:(fun()->report_current_graph t session.graph_scope "worker.readTagTitles")
+        session.database budget query in
+      match query with
+      |Read.Changes _->
+        let state,claimed=Core.Changefeed_owner.claim session.changefeed ~registration in
+        session.changefeed<-state;
+        if not claimed then Error(Read.Service_failed "Another registration still owns the changefeed") else
+        (match Core.Changefeed_owner.pull state ~registration ~read with
+         |Refused->Error(Read.Service_failed "The pending changefeed batch must be applied and acknowledged first")
+         |Cached batch->Ok batch
+         |Read->Result.bind(perform())(fun batch->
+           match Core.Changefeed_owner.remember state ~registration ~read batch with
+           |Ok next->session.changefeed<-next;Ok batch
+           |Error message->Error(Read.Protocol_mismatch message)))
+      |_->perform() in
+  Read.For_worker.answer budget query (execute query)
+;;
+let acknowledge_change_batch t ~registration ~scope ~(batch:Read.change_batch) ~current =
+  let owner=Read.change_batch_session batch in
+  if t.stopped || not(current()) || not(Read.matches_asset_scope owner scope)
+     || Read.For_worker.binding_serial(Read.For_worker.session_binding owner)<>registration
+  then Error Read.Revoked_session else
+  match reserve_writer t scope with
+  |Error message->Error(Read.Service_failed message)
+  |Ok job->Fun.protect ~finally:(fun()->finish_writer t job)(fun()->match attached_session t scope with
+    |None->Error Read.Revoked_session
+    |Some session->
+      let state=session.changefeed in
+      if batch.generation<>session.generation then Error(Read.Resync_required "generationChanged")
+      else if Core.Changefeed_owner.needs_resync state then Error(Read.Resync_required "changeHistoryInvalidated")
+      else if not(Core.Changefeed_owner.may_ack state ~registration ~generation:batch.generation ~through:batch.through)
+      then Error(Read.Service_failed "The changefeed ACK is not backed by this owner's delivered batch")
+      else match index_after session batch.through with
+      |None->Error(Read.Resync_required "changeCursorUnavailable")
+      |Some start->
+        let removed=Rrbvec.subvec session.windows 0 start |> Option.get in
+        let encoded_bytes=Rrbvec.fold_left(fun total window->total+window.encoded_bytes)0 removed in
+        session.changefeed<-Core.Changefeed_owner.release_windows state ~count:start ~encoded_bytes;
+        session.windows<-Rrbvec.subvec session.windows start(Rrbvec.length session.windows)|>Option.get;
+        session.acknowledged_through<-batch.through;
+        session.changefeed<-Core.Changefeed_owner.acknowledged session.changefeed ~registration
+          ~generation:batch.generation ~through:batch.through;
+        Ok(Read.For_worker.change_ack ~ack_owner:owner ~generation:batch.generation ~through:batch.through))
+;;
+
+let run_durable_mutation t ~(scope:Sync.graph_scope) ~intent ~current =
+  let module Mutation=Logseq_db_worker_contract.Worker_pure_mutation in
+  if not(mutation_owner_matches scope intent)then
+    Mutation.Rejected(worker_error ~code:Invalid_request "Durable intent logical owner does not match")
+  else if t.stopped || not(current())then Mutation.Unknown else
+  match attached_session t scope with
+  |None->Mutation.Unknown
+  |Some session->
+    let payload=Mutation.encode intent in
+    let existing()=Database.find_local_intent session.database ~namespace:(Mutation.namespace intent)
+      ~mutation_id:(Mutation.mutation_id intent)in
+    let matching prepared=Database.local_intent_payload prepared=payload in
+    let reject error=Mutation.Rejected(local_commit_error error)in
+    let prepare()=match existing()with
+      |Error _->Error Mutation.Unknown
+      |Ok(Some prepared)when matching prepared->Ok prepared
+      |Ok(Some _)->Error(reject Overlay.Mutation_identity_conflict)
+      |Ok None->
+        let append_title=match intent with
+          |Mutation.Append_intent append->
+            (match Database.current_snapshot session.database with
+             |Error _->Error Mutation.Unknown
+             |Ok snapshot->Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
+               match Database.graph_info snapshot with
+               |Error _->Error Mutation.Unknown
+               |Ok info->Ok(Some(journal_append_title info.journal_title_format
+                  (Logseq_db_worker_contract.Worker_pure_day.value(Mutation.append_parameters append).day)))))
+          |Mutation.Mutation_intent _->Ok None in
+        Result.bind append_title(fun append_title->
+          let raw,mutation=local_mutation ?append_title intent in
+          match parse_preconditions raw with
+          |Error message->Error(Mutation.Rejected(worker_error ~code:Conflict message))
+          |Ok expected->
+            match Database.persist_local_intent session.database ~namespace:(Mutation.namespace intent)
+              ~payload ~expected mutation with
+            |Ok prepared->Ok prepared
+            |Error(Overlay.Invalid_local_mutation _ as error)
+            |Error(Overlay.Mutation_identity_conflict as error)->
+              (match existing()with Ok(Some prepared)when matching prepared->Ok prepared|_->Error(reject error))
+            |Error _->Error Mutation.Unknown)in
+    match prepare()with
+    |Error outcome->outcome
+    |Ok prepared->
+      if t.stopped || not(current())then Mutation.Unknown else
+      match Database.commit_local_intent session.database prepared with
+      |Error _->(match Database.inspect_local_intent session.database prepared with
+        |Ok(Database.Intent_rejected error)->reject error|_->Mutation.Unknown)
+      |Ok proof->Mutation.Committed(commit_proof(Database.intent_commit_outcome proof))
+;;
+
+let durable_mutation t ~scope ~intent ~current =
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
+  match reserve_writer t scope with
+  |Error _->Wire.Unknown
+  |Ok job->
+    (* Reservation precedes any semaphore wait or fork. Once submitted, only the
+       physical protected task releases it, even if its Service waiter cancels. *)
+    let submitted=ref false and acquired=ref false in
+    let promise,resolve=Eio.Promise.create() in
+    Fun.protect
+      ~finally:(fun()->if not !submitted then (
+        if !acquired then Eio.Semaphore.release t.durable_slots;
+        finish_writer t job))
+      (fun()->
+        Eio.Semaphore.acquire t.durable_slots;acquired:=true;
+        Eio.Cancel.protect(fun()->
+          t.dependencies.runtime.fork ~sw:t.sw(fun()->
+            Fun.protect ~finally:(fun()->
+              Eio.Semaphore.release t.durable_slots;finish_writer t job)
+              (fun()->
+                let outcome=try run_durable_mutation t ~scope ~intent ~current with _->Wire.Unknown in
+                ignore(Eio.Promise.try_resolve resolve outcome:bool)));
+          submitted:=true);
+        Eio.Promise.await promise)
+;;
+
+let confirm_mutation_unfenced t ~(scope:Sync.graph_scope) ~read:(Read.Read_query(budget,query) as read) ~intent ~original ~current =
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
+  let fail message=Read.For_worker.answer budget query(Error(Read.Db_error
+    (Logseq_db_worker_contract.Error.create ~code:Conflict ~message ~details:[]|>Result.get_ok)))in
+  match mutation_owner_matches scope intent with
+  |false->fail "Durable intent logical owner does not match"
+  |true->
+    let wire=intent in
+    let payload=Wire.encode intent in
+    if t.stopped || not(current())then fail "The confirmation presentation retired."else
+    match attached_session t scope with
+    |None->fail "The scoped database is no longer attached."
+    |Some session->
+      let target_matches=match Wire.readback_target wire,query with
+        |`Page target,Read.Page{uuid;revision=None}->target=uuid
+        |`Block target,Read.Block_summary{block;after=None}->target=block
+        |_->false in
+      if not target_matches then fail "The canonical readback target does not match the intent."else
+      let checked=Result.bind(Database.find_local_intent session.database ~namespace:(Wire.namespace wire)
+        ~mutation_id:(Wire.mutation_id wire))(function
+        |None->Error Overlay.Mutation_identity_conflict
+        |Some prepared when Database.local_intent_payload prepared<>payload->Error Overlay.Mutation_identity_conflict
+        |Some prepared->Database.inspect_local_intent session.database prepared)in
+      match checked with
+      |Ok(Database.Intent_committed proof)->
+        let commit=Database.intent_commit_outcome proof in
+        let actual=Overlay.Generation.to_string commit.generation,
+          Overlay.Projection_revision.to_string commit.before_projection_revision,
+          Overlay.Projection_revision.to_string commit.after_projection_revision in
+        if actual<>original || not(current())then fail "The original commit evidence does not match."else
+        let answer=execute_typed_read t session read in
+        if current()then answer else fail "The confirmation presentation retired during readback."
+      |_->fail "No immutable original commit evidence is available."
+;;
+let confirm_mutation t ~scope ~read:(Read.Read_query(budget,query) as read) ~intent ~original ~current =
+  match reserve_writer t scope with
+  |Error message->Read.For_worker.answer budget query(Error(Read.Service_failed message))
+  |Ok job->Fun.protect ~finally:(fun()->finish_writer t job)
+    (fun()->confirm_mutation_unfenced t ~scope ~read ~intent ~original ~current)
+;;
+
+let recover_mutations_unfenced t ~(scope:Sync.graph_scope) ~after ~maximum_items ~maximum_bytes ~current =
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
+  let fail error=Error(Logseq_db_worker_contract.Error.message(local_commit_error error)) in
+  if maximum_items<=0 || maximum_items>256 || maximum_bytes<=0
+     || maximum_bytes>Wire.maximum_recovery_bytes || Option.exists(fun after->after<=0L)after
+  then Error "Invalid durable recovery budget or cursor"
+  else if t.stopped || not(current()) then Error "Durable recovery authority retired"
+  else match attached_session t scope with
+  | None->Error "The scoped database is no longer attached."
+  | Some session->
+    let namespace=Wire.namespace_for_owner ~origin:scope.account.managed_sync_origin
+      ~user:scope.account.user_id ~graph:scope.graph_id in
+    (* Fetch one indexed row at a time: the existing cursor belongs to a full
+       database page. This bounds resident payload bytes without guessing a row
+       cursor or skipping a row that does not fit the caller's remaining budget. *)
+    let rec loop cursor items =
+      if t.stopped || not(current()) then Error "Durable recovery authority retired" else
+      match Database.pending_local_intents session.database ~namespace ~after:cursor ~limit:1 with
+      | Error error->fail error
+      | Ok page->
+        (match page.items with
+         | []->Ok Wire.{items;next=None}
+         | [prepared]->
+           let intent=Database.local_intent_payload prepared in
+           (match Wire.restore ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id intent with
+            | Error _->Error "Stored durable intent owner or payload is invalid"
+            | Ok wire->
+              (match Database.inspect_local_intent session.database prepared with
+               | Error error->fail error
+               | Ok resolution->
+                 let outcome=match resolution with
+                   | Database.Intent_pending->Wire.Unknown
+                   | Intent_rejected error->Wire.Rejected(local_commit_error error)
+                   | Intent_committed proof->Wire.Committed(commit_proof(Database.intent_commit_outcome proof)) in
+                 let candidate=Wire.{items=Rrbvec.push_back items {intent=wire;outcome};next=page.next} in
+                 if Wire.recovery_page_bytes candidate>maximum_bytes then
+                   if Rrbvec.is_empty items then Error "A complete durable recovery item exceeds the byte budget"
+                   else Ok Wire.{items;next=cursor}
+                 else if candidate.next=None || Rrbvec.length candidate.items=maximum_items then Ok candidate
+                 else loop candidate.next candidate.items))
+         | _->Error "Durable recovery returned an invalid bounded page") in
+    Result.bind(loop after Rrbvec.empty)(fun page->
+      if not(current()) || t.stopped then Error "Durable recovery authority retired"
+      else if Wire.recovery_page_bytes page>maximum_bytes then Error "Durable recovery envelope exceeds the byte budget"
+      else Ok page)
+;;
+
+let recover_mutations t ~scope ~after ~maximum_items ~maximum_bytes ~current =
+  with_writer t scope(fun()->recover_mutations_unfenced t ~scope ~after ~maximum_items ~maximum_bytes ~current)
+;;
+
+let acknowledge_mutation_unfenced t ~(scope:Sync.graph_scope) ~intent ~original ~current =
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
+  let fail error=Error(Logseq_db_worker_contract.Error.message(local_commit_error error)) in
+  match mutation_owner_matches scope intent with
+  | false->Error "Durable intent owner or payload is invalid"
+  | true->
+    let wire=intent in
+    let payload=Wire.encode intent in
+    if t.stopped || not(current()) then Error "Durable acknowledgement authority retired" else
+    match attached_session t scope with
+    | None->Error "The scoped database is no longer attached."
+    | Some session->
+      (match Database.find_local_intent session.database ~namespace:(Wire.namespace wire) ~mutation_id:(Wire.mutation_id wire) with
+       | Error error->fail error
+       | Ok None->Error "No durable intent evidence is available"
+       | Ok(Some prepared) when Database.local_intent_payload prepared<>payload->Error "Durable intent identity does not match"
+       | Ok(Some prepared)->
+         match Database.inspect_local_intent session.database prepared with
+         | Error error->fail error
+         | Ok resolution->
+           if not(current()) then Error "Durable acknowledgement authority retired" else
+           let acknowledged=match original,resolution with
+             | None,Database.Intent_rejected _->Database.acknowledge_rejected_local_intent session.database prepared
+             | Some expected,Intent_committed proof->
+               let commit=Database.intent_commit_outcome proof in
+               let actual=Overlay.Generation.to_string commit.generation,
+                 Overlay.Projection_revision.to_string commit.before_projection_revision,
+                 Overlay.Projection_revision.to_string commit.after_projection_revision in
+               if expected=actual then Database.acknowledge_local_intent session.database proof
+               else Error Overlay.Mutation_identity_conflict
+             | _->Error(Overlay.Invalid_local_mutation "Intent has no matching settled acknowledgement proof") in
+           match acknowledged with
+           | Error error->fail error
+           | Ok() when current() && not t.stopped->Ok()
+           | Ok()->Error "Durable acknowledgement completed after authority retired")
+;;
+
+let acknowledge_mutation t ~scope ~intent ~original ~current =
+  with_writer t scope(fun()->acknowledge_mutation_unfenced t ~scope ~intent ~original ~current)
 ;;
 
 let protected_envelope (iv, ciphertext) =
@@ -2002,11 +2291,8 @@ let rec make_retirement_directory path =
 ;;
 
 let local_retirement_directory t (scope : Sync.graph_scope) =
-  let identity = Digest.to_hex (Digest.string
-    (Uri.to_string scope.account.managed_sync_origin ^ "\000" ^ scope.account.user_id)) in
-  Filename.concat t.dependencies.config.application_support_directory
-    (Filename.concat "logseq-db-worker/local-copy-retirements"
-       (Filename.concat identity (Graph.Uuid.to_string scope.graph_id)))
+  Filename.concat (local_retirement_account_directory t scope.account)
+    (Graph.Uuid.to_string scope.graph_id)
 ;;
 
 let fresh_retirement () =
@@ -2081,6 +2367,7 @@ let recover_local_retirements ?on_diagnostic t (scope : Sync.graph_scope) =
       let expected = json |> member "expected" |> to_string |> Overlay.Mirror_generation.of_string |> Result.get_ok in
       let captured = json |> member "uploads" |> Logseq_db_storage.Asset_upload_store.captured_graph_of_yojson |> Result.get_ok in
       if not (Logseq_db_storage.Asset_upload_store.captured_graph_matches captured
+        ~namespace:(Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id)
         ~origin:(Uri.to_string scope.account.managed_sync_origin) ~account:scope.account.user_id ~graph:scope.graph_id)
       then failwith "Retirement journal account mismatch";
       let* prepared, generation = Database.prepare_mirror_deletion
@@ -2121,6 +2408,39 @@ let recover_local_retirements ?on_diagnostic t (scope : Sync.graph_scope) =
       (try Sys.readdir directory with error ->
         report (exception_failure ~operation:"deleteMirror" ~reason:"restoreFailed" error);
         raise error)
+;;
+
+let prepare_host_copy t ~registration ~handoff_id ~(owner:Sync.account_scope) ~graph_id =
+  match t.host_copy with
+  |Some copy when copy.copy_bound=None && copy.copy_registration=registration
+      && copy.copy_graph=graph_id && copy.copy_owner.user_id=owner.user_id
+      && Uri.equal copy.copy_owner.managed_sync_origin owner.managed_sync_origin
+      && copy.copy_owner.account_generation=owner.account_generation
+      && copy.copy_owner.lifecycle_generation=owner.lifecycle_generation->
+    copy.copy_handoff<-handoff_id;Ok copy.copy_generation
+  |Some _->Error "Another host change still owns the exclusive local copy."
+  |None->
+    let scope:Sync.graph_scope={account=owner;graph_id;graph_generation=0} in
+    Result.bind(with_staging_lock t(fun()->recover_local_retirements t scope))(fun()->
+      let retirement=fresh_retirement() in
+      Database.prepare_mirror_deletion
+        ~application_support_directory:t.dependencies.config.application_support_directory ~graph_id ~retirement
+      |> Result.map_error(fun _->"The local copy is still in use or changed during handoff.")
+      |> Result.map(fun(prepared,generation)->
+        t.host_copy<-Some{copy_handoff=handoff_id;copy_registration=registration;copy_owner=owner;copy_graph=graph_id;copy_retirement=retirement;copy_preparation=prepared;copy_generation=generation;copy_bound=None};generation))
+;;
+let bind_host_copy t ~handoff_id (request:Sync.mirror_deletion)=
+  match t.host_copy with
+  |Some copy when copy.copy_handoff=handoff_id && copy.copy_bound=None
+     && copy.copy_graph=request.graph_id && copy.copy_owner.user_id=request.account.user_id
+     && Uri.equal copy.copy_owner.managed_sync_origin request.account.managed_sync_origin
+     && copy.copy_owner.account_generation=request.account.account_generation->copy.copy_bound<-Some request;Ok()
+  |_->Error(effect_error "The deletion does not own this exact prepared host copy.")
+;;
+let release_host_copy t ~registration =match t.host_copy with
+  |None->Ok()
+  |Some copy when copy.copy_registration<>registration->Error "The local-copy release owner does not match its registration."
+  |Some copy->Result.map(fun()->t.host_copy<-None)(Database.cancel_mirror_deletion_checked copy.copy_preparation)
 ;;
 
 let handle_sync_worker_effect t = function
@@ -2223,17 +2543,20 @@ let handle_sync_worker_effect t = function
           Error "Switch to another graph before deleting."
         | false -> Ok () in
       let* () = with_staging_lock t (fun () -> recover_local_retirements ~on_diagnostic:report t scope) in
-      let retirement = fresh_retirement () in
-      (* Ownership is acquired before any asset retirement or intent mutation. *)
-      let* prepared, expected = Database.prepare_mirror_deletion
-        ~application_support_directory:t.dependencies.config.application_support_directory
-        ~graph_id:request.graph_id ~retirement
-        |> Result.map_error (fun error ->
-          report (mirror_deletion_detail error);
-          match error with
-          | Overlay.Mirror_delete_busy -> "The local copy is still in use. Close attachment previews and try again."
-          | _ -> "The local copy changed. Refresh and try again.") in
-      Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion prepared) (fun () ->
+      (* A consumed host receipt supplies this original exclusive handle. Never
+         reacquire its namespace and accidentally compete with our own owner. *)
+      let* retirement,prepared,expected,host_owned=match t.host_copy with
+        |Some copy when copy.copy_bound=Some request->Ok(copy.copy_retirement,copy.copy_preparation,copy.copy_generation,true)
+        |Some _->Error "The local copy belongs to another host handoff."
+        |None->
+          let retirement=fresh_retirement() in
+          Database.prepare_mirror_deletion
+            ~application_support_directory:t.dependencies.config.application_support_directory
+            ~graph_id:request.graph_id ~retirement
+          |> Result.map_error(fun error->report(mirror_deletion_detail error);
+            "The local copy is still in use or changed. Refresh and try again.")
+          |> Result.map(fun(prepared,expected)->retirement,prepared,expected,false) in
+      Fun.protect ~finally:(fun () ->if not host_owned then Database.cancel_mirror_deletion prepared) (fun () ->
         let same_target (actual : Sync.graph_scope) = actual.graph_id=scope.graph_id
           && actual.account.user_id=scope.account.user_id
           && Uri.equal actual.account.managed_sync_origin scope.account.managed_sync_origin in
@@ -2251,6 +2574,7 @@ let handle_sync_worker_effect t = function
         with_staging_lock t (fun () ->
           let* () = if current () then Ok () else Error "The graph account is no longer current." in
           let* captured = with_upload_store t (fun db -> Logseq_db_storage.Asset_upload_store.capture_graph db
+            ~namespace:(Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner ~origin:request.account.managed_sync_origin ~user:request.account.user_id ~graph:request.graph_id)
             ~origin:(Uri.to_string request.account.managed_sync_origin) ~account:request.account.user_id ~graph:request.graph_id)
             |> Result.map_error (fun source ->
               report (failure_detail ~source ~operation:"deleteMirror" ~reason:"persistenceFailed" ()); source) in
@@ -2339,6 +2663,7 @@ let handle_sync_worker_effect t = function
                ; next_window = 1
                ; acknowledged_through = "change-window:v1:0"
                ; windows = Rrbvec.empty
+               ; changefeed=Core.Changefeed_owner.empty
                }
              in
              Hashtbl.replace t.databases database_id session;
@@ -2480,36 +2805,59 @@ let run_request t (type a) (request : a Core.runner_request)
   : (a, Core.effect_error) result
   =
   match request with
-  | Core.Execute_request { database; request } ->
+  | Core.Execute_request { database; read } ->
     (match Hashtbl.find_opt t.databases (Core.database_handle_id database) with
      | None -> Error (effect_error "The overlay database is unavailable.")
-     | Some session ->
-       Ok
-         (execute_database
-            ~on_enrichment_error:(fun () ->
-              report_current_graph t session.graph_scope "worker.readTagTitles")
-            session
-            ~response_budget_bytes:t.dependencies.config.response_budget_bytes
-            request))
+     | Some session -> Ok(execute_typed_read t session read))
   | Close_database database -> close_database_by_id t (Core.database_handle_id database)
   | Handle_sync_worker_effect worker_effect -> handle_sync_worker_effect t worker_effect
 ;;
 
-let complete t (Core.Request (ticket, request)) =
+let complete t ?writer (Core.Request (ticket, request)) =
+  Fun.protect ~finally:(fun()->Option.iter(finish_writer t)writer)(fun()->
+    match request with
+    |Core.Execute_request _->let result=run_request t request in
+      t.post(Core.Runner_completed(Core.Execute_request_completed(ticket,result)))
+    |Close_database _->let result=run_request t request in
+      t.post(Core.Runner_completed(Core.Close_database_completed(ticket,result)))
+    |Handle_sync_worker_effect _->let result=run_request t request in
+      t.post(Core.Runner_completed(Core.Sync_worker_effect_completed(ticket,result))))
+;;
+let worker_operation_scope t (Core.Request(_,request)) =
   match request with
-  | Core.Execute_request _ ->
-    let result = run_request t request in
-    t.post (Core.Runner_completed (Core.Execute_request_completed (ticket, result)))
-  | Close_database _ ->
-    let result = run_request t request in
-    t.post (Core.Runner_completed (Core.Close_database_completed (ticket, result)))
-  | Handle_sync_worker_effect _ ->
-    let result = run_request t request in
-    t.post (Core.Runner_completed (Core.Sync_worker_effect_completed (ticket, result)))
+  |Core.Execute_request{database;_}->Option.map(fun session->session.graph_scope,false)
+      (Hashtbl.find_opt t.databases(Core.database_handle_id database))
+  |Close_database database->Option.map(fun session->session.graph_scope,true)
+      (Hashtbl.find_opt t.databases(Core.database_handle_id database))
+  |Handle_sync_worker_effect worker_effect->
+    (match worker_effect with
+     |Sync.Inspect_mirror request|Attach_graph request->Some(request.scope,false)
+     |Activate_snapshot request->Some(Sync.snapshot_activation_scope request,false)
+     |Inspect_sync scope->Some(scope,false)
+     |Apply_outbox_transition request->Some(request.scope,false)
+     |Apply_authoritative_batch request->Some(request.scope.graph,false)
+     |Detach_graph scope->Some(scope,true)
+     |Reset_managed_account _|Delete_mirror _->None)
+;;
+let submit_worker t (Core.Request(ticket,request) as packed) =
+  let fork ?writer ()=
+    try t.dependencies.runtime.fork ~sw:t.sw(fun()->complete t ?writer packed)
+    with error->Option.iter(finish_writer t)writer;raise error in
+  match worker_operation_scope t packed with
+  |None->fork()
+  |Some(scope,cleanup)->match reserve_writer ~cleanup t scope with
+    |Ok writer->fork ~writer ()
+    |Error message->let error=effect_error message in
+      let result=match request with
+        |Core.Execute_request _->Core.Execute_request_completed(ticket,Error error)
+        |Close_database _->Core.Close_database_completed(ticket,Error error)
+        |Handle_sync_worker_effect _->Core.Sync_worker_effect_completed(ticket,Error error) in
+      t.post(Core.Runner_completed result)
 ;;
 
 let run_upload t (context : Sync.asset_context) instruction =
-  let current ticket = (not t.stopped) && t.upload_current ticket in
+  let current ticket = (not t.stopped) && t.upload_current ticket
+    && not(Core.Writer_fence.fenced t.writer_fence context.scope) in
   let on_diagnostic ticket detail =
     if current ticket then queue_notice_diagnostic t context.scope
       (Upload_notice ticket.Upload.operation) ticket.id detail in
@@ -2676,16 +3024,19 @@ let submit_upload t (context : Sync.asset_context) instruction =
   | Await_publication (ticket, _) ->
     if t.upload_current ticket && not (Hashtbl.mem t.upload_operations ticket)
     then (
-      clear_notice_diagnostic t context.scope (Upload_notice ticket.operation);
-      let cancelled, resolve = Eio.Promise.create () in
-      Hashtbl.add t.upload_operations ticket resolve;
-      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
-        Fun.protect
-          ~finally:(fun () -> Hashtbl.remove t.upload_operations ticket)
-          (fun () ->
-             Eio.Fiber.first
+      match reserve_writer t context.scope with
+      |Error _->t.post(Core.Upload_completed(ticket,Upload.Failed Upload.Invalid_content))
+      |Ok job->
+        clear_notice_diagnostic t context.scope (Upload_notice ticket.operation);
+        let cancelled, resolve = Eio.Promise.create () in
+        Hashtbl.add t.upload_operations ticket resolve;
+        (try t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+          Fun.protect
+            ~finally:(fun () -> Hashtbl.remove t.upload_operations ticket;finish_writer t job)
+            (fun () -> Eio.Fiber.first
                (fun () -> run_upload t context instruction)
-               (fun () -> Eio.Promise.await cancelled))))
+               (fun () -> Eio.Promise.await cancelled)))
+         with error->Hashtbl.remove t.upload_operations ticket;finish_writer t job;raise error))
 ;;
 
 let transfer_failure = function
@@ -2764,6 +3115,202 @@ let lookup_local_asset t ~scope ~asset ~checksum ~current ~diagnostic call =
         | Error _ as error -> error))
 ;;
 
+let release_asset_file_result t ~scope ~handle ~report_failure =
+  if t.stopped then Error "The Worker stopped before resource release." else
+  let detail=ref None in
+  match asset_call ~on_diagnostic:(fun value->detail:=Some value) t ~scope (Sync.Release_asset_file handle) with
+  | Ok Sync.Asset_unit -> Ok()
+  | Error failure ->
+    if report_failure then report_asset_failure ?detail:!detail t scope "assetRelease" failure;
+    Error(asset_failure_message failure)
+  | Ok _ ->
+    if report_failure then report_source_failure t scope "assetRelease" "invalidContent" "Unexpected asset completion";
+    Error "Unexpected asset release completion"
+;;
+let release_asset_file_checked t ~scope ~handle=release_asset_file_result t ~scope ~handle ~report_failure:true
+
+let unsettled_orphan_retains t=Core.Orphan_cleanup.count t.orphan_cleanup
+
+let release_orphan_work t work =
+  let resource=Core.Orphan_cleanup.resource work in
+  let result=try Eio.Cancel.protect(fun()->
+    release_asset_file_result t ~scope:resource.scope ~handle:resource.handle
+      ~report_failure:(Core.Orphan_cleanup.first_attempt work))
+    with _->Error "Attachment cleanup was interrupted." in
+  t.orphan_cleanup<-Core.Orphan_cleanup.completed t.orphan_cleanup work result;
+  let key=resource.scope,resource.handle in
+  let waiters=Option.value(Hashtbl.find_opt t.resource_release_waiters key)~default:[] in
+  Hashtbl.remove t.resource_release_waiters key;
+  List.iter(fun resolve->ignore(Eio.Promise.try_resolve resolve():bool))waiters;
+  if result=Ok() then Hashtbl.remove t.resource_cleanup_owners(resource.scope,resource.handle)
+;;
+
+let abandon_asset_file_internal ?cleanup_job t ~scope ~handle =
+  let first_release=Option.map(fun _->
+    let finished,resolve=Eio.Promise.create() in
+    let key=scope,handle in
+    Hashtbl.replace t.resource_release_waiters key
+      (resolve::Option.value(Hashtbl.find_opt t.resource_release_waiters key)~default:[]);
+    finished)cleanup_job in
+  Option.iter(fun job->Hashtbl.replace t.resource_cleanup_owners(scope,handle)job)cleanup_job;
+  t.orphan_cleanup<-Core.Orphan_cleanup.track t.orphan_cleanup {scope;handle};
+  if not t.orphan_cleanup_running && not t.stopped then (
+    t.orphan_cleanup_running<-true;
+    let next,work=Core.Orphan_cleanup.next t.orphan_cleanup in
+    t.orphan_cleanup<-next;
+    Option.iter(release_orphan_work t)work;
+    if unsettled_orphan_retains t=0 then t.orphan_cleanup_running<-false else
+      t.dependencies.runtime.fork ~sw:t.sw (fun()->
+        Fun.protect ~finally:(fun()->t.orphan_cleanup_running<-false)(fun()->
+          let rec retry ()=
+            if not t.stopped then (
+              let next,work=Core.Orphan_cleanup.next t.orphan_cleanup in
+              t.orphan_cleanup<-next;
+              match work with None->()|Some work->
+                t.dependencies.runtime.sleep(Core.Orphan_cleanup.retry_delay work);
+                if not t.stopped then (release_orphan_work t work;retry())) in
+          retry())));
+  (* A second release can queue behind an in-flight release. Its cleanup job
+     ends after its own real first attempt, so a host fence cannot mistake
+     ordinary queued IO for a failed physical release. Failures stay retained. *)
+  Option.iter(fun finished->Eio.Fiber.first
+    (fun()->Eio.Promise.await finished)
+    (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped)))first_release
+;;
+
+
+let abandon_asset_file t ~scope ~handle=abandon_asset_file_internal t ~scope ~handle
+
+let asset_cleanup_snapshot t ~scope =
+  let jobs=Hashtbl.fold(fun _ job values->
+    if job.cleanup_scope=scope then Rrbvec.push_back values job else values)
+    t.asset_cleanup_jobs Rrbvec.empty in
+  let jobs=Hashtbl.fold(fun(resource_scope,_) job values->
+    if resource_scope=scope then Rrbvec.push_back values job else values)
+    t.resource_cleanup_owners jobs in
+  {snapshot_scope=scope;snapshot_jobs=jobs}
+let await_asset_cleanup t snapshot =
+  let rec join seen job=
+    if Cleanup_ids.mem job.cleanup_id seen then seen else (
+      Eio.Promise.await job.finished;
+      Rrbvec.fold_left join(Cleanup_ids.add job.cleanup_id seen)job.children) in
+  Eio.Fiber.first
+    (fun()->
+      let joined=Rrbvec.fold_left join Cleanup_ids.empty snapshot.snapshot_jobs in
+      let pending=Hashtbl.fold(fun(scope,_) owner pending->
+        pending || (scope=snapshot.snapshot_scope && Cleanup_ids.mem owner.cleanup_id joined))t.resource_cleanup_owners false in
+      if t.stopped then Error "The Worker stopped before attachment settlement."
+      else if pending then Error "Attachment cleanup has an unsettled physical release. Retry after storage recovers."
+      else Ok())
+    (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped);
+      Error "The Worker stopped before attachment settlement.")
+;;
+let asset_callback_barrier t =
+  if t.next_asset_barrier=Int64.max_int then failwith "Asset callback barrier counter exhausted";
+  t.next_asset_barrier<-Int64.succ t.next_asset_barrier;
+  let token=t.next_asset_barrier in
+  let promise,resolve=Eio.Promise.create() in
+  Hashtbl.add t.asset_cleanup_barriers token resolve;
+  t.post(Core.Asset_cleanup_barrier token);
+  Fun.protect ~finally:(fun()->Hashtbl.remove t.asset_cleanup_barriers token)(fun()->
+    Eio.Fiber.first
+      (fun()->Eio.Promise.await promise)
+      (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped)))
+;;
+let await_sync_io t ~scope =
+  if t.stopped then Error "The Worker stopped before Sync I/O settlement."
+  else if t.next_asset_barrier=Int64.max_int then Error "I/O fence counter exhausted." else
+  let promise,resolve=Eio.Promise.create() in
+  t.next_asset_barrier<-Int64.succ t.next_asset_barrier;
+  let id=t.next_asset_barrier in
+  Hashtbl.add t.sync_io_waiters id(scope,resolve);
+  Fun.protect ~finally:(fun()->Hashtbl.remove t.sync_io_waiters id)(fun()->
+    t.post(Core.Sync_event(Sync.IO_fence_requested(id,scope)));
+    Eio.Fiber.first
+      (fun()->let result=Eio.Promise.await promise in
+        if t.stopped then Error "The Worker stopped before Sync I/O settlement." else result)
+      (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped);
+        Error "The Worker stopped before Sync I/O settlement."))
+;;
+
+let quiesce_writers t ~scope =
+  let next,outcome=Core.Writer_fence.freeze t.writer_fence scope in
+  t.writer_fence<-next;
+  match outcome with
+  |Error _->Error "Writer fence capacity is full."
+  |Ok fence->
+    let rec join ()=
+      let jobs=Hashtbl.fold(fun _ job jobs->
+        if Core.Writer_fence.same_incarnation job.writer_scope scope
+        then Rrbvec.push_back jobs job else jobs)t.writer_jobs Rrbvec.empty in
+      Rrbvec.iter(fun job->Eio.Promise.await job.writer_finished)jobs;
+      (* A completion can emit a deferred Detach. Cleanup admission remains open
+         behind the data fence; join its physical task and callback too. *)
+      asset_callback_barrier t;
+      if t.stopped then Error "The Worker stopped before writer settlement."
+      else if Core.Writer_fence.drained t.writer_fence fence then Ok()
+      else join () in
+    Eio.Fiber.first
+      (fun()->Result.bind(join())(fun()->
+        let children=asset_call t ~scope Sync.Await_asset_operations in
+        asset_callback_barrier t;
+        match children with
+        |Ok Sync.Asset_unit->join()
+        |Ok _->Error "Unexpected scoped asset settlement."
+        |Error _->Error "Scoped asset child I/O did not settle."))
+      (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped);
+        Error "The Worker stopped before writer settlement.")
+;;
+
+let physical_host_scopes t =
+  let scopes=Hashtbl.fold(fun scope () scopes->Rrbvec.push_back scopes scope)t.resource_scopes Rrbvec.empty in
+  Hashtbl.fold(fun _ session scopes->Rrbvec.push_back scopes session.graph_scope)t.databases scopes
+;;
+
+let settle_host_scope t ~(scope:Sync.graph_scope) =
+  Result.bind(quiesce_writers t ~scope)(fun()->
+    let io_scope={ (Sync.effect_scope_of_graph scope) with
+      presentation_generation=None;lifecycle_generation=None;connection_generation=None } in
+    Result.bind(await_sync_io t ~scope:io_scope)(fun()->
+      let databases=Hashtbl.fold(fun id session ids->
+        if Core.Writer_fence.same_incarnation session.graph_scope scope then id::ids else ids)t.databases [] in
+      let closed=List.fold_left(fun result id->Result.bind result(fun()->
+        Result.map_error (fun _->"A physical graph database close remains unsettled.")
+          (close_database_by_id ~scope t id)))(Ok())databases in
+      Result.bind closed(fun()->
+        asset_callback_barrier t;
+        Result.bind(await_asset_cleanup t (asset_cleanup_snapshot t ~scope))(fun()->
+          Result.bind(asset_unit t ~scope Sync.Close_asset_scope)(fun()->
+            if t.stopped then Error "The Worker stopped before host scope settlement."
+            else (Hashtbl.filter_map_inplace(fun actual value->
+              if Core.Writer_fence.same_incarnation actual scope then None else Some value)t.resource_scopes;
+              Ok()))))))
+;;
+
+let retire_account t ~account=
+  Result.bind (cleanup_account_uploads t account) (fun () ->
+    t.dependencies.sync_runner.retire_account ~account)
+;;
+
+let start_asset_cleanup_job ?parent ?(prepare=(fun _->())) t ~scope work =
+  if t.next_asset_cleanup=Int64.max_int then failwith "Asset cleanup counter exhausted";
+  t.next_asset_cleanup<-Int64.succ t.next_asset_cleanup;
+  let serial=t.next_asset_cleanup in
+  let finished,resolve=Eio.Promise.create() in
+  let job={cleanup_id=serial;cleanup_scope=scope;finished;children=Rrbvec.empty} in
+  Hashtbl.add t.asset_cleanup_jobs serial job;
+  Option.iter(fun parent->parent.children<-Rrbvec.push_back parent.children job)parent;
+  prepare job;
+  t.dependencies.runtime.fork ~sw:t.sw(fun()->
+    work job;
+    ignore(Eio.Promise.try_resolve resolve():bool);
+    Hashtbl.remove t.asset_cleanup_jobs serial)
+;;
+let asset_cleanup_parent t scope handle=
+  Option.bind(Hashtbl.find_opt t.asset_result_sources(scope,handle))(fun ticket->
+    Hashtbl.find_opt t.cancelled_asset_jobs ticket)
+;;
+
 let run_asset t (context : Sync.asset_context) instruction =
   let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
   let perform ticket action success =
@@ -2795,6 +3342,10 @@ let run_asset t (context : Sync.asset_context) instruction =
                      t ~scope:context.scope action in
                  action detail call
              in
+             (match result with
+              | Ok(Sync.Asset_cached(Some handle)|Asset_downloaded handle)->
+                Hashtbl.replace t.asset_result_sources(context.scope,handle)ticket
+              | _->());
              if valid ()
              then (
                let asset = match ticket with Transfer.Lookup ticket -> ticket.asset | Download ticket -> ticket.asset in
@@ -2812,7 +3363,10 @@ let run_asset t (context : Sync.asset_context) instruction =
              else (
                match result with
                | Ok (Sync.Asset_cached (Some handle) | Asset_downloaded handle) ->
-                 send_asset t ~scope:context.scope (Sync.Release_asset_file handle)
+                 let parent=asset_cleanup_parent t context.scope handle in
+                 Hashtbl.remove t.asset_result_sources(context.scope,handle);
+                 start_asset_cleanup_job ?parent t ~scope:context.scope(fun job->
+                   abandon_asset_file_internal ~cleanup_job:job t ~scope:context.scope ~handle)
                | Ok _ | Error _ -> ()))))
   in
   match instruction with
@@ -2863,15 +3417,23 @@ let run_asset t (context : Sync.asset_context) instruction =
                | _ -> Error (Transfer.Invalid_content "Unexpected download completion"))
            ))
   | Cancel ticket ->
-    let asset, id = match ticket with Transfer.Lookup ticket -> ticket.asset,ticket.id | Download ticket -> ticket.asset,ticket.id in
-    clear_notice_diagnostic ~ticket_id:id t context.scope (Download_notice asset);
-    Option.iter
-      (fun operation ->
-         if operation <> ""
-         then send_asset t ~scope:context.scope (Sync.Cancel_asset_operation operation))
-      (Hashtbl.find_opt t.asset_operations ticket)
+    let asset,id=match ticket with Transfer.Lookup ticket->ticket.asset,ticket.id|Download ticket->ticket.asset,ticket.id in
+    clear_notice_diagnostic ~ticket_id:id t context.scope(Download_notice asset);
+    start_asset_cleanup_job ~prepare:(fun job->Hashtbl.replace t.cancelled_asset_jobs ticket job)
+      t ~scope:context.scope(fun job->
+      Fun.protect ~finally:(fun()->match Hashtbl.find_opt t.cancelled_asset_jobs ticket with
+        | Some active when active.cleanup_id=job.cleanup_id->Hashtbl.remove t.cancelled_asset_jobs ticket
+        | _->())(fun()->
+      Option.iter(fun operation->if operation<>"" then send_asset t ~scope:context.scope(Sync.Cancel_asset_operation operation))
+        (Hashtbl.find_opt t.asset_operations ticket);
+      let rec joined()=if not t.stopped && Hashtbl.mem t.asset_operations ticket then (t.dependencies.runtime.sleep 0.001;joined()) in
+      joined();
+      asset_callback_barrier t))
   | Release_handle handle ->
-    send_asset t ~scope:context.scope (Sync.Release_asset_file handle)
+    let parent=asset_cleanup_parent t context.scope handle in
+    Hashtbl.remove t.asset_result_sources(context.scope,handle);
+    start_asset_cleanup_job ?parent t ~scope:context.scope(fun job->
+      abandon_asset_file_internal ~cleanup_job:job t ~scope:context.scope ~handle)
   | Retry_after { id; seconds } ->
     t.dependencies.runtime.fork ~sw:t.sw (fun () ->
       match asset_call t ~scope:context.scope (Sync.Asset_retry_after seconds) with
@@ -2889,6 +3451,10 @@ let run_asset t (context : Sync.asset_context) instruction =
 ;;
 
 let submit t = function
+  | Core.Sync_io_fence_reached(id,scope,result)->
+    (match Hashtbl.find_opt t.sync_io_waiters id with
+     |Some(expected,resolve) when expected=scope->ignore(Eio.Promise.try_resolve resolve result:bool)
+     |_->())
   | Core.Deliver_protected_result output ->
     (match
        Hashtbl.find_opt
@@ -2906,28 +3472,22 @@ let submit t = function
      | Some waiter when waiter.request = output.request -> ()
      | Some _ | None -> reclaim_asset_output t output)
   | Core.Read_uploads ticket ->
-    if (not t.stopped) && t.recovery_current ticket
-    then
-      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
-        if (not t.stopped) && t.recovery_current ticket
-        then (
-          let result =
-            with_staging_lock t (fun () ->
-              Result.bind
-                (reconcile_staging t ticket.scope ~current:(fun () ->
-                   t.recovery_current ticket))
-                (fun () ->
-                   with_upload_store t (fun db ->
-                     Logseq_db_storage.Asset_upload_store.list
-                       db
-                       ~origin:(Uri.to_string ticket.scope.account.managed_sync_origin)
-                       ~account:ticket.scope.account.user_id
-                       ~graph:ticket.scope.graph_id
-                       ~after:ticket.after
-                       ~limit:ticket.limit)))
-          in
-          if (not t.stopped) && t.recovery_current ticket
-          then t.post (Core.Uploads_loaded (ticket, result))))
+    if (not t.stopped) && t.recovery_current ticket then (
+      match reserve_writer t ticket.scope with
+      |Error message->t.post(Core.Uploads_loaded(ticket,Error message))
+      |Ok job->
+        (try t.dependencies.runtime.fork ~sw:t.sw(fun()->
+          Fun.protect ~finally:(fun()->finish_writer t job)(fun()->
+            if not t.stopped && t.recovery_current ticket then (
+              let current()=t.recovery_current ticket && not(Core.Writer_fence.fenced t.writer_fence ticket.scope) in
+              let result=with_staging_lock t(fun()->
+                Result.bind(reconcile_staging t ticket.scope ~current)(fun()->
+                  with_upload_store t(fun db->Logseq_db_storage.Asset_upload_store.list db
+                    ~origin:(Uri.to_string ticket.scope.account.managed_sync_origin)
+                    ~account:ticket.scope.account.user_id ~graph:ticket.scope.graph_id
+                    ~after:ticket.after ~limit:ticket.limit))) in
+              if not t.stopped && t.recovery_current ticket then t.post(Core.Uploads_loaded(ticket,result)))))
+         with error->finish_writer t job;raise error))
   | Core.Run_upload (context, instruction) ->
     if not t.stopped then submit_upload t context instruction
   | Core.Run_asset (context, instruction) ->
@@ -2935,22 +3495,25 @@ let submit t = function
   | Close_asset_scope scope ->
     t.notice_diagnostics <- List.filter (fun item -> item.scope<>scope) t.notice_diagnostics;
     send_asset t ~scope Sync.Close_asset_scope
+  | Core.Asset_cleanup_barrier_reached token->
+    Option.iter(fun resolve->
+      Hashtbl.remove t.asset_cleanup_barriers token;
+      ignore(Eio.Promise.try_resolve resolve():bool))
+      (Hashtbl.find_opt t.asset_cleanup_barriers token)
   | Core.Run_worker (Core.Request (_, Core.Handle_sync_worker_effect (Sync.Delete_mirror deletion)) as request) ->
     if deletion_authorized t deletion then t.deletion_owner <- Some deletion;
-    if not t.stopped then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
+    if not t.stopped then submit_worker t request
   | Core.Run_worker request ->
     if not t.stopped
-    then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
+    then submit_worker t request
   | Run_sync (Sync.Request (ticket, Sync.Delete_account_secrets account) as sync_effect)
     ->
     if not t.stopped
     then (
       match
-        with_upload_store t (fun db ->
-          Logseq_db_storage.Asset_upload_store.delete_account
-            db
-            ~origin:(Uri.to_string account.managed_sync_origin)
-            ~account:account.user_id)
+        (* This is the serial consumer: never await a staging owner whose asset
+           completion must return through this same consumer. *)
+        cleanup_account_uploads ~wait:false t account
       with
       | Ok () -> t.dependencies.sync_runner.submit sync_effect
       | Error message ->
@@ -2982,11 +3545,11 @@ let submit t = function
   | Publish output -> if not t.stopped then t.dependencies.publish output
 ;;
 
-let await_reply t ~id ~request ~post =
+let await_reply t ~id ~read ~post =
   let promise, resolve = Eio.Promise.create () in
   let key = Core.request_id_to_int64 id in
   Eio.Mutex.use_rw ~protect:true t.waiter_lock (fun () ->
-    Hashtbl.replace t.waiters key { request; resolve });
+    Hashtbl.replace t.waiters key { read; resolve });
   post ();
   let response = Eio.Promise.await promise in
   Eio.Mutex.use_rw ~protect:true t.waiter_lock (fun () -> Hashtbl.remove t.waiters key);
@@ -3009,6 +3572,7 @@ let shutdown t =
   then (
     t.post (Core.Sync_event Sync.Shutdown);
     t.stopped <- true;
+    ignore(Eio.Promise.try_resolve(snd t.asset_cleanup_stopped)():bool);
     t.notice_diagnostics <- [];
     Hashtbl.iter
       (fun _ resolve -> ignore (Eio.Promise.try_resolve resolve () : bool))
@@ -3019,13 +3583,16 @@ let shutdown t =
     Eio.Mutex.use_rw ~protect:true t.waiter_lock (fun () ->
       Hashtbl.iter
         (fun _ (waiter : waiter) ->
-           let response = failure waiter.request Closed_session "The Worker stopped." in
+           let Read.Read_query(budget,query)=waiter.read in
+           let response=Read.For_worker.answer budget query (Error(Read.Service_failed "The Worker stopped.")) in
            Eio.Promise.resolve waiter.resolve response)
         t.waiters;
       Hashtbl.clear t.waiters))
 ;;
 
 let retain_asset_file t ~scope ~handle =
+  if t.stopped || Core.Writer_fence.fenced t.writer_fence scope
+    || not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup) then None else
   let detail = ref None in
   match asset_call ~on_diagnostic:(fun value -> detail := Some value) t ~scope (Sync.Retain_asset_file handle) with
   | Ok (Sync.Asset_retained file) -> file
@@ -3072,16 +3639,28 @@ let prepare_import_unlocked
   in
   let* version = source_error "invalidRequest" (A.version ~checksum:(String.make 64 '0') ~file_type:request.file_type) in
   let* _ = source_error "invalidRequest" (prepare version 0L "validation.bin") in
+  let namespace=Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
+    ~origin:context.scope.account.managed_sync_origin ~user:context.scope.account.user_id ~graph:context.scope.graph_id in
+  let input_owner:Logseq_db_storage.Asset_upload_store.Inputs.owner={namespace;
+    origin=Uri.to_string context.scope.account.managed_sync_origin;account=context.scope.account.user_id;graph=context.scope.graph_id} in
+  let* complete_input=Logseq_db_types.Asset_import.Pure_intent.create ~namespace request
+    |> Result.map_error(fun _->"Invalid complete import input") |> source_error "invalidRequest" in
   if (not (current ())) || t.stopped
   then Error "The selected graph is no longer active"
+  else if not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup)
+  then Error "Attachment cleanup is pending. Retry after cleanup succeeds."
   else
+    let* reserved=source_error "persistenceFailed" (Eio.Cancel.protect(fun()->
+      with_upload_store t(fun db->Logseq_db_storage.Asset_upload_store.Inputs.reserve db ~owner:input_owner ~input:complete_input))) in
     let* () = source_error "restoreFailed" (reconcile_staging t context.scope ~current) in
     let* existing =
       source_error "persistenceFailed" (with_upload_store t (fun db ->
         Logseq_db_storage.Asset_upload_store.read db ~operation:request.operation))
     in
-    match existing with
-    | Some intent
+    match existing,reserved.prepared with
+    | None,Some _->source_error "restoreFailed" (Error "The original input was Prepared but its local upload checkpoint is unavailable; it cannot be replayed")
+    | Some _,None->source_error "restoreFailed" (Error "The upload checkpoint has no atomic original input proof")
+    | Some intent,Some _
       when intent.origin = Uri.to_string context.scope.account.managed_sync_origin
            && intent.account = context.scope.account.user_id
            && intent.graph = context.scope.graph_id
@@ -3092,8 +3671,8 @@ let prepare_import_unlocked
            && intent.local_mutation = request.local_mutation
            && intent.replace_reference = request.replace_reference
            && intent.metadata_mutation = request.metadata_mutation -> Ok intent
-    | Some _ -> source_error "identityConflict" (Error "This import identity is already in use")
-    | None ->
+    | Some _,Some _ -> source_error "identityConflict" (Error "This import identity is already in use")
+    | None,None ->
       let detail = ref None in
       let* file, checksum, size =
         match
@@ -3125,7 +3704,7 @@ let prepare_import_unlocked
           let* () =
             source_error "persistenceFailed" (Eio.Cancel.protect (fun () ->
               with_upload_store t (fun db ->
-                Logseq_db_storage.Asset_upload_store.save db ~expected:None intent)))
+                Logseq_db_storage.Asset_upload_store.Inputs.commit_prepared db ~owner:input_owner ~input:complete_input intent |> Result.map(fun _->()))))
           in
           Ok intent)
       in
@@ -3140,7 +3719,7 @@ let prepare_import_unlocked
       result
 ;;
 
-let prepare_import t ~(context : Sync.asset_context) request ~current =
+let prepare_import_unfenced t ~(context : Sync.asset_context) request ~current =
   with_staging_lock t (fun () ->
     let on_diagnostic detail = if current () then
       publish_failure (report_current_graph t context.scope) detail in
@@ -3168,8 +3747,13 @@ let prepare_import t ~(context : Sync.asset_context) request ~current =
       (prepare_import_unlocked ~on_diagnostic t ~context request ~current))
 ;;
 
+let prepare_import t ~(context:Sync.asset_context) request ~current =
+  with_writer t context.scope(fun()->prepare_import_unfenced t ~context request ~current)
+;;
+
 let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
-  if t.stopped
+  if t.stopped || Core.Writer_fence.fenced t.writer_fence scope
+    || not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup)
   then None
   else (
     match
@@ -3189,4 +3773,71 @@ let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
        | Ok _ -> report_source_failure t scope "assetPreview" "invalidContent" "Unexpected asset completion"; None)
     | Ok _ -> None
     | Error source -> report_source_failure t scope "assetMetadata" "persistenceFailed" source; None)
+;;
+
+let import_input_owner (scope:Sync.graph_scope) : Logseq_db_storage.Asset_upload_store.Inputs.owner =
+  {namespace=Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
+     ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id;
+   origin=Uri.to_string scope.account.managed_sync_origin;account=scope.account.user_id;graph=scope.graph_id}
+;;
+
+let with_upload_store_readonly t ~absent action =
+  let path=Filename.concat t.dependencies.config.application_support_directory "asset-upload-intents.sqlite" in
+  try
+    let exists=try ignore(Unix.stat path);true with Unix.Unix_error(Unix.ENOENT,_,_)->false in
+    if not exists then Ok absent else
+    let db=Sqlite3.db_open ~mode:`READONLY path in
+    let result=try action db with exn->Error(Printexc.to_string exn) in
+    if Sqlite3.db_close db then result else Error "The source recovery SQLite handle could not close"
+  with exn->Error(Printexc.to_string exn)
+;;
+
+let import_input_wire (row:Logseq_db_storage.Asset_upload_store.Inputs.record) : Logseq_db_types.Asset_import.Recovery.item =
+  {sequence=row.sequence;input=Logseq_db_types.Asset_import.Pure_intent.encode row.input;
+    prepared=row.evidence;acknowledged=row.acknowledged}
+;;
+
+let recover_import_inputs t ~scope ~after ~maximum_items ~maximum_bytes ~current =
+  let module R=Logseq_db_types.Asset_import.Recovery in
+  if t.stopped || not(current()) then Error "Import source recovery authority retired" else
+  if maximum_items<1 || maximum_items>R.maximum_items || maximum_bytes<R.maximum_page_overhead
+     || maximum_bytes>R.maximum_bytes || Option.exists(fun after->after<0L)after
+  then Error "Invalid import source recovery bounds" else
+  let owner=import_input_owner scope in
+  let result=with_upload_store_readonly t ~absent:R.{items=[];next=None}(fun db->
+    Result.map(fun(page:Logseq_db_storage.Asset_upload_store.Inputs.page)->
+      R.{items=List.map import_input_wire page.items;next=page.next})
+      (Logseq_db_storage.Asset_upload_store.Inputs.pending db ~owner ~after ~maximum_items ~maximum_bytes)) in
+  if t.stopped || not(current()) then Error "Import source recovery authority retired" else
+  Result.bind result(fun page->if R.page_encoded_bytes page>maximum_bytes
+    then Error "Import source recovery exceeded its encoded byte budget" else Ok page)
+;;
+
+let decode_import_input ~scope input=
+  let owner=import_input_owner scope in
+  Result.map(fun input->owner,input)
+    (Logseq_db_types.Asset_import.Pure_intent.restore ~namespace:owner.namespace input
+      |> Result.map_error(fun _->"Invalid complete original import input or logical namespace"))
+;;
+
+let confirm_import_input t ~scope ~input ~current =
+  if t.stopped || not(current()) then Error "Import source confirmation authority retired" else
+  Result.bind(decode_import_input ~scope input)(fun(owner,intent)->
+    let result=with_upload_store_readonly t ~absent:None(fun db->
+      Result.bind(Logseq_db_storage.Asset_upload_store.Inputs.read db ~owner
+        ~operation:(Logseq_db_types.Asset_import.Pure_intent.operation intent))(function
+        |None->Ok None
+        |Some row when Logseq_db_types.Asset_import.Pure_intent.encode row.input=input->Ok(Some(import_input_wire row))
+        |Some _->Error "The stored import operation belongs to different complete input bytes")) in
+    if t.stopped || not(current()) then Error "Import source confirmation authority retired" else result)
+;;
+
+let acknowledge_import_input t ~scope ~input ~prepared ~current =
+  if t.stopped || not(current()) then Error "Import source acknowledgement authority retired" else
+  if String.length prepared=0 || String.length prepared>8192 then Error "Invalid original Prepared proof size" else
+  Result.bind(decode_import_input ~scope input)(fun(owner,intent)->
+    with_writer t scope(fun()->with_staging_lock t(fun()->
+      if t.stopped || not(current()) then Error "Import source acknowledgement authority retired" else
+      Eio.Cancel.protect(fun()->with_upload_store t(fun db->
+        Logseq_db_storage.Asset_upload_store.Inputs.acknowledge db ~owner ~input:intent ~evidence:prepared)))))
 ;;

@@ -365,6 +365,9 @@ type t =
   ; on_asset_diagnostic : scope:Core.graph_scope -> operation:string
       -> request_operation:string -> Failure_diagnostic.t -> unit
   ; operations : (string, operation) Hashtbl.t
+  ; asset_jobs : (string,Core.graph_scope * unit Eio.Promise.t)Hashtbl.t
+  ; mutable next_general_job : int64
+  ; general_jobs : (int64,Core.effect_scope * unit Eio.Promise.t)Hashtbl.t
   ; submitted_operations : Submitted_effects.t
   ; keys : (string, key_entry) Hashtbl.t
   ; websockets : (Core.connection_scope, Websocket_eio.t) Hashtbl.t
@@ -391,6 +394,9 @@ let create ?(on_asset_diagnostic=(fun ~scope:_ ~operation:_ ~request_operation:_
     ; post
     ; on_asset_diagnostic
     ; operations = Hashtbl.create 32
+    ; asset_jobs = Hashtbl.create 32
+    ; next_general_job = 0L
+    ; general_jobs = Hashtbl.create 32
     ; submitted_operations = Submitted_effects.create 32
     ; keys = Hashtbl.create 8
     ; websockets = Hashtbl.create 4
@@ -408,6 +414,17 @@ let create ?(on_asset_diagnostic=(fun ~scope:_ ~operation:_ ~request_operation:_
     ; preparing_retirements = Hashtbl.create 4
     ; closed = false
     }
+;;
+
+let fork_general t ~scope task =
+  if t.next_general_job=Int64.max_int then failwith "Sync I/O owner counter exhausted";
+  t.next_general_job<-Int64.succ t.next_general_job;
+  let id=t.next_general_job in
+  let finished,resolve=Eio.Promise.create() in
+  Hashtbl.add t.general_jobs id(scope,finished);
+  let complete()=Hashtbl.remove t.general_jobs id;ignore(Eio.Promise.try_resolve resolve():bool) in
+  try t.dependencies.runtime.fork ~sw:t.sw(fun()->Fun.protect ~finally:complete task)
+  with error->complete();raise error
 ;;
 
 let asset_root t =
@@ -435,17 +452,15 @@ let delete_account_assets ?except_id t (account : Core.account_scope) =
          operation.cancel ()
        | Some _ | None -> ())
     t.operations;
-  Hashtbl.filter_map_inplace
-    (fun (scope : Core.graph_scope) cache ->
-       if
-         Uri.equal scope.account.managed_sync_origin account.managed_sync_origin
-         && String.equal scope.account.user_id account.user_id
-       then (
-         Asset_cache.close cache;
-         None)
-       else Some cache)
-    t.asset_caches;
-  Asset_cache.delete_account ~root:(asset_root t) ~account
+  let scopes=Hashtbl.to_seq_keys t.asset_caches |> Seq.filter(fun(scope:Core.graph_scope)->
+    Uri.equal scope.account.managed_sync_origin account.managed_sync_origin
+      && scope.account.user_id=account.user_id) |> Rrbvec.of_seq in
+  let closed=Rrbvec.fold_left(fun result scope->Result.bind result(fun()->
+    match Hashtbl.find_opt t.asset_caches scope with
+    |None->Ok()
+    |Some cache->Result.map(fun()->Hashtbl.remove t.asset_caches scope)(Asset_cache.close_checked cache)))
+    (Ok())scopes in
+  Result.bind closed(fun()->Asset_cache.delete_account ~root:(asset_root t) ~account)
   |> Result.map (fun () ->
     let origin = Uri.to_string account.managed_sync_origin in
     Hashtbl.filter_map_inplace (fun (actual_origin, user, _) retirement ->
@@ -453,6 +468,14 @@ let delete_account_assets ?except_id t (account : Core.account_scope) =
     Hashtbl.filter_map_inplace (fun ((scope : Core.graph_scope), _) () ->
       if Uri.equal scope.account.managed_sync_origin account.managed_sync_origin
          && scope.account.user_id=account.user_id then None else Some ()) t.asset_leases)
+;;
+
+let retire_account t ~account =
+  if t.closed then Error "Sync stopped before account retirement." else
+  let secrets=t.dependencies.secrets.delete_account_secrets
+    ~managed_sync_origin:account.Core.managed_sync_origin ~user_id:account.user_id in
+  Result.bind secrets(fun()->delete_account_assets t account
+    |> Result.map_error(fun _->"Account asset cache still has a physical cleanup obligation."))
 ;;
 
 let catalog_root local_store =
@@ -861,13 +884,7 @@ let execute_request
       |> map_error)
   | Delete_account_secrets account ->
     run_secret_action t (fun () ->
-      match delete_account_assets t account with
-      | Error _ -> Error (Core.Effect_failed "Account asset cache could not be removed.")
-      | Ok () ->
-        t.dependencies.secrets.delete_account_secrets
-          ~managed_sync_origin:account.managed_sync_origin
-          ~user_id:account.user_id
-        |> map_error)
+      retire_account t ~account |> Result.map_error(fun message->Core.Effect_failed message))
   | Encrypt_protected_values request ->
     Result.bind
       (Result.map_error
@@ -949,7 +966,7 @@ let retire_websocket_owner ?(abort = false) t (scope:Core.connection_scope) =
          owner.operation.cancel ());
       (* submit runs on the event consumer. Joining here would deadlock a callback
          waiting to publish into its full sink. The waiter is never a callback. *)
-      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+      fork_general t ~scope:({(Core.effect_scope_of_graph scope.graph) with connection_generation=Some scope.connection_generation}) (fun () ->
         (try Eio.Promise.await owner.finished with
          | Eio.Cancel.Cancelled _ ->
            Eio.Cancel.protect (fun () -> Eio.Promise.await owner.finished));
@@ -960,7 +977,7 @@ let retire_websocket_owner ?(abort = false) t (scope:Core.connection_scope) =
         if not t.closed then t.post (Core.Websocket_retired scope)))
   | _ when List.mem scope t.retired_websockets -> ()
   | _ ->
-    t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+    fork_general t ~scope:({(Core.effect_scope_of_graph scope.graph) with connection_generation=Some scope.connection_generation}) (fun () ->
       if not t.closed then t.post (Core.Websocket_retired scope))
 ;;
 
@@ -1059,7 +1076,7 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
     }
   in
   Hashtbl.replace t.operations id operation;
-  t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+  fork_general t ~scope:(Core.effect_ticket_scope ticket) (fun () ->
     let result =
       try
         Some
@@ -1115,7 +1132,7 @@ let submit_nonasset t instruction =
   if not t.closed
   then (
     match instruction with
-    | Core.Asset_io _ | Core.Protected_io _ ->
+    | Core.Asset_io _ | Core.Protected_io _ | Core.Await_io _ ->
       invalid_arg "Effect requires its dedicated interpreter"
     | Core.Request (ticket, request) -> submit_request t ticket request
     | Cancel_effects scope -> cancel_scope t scope
@@ -1133,7 +1150,7 @@ let submit_nonasset t instruction =
         }
       in
       Hashtbl.replace t.operations id operation;
-      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+      fork_general t ~scope:(Core.runner_effect_scope instruction) (fun () ->
         (try
            Eio.Fiber.first
              (fun () -> t.dependencies.runtime.sleep request.delay_seconds)
@@ -1149,7 +1166,7 @@ let submit_nonasset t instruction =
       (match Hashtbl.find_opt t.websocket_owners request.scope.graph with
        | Some owner when owner.physical_scope = request.scope -> ()
        | Some _ ->
-         t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+         fork_general t ~scope:(Core.runner_effect_scope instruction) (fun () ->
            if not t.closed
            then
              t.post
@@ -1186,7 +1203,7 @@ let submit_nonasset t instruction =
          in
          Hashtbl.replace t.websocket_owners request.scope.graph owner;
          Hashtbl.replace t.operations key operation;
-         t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+         fork_general t ~scope:(Core.runner_effect_scope instruction) (fun () ->
            let registered = ref false in
            Fun.protect
              ~finally:(fun () ->
@@ -1602,7 +1619,7 @@ let fetch_asset
           ~version)))
 ;;
 
-let close_asset_scope ?except_id t scope =
+let close_asset_scope_checked ?except_id t scope =
   Hashtbl.iter
     (fun id (operation : operation) ->
        if
@@ -1616,8 +1633,12 @@ let close_asset_scope ?except_id t scope =
          operation.cancelled <- true;
          operation.cancel ()))
     t.operations;
-  Option.iter Asset_cache.close (Hashtbl.find_opt t.asset_caches scope);
-  Hashtbl.remove t.asset_caches scope
+  match Hashtbl.find_opt t.asset_caches scope with
+  |None->Ok()
+  |Some cache->Asset_cache.close_checked cache
+    |> Result.map(fun()->Hashtbl.remove t.asset_caches scope)
+;;
+let close_asset_scope ?except_id t scope=ignore(close_asset_scope_checked ?except_id t scope)
 ;;
 
 let scoped_asset_cache t scope =
@@ -1649,10 +1670,10 @@ let retain_asset_file t ~scope ~handle =
 ;;
 
 let release_asset_file t ~scope ~handle =
-  Hashtbl.remove t.asset_leases (scope, handle);
-  Option.iter
-    (fun cache -> Asset_cache.release cache handle)
-    (Hashtbl.find_opt t.asset_caches scope)
+  let result=match Hashtbl.find_opt t.asset_caches scope with
+    | None -> Ok ()
+    | Some cache -> Asset_cache.release_checked cache handle |> Result.map_error asset_cache_failure in
+  Result.map(fun()->Hashtbl.remove t.asset_leases(scope,handle))result
 ;;
 
 let cancel_graph_asset_operations ?except_id t (request : Core.mirror_deletion) =
@@ -1694,11 +1715,13 @@ let prepare_graph_asset_deletion ?except_id t (scope : Core.graph_scope) retirem
     else if attempts = 0 then Error (Core.Asset_invalid_content "Attachment resources are still in use.")
     else (t.dependencies.runtime.sleep 0.005; wait (attempts - 1)) in
   let result = Result.bind (wait 1000) (fun () ->
-    Hashtbl.fold (fun scope _ scopes -> if same_target scope then scope :: scopes else scopes)
-      t.asset_caches [] |> List.iter (close_asset_scope ?except_id t);
-    Asset_cache.prepare_graph_deletion ~root:(asset_root t) ~scope ~retirement
-    |> Result.map_error asset_cache_failure
-    |> Result.map (fun () -> Core.Asset_deletion_prepared (Core.asset_deletion_reference ~scope ~retirement))) in
+    let scopes=Hashtbl.fold(fun scope _ scopes->if same_target scope then Rrbvec.push_back scopes scope else scopes)
+      t.asset_caches Rrbvec.empty in
+    let closed=Rrbvec.fold_left(fun result scope->Result.bind result(fun()->
+      close_asset_scope_checked ?except_id t scope |> Result.map_error asset_cache_failure))(Ok())scopes in
+    Result.bind closed(fun()->Asset_cache.prepare_graph_deletion ~root:(asset_root t) ~scope ~retirement
+      |> Result.map_error asset_cache_failure
+      |> Result.map(fun()->Core.Asset_deletion_prepared(Core.asset_deletion_reference ~scope ~retirement)))) in
   (* A failed preparation may already own a durable rename. Its coordinating
      journal will cancel it; keep the barrier until that exact terminal action. *)
   result
@@ -1938,7 +1961,17 @@ let prune_staged_assets t ~scope ~keep =
       |> Result.map_error asset_cache_failure)
 ;;
 
-let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
+let capture_asset_jobs t (scope:Core.graph_scope) =
+  let same (actual:Core.graph_scope)=
+    Uri.equal actual.account.managed_sync_origin scope.account.managed_sync_origin
+    && actual.account.user_id=scope.account.user_id
+    && actual.account.account_generation=scope.account.account_generation
+    && actual.graph_id=scope.graph_id && actual.graph_generation=scope.graph_generation in
+  Hashtbl.fold(fun _ (owner,finished) jobs->
+    if same owner then Rrbvec.push_back jobs finished else jobs)t.asset_jobs Rrbvec.empty
+;;
+
+let execute_asset ?except_id ?(asset_snapshot=Rrbvec.empty) t (request : Core.asset_io_request) ~current =
   let scope = request.context.scope in
   let map_unit result = Result.map (fun () -> Core.Asset_unit) result in
   let storage_result result =
@@ -1952,7 +1985,7 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
       action
   in
   let permitted = match request.action with
-    | Core.Release_asset_file _ | Cancel_asset_operation _ | Prepare_graph_asset_deletion _
+    | Core.Release_asset_file _ | Await_asset_operations | Cancel_asset_operation _ | Prepare_graph_asset_deletion _
     | Commit_graph_asset_deletion _ | Cancel_graph_asset_deletion _ | Delete_account_assets -> true
     | _ -> not (asset_blocked t scope) in
   if not permitted then Error Core.Asset_cancelled else
@@ -2048,16 +2081,17 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
         Core.Asset_invalid_content "Attachment preview storage is unavailable"
       | failure -> failure)
   | Release_asset_file handle ->
-    release_asset_file t ~scope ~handle;
-    Ok Core.Asset_unit
+    release_asset_file t ~scope ~handle |> map_unit
   | Release_staged_file file ->
     release_staged_asset t ~scope ~file |> storage_result |> map_unit
   | Prune_asset_staging keep ->
     prune_staged_assets t ~scope ~keep
     |> Result.map (fun count -> Core.Asset_pruned count)
+  | Await_asset_operations ->
+    Rrbvec.iter Eio.Promise.await asset_snapshot;
+    if t.closed then Error Core.Asset_cancelled else Ok Core.Asset_unit
   | Close_asset_scope ->
-    close_asset_scope ?except_id t scope;
-    Ok Core.Asset_unit
+    close_asset_scope_checked ?except_id t scope |> Result.map_error asset_cache_failure |> map_unit
   | Prepare_graph_asset_deletion retirement ->
     prepare_graph_asset_deletion ?except_id t scope retirement ~current
   | Commit_graph_asset_deletion deletion -> finish_graph_asset_deletion t deletion ~commit:true
@@ -2102,6 +2136,17 @@ let claim_operation t instruction =
     true)
 ;;
 
+let fork_asset_task t id (request:Core.asset_io_request) task =
+  let finished,resolve=Eio.Promise.create() in
+  let tracked=match request.action with Core.Await_asset_operations->false|_->true in
+  if tracked then Hashtbl.add t.asset_jobs id(request.context.scope,finished);
+  let complete()=
+    if tracked then Hashtbl.remove t.asset_jobs id;
+    ignore(Eio.Promise.try_resolve resolve():bool) in
+  try t.dependencies.runtime.fork ~sw:t.sw(fun()->Fun.protect ~finally:complete task)
+  with error->complete();raise error
+;;
+
 let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
   let id =
     scoped_operation_id "asset" request.context.scope (Core.asset_ticket_id ticket)
@@ -2143,7 +2188,10 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
       }
     in
     Hashtbl.add t.operations id operation;
-    t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+    let asset_snapshot=match request.action with
+      |Core.Await_asset_operations->capture_asset_jobs t request.context.scope
+      |_->Rrbvec.empty in
+    fork_asset_task t id request (fun () ->
       let current () = (not t.closed) && not operation.cancelled in
       let result =
         Fun.protect
@@ -2161,7 +2209,7 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
                  (fun () ->
                     if not (current ()) then raise Runner_cancelled;
                     with_asset_diagnostics t request ~current (fun () ->
-                      execute_asset ~except_id:id t request ~current))
+                      execute_asset ~except_id:id ~asset_snapshot t request ~current))
                  (fun () ->
                     Eio.Promise.await cancelled;
                     raise Runner_cancelled)
@@ -2209,7 +2257,7 @@ let submit_protected t instruction ticket (request : Core.protected_request) =
       }
     in
     Hashtbl.add t.operations id operation;
-    t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+    fork_general t ~scope:(Core.effect_scope_of_graph request.protected_scope) (fun () ->
       let result =
         Fun.protect
           ~finally:(fun () -> Hashtbl.remove t.operations id)
@@ -2234,6 +2282,7 @@ let cleanup_asset_action = function
   | Core.Release_asset_file _
   | Release_staged_file _
   | Close_asset_scope
+  | Await_asset_operations
   | Prepare_graph_asset_deletion _
   | Commit_graph_asset_deletion _
   | Cancel_graph_asset_deletion _
@@ -2250,11 +2299,28 @@ let cleanup_asset_action = function
   | Asset_retry_after _ -> false
 ;;
 
+let submit_io_fence t id scope =
+  (* Capture before yielding/forking. Later unrelated work is not part of this
+     round; waiting must never occupy the serial callback consumer. *)
+  let jobs=Hashtbl.fold(fun _ (owner,finished) jobs->
+    if scope_matches scope owner then Rrbvec.push_back jobs finished else jobs)
+    t.general_jobs Rrbvec.empty in
+  let jobs=Hashtbl.fold(fun _ (owner,finished) jobs->
+    if scope_matches scope(Core.effect_scope_of_graph owner)
+    then Rrbvec.push_back jobs finished else jobs)t.asset_jobs jobs in
+  t.dependencies.runtime.fork ~sw:t.sw(fun()->
+    let result=if t.closed then Error "Sync stopped before I/O settlement." else (
+      Rrbvec.iter Eio.Promise.await jobs;
+      if t.closed then Error "Sync stopped before I/O settlement." else Ok()) in
+    t.post(Core.IO_fence_completed(id,scope,result)))
+;;
+
 let submit t instruction =
   match instruction with
-  | Core.Asset_io (ticket, ({ action = Core.Prepare_graph_asset_deletion _; _ } as request)) ->
-    (* Deletion may wait for native leases. It must not block the event consumer
-       that delivers their release, and shutdown must revoke its execution. *)
+  |Core.Await_io(id,scope)->submit_io_fence t id scope
+  | Core.Asset_io (ticket, ({ action = (Core.Prepare_graph_asset_deletion _ | Await_asset_operations); _ } as request)) ->
+    (* Waiting must leave the serial event consumer free to deliver the I/O
+       callbacks or native lease releases being joined. *)
     if t.closed
     then t.post (Core.Runner_completed (Core.Asset_completion (ticket, Error Core.Asset_cancelled)))
     else submit_asset_io t instruction ticket request

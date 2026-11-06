@@ -126,4 +126,9 @@ val create
     Replaying an already submitted ticket does not execute I/O or post a second completion. *)
 val submit : t -> Logseq_sync_pure_reducer.Core.runner_effect -> unit
 
+(** Checked physical cleanup for the original retired logical account. The
+    caller must hold its lifecycle fence and join admitted IO first. Retained
+    native leases preserve their cache and return Error; this issues no authority. *)
+val retire_account:t -> account:Logseq_sync_pure_reducer.Core.account_scope -> (unit,string)result
+
 val shutdown : t -> unit

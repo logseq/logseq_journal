@@ -14,6 +14,7 @@
   logical_change
   mirror
   mutation_receipt
+  mutation_pure_intent
   create_journal_page
   delete_blocks
   graph_read
@@ -45,9 +46,13 @@
   eio
   logseq_db_storage
   logseq_db_types
+  melange-transit-core
   melange-transit-native
   ppx_deriving_yojson.runtime
   sqlite3
-  uutf)
+  unix
+  uutf
+  datascript_ocaml
+  yojson)
  (preprocess
   (pps ppx_deriving_yojson)))

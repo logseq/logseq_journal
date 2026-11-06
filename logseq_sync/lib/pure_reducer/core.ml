@@ -38,6 +38,13 @@ type graph_scope =
   ; graph_generation : graph_generation
   }
 
+(** Execution admission gate owned by a pending host handoff. It grants no
+    deletion authority. Release is exact-ID and cannot unfreeze a later round. *)
+module Host_cleanup_scopes=Set.Make(struct type t=graph_scope let compare=Stdlib.compare end)
+type host_fence_target=One_graph of graph_id|All_graphs
+type host_fence={id:Logseq_db_types.Graph_types.Uuid.t;owner:account_scope;
+  target:host_fence_target;captured_scopes:graph_scope Rrbvec.t;previous:Logseq_db_types.Graph_types.Uuid.t option}
+
 type connection_scope =
   { graph : graph_scope
   ; connection_generation : connection_generation
@@ -430,6 +437,9 @@ type asset_action =
   | Release_asset_file of string
   | Release_staged_file of string
   | Prune_asset_staging of string list
+  (** Join already admitted actual asset I/O tasks and their callback posting.
+      This read-only barrier neither closes caches nor grants a host permit. *)
+  | Await_asset_operations
   | Close_asset_scope
   | Prepare_graph_asset_deletion of retirement_id
   | Commit_graph_asset_deletion of asset_deletion
@@ -590,6 +600,10 @@ type timer_request =
   }
 
 type runner_effect =
+  (* Snapshot actual I/O owners before fork; wait off the serial consumer and
+      report after their physical task and callback posting finish. No host,
+      filesystem or data-admission permission is granted. *)
+  | Await_io of int64 * effect_scope
   | Asset_io of asset_ticket * asset_io_request
   | Protected_io of protected_ticket * protected_request
   | Request : 'a effect_ticket * 'a runner_request -> runner_effect
@@ -622,6 +636,7 @@ let scope_of_request : type a. a runner_request -> effect_scope = function
 ;;
 
 let runner_effect_scope = function
+  | Await_io(_,scope)->scope
   | Protected_io (_, request) -> effect_scope_of_graph request.protected_scope
   | Asset_io (_, request) -> effect_scope_of_graph request.context.scope
   | Request (ticket, _) -> ticket.scope
@@ -633,6 +648,7 @@ let runner_effect_scope = function
 ;;
 
 let runner_effect_diagnostic = function
+  | Await_io(id,_)->Printf.sprintf "io-fence:%Ld" id
   | Protected_io (ticket, _) -> protected_ticket_id ticket
   | Asset_io (ticket, _) -> asset_ticket_id ticket
   | Request (ticket, _) -> Printf.sprintf "request:%d" ticket.id
@@ -788,6 +804,10 @@ type timeline_scope =
   }
 
 type event =
+  | Host_fence_started of host_fence
+  | Host_fence_released of Logseq_db_types.Graph_types.Uuid.t
+  | IO_fence_requested of int64 * effect_scope
+  | IO_fence_completed of int64 * effect_scope * (unit,string) result
   | Asset_requested of asset_request
   | Protected_requested of protected_request
   | Restore_local_account of { user_id : string }
@@ -927,7 +947,9 @@ type graph_session =
   }
 
 type t =
-  { resident_order : graph_id list
+  { host_fence : host_fence option
+  ; host_cleanup_scopes : Host_cleanup_scopes.t
+  ; resident_order : graph_id list
   ; resident_sessions : graph_session list
   ; resident_next_generation : int
   ; resident_enabled : bool
@@ -1013,7 +1035,9 @@ let initial config =
     }
   in
   Ok
-    { resident_order = []
+    { host_fence = None
+    ; host_cleanup_scopes = Host_cleanup_scopes.empty
+    ; resident_order = []
     ; resident_sessions = []
     ; resident_next_generation = 0
     ; resident_enabled = false
@@ -1551,7 +1575,11 @@ let is_graph_key_access (Pending_effect ticket) =
   | _ -> false
 ;;
 
+let host_fence_blocks core graph_id=match core.host_fence with
+  |None->false|Some fence->match fence.target with All_graphs->true|One_graph id->id=graph_id
+;;
 let select_graph_transition core ~persist graph_id =
+  if host_fence_blocks core graph_id then unchanged core else
   match core.user_id, graph_in_catalog core.public_state.snapshot.catalog graph_id with
   | Some user_id, Some graph ->
     let graph_generation = max core.resident_next_generation core.public_state.snapshot.startup.graph_generation + 1 in
@@ -1703,6 +1731,7 @@ let graph_attached core (attachment : graph_attachment) =
 
 let operation_name = function
   | Overlay.Save_block_operation -> "save-block"
+  | Append_journal_operation -> "append-journal"
   | Insert_blocks_operation -> "insert-blocks"
   | Delete_blocks_operation -> "delete-blocks"
   | Create_journal_page_operation -> "create-journal-page"
@@ -3099,6 +3128,8 @@ let step core event =
   then unchanged core
   else (
     match event with
+    | Host_fence_started _ | Host_fence_released _
+    | IO_fence_requested _ | IO_fence_completed _ -> unchanged core
     | Sign_in_requested scope when startup_scope_is_current core scope ->
       let next=network_phase core Online_by_user in {next;effects=[publish next]}
     | Online_cancelled scope when startup_scope_is_current core scope ->
@@ -3451,6 +3482,7 @@ let asset_cleanup_action = function
   | Release_asset_file _
   | Release_staged_file _
   | Close_asset_scope
+  | Await_asset_operations
   | Prepare_graph_asset_deletion _
   | Commit_graph_asset_deletion _
   | Cancel_graph_asset_deletion _
@@ -3505,6 +3537,7 @@ let asset_result_matches (request : asset_io_request) = function
      | Release_staged_file _, Asset_unit
      | Prune_asset_staging _, Asset_pruned _
      | Close_asset_scope, Asset_unit
+     | Await_asset_operations, Asset_unit
      -> true
      | Prepare_graph_asset_deletion retirement, Asset_deletion_prepared deletion ->
        retirement = deletion.retirement && request.context.scope = deletion.deletion_scope
@@ -3610,6 +3643,8 @@ let request_asset core (request : asset_request) =
             && scope.graph_id = request.scope.graph_id in
           Option.fold ~none:false ~some:same_target core.deletion_scope
           || Option.fold ~none:false ~some:same_target core.current_graph_scope
+        | Close_asset_scope|Await_asset_operations->List.mem request.scope core.asset_known_scopes
+          || Host_cleanup_scopes.mem request.scope core.host_cleanup_scopes
         | _ -> List.mem request.scope core.asset_known_scopes
       in
       if known
@@ -3651,7 +3686,8 @@ let request_asset core (request : asset_request) =
         cancel_asset_pending core (fun previous ->
           previous.context.scope = request.scope && previous.operation = operation)
       | Close_asset_scope ->
-        cancel_asset_pending core (fun previous -> previous.context.scope = request.scope)
+        cancel_asset_pending core (fun previous -> previous.context.scope = request.scope
+          && not(asset_cleanup_action previous.action))
       | Prepare_graph_asset_deletion retirement
         when not (Asset_retirement_set.mem (asset_retirement_key request.scope retirement) core.asset_retirement_observed) ->
         cancel_asset_pending core (fun previous ->
@@ -4219,6 +4255,32 @@ let state_for_scope core (scope : graph_scope) =
   else if core.current_graph_scope=Some scope then Some core.public_state
   else Option.map (fun session -> (restore_session core session).public_state)
     (List.find_opt (fun s -> s.saved_identity=scope) core.resident_sessions)
+type coordination_state =
+  { account : account_scope option
+  ; desired_residents : graph_id list
+  ; residents : (graph_scope * state) list
+  ; selected : timeline_scope option
+  ; deletion : (graph_scope * local_deletion) option
+  }
+let coordination_state core =
+  let desired_residents=resident_graphs core in
+  let saved=(remember_current core).resident_sessions in
+  let residents=List.filter_map (fun id ->
+    Option.map (fun session -> session.saved_identity,
+      (restore_session core session).public_state)
+      (List.find_opt (fun session -> session.saved_identity.graph_id=id
+        && session.saved_identity.account.account_generation=
+           core.public_state.snapshot.startup.account_generation) saved)) desired_residents in
+  let snapshot=core.public_state.snapshot in
+  let selected=Option.bind snapshot.selected_graph (fun id ->
+    List.find_map (fun ((scope:graph_scope),_) ->
+      if scope.graph_id<>id then None else Some
+        {startup={account_generation=scope.account.account_generation;
+          presentation_generation=snapshot.startup.presentation_generation};
+         graph_id=id;graph_generation=scope.graph_generation}) residents) in
+  {account=Option.map (account_scope core) core.user_id;desired_residents;residents;selected;
+   deletion=(match core.deletion_scope,snapshot.local_deletion with
+     | Some scope,Some phase -> Some(scope,phase) | _ -> None)}
 let asset_context_for_scope core (scope : graph_scope) =
   if scope_for_graph core ~graph_id:scope.graph_id <> Some scope then None
   else if core.current_graph_scope=Some scope then asset_context core
@@ -4230,7 +4292,19 @@ let session_for_effect core (scope : effect_scope) =
     (scope.graph_generation=Some s.graph_generation && scope.account_generation=Some s.account.account_generation)
     || List.exists (fun (Pending_effect ticket)->ticket.scope=scope) session.saved_pending_effects)
     (remember_current core).resident_sessions
+let private_deletion_asset_scope core (scope:graph_scope)=
+  Option.exists(fun (owner:graph_scope)->owner.graph_id=scope.graph_id && owner.account=scope.account)core.deletion_scope
+;;
 let event_graph_scope core = function
+  |Asset_requested{scope;action=(Close_asset_scope|Await_asset_operations);_}
+    when Host_cleanup_scopes.mem scope core.host_cleanup_scopes->None
+  |Runner_completed(Asset_completion(ticket,_))
+    when (match ticket.asset_request.action with Close_asset_scope|Await_asset_operations->true|_->false)
+      && Host_cleanup_scopes.mem ticket.asset_request.context.scope core.host_cleanup_scopes->None
+  |Asset_requested {scope;action=(Prepare_graph_asset_deletion _|Commit_graph_asset_deletion _|Cancel_graph_asset_deletion _);_}
+    when private_deletion_asset_scope core scope->None
+  |Runner_completed(Asset_completion(ticket,_))
+    when private_deletion_asset_scope core ticket.asset_request.context.scope->None
   | Asset_requested ({scope;action;_} as request) when asset_cleanup_action action ->
     (match List.find_opt (fun session->List.mem scope session.saved_asset_known_scopes)
       (remember_current core).resident_sessions with
@@ -4329,6 +4403,7 @@ let valid_residents core ids =
   List.length ids<=3 && List.length (List.sort_uniq compare ids)=List.length ids
   && List.for_all (fun id -> Option.is_some (graph_in_catalog core.public_state.snapshot.catalog id)) ids
 let configure_residents core ids =
+  let ids=List.filter(fun id->not(host_fence_blocks core id))ids in
   if not (valid_residents core ids) then unchanged core else
   let old_visible=visible_identity core in
   let core=remember_current {core with resident_enabled=true} in
@@ -4344,7 +4419,7 @@ let configure_residents core ids =
     let base = match core.current_graph_scope with
       | Some _ -> empty_session core
       | None -> let blank=initial core.config |> Result.get_ok in
-        let base={blank with user_id=core.user_id;next_effect_id=core.next_effect_id;
+        let base={blank with host_fence=core.host_fence;host_cleanup_scopes=core.host_cleanup_scopes;user_id=core.user_id;next_effect_id=core.next_effect_id;
           resident_order=core.resident_order;resident_enabled=true;resident_sessions=core.resident_sessions;
           resident_next_generation=core.resident_next_generation;foreground=core.foreground;
           lifecycle_generation=core.lifecycle_generation;public_state=core.public_state} in
@@ -4398,12 +4473,12 @@ let prune_sessions core =
        || session.saved_protected_pending<>[]
     then Some session
     else if session.saved_asset_known_scopes=[]
-      || session.saved_identity.account.account_generation<>core.public_state.snapshot.startup.account_generation
     then None
     else (
-      (* Retained native pages may release their admitted file leases after
-         the graph has closed. Keep only cleanup ownership and retirement
-         fences; the closed graph's snapshot, key and network state are gone. *)
+      (* Original native leases retain cleanup authority across graph/account
+         retirement. This tombstone cannot acquire/read: it has no live snapshot,
+         key, or execution owner. Keep it for idempotent release even after a
+         checked cache close, including a lost per-handle ACK. *)
       Some(cleanup_session core session))) core.resident_sessions}
 let step core event =
   match event with
@@ -4440,7 +4515,8 @@ let step core event =
     (* Account cleanup owns the old physical files. Already admitted requests
        must still receive their completion while their native owners retire. *)
     let cleanup=List.filter_map(fun session ->
-      if session.saved_assets_pending=[] && session.saved_protected_pending=[] then None
+      if session.saved_assets_pending=[] && session.saved_protected_pending=[]
+         && session.saved_asset_known_scopes=[] then None
       else Some(cleanup_session signed_out.next session)) closed in
     {next={signed_out.next with resident_order=[];resident_sessions=cleanup;
       public_state={signed_out.next.public_state with snapshot={signed_out.next.public_state.snapshot with resident_graphs=[]}}};
@@ -4498,3 +4574,45 @@ let step core event =
   if changed then {transition with effects=transition.effects @ [Publish(Resident_scopes_changed(scopes transition.next))]}
   else transition
 ;;
+
+let step core = function
+  |IO_fence_requested(id,scope)->{next=core;effects=[Run(Await_io(id,scope))]}
+  |IO_fence_completed _->unchanged core
+  |event->step core event
+;;
+
+let step core = function
+  |Host_fence_started fence->
+    let current=Option.map(account_scope core)core.user_id in
+    let owner_matches=Option.exists(fun (owner:account_scope)->
+      Uri.equal owner.managed_sync_origin fence.owner.managed_sync_origin
+      && owner.user_id=fence.owner.user_id && owner.account_generation=fence.owner.account_generation
+      && owner.lifecycle_generation=fence.owner.lifecycle_generation)current in
+    let replace_matches=match core.host_fence,fence.previous with
+      |None,None->true
+      |Some old,Some previous->old.id=previous && old.target=fence.target
+      |Some old,None->old.id=fence.id && old.target=fence.target
+      |_->false in
+    if not owner_matches || not replace_matches || Rrbvec.length fence.captured_scopes>8192 then unchanged core else
+    let residents=resident_graphs core in
+    let core=remember_current{core with host_fence=Some fence;
+      host_cleanup_scopes=Rrbvec.fold_left(fun scopes scope->Host_cleanup_scopes.add scope scopes)Host_cleanup_scopes.empty fence.captured_scopes;
+      resident_enabled=true;resident_order=residents} in
+    let closed=configure_residents core(List.filter(fun id->not(host_fence_blocks core id))residents) in
+    (match fence.target with
+    |One_graph _->closed
+    |All_graphs->
+      let scope={ (effect_scope_of_account fence.owner) with
+        presentation_generation=None;lifecycle_generation=None } in
+      {closed with effects=Run(Cancel_effects scope)::closed.effects})
+  |Host_fence_released id->
+    (match core.host_fence with
+     |Some fence when fence.id=id->let next={core with host_fence=None;host_cleanup_scopes=Host_cleanup_scopes.empty} in {next;effects=[publish next]}
+     |_->unchanged core)
+  |Account_authenticated{user_id=Some user} when core.user_id=Some user
+      && Option.exists(fun fence->fence.target=All_graphs)core.host_fence->unchanged core
+  |(Catalog_refresh_requested _|Sign_in_requested _|Online_recovery_requested _)
+    when Option.exists(fun fence->fence.target=All_graphs)core.host_fence->unchanged core
+  |event->step core event
+;;
+let host_fence_active core=core.host_fence

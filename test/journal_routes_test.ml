@@ -261,6 +261,23 @@ let test_direct_capture_preserves_source_and_mutation_identity () =
       ~message:"storage unavailable"
   in
   require_string source (Journal_capture.source failed) "failed direct Capture draft";
+  let changed = Journal_capture.update_source failed ~source:"replacement source" in
+  require_string "replacement source" (Journal_capture.source changed)
+    "unknown plain Capture did not retain a separate editable buffer";
+  require(Journal_capture.pending_command changed=Journal_capture.pending_command failed)
+    "editing changed the admitted original source";
+  require (Journal_capture.retry_identity_locked failed)
+    "unknown plain Capture did not retain its original identity";
+  let changed_choice = Journal_capture.toggle_task_intent failed in
+  let _, changed_retry = Journal_capture.retry changed_choice in
+  (match request, changed_retry with
+   | Some (Journal_graph_request.Capture original), Some (Capture latest) ->
+     require (latest.command.mutation_id = original.command.mutation_id
+       && latest.command.block_id = original.command.block_id
+       && latest.command.source = original.command.source
+       && latest.command.status_intent_revision = 1L)
+       "unknown plain Capture status retry replaced its original insertion"
+   | _ -> fail "unknown plain Capture lost its retry");
   let retrying, retry = Journal_capture.retry failed in
   require
     (retry = request)
@@ -374,6 +391,8 @@ let test_direct_capture_pending_attachments () =
        command.source
        "attachment-only Capture did not name the block after its pick"
    | _ -> fail "attachment-only Capture admitted a non-Capture request");
+  require(Journal_capture.remove_attachment saving ~token==saving)
+    "pending submission allowed removal of its original staged input";
   (match Journal_capture.attachment_imports saving with
    | Some (block_id, [ staged ]) ->
      require_string
@@ -550,11 +569,10 @@ let test_direct_capture_task_intent_survives_edit_failure_and_retry () =
   require
     (Journal_capture.task_state replacement = Journal_model.No_status)
     "failed task recovery did not clear intent";
-  require_string
-    edited_source
-    (Journal_capture.source
-       (Journal_capture.update_source replacement ~source:"Another draft"))
-    "ambiguous failed attempt must retain its body until confirmed";
+  let edited=Journal_capture.update_source replacement ~source:"Another draft" in
+  require_string "Another draft" (Journal_capture.source edited) "failed task draft remains editable";
+  require(Journal_capture.pending_command edited=Journal_capture.pending_command replacement)
+    "task draft edit changed its admitted payload";
   let _, replacement_request = Journal_capture.retry replacement in
   match replacement_request with
   | Some
@@ -567,6 +585,59 @@ let test_direct_capture_task_intent_survives_edit_failure_and_retry () =
   | _ -> fail "status recovery did not retain original Capture identity"
 ;;
 
+let test_detail_page_keeps_newer_point_content () =
+  let module D=Journal_detail in
+  let root=block ~source:"root A" ~revision:"opaque-A" ~child_count:3 () in
+  let root_id=Journal_model.id root in
+  let child=block ~id:(generated_block_id 550) ~parent_id:(Some root_id)
+    ~source:"child A" ~revision:"child-A" () in
+  let cursor:Journal_graph_projection.block_cursor={after_sibling_order="one";
+    after_block_id=Journal_model.id child;protocol_cursor=Some(Journal_graph_projection.Child_cursor
+      {after=Coordination_test_fixture.child_continuation "point-race";maximum_items=128})} in
+  let initial:Journal_graph_projection.detail={root;children={blocks=[child];continuation=Some cursor}} in
+  let state,requests=D.step(D.create ~session_number:69L initial)(Load_more root_id) in
+  let generation=match requests with [Journal_graph_request.Load_detail{request_generation;_}]->request_generation|_->assert false in
+  let root_b=block ~source:"root B" ~revision:"opaque-B" ~child_count:3 () in
+  let child_b=block ~id:(Journal_model.id child) ~parent_id:(Some root_id)
+    ~source:"child B" ~revision:"child-B" () in
+  let state=D.apply_block(D.apply_block state root_b)child_b in
+  let new_child=block ~id:(generated_block_id 552) ~parent_id:(Some root_id) ~source:"new page" () in
+  let loaded={initial with children={blocks=[child;new_child];continuation=None}} in
+  let next,_=D.step state(Loaded(generation,loaded)) in
+  require_string "root B" (Journal_model.source(D.root next)) "late page root";
+  require_string "child B" (Journal_model.source(Option.get(D.find_block next ~block_id:(Journal_model.id child)))) "late page child";
+  require(List.exists(fun value->Journal_model.id value=Journal_model.id new_child)(D.children next))
+    "preserving point content discarded a valid paginated child";
+  require(D.continuation next ~parent_id:root_id=None) "preserving point content discarded the page continuation";
+  let run actions=
+    let state,requests=D.step(D.create ~session_number:69L initial)(Load_more root_id) in
+    let generation=match requests with [Journal_graph_request.Load_detail{request_generation;_}]->request_generation|_->assert false in
+    let state=ref state and expected_root=ref "root A" and expected_child=ref "child A" in
+    List.iteri(fun index action->
+      (match action mod 5 with
+       | 0->let source=Printf.sprintf "root update %d" index in expected_root:=source;
+         state:=D.apply_block !state(block ~source ~revision:source ~child_count:3 ())
+       | 1->let source=Printf.sprintf "child update %d" index in expected_child:=source;
+         state:=D.apply_block !state(block ~id:(Journal_model.id child) ~parent_id:(Some root_id) ~source ~revision:source ())
+       | 2|3->state:=fst(D.step !state(Loaded(generation,loaded)))
+       | _->state:=fst(D.step !state(Load_failed(Int64.pred generation,false,"stale failure"))));
+      require_string !expected_root(Journal_model.source(D.root !state)) "generated page/point root";
+      require_string !expected_child(Journal_model.source(Option.get(D.find_block !state ~block_id:(Journal_model.id child))))
+        "generated page/point child") actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | item::rest->remove(item::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x0A6E;seed|] in
+    let actions=List.init 40(fun _->Random.State.int random 50) in
+    if fails actions then fail "page/point seed=%d minimized=[%s]" seed
+      (String.concat ";" (List.map string_of_int(shrink actions)))
+  done
+;;
+
 let test_child_refresh_replaces_cursor_and_fences_pending_read () =
   let module D = Journal_detail in
   let root = block ~child_count:3 () in
@@ -576,7 +647,7 @@ let test_child_refresh_replaces_cursor_and_fences_pending_read () =
     { after_sibling_order = Journal_model.sibling_order child
     ; after_block_id = Journal_model.id child
     ; protocol_cursor =
-        Some (Logseq_db_types.Graph_types.Cursor.of_string token |> Result.get_ok)
+        Some (Journal_graph_projection.Child_cursor {after=Coordination_test_fixture.child_continuation token;maximum_items=128})
     }
   in
   let projection token : Journal_graph_projection.detail =
@@ -629,8 +700,7 @@ let test_append_restarts_partial_children_without_reusing_cursor () =
          ; after_block_id = Journal_model.id child
          ; protocol_cursor =
              Some
-               (Logseq_db_types.Graph_types.Cursor.of_string "before-append"
-                |> Result.get_ok)
+               (Journal_graph_projection.Child_cursor {after=Coordination_test_fixture.child_continuation "before-append";maximum_items=128})
          }
        in
        let initial =
@@ -727,8 +797,7 @@ let test_append_restarts_partial_children_without_reusing_cursor () =
            { cursor with
              protocol_cursor =
                Some
-                 (Logseq_db_types.Graph_types.Cursor.of_string "after-append"
-                  |> Result.get_ok)
+                 (Journal_graph_projection.Child_cursor {after=Coordination_test_fixture.child_continuation "after-append";maximum_items=128})
            }
          in
          let first, _ =
@@ -1030,29 +1099,33 @@ let test_route_generation_background_and_runtime_replacement () =
     "Back did not return Timeline"
 ;;
 
+let favorites_cursor_factory ?(graph_generation = 7) () =
+  fun after n ->
+    let wire_next = Some (Logseq_db_types.Graph_types.Cursor.of_string
+      ("favorites-fixture:" ^ string_of_int n) |> Result.get_ok) in
+    (Coordination_test_fixture.favorites ~graph_generation ~after ~wire_next []).next
+    |> Option.get
+;;
+
 let test_favorites_state_isolates_requests_and_refreshes () =
   let module F = Journal_routes.Favorites in
-  let module P = Logseq_db_worker.Protocol in
   let module G = Logseq_db_types.Graph_types in
   let uuid n =
     G.Uuid.of_string (Printf.sprintf "75000000-0000-4000-8000-%012d" n) |> Result.get_ok
   in
-  let item n : P.v2_favorite_item =
+  let item n : Worker_pure_data.favorite_item =
     { membership_uuid = uuid n
     ; membership_order = string_of_int n
     ; membership_revision = "member"
     ; target =
-        V2_favorite_page
+        Worker_pure_data.V2_favorite_page
           { uuid = uuid (n + 100); title = string_of_int n; revision = "page" }
     }
   in
-  let result ?(cursor = None) items : P.v2_favorites_result =
-    { favorites_page = Some (uuid 99)
-    ; generation = "generation:v1:1"
-    ; projection_revision = "projection:v1:1"
-    ; items
-    ; next_cursor = cursor
-    }
+  let result ?(cursor = None) items =
+    Coordination_test_fixture.favorites ~graph_generation:7
+      ~favorites_page:(Some (uuid 99)) ~generation:"generation:v1:1"
+      ~projection_revision:"projection:v1:1" ~next:cursor items
   in
   let request = function
     | [ r ] -> r
@@ -1068,7 +1141,7 @@ let test_favorites_state_isolates_requests_and_refreshes () =
     "first request lost graph identity";
   let selected, commands = F.step selected (Select true) in
   require (commands = []) "reselection duplicated a request";
-  let cursor = G.Cursor.of_string "favorites-test:next" |> Result.get_ok in
+  let cursor = favorites_cursor_factory () None 0 in
   let selected, commands =
     F.step selected (Loaded (first, result ~cursor:(Some cursor) []))
   in
@@ -1078,7 +1151,7 @@ let test_favorites_state_isolates_requests_and_refreshes () =
     F.step selected (Loaded (second, result [ item 1; item 2; item 3 ]))
   in
   require
-    (F.initialized loaded && List.length (F.items loaded) = 3 && commands = [])
+    (F.initialized loaded && Rrbvec.length (F.items loaded) = 3 && commands = [])
     "loaded favorites missing";
   let loaded, _ = F.step loaded (Visible { first_index = 1; last_exclusive = 3 }) in
   let hidden, _ = F.step loaded (Select false) in
@@ -1098,7 +1171,7 @@ let test_favorites_state_isolates_requests_and_refreshes () =
   let followup = request commands in
   let failed, _ = F.step coalesced (Failed (followup, false, "Read failed")) in
   require
-    (F.error failed = Some "Read failed" && F.items failed <> [])
+    (F.error failed = Some "Read failed" && not (Rrbvec.is_empty (F.items failed)))
     "refresh failure erased cache";
   let retrying, commands = F.step failed Retry in
   let retry = request commands in
@@ -1110,17 +1183,68 @@ let test_favorites_state_isolates_requests_and_refreshes () =
   let replaced = F.create ~graph_generation:8 in
   let replaced, commands = F.step replaced (Loaded (restart, result [ item 1 ])) in
   require
-    (commands = [] && F.items replaced = [])
+    (commands = [] && Rrbvec.is_empty (F.items replaced))
     "old graph completion contaminated replacement";
   let hidden, _ = F.step restarted (Select false) in
   let hidden, commands = F.step hidden (Loaded (restart, result [ item 1 ])) in
   require
-    (commands = [] && List.length (F.items hidden) = 1)
+    (commands = [] && Rrbvec.length (F.items hidden) = 1)
     "inactive current completion was discarded"
 ;;
 
+let test_favorites_retains_large_typed_pages () =
+  let module F = Journal_routes.Favorites in
+  let module U = Logseq_db_types.Graph_types.Uuid in
+  let uuid n =
+    U.of_string (Printf.sprintf "76000000-0000-4000-8000-%012d" n) |> Result.get_ok
+  in
+  let state, requests = F.step (F.create ~graph_generation:7) (Select true) in
+  let state = ref state
+  and request = ref (List.hd requests) in
+  let next_cursor = favorites_cursor_factory () in
+  for page = 0 to 199 do
+    let after = if page = 199 then None else Some (next_cursor !request.cursor page) in
+    let items =
+      Rrbvec.init 50 (fun index ->
+        let n = (page * 50) + index + 1 in
+        Worker_pure_data.{ membership_uuid = uuid n
+          ; membership_order = string_of_int n
+          ; membership_revision = "m"
+          ; target =
+              Worker_pure_data.V2_favorite_page
+                { uuid = uuid (20000 + n); title = string_of_int n; revision = "p" }
+          })
+    in
+    let result = Coordination_test_fixture.favorites ~graph_generation:7
+      ~favorites_page:(Some (uuid 99999)) ~next:after (Rrbvec.to_list items)
+    in
+    let loaded, commands = F.step !state (Loaded (!request, result)) in
+    require (commands = []) "nonempty page unexpectedly restarted the scan";
+    state := loaded;
+    require
+      (Rrbvec.length (F.items !state) = (page + 1) * 50)
+      "typed pages lost accumulated rows";
+    if page < 199
+    then (
+      let pending, commands =
+        F.step
+          !state
+          (Visible { first_index = page * 50; last_exclusive = (page + 1) * 50 })
+      in
+      state := pending;
+      request := List.hd commands;
+      require (!request.cursor = after) "visible paging changed its sealed continuation")
+  done;
+  require
+    (Rrbvec.length (F.items !state) = 10000 && not (F.has_more !state))
+    "large paginated state inferred completeness before the final page";
+  let last = Rrbvec.nth (F.items !state) 9999 in
+  require
+    (U.equal last.membership_uuid (uuid 10000))
+    "Rrbvec append changed Favorites order"
+;;
+
 let test_favorite_target_origin_and_delete () =
-  let module P = Logseq_db_worker.Protocol in
   let module G = Logseq_db_types.Graph_types in
   let module F = Journal_routes.Favorites in
   let uuid suffix =
@@ -1128,12 +1252,12 @@ let test_favorite_target_origin_and_delete () =
   in
   let membership = uuid "000000000001"
   and target = uuid "000000000002" in
-  let item : P.v2_favorite_item =
+  let item : Worker_pure_data.favorite_item =
     { membership_uuid = membership
     ; membership_order = "a"
     ; membership_revision = "membership-1"
     ; target =
-        V2_favorite_block
+        Worker_pure_data.V2_favorite_block
           { uuid = target; title = "Target"; task_status = None; revision = "block-1" }
     }
   in
@@ -1155,7 +1279,7 @@ let test_favorite_target_origin_and_delete () =
    | _ -> fail "block favorite did not load detail");
   let page_item =
     { item with
-      target = V2_favorite_page { uuid = target; title = "Page"; revision = "page-1" }
+      target = Worker_pure_data.V2_favorite_page { uuid = target; title = "Page"; revision = "page-1" }
     }
   in
   let untouched, request =
@@ -1176,16 +1300,13 @@ let test_favorite_target_origin_and_delete () =
       selected
       (Loaded
          ( request
-         , { favorites_page = Some membership
-           ; generation = "generation-1"
-           ; projection_revision = "projection-1"
-           ; items = [ item; { page_item with membership_uuid = uuid "000000000003" } ]
-           ; next_cursor = None
-           } ))
+         , Coordination_test_fixture.favorites ~favorites_page:(Some membership)
+             ~generation:"generation-1" ~projection_revision:"projection-1"
+             [ item; { page_item with membership_uuid = uuid "000000000003" } ] ))
   in
   let hidden, _ = F.step loaded (Hide_target (G.Uuid.to_string target)) in
   require
-    (List.length (F.items hidden) = 1)
+    (Rrbvec.length (F.items hidden) = 1)
     "delete did not hide only the matching block favorite"
 ;;
 
@@ -1516,7 +1637,8 @@ let test_late_capture_completion_preserves_newer_edit () =
       ~creation_time:(creation_time 550)
   in
   require (request <> None) "Capture admission failed";
-  let interrupted = Journal_capture.fail capture ~message:"Interrupted" in
+  let interrupted = Journal_capture.fail capture ~message:"Known rejection acknowledged"
+    |> Journal_capture.release_rejected_attempt in
   let state =
     R.step start (Capture_admitted interrupted)
     |> fun state -> R.step state (Capture_edited "Newer text")
@@ -1540,7 +1662,7 @@ let test_late_capture_completion_preserves_newer_edit () =
     "late capture completion"
 ;;
 
-let test_failed_append_edit_replaces_only_failed_attempt () =
+let test_uncertain_append_keeps_original_attempt () =
   let module D = Journal_detail in
   let root = block () in
   let owner, request =
@@ -1569,19 +1691,15 @@ let test_failed_append_edit_replaces_only_failed_attempt () =
       ()
   in
   let blocked = D.apply_child_edit owner edited in
-  require_string
-    "Original"
-    (Journal_capture.source (Option.get (D.child_capture blocked)))
-    "in-flight edit";
+  require_string "Corrected" (Journal_capture.source(Option.get(D.child_capture blocked)))
+    "in-flight editor buffer";
   let failed = D.fail owner ~message:"Offline" in
   let changed = D.apply_child_edit failed edited in
-  require_string
-    "Corrected"
-    (Journal_capture.source (Option.get (D.child_capture changed)))
-    "failed Append edit";
+  require_string "Corrected" (Journal_capture.source(Option.get(D.child_capture changed)))
+    "failed Append editor buffer";
   require
-    (D.mode changed = Reading && snd (D.retry changed) = None)
-    "editing a failed attempt retained its obsolete retry";
+    (D.mode changed = Failed "Offline" && snd (D.retry changed) = request)
+    "uncertain insertion lost its original retry";
   let child =
     block
       ~id:"70000000-0000-4000-a000-000000000012"
@@ -1589,23 +1707,21 @@ let test_failed_append_edit_replaces_only_failed_attempt () =
       ()
   in
   let late = D.apply_child_created changed ~child ~parent:root in
-  require_string
-    "Corrected"
-    (Journal_capture.source (Option.get (D.child_capture late)))
-    "late Append completion";
+  require_string "Corrected" (Journal_capture.source(Option.get(D.child_capture late)))
+    "matching late insertion erased the newer child draft";
+  require(Journal_capture.can_save(Option.get(D.child_capture late))) "settled child kept the newer draft blocked";
   let toggled = D.toggle_child_task failed in
   require
-    (D.mode toggled = Reading && snd (D.retry toggled) = None)
-    "task edit retained failed request";
+    (D.mode toggled = Failed "Offline" && snd (D.retry toggled) <> None)
+    "task edit discarded uncertain insertion";
   require
     (Journal_capture.task_state (Option.get (D.child_capture toggled))
      = Journal_model.Default_status)
     "failed Append task edit ignored";
   let text_changed = D.update_child_source failed "Replacement" in
-  require_string
-    "Replacement"
-    (Journal_capture.source (Option.get (D.child_capture text_changed)))
-    "failed Append source replacement"
+  require_string "Replacement" (Journal_capture.source(Option.get(D.child_capture text_changed)))
+    "uncertain Append editor buffer";
+  require(snd(D.retry text_changed)=request) "editor buffer replaced the original child request"
 ;;
 
 let test_failed_task_append_retains_identity () =
@@ -1629,10 +1745,8 @@ let test_failed_task_append_retains_identity () =
   let failed = D.fail saving ~message:"Status deleted after insertion" in
   let cleared = D.set_child_task failed Journal_model.No_status in
   let edited = D.update_child_source cleared "Another draft" in
-  require_string
-    "Original task"
-    (Journal_capture.source (Option.get (D.child_capture edited)))
-    "task Append retained body";
+  require_string "Another draft" (Journal_capture.source(Option.get(D.child_capture edited)))
+    "task Append editor buffer";
   match snd (D.retry edited) with
   | Some (Journal_graph_request.Create_child command) ->
     require_string
@@ -1684,10 +1798,8 @@ let test_retained_task_append_keeps_recovery_identity () =
          D.set_child_task t Journal_model.No_status
          |> fun t -> D.update_child_source t "Another draft"
        in
-       require_string
-         "Retained task"
-         (Journal_capture.source (Option.get (D.child_capture restored)))
-         "retained task recovery body";
+       require_string "Another draft" (Journal_capture.source(Option.get(D.child_capture restored)))
+         "retained task editor buffer";
        match snd (D.retry restored) with
        | Some (Journal_graph_request.Create_child command) ->
          require
@@ -1886,17 +1998,16 @@ let test_automatic_outline_reads_are_bounded_and_idempotent () =
 
 let test_favorites_hidden_rows_do_not_block_pagination () =
   let module F = Journal_routes.Favorites in
-  let module P = Logseq_db_worker.Protocol in
   let module G = Logseq_db_types.Graph_types in
   let uuid n =
     G.Uuid.of_string (Printf.sprintf "76000000-0000-4000-8000-%012d" n) |> Result.get_ok
   in
-  let item membership target : P.v2_favorite_item =
+  let item membership target : Worker_pure_data.favorite_item =
     { membership_uuid = uuid membership
     ; membership_order = string_of_int membership
     ; membership_revision = "member"
     ; target =
-        V2_favorite_block
+        Worker_pure_data.V2_favorite_block
           { uuid = uuid (100 + target)
           ; title = "Target"
           ; task_status = None
@@ -1904,16 +2015,11 @@ let test_favorites_hidden_rows_do_not_block_pagination () =
           }
     }
   in
-  let cursor n =
-    G.Cursor.of_string ("favorites-test:" ^ string_of_int n) |> Result.get_ok
-  in
-  let result items next : P.v2_favorites_result =
-    { favorites_page = Some (uuid 99)
-    ; generation = "generation:v1:1"
-    ; projection_revision = "projection:v1:1"
-    ; items
-    ; next_cursor = next
-    }
+  let make_cursor=favorites_cursor_factory ~graph_generation:1 () in
+  let cursor n = make_cursor None n in
+  let result items next =
+    Coordination_test_fixture.favorites ~favorites_page:(Some (uuid 99))
+      ~generation:"generation:v1:1" ~projection_revision:"projection:v1:1" ~next items
   in
   let one = function
     | [ request ] -> request
@@ -1937,7 +2043,7 @@ let test_favorites_hidden_rows_do_not_block_pagination () =
       (loaded 16)
       (List.init 14 (( + ) 1))
   in
-  require (List.length (F.items hidden) = 2) "fixture did not hide target rows";
+  require (Rrbvec.length (F.items hidden) = 2) "fixture did not hide target rows";
   let paging, requests =
     F.step hidden (Visible { first_index = 0; last_exclusive = 2 })
   in
@@ -1958,7 +2064,7 @@ let test_favorites_hidden_rows_do_not_block_pagination () =
   let hidden, _ = hide (loaded 2) 1 in
   let empty, requests = hide hidden 2 in
   require
-    (F.items empty = [] && requests <> [])
+    (Rrbvec.is_empty(F.items empty) && requests <> [])
     "hiding the final row stranded the continuation";
   let request = one requests in
   let _, requests =
@@ -2764,7 +2870,7 @@ let test_projected_unknown_children_are_read_once () =
   let grandchild = member 3 (uuid 2) in
   let project root children =
     P.detail_on_page ~page ~time_context:{ localtime = Unix.gmtime } ~root
-      { G.items = children; continuation = None }
+      { Journal_graph_projection.items = children; continuation = None }
     |> Result.get_ok in
   let projection = project root [ child ] in
   require (Journal_model.child_count (List.hd projection.children.blocks) = 0)
@@ -2915,8 +3021,7 @@ let test_detail_128_item_pages_preserve_order_and_completion () =
   let cursor ordinal : Journal_graph_projection.block_cursor =
     { after_sibling_order = Printf.sprintf "%06d" ordinal
     ; after_block_id = Journal_model.id (List.nth children (ordinal - 1))
-    ; protocol_cursor = Some (Logseq_db_types.Graph_types.Cursor.of_string
-        (Printf.sprintf "detail-page-%d" ordinal) |> Result.get_ok) } in
+    ; protocol_cursor = Some (Journal_graph_projection.Child_cursor {after=Coordination_test_fixture.child_continuation (Printf.sprintf "detail-page-%d" ordinal);maximum_items=128}) } in
   let request after = function
     | [ Journal_graph_request.Load_detail
           { block_id; limit; after = actual; request_generation } ] ->
@@ -4086,8 +4191,930 @@ let test_staged_file_adapter_guard_and_failures () =
       require (Sys.file_exists kept && Sys.is_directory blocked) "adapter crossed guarded resource scope")
 ;;
 
+let child_equal expected actual label = if expected<>actual then failwith label
+let child_identity_detail () =
+  Journal_detail.create ~session_number:11L
+    {root=block();children={blocks=[];continuation=None}}
+;;
+let child_identity_append detail =
+  Journal_detail.admit_child detail ~mutation_id:"70000000-0000-4000-9000-000000000071"
+    ~calendar_generation:1L ~block_id:"70000000-0000-4000-a000-000000000071"
+    ~sibling_order:"a" ~creation_time:(creation_time 550)
+;;
+let test_child_oversize_is_editable_before_admission () =
+  let source=String.make(Worker_pure_data.maximum_title_bytes+1)'x' in
+  let detail=child_identity_detail() |> fun detail->Journal_detail.update_child_source detail source in
+  let next,request=child_identity_append detail in
+  require(request<>None) "refactor changed the existing Child submission boundary";
+  let command=match request with Some(Journal_graph_request.Create_child command)->command
+    |_->fail "Child submission lost its command" in
+  let next=Journal_detail.release_rejected_child next ~command ~message:"Known not admitted" in
+  let next=Journal_detail.update_child_source next "Shortened child" in
+  require(Option.map Journal_capture.source(Journal_detail.child_capture next)=Some "Shortened child")
+    "unadmitted oversized Child could not be corrected"
+;;
+let child_status_a=Journal_model.Status "00000002-1615-5853-7700-000000000000"
+let child_status_b=Journal_model.Status "00000002-1827-5820-8200-000000000000"
+let failed_child_choice_from task_state =
+  let draft=child_identity_detail() |> fun t->Journal_detail.update_child_source t "Frozen child source"
+    |> fun t->Journal_detail.set_child_task t task_state in
+  let saving,request=child_identity_append draft in
+  Journal_detail.fail saving ~message:"Accepted response unknown",Option.get request
+;;
+let failed_child_choice () = failed_child_choice_from child_status_a
+let child_command = function
+  | Journal_graph_request.Create_child command->command
+  | _->failwith "Child owner lost its pending request"
+;;
+let test_child_reselected_status_intent () =
+  let failed,first=failed_child_choice() in
+  let duplicate=Journal_detail.set_child_task failed child_status_a in
+  child_equal (Some first)(snd(Journal_detail.retry duplicate)) "duplicate choice keeps its intent";
+  let second=Journal_detail.set_child_task failed child_status_b in
+  let second,request_b=Journal_detail.retry second in
+  let second=Journal_detail.fail second ~message:"Second response unknown" in
+  let third=Journal_detail.set_child_task second child_status_a in
+  let _,request_a2=Journal_detail.retry third in
+  require(Option.get request_a2<>first) "A to B to A reused the first child status intent";
+  let original=child_command first and actual=child_command(Option.get request_a2) in
+  child_equal original.mutation_id actual.mutation_id "new status choice replaced original insertion";
+  child_equal original.block_id actual.block_id "new status choice replaced child identity";
+  child_equal original.source actual.source "new status choice changed frozen source";
+  child_equal original.expected_parent_revision actual.expected_parent_revision "new choice changed parent precondition";
+  require(request_b<>Some first) "new status choice was not distinct"
+;;
+let test_retained_child_status_keeps_frozen_attempt () =
+  let failed,first=failed_child_choice() in
+  let retained=Journal_detail.retain_composer failed |> Option.get in
+  let retained=Journal_detail.map_retained_capture retained
+    ~f:(fun capture->Journal_capture.with_task_state capture child_status_b) in
+  let restored=Journal_detail.restore_composer(child_identity_detail())retained in
+  let _,request=Journal_detail.retry restored in
+  let current=Option.get request |> child_command and original=child_command first in
+  child_equal original.mutation_id current.mutation_id "retained choice lost insertion owner";
+  child_equal original.source current.source "retained choice lost frozen source";
+  child_equal child_status_b current.task_state "retained status choice was ignored"
+;;
+
+let test_uncertain_plain_child_keeps_identity () =
+  let saving, request = child_identity_detail ()
+    |> fun t -> Journal_detail.update_child_source t "Frozen plain child"
+    |> child_identity_append in
+  let original = Option.get request |> child_command in
+  let failed = Journal_detail.fail saving ~message:"Accepted insertion response unknown" in
+  List.iter (fun owner ->
+    let owner = Journal_detail.set_child_task owner child_status_a in
+    let owner = Journal_detail.update_child_source owner "Unsafe replacement" in
+    let _, request = Journal_detail.retry owner in
+    require (request <> None) "uncertain plain insertion lost its retry owner";
+    let actual = Option.get request |> child_command in
+    child_equal original.mutation_id actual.mutation_id "plain insertion ID replaced";
+    child_equal original.block_id actual.block_id "plain child ID replaced";
+    child_equal original.source actual.source "uncertain plain child source replaced";
+    require actual.status_confirmation "new status choice was not retained as a sub-operation";
+    let cleared = Journal_detail.set_child_task owner Journal_model.No_status in
+    let command = snd (Journal_detail.retry cleared) |> Option.get |> child_command in
+    require command.status_confirmation "returning to No status silently skipped Clear";
+    child_equal 2L command.status_intent_revision "plain child lost A to Clear choice history")
+    [failed; Journal_detail.restore_composer (child_identity_detail ())
+       (Journal_detail.retain_composer saving |> Option.get
+        |> Journal_detail.interrupt_retained_composer)]
+;;
+
+(* Public pure business owner: generated traces start with a legally admitted,
+   uncertain insertion, then interleave edits, retries and retained composers.
+   Choice history is independent of the implementation's revision counter. *)
+let test_child_choice_traces () =
+  let choices = [| child_status_a; child_status_b; Journal_model.No_status |] in
+  let run initial_choice actions =
+    let initial, request = failed_child_choice_from initial_choice in
+    let original = child_command request in
+    let current = ref initial and selected = ref initial_choice and revision = ref 0L in
+    List.iteri (fun index action ->
+      let before = !current in
+      let _, before_request = Journal_detail.retry before in
+      let pick = choices.(action mod Array.length choices) in
+      let choose () =
+        if pick <> !selected then revision := Int64.succ !revision;
+        selected := pick
+      in
+      current := (match action / 3 with
+        | 0 -> choose (); Journal_detail.set_child_task before pick
+        | 1 -> choose (); Journal_detail.map_child_capture before
+            ~f:(fun capture -> Journal_capture.with_task_state capture pick)
+        | 2 ->
+          choose ();
+          let draft = Journal_detail.retain_composer before |> Option.get in
+          let draft = Journal_detail.map_retained_capture draft
+            ~f:(fun capture -> Journal_capture.with_task_state capture pick) in
+          Journal_detail.restore_composer (child_identity_detail ()) draft
+        | 3 -> Journal_detail.update_child_source before "Do not replace frozen source"
+        | 4 ->
+          let saving, admitted = Journal_detail.retry before in
+          child_equal before_request admitted "retry replaced the frozen request";
+          let ignored = Journal_detail.set_child_task saving pick in
+          child_equal admitted (snd (Journal_detail.retry
+            (Journal_detail.fail ignored ~message:"Still uncertain")))
+            "in-flight status edit changed an admitted operation";
+          Journal_detail.fail ignored ~message:"Still uncertain"
+        | _ ->
+          let draft = Journal_detail.retain_composer before |> Option.get in
+          let other = Journal_detail.create ~session_number:99L
+            { root=block ~id:"70000000-0000-4000-a000-000000000099" ();
+              children={blocks=[];continuation=None} } in
+          require (Journal_detail.child_capture (Journal_detail.restore_composer other draft)=None)
+            "foreign root adopted a retained child";
+          before);
+      child_equal before_request (snd (Journal_detail.retry before))
+        "later pure transition mutated an earlier state";
+      let _, pending = Journal_detail.retry !current in
+      let actual = Option.get pending |> child_command in
+      child_equal !selected actual.task_state "selected status lost";
+      child_equal !revision actual.status_intent_revision "choice history reused a status identity";
+      require (actual.status_confirmation =
+        (original.status_confirmation || !revision > 0L)) "status sub-operation was lost";
+      child_equal original {actual with task_state=original.task_state;
+        status_confirmation=original.status_confirmation;
+        status_intent_revision=original.status_intent_revision}
+        (Printf.sprintf "frozen insertion changed at action %d" index)) actions
+  in
+  let fails initial actions = try run initial actions; false with _ -> true in
+  let rec shrink initial actions =
+    let rec remove prefix = function
+      | [] -> actions
+      | _ :: rest when fails initial (List.rev_append prefix rest) ->
+        shrink initial (List.rev_append prefix rest)
+      | item :: rest -> remove (item :: prefix) rest
+    in
+    remove [] actions
+  in
+  for seed = 0 to 199 do
+    let random = Random.State.make [|0xC11D; seed|] in
+    let initial = if seed mod 2 = 0 then child_status_a else Journal_model.No_status in
+    let actions = List.init 80 (fun _ -> Random.State.int random 18) in
+    if fails initial actions then (
+      let minimal = shrink initial actions in
+      fail "Child choice trace seed=%d minimized=[%s]" seed
+        (String.concat ";" (List.map string_of_int minimal)))
+  done
+;;
+
+module Detail_observation_fixture = struct
+  module M=Journal_detail.Pure_observation
+  module W=Journal_worker_coordination.Worker_api
+  module C=Journal_worker_coordination.Worker_pure_coordinator
+  module Read=Worker_pure_read
+  module S=Logseq_db_worker_lui.Logseq_db_worker_lui_service
+  module Id=Journal_worker_ids
+  let root=W.Uuid.of_string "70000000-0000-4000-a000-000000005540" |> Result.get_ok
+  let make ?(failed=false) () =
+    let issuer,raw,projection,session=Coordination_test_fixture.fixture 5540L in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
+    let ready=(C.step(C.initial ~client_id:root)(C.Worker_bound I.binding)).next
+      |> fun state->(C.step state(C.Bootstrap_received(I.binding,W.Ready projection))).next in
+    let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+    let operation=W.Observe(budget,W.Outline_block{uuid=root;revision=None}) in
+    let ticket,planned=C.request ready session operation |> Result.get_ok in
+    let wire=I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok in
+    let registration,owner,observation_id,request_id,read=match wire with S.Coordination_observe value->
+      value.registration,value.owner,value.observation_id,value.request_id,value.read|_->assert false in
+    let Read.Read_query(source_budget,source_query)=read in
+    let answer=match source_query with
+      |Read.Outline_block _->Read.For_worker.answer source_budget source_query
+        (Ok(Worker_pure_data.V2_missing_block{uuid=root;revision="missing-0"}))
+      |_->assert false in
+    let response=S.Coordination_observed{registration;owner;observation_id;request_id;epoch=0L;answer} in
+    let handle,epoch=I.observation_registration session ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok in
+    let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+    let registered=(C.step admitted(C.Observation_registered(ticket,handle,epoch))).next in
+    let reply=if failed then W.Answered(Error W.Response_budget_exceeded) else I.reply session
+      ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok in
+    let completed=(C.step registered(C.Completed(ticket,reply))).next in
+    let context:M.context={entry_id="detail-observation-fixture";request_generation=1L;root;owner;original=request_id;maximum_children=128} in
+    context,ticket,handle,planned.next,completed,issuer,session,raw
+  let refresh issuer session handle state =
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
+    let operation=W.Refresh handle in
+    let ticket,planned=C.request state session operation |> Result.get_ok in
+    let registration,owner,observation_id,request_id=match I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok with
+      | S.Coordination_refresh_observation value->value.registration,value.owner,value.observation_id,value.request_id
+      | _->assert false in
+    let query=W.observation_query handle in
+    let answer=match query with
+      |W.Outline_block _->Read.For_worker.answer (W.observation_budget handle) query
+        (Ok(Worker_pure_data.V2_missing_block{uuid=root;revision="missing-1"}))
+      |_-> . in
+    let response=S.Coordination_observed{registration;owner;observation_id;request_id;epoch=1L;answer} in
+    let value=match I.reply session ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok with
+      | W.Answered(Ok value)->value|_->assert false in
+    let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64 2L))).next in
+    let registered=(C.step admitted(C.Observation_registered(ticket,handle,value.epoch))).next in
+    (C.step registered(C.Completed(ticket,W.Answered(Ok value)))).next
+
+end
+
+let test_detail_observation_context_retains_empty_and_releases () =
+  let module F=Detail_observation_fixture in let module M=F.M in let module C=F.C in
+  let context,ticket,handle,pending,ready,_,_,_=F.make() in
+  let model,effects=M.planned M.empty context ticket in
+  require(Rrbvec.is_empty effects) "new Detail observation cancelled an unrelated owner";
+  let waiting,effects=M.inspect model(C.view pending) in
+  require(Rrbvec.is_empty effects && M.context_count waiting=1) "pending Observe fabricated a sample";
+  let current,effects=M.inspect waiting(C.view ready) in
+  require(Rrbvec.exists(function M.Initial(_,sample)->(match sample.value with Worker_pure_data.V2_missing_block _->true|_->false)|_->false)effects)
+    "missing/empty Detail observation was discarded";
+  require(not(Rrbvec.exists(function M.Release _->true|_->false)effects)) "empty Detail observation was released";
+  let current,again=M.inspect current(C.view ready) in
+  require(Rrbvec.is_empty again) "one observation epoch was forwarded twice";
+  let previous=current in
+  let retired,effects=M.retain current Rrbvec.empty in
+  require(M.context_count previous=1 && M.context_count retired=0) "retirement mutated an earlier pure state";
+  require(Rrbvec.exists(function M.Release actual->F.W.same_observation actual handle<>None|_->false)effects)
+    "native Back did not release the exact registered observation";
+  let retired,effects=M.inspect retired(C.view ready) in
+  require(M.context_count retired=0 && Rrbvec.is_empty effects) "late observed DTO revived a retired Detail"
+;;
+
+let test_detail_observation_failure_recovers_same_handle () =
+  let module F=Detail_observation_fixture in let module M=F.M in let module C=F.C in
+  let context,ticket,handle,_,failed,issuer,session,_=F.make ~failed:true () in
+  let model,_=M.planned M.empty context ticket in
+  let model,_=M.inspect model(C.view failed) in
+  let refreshed=F.refresh issuer session handle (C.step failed(C.Forget ticket)).next in
+  let model,effects=M.inspect model(C.view refreshed) in
+  require(M.context_count model=1) "failed observation lost its presentation context";
+  require(Rrbvec.exists(function M.Updated(_,sample)->F.W.same_observation sample.observation handle<>None|_->false)effects)
+    "recovery replaced the original observation or initial read owner";
+  require(not(Rrbvec.exists(function M.Release _|Cancel_initial _->true|_->false)effects))
+    "read recovery retired its live registration"
+;;
+
+(* This business projection owner exposes a synchronous Runtime facade rather
+   than a pure reducer. Exercise that facade; do not duplicate database IO. *)
+let test_observed_absence_does_not_commit_user_deletion () =
+  let module F=Detail_observation_fixture in
+  let runtime=Journal_graph_runtime.create() in
+  let request=Journal_graph_runtime.plan_observed_block runtime ~root:F.root in
+  let output=Journal_graph_runtime.receive_worker_read runtime ~request_id:request
+    (Journal_graph_runtime.Query_result(F.W.Outline_block{uuid=F.root;revision=None},
+      Worker_pure_data.V2_missing_block{uuid=F.root;revision="missing-observed"})) in
+  require(not(List.exists(fun response->match response.Journal_graph_runtime.payload with
+    | Block_removed _|Subtree_deleted _->true|_->false)output.responses))
+    "an observed absence committed deletion of retained Detail drafts";
+  require(not(Journal_graph_runtime.owns_read runtime request)) "observed absence kept a consumed DTO owner"
+;;
+
+let test_detail_observation_binding_revocation_is_visible () =
+  let module F=Detail_observation_fixture in let module M=F.M in let module C=F.C in
+  let context,ticket,_,_,ready,issuer,_,_=F.make() in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
+  let model,_=M.planned M.empty context ticket in
+  let model,_=M.inspect model(C.view ready) in
+  let forgotten=(C.step ready(C.Forget ticket)).next in
+  let revoked=(C.step forgotten(C.Binding_invalidated I.binding)).next in
+  let retired,effects=M.inspect model(C.view revoked) in
+  require(M.context_count retired=0) "binding revocation silently retained a dead Detail observation";
+  require(Rrbvec.exists(function M.Failed(actual,F.W.Revoked_session)->actual=context|_->false)effects)
+    "binding revocation left Detail without an explicit resubscription path";
+  let _,again=M.inspect retired(C.view revoked) in
+  require(Rrbvec.is_empty again) "retired binding emitted repeated presentation failures"
+;;
+
+let test_detail_observation_generated_lifetimes () =
+  let module F=Detail_observation_fixture in let module M=F.M in let module C=F.C in
+  let run actions =
+    let context,ticket,handle,pending,ready,issuer,session,_=F.make() in
+    let refreshed=F.refresh issuer session handle (C.step ready(C.Forget ticket)).next in
+    let current=ref(fst(M.planned M.empty context ticket)) and retired=ref false
+      and cleanup_count=ref 0 and last_epoch=ref None and latest_view=ref 0 in
+    List.iter(fun action->
+      let before= !current in let snapshot=Marshal.to_string before [] in
+      (* Core views are authoritative snapshots. Packet reordering is reduced by
+         Core before this boundary; a caller never republishes an older view. *)
+      if action mod 7<=2 then latest_view:=max !latest_view (action mod 7);
+      let current_view=C.view(match !latest_view with 0->pending|1->ready|_->refreshed) in
+      let transition model=match action mod 7 with
+        | 0|1|2->M.inspect model current_view
+        | 3->M.retain model(Rrbvec.singleton(context.entry_id,context.request_generation,context.root))
+        | 4->M.retain model Rrbvec.empty
+        | 5 when not !retired->M.planned model context ticket
+        | 6 when not !retired->M.planned model {context with entry_id="foreign-context"} ticket
+        | _->M.inspect model current_view in
+      let next,effects=transition before and again,repeated=transition before in
+      require(next=again && effects=repeated && snapshot=Marshal.to_string before [])
+        "Detail observation transition mutated its input or was nondeterministic";
+      require(M.context_count next<=1) "one observation acquired two native owners";
+      Rrbvec.iter(function
+        | M.Initial(actual,sample)|Updated(actual,sample)->
+          require(not !retired && actual=context) "late DTO crossed native context ownership";
+          require(Option.fold ~none:true ~some:(fun previous->F.W.compare_observation_epoch sample.epoch previous>0)!last_epoch)
+            "observation epoch was duplicated or moved backwards";
+          last_epoch:=Some sample.epoch
+        | Cancel_initial _|Release _->incr cleanup_count
+        | _->())effects;
+      current:=next;
+      if M.context_count next=0 then retired:=true;
+      require(!cleanup_count<=1) "retired UI context issued cleanup twice";
+      if !retired then require(M.context_count next=0) "stale input revived a retired Detail")actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | item::rest->remove(item::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x0B5E;seed|] in
+    let actions=List.init 60(fun _->Random.State.int random 70) in
+    if fails actions then fail "Detail observation seed=%d minimized=[%s]" seed
+      (String.concat ";" (List.map string_of_int(shrink actions)))
+  done
+;;
+
+let test_detail_observation_ticket_has_one_context_owner () =
+  let module F=Detail_observation_fixture in let module M=F.M in
+  let context,ticket,_,_,_,_,_,_=F.make() in
+  let model,_=M.planned M.empty context ticket in
+  let other={context with entry_id="foreign-native-entry"} in
+  let attempted,effects=M.planned model other ticket in
+  require(M.context_count attempted=1) "one Observe ticket acquired two context owners";
+  require(not(Rrbvec.exists(function M.Cancel_initial _|Forget_initial _|Release _->true|_->false)effects))
+    "a foreign context retired the legitimate Observe ticket";
+  let wrong_root=F.W.Uuid.of_string "70000000-0000-4000-a000-000000005541" |> Result.get_ok in
+  let attempted,effects=M.planned model {other with root=wrong_root} ticket in
+  require(M.context_count attempted=1 && not(Rrbvec.exists(function M.Cancel_initial _|Release _->true|_->false)effects))
+    "malformed reattachment cancelled another context's observation"
+;;
+
+let test_detail_observation_failure_and_pending_cancel () =
+  let module F=Detail_observation_fixture in let module M=F.M in let module C=F.C in
+  let context,ticket,handle,_,failed,_,_,_=F.make ~failed:true () in
+  let model,_=M.planned M.empty context ticket in
+  let model,effects=M.inspect model(C.view failed) in
+  require(M.context_count model=1) "read failure erased a registered Detail observation";
+  require(Rrbvec.exists(function M.Failed(_,F.W.Response_budget_exceeded)->true|_->false)effects)
+    "failed initial sample lost its owned error";
+  require(not(Rrbvec.exists(function M.Release _->true|_->false)effects)) "read failure pretended to release a resource";
+  let _,effects=M.retain model(Rrbvec.singleton(context.entry_id,2L,context.root)) in
+  require(Rrbvec.exists(function M.Release actual->F.W.same_observation actual handle<>None|_->false)effects)
+    "new route generation retained an old observation";
+  let pending,_=M.planned M.empty context ticket in
+  let _,effects=M.retain pending Rrbvec.empty in
+  require(Rrbvec.exists(function M.Cancel_initial actual->C.ticket_id actual=C.ticket_id ticket|_->false)effects)
+    "pop racing registration did not cancel the exact initial ticket";
+  require(Rrbvec.exists(function M.Forget_initial _->true|_->false)effects)
+    "cancelled initial ticket leaked its presentation slot"
+;;
+
+module Child_chain_fixture = struct
+  module C = Journal_graph_mutation_confirmation.Pure_insertion
+  module W = Journal_worker_coordination.Worker_api
+  module G = Logseq_db_types.Graph_types
+  type t =
+    { initial : C.t
+    ; action : C.action
+    ; command : Journal_graph_projection.create_child
+    ; session : W.session
+    ; presentation : W.presentation
+    ; projection : W.projection
+    ; binding : W.binding
+    ; confirm : int -> W.durable_intent -> W.presentation -> W.mutation_progress
+    }
+  let make ?(append=false) ?(task_state=Journal_model.No_status) () =
+    let issuer,_,projection,session=Coordination_test_fixture.fixture
+      ~limits:{Coordination_test_fixture.limits with response_budget_bytes=Worker_pure_data.maximum_response_bytes} 5514L in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
+    let presentation=Option.get(W.selected projection) in
+    let uuid s=G.Uuid.of_string s |> Result.get_ok in
+    let _,request=child_identity_detail() |> fun t->Journal_detail.update_child_source t "Frozen child source"
+      |> fun t->Journal_detail.set_child_task t task_state |> child_identity_append in
+    let command=Option.get request |> child_command in
+    let page:G.page={uuid=uuid "70000000-0000-4000-b000-000020260809";name="Child fixture";title="Child fixture";
+      kind=(if append then Journal_page{journal_day=20260809} else Ordinary_page);created_at_ms=1L;updated_at_ms=1L;tags=[];properties=[];recycled=false} in
+    let parent=(if append then page.uuid else uuid command.parent_block_id) and child=uuid command.block_id in
+    let insert=W.Insert_blocks {parent;
+      roots=[{uuid=child;title=command.source;children=[]}];
+      preconditions={blocks=[parent,command.expected_parent_revision];pages=[];
+        scopes=[Worker_pure_data.V2_children_scope parent,"children-state:v1:frozen"]}} in
+    let resolved_status=match task_state with Journal_model.Status id->Some(uuid id)|_->None in
+    let initial,action=if not append then C.start ~command ~page ~resolved_status ~insert |> Result.get_ok
+      else let capture:Journal_graph_projection.capture={mutation_id=command.mutation_id;block_id=command.block_id;
+        source=command.source;sibling_order=command.sibling_order;creation_time=command.creation_time;children=[];
+        task_state=command.task_state;status_confirmation=command.status_confirmation;status_intent_revision=command.status_intent_revision} in
+      C.start_capture ~command:capture ~resolved_status
+        ~root:Worker_pure_data.{block_id=child;title=command.source;task_status=resolved_status;children=Rrbvec.empty}
+      |> Result.get_ok in
+    let confirm index intent presentation =
+      let id=W.durable_intent_id intent in
+      let request_id=W.request_id id in
+      let after=Printf.sprintf "projection:v1:%d" (index+1) in
+      let receipt=(let packet = ((Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(id) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:(Printf.sprintf "projection:v1:%d" index) ~after:(after))) in
+        match I.reply session ~request_id (match intent with W.Append_intent intent->W.Append intent|Mutation_intent intent->W.Mutate intent)
+          (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
+            {request_id=id;
+             outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
+        | Ok(W.Answered(Ok(W.Submission_committed proof))) -> proof
+        | _ -> failwith "Production mutation receipt was rejected") in
+      let block:G.block={uuid=child;title=command.source;parent;page=page.uuid;order="a";
+        created_at_ms=1L;updated_at_ms=1L;refs=[];tags=[];properties=[]} in
+      (* Equal visible status is deliberately insufficient to prove a status sub-operation. *)
+      let value:Worker_pure_data.block_record={block;task_status=resolved_status;rendered_page_title=page.title;tag_titles=[]} in
+      let confirmation=Coordination_test_fixture.confirmed_summary issuer session presentation receipt (W.request_id id)
+        ~lookup:(Worker_pure_data.V2_present_block{value;revision=Printf.sprintf "child-state:v1:%d" index})
+        ~page:(Some(Worker_pure_data.V2_present_page{page;revision="page-state:v1:1"})) ~items:[]
+        ~scope_revision:"children-state:v1:1" ~generation:"generation:v1:1:1" ~projection_revision:after in
+      W.Confirmed confirmation in
+    {initial;action;command;session;presentation;projection;binding=I.binding;confirm}
+  let write fixture state = function
+    | C.Write(index,round)->index,round,W.encode_durable_intent(C.stage_intent fixture.session(C.stage state index) |> Result.get_ok)
+    | _->fail "expected a child write"
+  let bind fixture state action =
+    let index,round,_=write fixture state action in
+    let stage=C.stage state index in
+    let intent=C.stage_intent fixture.session stage |> Result.get_ok in
+    let state=C.bind state ~index ~round ~intent ~presentation:fixture.presentation |> Option.get in
+    state,index,round,intent
+  let confirm fixture state action =
+    let state,index,round,intent=bind fixture state action in
+    C.receive state ~index ~round (fixture.confirm index intent fixture.presentation)
+  let applied fixture state action =
+    let round=match action with C.Read_parent(round,_)->round|_->fail "expected canonical parent read" in
+    let ready,action=C.projection_ready state ~round in
+    require (action=C.Present round) "parent projection cannot be presented";
+    let ignored,action=C.applied ready ~round:Int64.(succ round) fixture.presentation in
+    require(ignored==ready && action=C.Ignore) "foreign UI application advanced cleanup";
+    C.applied ready ~round fixture.presentation
+  let rec flush_prefix fixture state action = match action with
+    | C.Write _ | Complete -> state,action
+    | Read_parent _ -> let state,action=applied fixture state action in flush_prefix fixture state action
+    | Present round -> let state,action=C.applied state ~round fixture.presentation in flush_prefix fixture state action
+    | Acknowledge(index,round,_,_) ->
+      let state,action=C.acknowledged state ~index ~round(Ok()) in flush_prefix fixture state action
+    | Read_child round ->
+      let state,action=C.read_child state ~round(Option.get(C.canonical state)) in flush_prefix fixture state action
+    | Wait message ->fail "prefix settlement failed: %s" message
+    | Ignore ->fail "prefix settlement ignored its current operation"
+end
+
+let test_capture_oversize_is_editable_before_admission () =
+  let source=String.make (Worker_pure_data.maximum_title_bytes+1) 'x' in
+  let original=Journal_capture.create ~session_number:5518L ~source in
+  let next,request=Journal_capture.admit_save original
+    ~mutation_id:"70000000-0000-4000-9000-000000005518"
+    ~block_id:"70000000-0000-4000-a000-000000005518" ~sibling_order:"a1"
+    ~calendar_generation:1L ~creation_time:(creation_time 551) in
+  require(request<>None) "refactor changed the existing Capture submission boundary";
+  require(Journal_capture.phase next=Journal_capture.Saving)
+    "Capture did not preserve its existing saving transition";
+  let rejected=Journal_capture.release_rejected_attempt next in
+  let shortened=Journal_capture.update_source rejected ~source:"Shortened draft" in
+  require_string "Shortened draft" (Journal_capture.source shortened)
+    "known non-admission could not be corrected"
+;;
+
+let test_capture_retained_attempt_survives_runtime_reset () =
+  let module F=Child_chain_fixture in let module C=F.C in let module R=Journal_graph_runtime in
+  let fixture=F.make ~append:true () in
+  let sampler=Journal_calendar.Sampler.create
+    ~clock:(fun()->Int64.to_float(Journal_time.instant_unix_ms fixture.command.creation_time)/.1000.)
+    ~localtime:Unix.gmtime () in
+  let calendar=Journal_calendar.Sampler.sample sampler |> Result.get_ok in
+  let runtime=R.create ~localtime:Unix.gmtime () in R.set_calendar runtime calendar;
+  let capture,request=Journal_capture.admit_save
+    (Journal_capture.create ~session_number:5519L ~source:fixture.command.source)
+    ~mutation_id:fixture.command.mutation_id ~block_id:fixture.command.block_id
+    ~sibling_order:fixture.command.sibling_order ~calendar_generation:(Journal_calendar.generation calendar)
+    ~creation_time:fixture.command.creation_time in
+  let boundary=ref 0 in
+  let only output=incr boundary;match output.R.requests with [request]->request|_->
+    fail "Capture continuation %d emitted %d requests and %d responses: %s" !boundary
+      (List.length output.requests)(List.length output.responses)
+      (List.map(fun response->match response.R.payload with
+        | Capture_waiting{message;_}->message|_->"other")output.responses |> String.concat ";") in
+  let initial=R.submit runtime (Option.get request) |> only in
+  let intent=R.worker_intent runtime initial fixture.session |> Result.get_ok in
+  let wire=F.W.encode_durable_intent intent in
+  require(R.bind_mutation runtime initial ~presentation:fixture.presentation ~intent) "Capture did not bind original Append";
+  ignore(R.receive_mutation runtime initial F.W.Outcome_unknown);
+  let command=Journal_capture.pending_command capture |> Option.get in
+  let chain=R.capture_chain runtime ~command |> Option.get in
+  let capture=Journal_capture.retain_chain capture chain |> fun capture->Journal_capture.fail capture ~message:"Unknown original Append" in
+  let capture=Journal_capture.with_task_state capture child_status_a in
+  R.reset runtime;R.set_calendar runtime calendar;
+  let capture,request=Journal_capture.retry capture in
+  let resumed=R.submit ?capture_chain:(Journal_capture.retained_chain capture) runtime (Option.get request) |> only in
+  let resumed_wire=R.worker_intent runtime resumed fixture.session |> Result.get_ok |> F.W.encode_durable_intent in
+  require(resumed_wire=wire) "Runtime reset reconstructed the accepted Append with a new status payload";
+  require(Journal_capture.source capture=fixture.command.source) "Runtime reset lost frozen source";
+  require(R.bind_mutation runtime resumed ~presentation:fixture.presentation ~intent) "restored Append did not bind";
+  let progress=fixture.confirm 0 intent fixture.presentation in
+  let output=R.receive_mutation runtime resumed progress in
+  let root,round=List.find_map(fun response->match response.R.payload with
+    | Capture_projection_ready{root;round;_}->Some(root,round)|_->None)output.responses |> Option.get in
+  let ack=R.child_projection_applied runtime ~root ~round ~presentation:fixture.presentation |> only in
+  let canonical=R.receive_child_ack runtime ack (Ok()) |> only in
+  let summary=match progress with F.W.Confirmed proof->(match F.W.confirmation_primary proof with
+    | Confirmed_block summary->summary|_->assert false)|_->assert false in
+  let status=R.receive_worker_read runtime ~request_id:canonical (R.Query_result(F.W.Block_summary{block=root;after=None},summary)) |> only in
+  let status_intent=R.worker_intent runtime status fixture.session |> Result.get_ok in
+  require(R.bind_mutation runtime status ~presentation:fixture.presentation ~intent:status_intent)
+    "status continuation did not bind";
+  ignore(R.receive_mutation runtime status F.W.Outcome_unknown);
+  let command=Journal_capture.pending_command capture |> Option.get in
+  let chain=R.capture_chain runtime ~command |> Option.get in
+  let capture=Journal_capture.retain_chain capture chain |> fun capture->Journal_capture.fail capture ~message:"Unknown original status" in
+  R.reset runtime;R.set_calendar runtime calendar;
+  let capture,request=Journal_capture.retry capture in
+  let resumed=R.submit ?capture_chain:(Journal_capture.retained_chain capture) runtime (Option.get request) |> only in
+  require(F.W.encode_durable_intent(R.worker_intent runtime resumed fixture.session |> Result.get_ok)=F.W.encode_durable_intent status_intent) "Runtime reset rebuilt an accepted status with new preconditions";
+  let _,_,projection,session=Coordination_test_fixture.fixture 5520L in
+  let presentation=Option.get(F.W.selected projection) in
+  let intent=R.worker_intent runtime resumed session |> Result.get_ok in
+  require(R.bind_mutation runtime resumed ~presentation ~intent)
+    "fresh execution did not adopt its original logical operation"
+;;
+
+let test_capture_chain_freezes_complete_payload () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make() in
+  let uuid value=F.G.Uuid.of_string value |> Result.get_ok in
+  let child:Journal_graph_projection.capture_child={
+    mutation_id="70000000-0000-4000-9000-000000005519";
+    block_id="70000000-0000-4000-a000-000000005519";sibling_order="a0";
+    source="Frozen child 中文";task_state=child_status_a;creation_time=fixture.command.creation_time} in
+  let command:Journal_graph_projection.capture={mutation_id=fixture.command.mutation_id;
+    block_id=fixture.command.block_id;sibling_order=fixture.command.sibling_order;
+    source=fixture.command.source;task_state=Journal_model.No_status;
+    status_confirmation=false;status_intent_revision=0L;creation_time=fixture.command.creation_time;
+    children=[child]} in
+  let root:Worker_pure_data.append_node={block_id=uuid command.block_id;title=command.source;task_status=None;
+    children=Rrbvec.singleton Worker_pure_data.{block_id=uuid child.block_id;title=child.source;
+      task_status=(match child_status_a with Status id->Some(uuid id)|_->assert false);children=Rrbvec.empty}} in
+  let state,_=C.start_capture ~command ~resolved_status:None ~root |> Result.get_ok in
+  let original=F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage state 0) |> Result.get_ok) in
+  require(Result.is_error(C.retarget_capture state ~command:{command with source="Changed"} ~resolved_status:None))
+    "Capture retry changed its root source";
+  require(Result.is_error(C.retarget_capture state ~command:{command with children=[{child with source="Changed"}]} ~resolved_status:None))
+    "Capture retry changed its original child payload";
+  require(Result.is_error(C.start_capture ~command:{command with children=[]} ~resolved_status:None ~root))
+    "Capture admitted children different from the atomic wire";
+  let selected={command with task_state=child_status_a;status_intent_revision=1L;status_confirmation=true} in
+  let state=C.retarget_capture state ~command:selected
+    ~resolved_status:(match child_status_a with Status id->Some(uuid id)|_->assert false) |> Result.get_ok in
+  let state,action=C.retry state in
+  let _,_,wire=F.write fixture state action in
+  require(wire=original) "Capture changed an unknown Append when a later status was selected"
+;;
+
+let test_append_chain_uses_canonical_journal_owner () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~append:true () in
+  let state=fixture.initial in
+  let _,_,original=F.write fixture state fixture.action in
+  let state,action=C.retry state in
+  let _,_,actual=F.write fixture state action in
+  require(actual=original) "atomic Append retry changed its frozen intent";
+  let state,index,round,intent=F.bind fixture state action in
+  let state,action=C.receive state ~index ~round (fixture.confirm index intent fixture.presentation) in
+  require(match action with C.Present _->true|_->false) "atomic Append lost its canonical journal owner";
+  require((C.page state).kind=F.G.Journal_page{journal_day=20260809}) "atomic Append adopted a different day"
+;;
+
+let child_unknown_stages fixture =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let bound,index,round,_=F.bind fixture fixture.initial fixture.action in
+  let initial,_=C.receive bound ~index ~round F.W.Outcome_unknown in
+  let inserted,action=F.confirm fixture fixture.initial fixture.action in
+  let inserted,status=F.flush_prefix fixture inserted action in
+  let bound,index,round,_=F.bind fixture inserted status in
+  let unknown_status,_=C.receive bound ~index ~round F.W.Outcome_unknown in
+  [initial,0;unknown_status,1]
+;;
+let test_child_retained_chain_survives_projection_reopen () =
+  let module F=Child_chain_fixture in let module C=F.C in let module D=Journal_detail in
+  let fixture=F.make ~task_state:child_status_a () in
+  List.iter(fun(chain,index)->
+    let expected=F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage chain index) |> Result.get_ok) in
+    let saving,_=child_identity_detail() |> fun detail->D.update_child_source detail fixture.command.source
+      |> fun detail->D.set_child_task detail child_status_a |> child_identity_append in
+    let saving=D.retain_child_chain saving ~command:fixture.command chain in
+    require(Option.exists(fun retained->retained==chain)(D.child_chain saving ~command:fixture.command))
+      "Saving Child did not retain its bound pure chain";
+    let retained=D.retain_composer saving |> Option.get |> D.interrupt_retained_composer in
+    require(Option.exists(fun retained->retained==chain)(D.retained_child_chain retained ~command:fixture.command))
+      "interruption discarded the original Child stage";
+    let reopened=D.restore_composer(child_identity_detail())retained |> fun detail->D.set_child_task detail child_status_b in
+    let _,request=D.retry reopened in
+    let command=Option.get request |> child_command in
+    let chain=D.child_chain reopened ~command |> Option.get in
+    let chain=C.retarget chain ~command
+      ~resolved_status:(match child_status_b with Status value->Some(F.G.Uuid.of_string value |> Result.get_ok)|_->assert false)
+      |> Result.get_ok in
+    let chain,action=C.retry chain in
+    let _,_,wire=F.write fixture chain action in
+    require(wire=expected)
+      "Child reopening replaced an accepted wire/precondition before reconciling it")
+    (child_unknown_stages fixture)
+;;
+
+let test_child_retained_chain_generated_roundtrips () =
+  let module F=Child_chain_fixture in let module C=F.C in let module D=Journal_detail in
+  let run stage actions =
+    let fixture=F.make ~task_state:child_status_a () in
+    let chain,index=List.nth(child_unknown_stages fixture)stage in
+    let expected=(F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage chain index) |> Result.get_ok)) in
+    let saving,_=child_identity_detail() |> fun detail->D.update_child_source detail fixture.command.source
+      |> fun detail->D.set_child_task detail child_status_a |> child_identity_append in
+    let current=ref(D.retain_child_chain saving ~command:fixture.command chain
+      |> fun detail->D.fail detail ~message:"Unknown original Child") in
+    List.iter(fun action->
+      let before= !current in
+      current:=(match action mod 6 with
+        | 0->let draft=D.retain_composer before |> Option.get |> D.interrupt_retained_composer in
+          D.restore_composer(child_identity_detail())draft
+        | 1->D.set_child_task before (if (action/6) mod 3=0 then Journal_model.No_status
+            else if (action/6) mod 3=1 then child_status_a else child_status_b)
+        | 2->D.update_child_source before "Do not replace accepted source"
+        | 3->let saving,_=D.retry before in D.fail saving ~message:"Still unknown"
+        | 4->let draft=D.retain_composer before |> Option.get in
+          let foreign=D.create ~session_number:5531L
+            {root=block ~id:"70000000-0000-4000-a000-000000005531" ();children={blocks=[];continuation=None}} in
+          require(D.child_capture(D.restore_composer foreign draft)=None) "foreign Detail adopted the original chain";
+          before
+        | _->D.fail before ~message:"Duplicate interruption");
+      let _,request=D.retry(D.fail !current ~message:"Read pending") in
+      let command=Option.get request |> child_command in
+      let retained=D.child_chain !current ~command |> Option.get in
+      require((F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage retained index) |> Result.get_ok))=expected) "retained Child acquired a new payload";
+      require(command.source=fixture.command.source) "retained Child admitted source changed";
+      require(command.mutation_id=fixture.command.mutation_id && command.block_id=fixture.command.block_id)
+        "retained Child replaced an original identity";
+      let _,previous_request=D.retry(D.fail before ~message:"Old snapshot") in
+      require(previous_request<>None) "later transition mutated an old pending owner")actions in
+  let fails stage actions=try run stage actions;false with _->true in
+  let rec shrink stage actions=
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails stage(List.rev_append prefix rest)->shrink stage(List.rev_append prefix rest)
+      | item::rest->remove(item::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xC105E;seed|] in
+    let actions=List.init 60(fun _->Random.State.int random 60) in
+    let stage=seed mod 2 in
+    if fails stage actions then fail "Child retained wire seed=%d stage=%d minimized=[%s]" seed stage
+      (String.concat ";" (List.map string_of_int(shrink stage actions)))
+  done
+;;
+
+let test_child_chain_frozen_unknown_choice () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~task_state:child_status_a () in
+  let insertion,insert_index,insert_round,_=F.bind fixture fixture.initial fixture.action in
+  let unknown,action=C.receive insertion ~index:insert_index ~round:insert_round F.W.Outcome_unknown in
+  require(match action with C.Write(0,_)->F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage unknown 0) |> Result.get_ok)=F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage insertion 0) |> Result.get_ok)|_->false) "unknown insertion did not recover its original wire";
+  let retried,retry=C.retry unknown in
+  child_equal (let _,_,wire=F.write fixture fixture.initial fixture.action in wire) (let _,_,wire=F.write fixture retried retry in wire)
+    "unknown retry rebuilt frozen parent/scope preconditions";
+  let old,action=C.receive retried ~index:insert_index ~round:insert_round F.W.Outcome_unknown in
+  require(old==retried && action=C.Ignore) "old insertion callback changed the retried phase";
+  let inserted,parent=F.confirm fixture retried retry in
+  let inserted,status_a=F.flush_prefix fixture inserted parent in
+  require(match status_a with C.Write(1,_)->true|_->false)
+    "equal status skipped its own mutation proof";
+  let active,index,round,_=F.bind fixture inserted status_a in
+  let active,_=C.receive active ~index ~round F.W.Outcome_unknown in
+  let command_b={fixture.command with task_state=child_status_b;status_intent_revision=1L} in
+  let status_b=match child_status_b with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None in
+  let selected=C.retarget active ~command:command_b ~resolved_status:status_b |> Result.get_ok in
+  let selected,retry_a=C.retry selected in
+  child_equal (let _,_,wire=F.write fixture inserted status_a in wire) (let _,_,wire=F.write fixture selected retry_a in wire)
+    "new choice replaced an unresolved status payload";
+  let after_a,parent=F.confirm fixture selected retry_a in
+  let after_a,write_b=F.flush_prefix fixture after_a parent in
+  require(match write_b with C.Write(1,_)->true|_->false) "old status did not settle before the new choice";
+  let active,index,round,_=F.bind fixture after_a write_b in
+  let active,_=C.receive active ~index ~round F.W.Outcome_unknown in
+  let command_a2={fixture.command with status_intent_revision=2L} in
+  let status_a_uuid=match child_status_a with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None in
+  let selected=C.retarget active ~command:command_a2 ~resolved_status:status_a_uuid |> Result.get_ok in
+  let selected,retry_b=C.retry selected in
+  let after_b,parent=F.confirm fixture selected retry_b in
+  let after_b,write_a2=F.flush_prefix fixture after_b parent in
+  let _,_,first_wire=F.write fixture inserted status_a and _,_,second_wire=F.write fixture after_b write_a2 in
+  require(first_wire<>second_wire) "A to B to A reused the original status intent";
+  require(Result.is_error(C.retarget after_b ~command:{command_a2 with source="Replace accepted body"}
+    ~resolved_status:status_a_uuid)) "child retarget replaced the frozen insertion body"
+;;
+
+let test_child_chain_ack_failure_keeps_proofs () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~task_state:child_status_a () in
+  let inserted,parent=F.confirm fixture fixture.initial fixture.action in
+  let inserted,status=F.flush_prefix fixture inserted parent in
+  let confirmed,parent=F.confirm fixture inserted status in
+  let applied,ack=F.applied fixture confirmed parent in
+  let index,round=match ack with C.Acknowledge(index,round,_,_)->index,round|_->fail "UI applied chain did not ACK" in
+  child_equal 1 index "a successful insertion ACK was sent again";
+  let failed,_=C.acknowledged applied ~index ~round (Error "Synthetic release/ACK failure") in
+  let retried,write=C.retry failed in
+  child_equal (let _,_,wire=F.write fixture inserted status in wire) (let _,_,wire=F.write fixture retried write in wire)
+    "ACK failure replay changed the original status preconditions";
+  let stale,action=C.acknowledged retried ~index ~round (Ok()) in
+  require(stale==retried && action=C.Ignore) "old ACK completed a new retry round";
+  let confirmed,parent=F.confirm fixture retried write in
+  let applied,ack=F.applied fixture confirmed parent in
+  let index,round=match ack with C.Acknowledge(index,round,_,_)->index,round|_->fail "remaining cleanup missing" in
+  child_equal 1 index "a successful insertion ACK was sent again";
+  let completed,action=C.acknowledged applied ~index ~round (Ok()) in
+  require(action=C.Complete) "all child stages did not settle";
+  let same,action=C.retry completed in
+  require(same==completed && action=C.Ignore) "completed child was replayed"
+;;
+
+(* Capacity belongs to the public SDK coordinator, so this regression composes
+   the two pure owners rather than injecting a synthetic refusal into business. *)
+let test_child_chain_sdk_capacity_progress () =
+  let module F=Child_chain_fixture in let module B=F.C in
+  let module K=Journal_worker_coordination.Worker_pure_coordinator in
+  let module Id=Journal_worker_ids in
+  let fixture=F.make() in
+  let client=F.G.Uuid.of_string "98000000-0000-4000-8000-000000005515" |> Result.get_ok in
+  let boot=K.step(K.initial ~client_id:client)(Worker_bound fixture.binding) in
+  let core=ref(K.step boot.next(Bootstrap_received(fixture.binding,F.W.Ready fixture.projection))).next in
+  let serial=ref 0L and acknowledgements=ref 0 in
+  let run : type a. a F.W.request -> a -> unit = fun operation value ->
+    match K.request !core fixture.session operation with
+    | Error error->fail "Child stalled at actual SDK capacity after %Ld attempts: %s" !serial
+        (match error with F.W.Invalid_input message->message|_->"other refusal")
+    | Ok(ticket,transition)->
+      serial:=Int64.succ !serial;
+      core:=transition.next;
+      core:=(K.step !core(Admitted(ticket,Id.Worker.Request_id.of_int64 !serial))).next;
+      core:=(K.step !core(Completed(ticket,F.W.Answered(Ok value)))).next;
+      core:=(K.step !core(Forget ticket)).next in
+  let state=ref fixture.initial and action=ref fixture.action in
+  for n=1 to 70 do
+    let bound,index,round,intent=F.bind fixture !state !action in
+    run(match intent with F.W.Append_intent intent->F.W.Append intent|Mutation_intent intent->F.W.Mutate intent)F.W.Submission_unknown;
+    let unknown,_=B.receive bound ~index ~round F.W.Outcome_unknown in
+    let selected=if n mod 2=0 then child_status_a else child_status_b in
+    let resolved=match selected with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None in
+    let command={(B.command unknown) with task_state=selected;status_confirmation=true;
+      status_intent_revision=Int64.of_int n} in
+    let selected=B.retarget unknown ~command ~resolved_status:resolved |> Result.get_ok in
+    let selected,retry=B.retry selected in
+    let bound,index,round,intent=F.bind fixture selected retry in
+    let progress=fixture.confirm index intent fixture.presentation in
+    let confirmation=match progress with F.W.Confirmed value->value|_->assert false in
+    let receipt=F.W.confirmation_receipt confirmation in
+    run(match intent with F.W.Append_intent intent->F.W.Append intent|Mutation_intent intent->F.W.Mutate intent)(F.W.Submission_committed receipt);
+    run(F.W.Confirm(fixture.presentation,receipt))confirmation;
+    let next,out=B.receive bound ~index ~round progress in
+    let rec drain fuel state action =
+      require(fuel>0) "child prefix settlement did not terminate";
+      match action with
+      | B.Write _->state,action
+      | Read_parent(round,_)->
+        let next,action=B.projection_ready state ~round in drain(fuel-1)next action
+      | Present round->
+        let next,action=B.applied state ~round fixture.presentation in drain(fuel-1)next action
+      | Acknowledge(index,round,intent,_)->
+        run(F.W.Acknowledge_intent intent)();incr acknowledgements;
+        let next,action=B.acknowledged state ~index ~round(Ok()) in drain(fuel-1)next action
+      | Read_child round->
+        let summary=match F.W.confirmation_primary confirmation with
+          | Confirmed_block value->value|_->assert false in
+        let next,action=B.read_child state ~round summary in drain(fuel-1)next action
+      | Wait message->fail "child prefix stopped instead of settling: %s" message
+      | Ignore|Complete->fail "pending newer child choice was discarded" in
+    let next,out=drain 16 next out in
+    state:=next;action:=out
+  done;
+  require(!acknowledgements>=70) "child kept unconsumed prefixes until exhausting the SDK ledger"
+;;
+
+let test_child_rejected_status_rebound_canonical () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~task_state:child_status_a () in
+  let inserted,parent=F.confirm fixture fixture.initial fixture.action in
+  let inserted,status=F.flush_prefix fixture inserted parent in
+  let bound,index,round,_=F.bind fixture inserted status in
+  let rejected,read=C.receive bound ~index ~round (F.W.Rejected(Service_failed "Known status rejection")) in
+  let read_round=match read with C.Read_child round->round|_->fail "status rejection lost canonical read" in
+  let parent,action=C.read_child rejected ~round:read_round(Option.get(C.canonical rejected)) in
+  let applied,ack=F.applied fixture parent action in
+  let index,round,intent=match ack with C.Acknowledge(i,r,intent,_)->i,r,intent|_->fail "status rejection lost ACK" in
+  let rebound=C.rebind_ack applied ~index ~round ~intent ~presentation:fixture.presentation |> Option.get in
+  let rejected,action=C.receive rebound ~index ~round(F.W.Rejected(Service_failed "Known status rejection")) in
+  let round=match action with C.Read_child round->round|_->fail "rebound rejection lost canonical read" in
+  let parent,action=C.read_child rejected ~round(Option.get(C.canonical rejected)) in
+  let applied,action=F.applied fixture parent action in
+  let index,round=match action with C.Acknowledge(i,r,_,_)->i,r|_->fail "rebound canonical never reached ACK" in
+  let settled,done_=C.acknowledged applied ~index ~round(Ok())in
+  require(done_=C.Complete) "rebound status rejection remained stuck";
+  let _,again=C.retry settled in
+  require(again=C.Ignore) "acknowledged rejected status retained a creating/retry obligation"
+;;
+
+let test_child_chain_generated_traces ?(append=false) () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let run actions =
+    let fixture=F.make ~append ~task_state:child_status_a () in
+    let foreign=Coordination_test_fixture.fixture ~graph:(F.G.Uuid.of_string "98000000-0000-4000-8000-000000008891" |> Result.get_ok) 8891L |> fun (_,_,p,_)->Option.get(F.W.selected p) in
+    let state=ref fixture.initial and action=ref fixture.action in
+    let revision=ref 0 and frozen=Hashtbl.create 8 in
+    let take transition =
+      let before= !state in
+      let snapshot=Marshal.to_string before [] in
+      let next,out=transition before and again,out2=transition before in
+      require(next=again && out=out2) "child transition is nondeterministic";
+      require(snapshot=Marshal.to_string before []) "child transition mutated its input";
+      state:=next;action:=out in
+    List.iter(fun n ->
+      match n mod 8 with
+      | 0 ->
+        incr revision;
+        let task_state=if !revision mod 2=0 then child_status_a else child_status_b in
+        let resolved_status=match task_state with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None in
+        let command={(C.command !state) with task_state;status_confirmation=true;status_intent_revision=Int64.of_int !revision} in
+        (match C.retarget !state ~command ~resolved_status with Ok next->state:=next|Error _->())
+      | 1 -> take C.retry
+      | 2 ->
+        let before= !state in
+        let same,out=C.applied before ~round:0L fixture.presentation in
+        require(same==before && out=C.Ignore) "obsolete UI application changed lifecycle"
+      | _ -> match !action with
+        | C.Write(index,round) ->
+          let wire=F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage !state index) |> Result.get_ok) in
+          let id=C.stage_id(C.stage !state index) |> F.G.Uuid.to_string in
+          (match Hashtbl.find_opt frozen id with None->Hashtbl.add frozen id wire
+           |Some previous->require(previous=wire) "one child intent acquired a different payload");
+          let intent=C.stage_intent fixture.session (C.stage !state index) |> Result.get_ok in
+          state:=C.bind !state ~index ~round ~intent ~presentation:fixture.presentation |> Option.get;
+          require(C.bind !state ~index ~round ~intent ~presentation:foreign=None)
+            "foreign logical graph bound a child stage";
+          state:=C.bind !state ~index ~round ~intent ~presentation:fixture.presentation |> Option.get;
+          let progress=if n mod 5=0 then F.W.Outcome_unknown
+            else if n mod 7=0 then F.W.Rejected(Service_failed "Generated noncommit")
+            else fixture.confirm index intent fixture.presentation in
+          take(fun state->C.receive state ~index ~round progress)
+        | Read_parent(round,_) ->take(fun state->C.projection_ready state ~round)
+        | Read_child round ->take(fun state->C.read_child state ~round(Option.get(C.canonical state)))
+        | Present round ->take(fun state->C.applied state ~round fixture.presentation)
+        | Acknowledge(index,round,_,_) ->
+          take(fun state->C.acknowledged state ~index ~round
+            (if n mod 5=0 then Error "Generated ACK interruption" else Ok()))
+        | Wait _ | Ignore ->take C.retry
+        | Complete ->
+          let same,out=C.retry !state in
+          require(same== !state && out=C.Ignore) "terminal child resurrected") actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions =
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | x::rest->remove(x::prefix)rest in remove [] actions in
+  for seed=0 to 199 do
+    let random=Random.State.make[|0xC111;seed|] in
+    let actions=List.init 80(fun _->Random.State.int random 80) in
+    if fails actions then (
+      let minimal=shrink actions in
+      let cause=try run minimal;"unknown" with error->Printexc.to_string error in
+      fail "Child lifecycle seed=%d minimized=[%s]: %s" seed
+        (minimal |> List.map string_of_int |> String.concat ";") cause)
+  done
+;;
+
+let test_child_known_rejection_is_terminal () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make() in
+  let bound,index,round,_=F.bind fixture fixture.initial fixture.action in
+  let rejected,action=C.receive bound ~index ~round (F.W.Rejected(Service_failed "Known not applied")) in
+  require(action=C.Present round) "known rejection must reach its UI consumer";
+  let applied,ack=C.applied rejected ~round fixture.presentation in
+  let index,round=match ack with C.Acknowledge(index,round,_,_)->index,round|_->fail "known rejection did not ACK" in
+  let completed,action=C.acknowledged applied ~index ~round (Ok()) in
+  require(action=C.Complete) "known rejection did not settle";
+  let same,action=C.retry completed in
+  require(same==completed && action=C.Ignore) "settled non-insertion was replayed as the same logical action";
+  require(Result.is_error(C.retarget completed ~command:{fixture.command with
+    task_state=child_status_a;status_confirmation=true;status_intent_revision=1L}
+    ~resolved_status:(match child_status_a with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None)))
+    "settled non-insertion adopted a new child choice"
+;;
+
+
 let tests =
-  [ "pure Root cleanup plan contract", test_root_cleanup_plan_contract
+  [ "Child generated lifecycle traces",(fun ()->test_child_chain_generated_traces ())
+  ; "Rejected child status rebind reaches canonical ACK",test_child_rejected_status_rebound_canonical
+  ; "Child prefixes progress through actual SDK capacity",test_child_chain_sdk_capacity_progress
+  ; "Known child non-insertion is terminal",test_child_known_rejection_is_terminal
+  ; "Child chain freezes unknown writes and status choices",test_child_chain_frozen_unknown_choice
+  ; "Child chain ACK failure retains original proofs",test_child_chain_ack_failure_keeps_proofs
+  ; "Uncertain plain child preserves insertion identity",test_uncertain_plain_child_keeps_identity
+  ; "Child reselected status is a distinct sub-operation",test_child_reselected_status_intent
+  ; "Retained child status preserves its admitted owner",test_retained_child_status_keeps_frozen_attempt
+  ; "Child choice retained/retry pure generated traces",test_child_choice_traces
+  ; "pure Root cleanup plan contract", test_root_cleanup_plan_contract
   ; "staging adapter guard and failures", test_staged_file_adapter_guard_and_failures
   ; "Page append exact page ownership", test_page_detail_append_matches_exact_page
   ; ( "Initial staging refresh and delete review regressions"
@@ -4143,7 +5170,7 @@ let tests =
     ; ( "task Append failure retains insertion identity"
       , test_failed_task_append_retains_identity )
     ; ( "failed Append editing and late completion"
-    , test_failed_append_edit_replaces_only_failed_attempt )
+    , test_uncertain_append_keeps_original_attempt )
   ; ( "late Capture completion preserves newer edit"
     , test_late_capture_completion_preserves_newer_edit )
   ; "retained graph Append owner", test_graph_retained_append_owner
@@ -4183,6 +5210,7 @@ let tests =
           "loading Back lost Favorites origin" )
   ; ( "favorites isolated cache and refresh reducer"
     , test_favorites_state_isolates_requests_and_refreshes )
+  ; ( "Favorites retains large typed pages", test_favorites_retains_large_typed_pages )
   ; ( "direct Capture source and mutation identity"
     , test_direct_capture_preserves_source_and_mutation_identity )
   ; "direct Capture pending attachments", test_direct_capture_pending_attachments
@@ -4224,6 +5252,22 @@ let test_resident_focus_preserves_graph_drafts_and_saving () =
   require (R.capture (focus cleared 1)=None) "logout retained resident draft"
 let tests=tests @ ["resident focus keeps per-graph drafts and pending Capture",test_resident_focus_preserves_graph_drafts_and_saving]
 ;;
+let () = test_detail_page_keeps_newer_point_content ()
+let () = test_observed_absence_does_not_commit_user_deletion ()
+let () = test_detail_observation_binding_revocation_is_visible ()
+let () = test_detail_observation_generated_lifetimes ()
+let () = test_detail_observation_failure_recovers_same_handle ()
+let () = test_detail_observation_ticket_has_one_context_owner ()
+let () = test_detail_observation_context_retains_empty_and_releases ()
+let () = test_detail_observation_failure_and_pending_cancel ()
+let () = test_child_retained_chain_generated_roundtrips ()
+let () = test_child_retained_chain_survives_projection_reopen ()
+let () = test_child_oversize_is_editable_before_admission ()
+let () = test_capture_retained_attempt_survives_runtime_reset ()
+let () = test_capture_chain_freezes_complete_payload ()
+let () = test_capture_oversize_is_editable_before_admission ()
+let () = test_child_chain_generated_traces ~append:true ()
+let () = test_append_chain_uses_canonical_journal_owner ()
 let () = test_native_composer_dismissal_and_edit_fences ()
 let () = test_collapse_retains_complete_capture ()
 
@@ -4234,3 +5278,351 @@ let () =
        test ())
     tests
 ;;
+
+(* The pure insertion reducer receives an already resolved choice. A catalog
+   update between Runtime planning and binding is owned by this public Runtime
+   boundary, and cannot be reproduced by giving the pure reducer bad input. *)
+let () =
+  let module R=Journal_graph_runtime in let module F=Child_chain_fixture in
+  let fixture=F.make ~append:true () in
+  let runtime=R.create ~localtime:Unix.gmtime () in
+  let sampler=Journal_calendar.Sampler.create
+    ~clock:(fun()->Int64.to_float(Journal_time.instant_unix_ms fixture.command.creation_time)/.1000.)
+    ~localtime:Unix.gmtime () in
+  let calendar=Journal_calendar.Sampler.sample sampler |> Result.get_ok in
+  R.set_calendar runtime calendar;
+  let only output=match output.R.requests with [request]->request|_->fail "expected one Runtime request" in
+  let status_a=F.G.Uuid.of_string "00000002-1615-5853-7700-000000000000" |> Result.get_ok in
+  let status_b=F.G.Uuid.of_string "00000002-1827-5820-8200-000000000000" |> Result.get_ok in
+  let issuer,_,_,catalog_session=Coordination_test_fixture.fixture 9901L in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
+  let catalog status=
+    let request=R.submit runtime Journal_graph_request.Load_task_statuses |> only in
+    let item uuid:F.G.task_status_definition={uuid;title=F.G.Uuid.to_string uuid;ident=None;order="a";checkbox_state=None} in
+    match R.worker_read runtime request with
+    |Some(R.Read read)->
+      let budget=F.W.read_budget catalog_session ~maximum_items:read.maximum_items ~maximum_bytes:65536 |> Result.get_ok in
+      let operation=F.W.Query(budget,read.query) in
+      let response=match I.request catalog_session ~request_id:(F.W.request_id request) operation |> Result.get_ok with
+        |Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_query source->
+          let answer=match read.query with
+            |F.W.Task_statuses _->Worker_pure_read.For_worker.answer budget read.query
+              (Ok(Worker_pure_read.For_worker.task_status_catalog ~property_uuid:None ~default_status:(Some status)
+                ~items:[item status_a;item status_b] ~next:None))
+            |_->failwith "catalog fixture changed query"in
+          Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_queried{registration=source.registration;
+            owner=source.owner;request_id=source.request_id;answer}
+        |_->failwith "catalog fixture changed request"in
+      (match I.reply catalog_session ~request_id:(F.W.request_id request) operation response with
+       |Ok(F.W.Answered(Ok value))->ignore(R.receive_worker_read runtime ~request_id:request (R.Query_result(read.query,value)))
+       |_->failwith "catalog fixture rejected its typed value")
+    |_->failwith "catalog fixture lost its typed query" in
+  catalog status_a;
+  let command:Journal_graph_projection.capture={mutation_id=fixture.command.mutation_id;
+    block_id=fixture.command.block_id;sibling_order=fixture.command.sibling_order;
+    source=fixture.command.source;task_state=Journal_model.Default_status;creation_time=fixture.command.creation_time;
+    children=[];status_confirmation=false;status_intent_revision=0L} in
+  let request=R.submit runtime(Capture{calendar_generation=Journal_calendar.generation calendar;command}) |> only in
+  let intent=R.worker_intent runtime request fixture.session |> Result.get_ok in
+  let wire=F.W.encode_durable_intent intent in
+  let expected=F.W.append_intent fixture.session ~mutation_id:(F.G.Uuid.of_string command.mutation_id |> Result.get_ok)
+    ~block_id:(F.G.Uuid.of_string command.block_id |> Result.get_ok)
+    ~day:(F.W.journal_day(Journal_time.local_day command.creation_time) |> Result.get_ok)
+    ~title:command.source ~task_status:(Some status_a) ~children:Rrbvec.empty |> Result.get_ok in
+  require(wire=F.W.encode_durable_intent(F.W.Append_intent expected)) "initial Append did not freeze the resolved default";
+  catalog status_b;
+  require(F.W.encode_durable_intent(R.worker_intent runtime request fixture.session |> Result.get_ok)=wire) "catalog update replaced the planned atomic payload";
+  require(R.bind_mutation runtime request ~presentation:fixture.presentation ~intent)
+    "catalog update re-resolved and rejected the already frozen default"
+;;
+
+let () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~task_state:child_status_a () in
+  let inserted,index,round,_=F.bind fixture fixture.initial fixture.action in
+  let unknown,_=C.receive inserted ~index ~round F.W.Outcome_unknown in
+  let command={fixture.command with task_state=Journal_model.No_status;
+    status_confirmation=true;status_intent_revision=1L} in
+  let selected=C.retarget unknown ~command ~resolved_status:None |> Result.get_ok in
+  let selected,retry=C.retry selected in
+  require(let _,_,wire=F.write fixture selected retry and _,_,original=F.write fixture fixture.initial fixture.action in wire=original)
+    "explicit Clear replaced the unknown original insertion";
+  let confirmed,parent=F.confirm fixture selected retry in
+  let cleared,action=F.flush_prefix fixture confirmed parent in
+  let _,_,wire=F.write fixture cleared action in
+  let block=F.G.Uuid.of_string command.block_id |> Result.get_ok in
+  let expected=F.W.mutation_intent fixture.session ~mutation_id:(C.stage_id(C.stage cleared 1))
+    (F.W.Clear_task_status{block;preconditions={blocks=[block,"child-state:v1:0"];pages=[];scopes=[]}}) |> Result.get_ok in
+  require(wire=F.W.encode_durable_intent(F.W.Mutation_intent expected))
+    "No status after an uncertain insert skipped the real explicit Clear stage";
+  let bound,index,round,_=F.bind fixture cleared action in
+  let unknown,_=C.receive bound ~index ~round F.W.Outcome_unknown in
+  let unknown,retry=C.retry unknown in
+  require(let _,_,actual=F.write fixture unknown retry in actual=wire)
+    "unknown Clear retry replaced its original immutable payload"
+;;
+
+
+(* The insertion reducer owns bounded recovery; UI callbacks do not decide retries. *)
+let test_insertion_recovers_without_user_retry () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  List.iter(fun interrupted ->
+    let fixture=F.make () in
+    let state,index,round,intent=F.bind fixture fixture.initial fixture.action in
+    let snapshot=Marshal.to_string state [] in
+    let next,action=if interrupted then C.interrupted state ~index ~round "Local reply unavailable"
+      else C.receive state ~index ~round F.W.Outcome_unknown in
+    let i,r,wire=F.write fixture next action in
+    require(wire=(F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage state index) |> Result.get_ok)) && i=index && r>round)
+      "background recovery changed the original insertion";
+    require(snapshot=Marshal.to_string state []) "background recovery mutated its input";
+    let same,late=C.receive next ~index ~round F.W.Outcome_unknown in
+    require(same==next && late=C.Ignore) "late original completion restarted recovery";
+    let next=C.bind next ~index:i ~round:r ~intent ~presentation:fixture.presentation |> Option.get in
+    let _,again=C.receive next ~index:i ~round:r F.W.Outcome_unknown in
+    require(match again with C.Wait _->true|_->false) "persistent local error entered an automatic loop";
+    let confirmed,parent=F.confirm fixture next action in
+    let _,done_=F.flush_prefix fixture confirmed parent in
+    require(done_=C.Complete) "same intent did not settle after background recovery") [false;true]
+;;
+let () = test_insertion_recovers_without_user_retry ()
+
+let test_insertion_recovery_budgets_follow_stages () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~task_state:child_status_a () in
+  let bound,index,round,_=F.bind fixture fixture.initial fixture.action in
+  let recovering,wire=C.receive bound ~index ~round F.W.Outcome_unknown in
+  let confirmed,parent=F.confirm fixture recovering wire in
+  let applied,ack=F.applied fixture confirmed parent in
+  let index,round=match ack with C.Acknowledge(index,round,_,_)->index,round|_->fail "missing insertion ACK" in
+  let recovering,wire=C.acknowledged applied ~index ~round (Error "Transient local ACK failure") in
+  ignore(F.write fixture recovering wire);
+  let confirmed,parent=F.confirm fixture recovering wire in
+  let progressed,status=F.flush_prefix fixture confirmed parent in
+  let bound,index,round,_=F.bind fixture progressed status in
+  let _,wire=C.receive bound ~index ~round F.W.Outcome_unknown in
+  require(match wire with C.Write(1,_)->true|_->false) "prior insertion recovery exhausted a distinct status stage"
+;;
+let () = test_insertion_recovery_budgets_follow_stages ()
+
+let source_recovery_fixture () =
+  let module W=Journal_worker_coordination.Worker_api in
+  let module C=Journal_worker_coordination.Worker_pure_coordinator in
+  let fixture=Child_chain_fixture.make()in
+  let ready=(C.step (C.step(C.initial ~client_id:(W.Uuid.of_string "70000000-0000-4000-9000-000000005590" |> Result.get_ok))
+    (C.Worker_bound fixture.binding)).next (C.Bootstrap_received(fixture.binding,W.Ready fixture.projection))).next in
+  let source:Logseq_db_types.Asset_import.t={operation=W.Uuid.of_string "70000000-0000-4000-9000-000000005591" |> Result.get_ok;
+    asset=W.Uuid.of_string "70000000-0000-4000-9000-000000005592" |> Result.get_ok;
+    target=W.Uuid.of_string fixture.command.block_id |> Result.get_ok;replace_reference=None;
+    local_mutation=W.Uuid.of_string "70000000-0000-4000-9000-000000005593" |> Result.get_ok;
+    metadata_mutation=W.Uuid.of_string "70000000-0000-4000-9000-000000005594" |> Result.get_ok;
+    source_file="/isolated/synthetic-source.png";title="Synthetic source";file_type="png"}in
+  let intent=W.asset_import_intent fixture.session source |> Result.get_ok in
+  ready,intent
+;;
+let test_source_lookup_completion_after_owner_retirement () =
+  let module M=Journal_worker_coordination_host.Pure_source_recovery in
+  let ready,intent=source_recovery_fixture()in
+  let state,reads=M.plan M.empty ready(Rrbvec.singleton intent)in
+  require(Rrbvec.length reads=1) "pending source did not plan one read";
+  let read=Rrbvec.nth reads 0 in
+  let state,retired=M.plan state ready Rrbvec.empty in
+  require(Rrbvec.is_empty retired) "retired source created another request";
+  let _,completion=M.completed state read ~retryable:true in
+  require(match completion with M.Ignored->true|_->false) "late source error must not notify a retired owner"
+;;
+let () = test_source_lookup_completion_after_owner_retirement ()
+
+let test_source_recovery_generated_lifetimes () =
+  let module M=Journal_worker_coordination_host.Pure_source_recovery in
+  let module W=Journal_worker_coordination.Worker_api in
+  let ready,intent=source_recovery_fixture()in
+  let encoded=W.encode_asset_import_intent intent in
+  let run actions =
+    let state=ref M.empty and active=ref true and current=ref None and old=ref [] and sent=ref 0 in
+    let observe read =
+      incr sent;
+      require(!sent<=2) "one pending source exceeded its bounded read attempts";
+      require(W.encode_asset_import_intent read.M.intent=encoded) "recovery changed the frozen input";
+      current:=Some read in
+    List.iter(fun action->
+      let before= !state and snapshot=Marshal.to_string !state [] in
+      (match action mod 5 with
+       |0|1->let intents=if !active then Rrbvec.singleton intent else Rrbvec.empty in
+         let next,reads=M.plan before ready intents and again,duplicates=M.plan before ready intents in
+         require(Marshal.to_string next []=Marshal.to_string again []
+           && Marshal.to_string reads []=Marshal.to_string duplicates []) "source planning is nondeterministic";
+         state:=next;Rrbvec.iter observe reads
+       |2->Option.iter(fun read->
+         let next,result=M.completed before read ~retryable:(action land 8<>0)in
+         state:=next;old:=read::!old;
+         (match result with M.Retry read->observe read|Ignored|Settled->current:=None))!current
+       |3->(match !old with []->()|read::_->
+         let next,result=M.completed before read ~retryable:true in
+         require(match result with M.Ignored->true|_->false) "duplicate source completion notified or retried";
+         state:=next)
+       |_->active:=false;state:=fst(M.plan before ready Rrbvec.empty));
+      require(snapshot=Marshal.to_string before []) "source transition mutated a shared prior snapshot")actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions =
+    let rec drop prefix=function
+      |[]->actions
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |action::rest->drop(action::prefix)rest in drop []actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x5011CE;seed|]in
+    let actions=List.init 60(fun _->Random.State.int random 80)in
+    if fails actions then fail "source recovery seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+let () = test_source_recovery_generated_lifetimes ()
+
+(* Root owns the editable buffer; its admitted submission remains immutable
+   until the real settled completion supplied by Runtime. *)
+let test_pending_capture_edits_keep_original_submission () =
+  let module R=Root_state in
+  let original="Original submission" in
+  let state=root_navigation ~graph_generation:1 |> fun state->R.step state(Capture_edited original) in
+  let capture,request=Journal_capture.admit_save(Option.get(R.capture state))
+    ~mutation_id:"70000000-0000-4000-9000-000000005601"
+    ~block_id:"70000000-0000-4000-a000-000000005601" ~sibling_order:"z"
+    ~calendar_generation:1L ~creation_time:(creation_time 550)in
+  let command=match Option.get request with Journal_graph_request.Capture{command;_}->command|_->assert false in
+  let waiting=R.step (R.step state(Capture_admitted capture))
+    (Completed{payload=Capture_waiting{command;message="Original local result is not available"}})in
+  require(Journal_capture.phase(Option.get(R.capture waiting))=Journal_capture.Saving)
+    "unknown creation became a separate failed/readonly UI state";
+  let edited=R.step waiting(Capture_edited "Newer draft")in
+  let draft=Option.get(R.capture edited)in
+  require_string "Newer draft" (Journal_capture.source draft) "pending editor buffer";
+  require(Journal_capture.pending_command draft=Some command) "editing rewrote the original submission";
+  require(not(Journal_capture.can_save draft)) "unknown original admitted another creation";
+  let completed=R.step edited(Completed{payload=Block_captured{
+    block=block ~id:command.block_id ~source:original();timeline_entry_update=None}})in
+  let draft=Option.get(R.capture completed)in
+  require_string "Newer draft" (Journal_capture.source draft) "late submission erased the current editor";
+  require(Journal_capture.pending_command draft=None && Journal_capture.can_save draft)
+    "settled original did not release the edited draft";
+  let duplicate=R.step completed(Completed{payload=Block_captured{
+    block=block ~id:command.block_id ~source:original();timeline_entry_update=None}})in
+  require(R.capture duplicate=R.capture completed) "duplicate original completion changed the new draft"
+;;
+let ()=test_pending_capture_edits_keep_original_submission()
+
+let test_insertion_delayed_recovery_tokens () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make()in
+  let state,index,round,_=F.bind fixture fixture.initial fixture.action in
+  let state,action=C.receive state ~index ~round F.W.Outcome_unknown in
+  let state,index,round,_=F.bind fixture state action in
+  let state,wait=C.receive state ~index ~round F.W.Outcome_unknown in
+  require(match wait with C.Wait _->true|_->false) "exhausted immediate recovery replayed without a timer";
+  let current=ref state and previous=ref None and last_delay=ref 0. in
+  for _=0 to 10 do
+    let snapshot=Marshal.to_string !current []in
+    let armed,recovery=C.take_recovery !current in
+    require(snapshot=Marshal.to_string !current []) "arming recovery mutated its old snapshot";
+    let recovery=Option.get recovery in
+    require(recovery.delay>= !last_delay && recovery.delay<=30.) "recovery backoff is unbounded or decreasing";
+    last_delay:=recovery.delay;
+    let duplicate,twice=C.take_recovery armed in
+    require(twice=None && duplicate==armed) "duplicate publish created a second recovery timer";
+    Option.iter(fun old->let same,ignored=C.resume_recovery armed old in
+      require(same==armed && ignored=C.Ignore) "obsolete timer restarted a later attempt")!previous;
+    let retrying,action=C.resume_recovery armed recovery in
+    let _,_,wire=F.write fixture retrying action in
+    require(wire=(F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage state 0) |> Result.get_ok))) "timer replaced the original durable payload";
+    let duplicate,ignored=C.resume_recovery retrying recovery in
+    require(duplicate==retrying && ignored=C.Ignore) "timer fired the same attempt twice";
+    let bound,index,round,_=F.bind fixture retrying action in
+    let failed,wait=C.receive bound ~index ~round F.W.Outcome_unknown in
+    require(match wait with C.Wait _->true|_->false) "persistent error caused an immediate retry loop";
+    previous:=Some recovery;current:=failed
+  done;
+  require(!last_delay=30.) "background recovery never reached its capped interval"
+;;
+let ()=test_insertion_delayed_recovery_tokens()
+
+let test_pending_capture_buffer_traces () =
+  let module R=Root_state in
+  let run actions =
+    let original="Original source 中文"in
+    let initial=root_navigation ~graph_generation:1 |> fun state->R.step state(Capture_edited original)in
+    let capture,request=Journal_capture.admit_save(Option.get(R.capture initial))
+      ~mutation_id:"70000000-0000-4000-9000-000000005602"
+      ~block_id:"70000000-0000-4000-a000-000000005602" ~sibling_order:"z"
+      ~calendar_generation:1L ~creation_time:(creation_time 550)in
+    let command=match Option.get request with Journal_graph_request.Capture{command;_}->command|_->assert false in
+    let state=ref(R.step initial(Capture_admitted capture))and expected=ref original in
+    List.iteri(fun index action->
+      let before= !state and snapshot=Marshal.to_string !state []in
+      let current=Option.get(R.capture before)in
+      let event:R.event=match action mod 5 with
+        |0|1->let text=if action land 8=0 then original else Printf.sprintf "Buffer 中文 %d"index in
+          expected:=text;
+          let offset=Ui.Text_editing.Utf16.length text in
+          Capture_native_edit(edit ~session_id:(Journal_capture.session_id current)
+            ~local_revision:(Int64.succ(Journal_ids.Text_input.Local_revision.to_int64(Journal_capture.accepted_local_revision current)))
+            ~base_document_revision:(Journal_ids.Text_input.Document_revision.to_int64(Journal_capture.document_revision current))
+            ~text ~selection_start:offset ~selection_end:offset())
+        |2->Completed{payload=Capture_waiting{command;message="Local confirmation unavailable"}}
+        |3->Completed{payload=Block_captured{block=block ~id:"70000000-0000-4000-a000-000000005603"();timeline_entry_update=None}}
+        |_->Capture_native_edit(edit ~session_id:(Journal_ids.Text_input.Session_id.of_int64 99999L)
+          ~local_revision:1L ~base_document_revision:0L ~text:"Obsolete editor" ~selection_start:0 ~selection_end:0())in
+      let next=R.step before event and again=R.step before event in
+      require(Marshal.to_string next []=Marshal.to_string again []) "pending buffer transition is nondeterministic";
+      state:=next;
+      let current=Option.get(R.capture next)in
+      require_string !expected(Journal_capture.source current) "pending buffer trace";
+      require(Journal_capture.pending_command current=Some command && not(Journal_capture.can_save current))
+        "pending buffer trace changed an immutable submission or admitted a new one";
+      require(snapshot=Marshal.to_string before []) "pending buffer trace mutated a prior snapshot")actions;
+    let completed=R.step !state(Completed{payload=Block_captured{
+      block=block ~id:command.block_id ~source:original();timeline_entry_update=None}})in
+    if !expected=original then require(R.capture completed=None) "unchanged submitted buffer did not finish"
+    else let draft=Option.get(R.capture completed)in
+      require_string !expected(Journal_capture.source draft) "settled buffer trace";
+      require(Journal_capture.pending_command draft=None && Journal_capture.can_save draft)
+        "settled original kept the new draft owned"in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions =
+    let rec remove prefix=function []->actions
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |event::rest->remove(event::prefix)rest in remove []actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xB0FF;seed|]in
+    let actions=List.init 60(fun _->Random.State.int random 80)in
+    if fails actions then fail "pending buffer seed=%d minimized=[%s]"seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+let ()=test_pending_capture_buffer_traces()
+
+let test_delayed_recovery_cannot_borrow_another_submission () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make()in
+  let arm state action =
+    let state,index,round,_=F.bind fixture state action in
+    let state,action=C.receive state ~index ~round F.W.Outcome_unknown in
+    let state,index,round,_=F.bind fixture state action in
+    let state,_=C.receive state ~index ~round F.W.Outcome_unknown in
+    let state,token=C.take_recovery state in state,Option.get token in
+  let _,old=arm fixture.initial fixture.action in
+  let command={fixture.command with mutation_id="70000000-0000-4000-9000-000000005604";
+    block_id="70000000-0000-4000-a000-000000005604"}in
+  let parent=F.G.Uuid.of_string command.parent_block_id |> Result.get_ok in
+  let insert=F.W.Insert_blocks{parent;roots=[{uuid=F.G.Uuid.of_string command.block_id |> Result.get_ok;title=command.source;children=[]}];
+    preconditions={blocks=[parent,command.expected_parent_revision];pages=[];
+      scopes=[Worker_pure_data.V2_children_scope parent,"children-state:v1:frozen"]}} in
+  let initial,action=C.start ~command ~page:(C.page fixture.initial) ~resolved_status:None ~insert |> Result.get_ok in
+  let wire=F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage initial 0) |> Result.get_ok) in
+  let current,token=arm initial action in
+  require(old.round=token.round && old.delay=token.delay) "foreign timer test did not reproduce reused local counters";
+  let same,out=C.resume_recovery current old in
+  require(same==current && out=C.Ignore) "old submission timer borrowed a different immutable intent";
+  let current,out=C.resume_recovery current token in
+  let _,_,actual=F.write fixture current out in
+  require(actual=wire) "current submission timer did not retain its own payload"
+;;
+let ()=test_delayed_recovery_cannot_borrow_another_submission()

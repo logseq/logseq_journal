@@ -147,7 +147,6 @@ module Json = struct
   type sign_out = { signedOut : bool } [@@deriving yojson]
   type ready = { ready : bool } [@@deriving yojson]
   type presented = { presented : bool } [@@deriving yojson]
-  type text = { text : string } [@@deriving yojson]
   type copied = { copied : bool } [@@deriving yojson]
 end
 
@@ -251,9 +250,7 @@ let decode_environment_event bytes =
 let is_environment_event bytes = Result.is_ok (decode_envelope [24] bytes)
 
 let copy_text_request ~text =
-  if not (Journal_validation.is_valid_utf_8 text)
-  then Error "Clipboard text is invalid."
-  else json_request 28 Json.text_to_yojson { text }
+  Result.bind (Journal_pure_copy.clipboard_payload ~text) (encode_envelope 28)
 ;;
 
 let decode_copy_text_response bytes =

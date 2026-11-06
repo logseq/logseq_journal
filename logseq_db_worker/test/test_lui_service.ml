@@ -1,6 +1,5 @@
 module T = Logseq_db_worker_test_support.Test_support
-module P = Logseq_db_worker.Protocol
-module ID = Logseq_db_worker_lui.Journal_worker_ids
+module ID = Journal_worker_ids
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Runner = Logseq_sync_effect_runner.Effect_runner
 module Worker = Logseq_db_worker_lui.Journal_worker
@@ -46,19 +45,15 @@ let accepted = function
 
 let await_response client request_id =
   let rec loop () =
-    match
-      Worker.For_testing.drain_events client ~max_events:64
-      |> List.find_map (function
-        | Worker.Response { request_id = actual; outcome = Completed response; _ }
-          when ID.Worker.Request_id.equal request_id actual -> Some response
-        | Response _ | Push _ | Terminal _ -> None)
-    with
-    | Some response -> response
-    | None ->
-      Worker.For_testing.await_output client;
-      loop ()
-  in
-  loop ()
+    match Worker.For_testing.drain_events client ~max_events:64 |> List.find_map(function
+      |Worker.Response{request_id=actual;outcome;_}when ID.Worker.Request_id.equal request_id actual->Some outcome
+      |_->None)with
+    |Some(Worker.Completed response)->response
+    |Some(Failed message)->T.fail "expected completed response: %s" message
+    |Some Cancelled->T.fail "expected response was canceled"
+    |Some Shutdown->T.fail "Worker stopped before expected response"
+    |None->Worker.For_testing.await_output client;loop() in
+  loop()
 ;;
 
 let with_client config run =
@@ -70,43 +65,111 @@ let with_client config run =
   Fun.protect ~finally:(fun () -> Worker_runtime.stop client) (fun () -> run client)
 ;;
 
-let v2_graph_info_request () =
-  let json =
-    `Assoc
-      [ "api_version", `Int 2
-      ; "request_id", `String "00000000-0000-4000-8000-000000000001"
-      ; "command", `List [ `String "V2_graph_info" ]
-      ]
-  in
-  match P.request_of_yojson json with
-  | Ok request -> request
-  | Error error ->
-    T.fail
-      "unable to build v2 graph-info request: %s"
-      (Logseq_db_worker.Error.message error)
+let test_coordination_registration () =
+  T.with_managed (fun fixture ->
+    let config={fixture.config with response_budget_bytes=4096} in
+    with_client config (fun client ->
+    let updates=ref [] in
+    let drain () =
+      let events=Worker.For_testing.drain_events client ~max_events:64 in
+      List.iter (function Worker.Push {payload=Service.Coordination_updates batch;_}->
+        updates:=List.rev_append batch !updates | _ -> ()) events;
+      events in
+    let send request=
+      let id=Worker.send client request |> accepted in
+      let rec receive () =
+        match drain () |> List.find_map (function
+          | Worker.Response {request_id;outcome;_} when ID.Worker.Request_id.equal id request_id -> Some outcome
+          | _ -> None) with
+        | Some (Completed response) -> response
+        | Some _ -> T.fail "coordination command did not complete"
+        | None -> Worker.For_testing.await_output client;receive () in
+      receive () in
+    let baseline id = match send (Service.Register_coordination id) with
+      | Service.Coordination_registered baseline -> baseline
+      | _ -> T.fail "registration did not return a baseline" in
+    let first=baseline 10L in
+    T.require (first.registration=10L && first.baseline.state.residents=[])
+      "empty baseline must be authoritative without an invented Open DB";
+    T.require (first.limits.response_budget_bytes=config.response_budget_bytes)
+      "baseline must retain effective configured response budget";
+    let same=baseline 10L in
+    T.require (same.baseline.version=first.baseline.version) "duplicate registration changed version";
+    ignore(send (Service.Client_command (Restore_local_account {user_id="baseline-synthetic"})));
+    let changed ()=List.exists (function Service.Coordination_snapshot next ->
+      next.registration=10L && next.baseline.version>first.baseline.version
+        && Option.is_some next.baseline.state.sync.account | _ -> false) !updates in
+    let deadline=Unix.gettimeofday () +. 2. in
+    while not(changed ()) && Unix.gettimeofday ()<deadline do
+      ignore(drain ());Thread.delay 0.001
+    done;
+    T.require (changed ()) "registered state change was lost between sample and notification";
+    (match send (Service.Release_coordination 10L) with
+     | Coordination_released 10L -> () | _ -> T.fail "missing exact unregister ACK");
+    (* A release of a known future registration fences its delayed first send. *)
+    (match send (Service.Release_coordination 20L) with
+     | Coordination_released 20L -> () | _ -> T.fail "missing pre-registration release ACK");
+    let id=Worker.send client (Service.Register_coordination 20L) |> accepted in
+    let rec refusal () =
+      match Worker.For_testing.drain_events client ~max_events:64 |> List.find_map (function
+        | Worker.Response {request_id;outcome;_} when ID.Worker.Request_id.equal id request_id -> Some outcome
+        | _ -> None) with
+      | Some (Failed _) -> ()
+      | Some _ -> T.fail "released registration was resurrected"
+      | None -> Worker.For_testing.await_output client;refusal () in
+    refusal ();
+    let next=baseline 21L in
+    T.require (next.registration=21L) "new binding was not admitted";
+    ignore(send (Service.Release_coordination 10L));
+    T.require ((baseline 21L).registration=21L) "old unregister retired a newer binding"))
 ;;
 
-let test_managed_worker_starts_closed_and_replies_with_v2_envelope () =
-  T.with_managed (fun fixture ->
-    with_client fixture.config (fun client ->
-      let request = v2_graph_info_request () in
-      let id = Worker.send client (Service.Graph_request request) |> accepted in
-      match await_response client id with
-      | Service.Graph_response response ->
-        (match P.response_to_yojson response with
-         | `List
-             [ `String "V2_response"
-             ; `Assoc
-                 [ ("api_version", `Int 2)
-                 ; ("request_id", `String "00000000-0000-4000-8000-000000000001")
-                 ; ("outcome", `List [ `String "V2_failed"; `Assoc _ ])
-                 ]
-             ] -> ()
-         | json ->
-           T.fail
-             "pre-selection v2 request did not return a v2 failure envelope: %s"
-             (Yojson.Safe.to_string json))
-      | _ -> T.fail "managed worker returned the wrong response kind"))
+(* Service owns registration and serial handoff commands. Core-only tests
+   cannot prove that this real mailbox routes a receipt to its physical owner. *)
+let test_host_handoff_real_service_single_use () =
+  let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
+  T.with_managed(fun fixture->with_client fixture.config(fun client->
+    let send request=await_response client(Worker.send client request |> accepted) in
+    ignore(send(Service.Client_command(Restore_local_account{user_id="host-synthetic"})));
+    let baseline=match send(Service.Register_coordination 71L)with
+      |Coordination_registered value->value|_->T.fail "host baseline" in
+    let owner=Option.get baseline.baseline.state.sync.account in
+    let plan:Logseq_db_worker.host_plan={version=baseline.baseline.version;
+      id=Logseq_db_types.Graph_types.Uuid.of_string "00000000-0000-4000-8000-000000079071" |> Result.get_ok;
+      registration=71L;owner;change=H.Stop_connection;expected=Rrbvec.empty} in
+    let receipt=match send(Service.Coordination_prepare_host_change plan)with
+      |Coordination_host_prepared receipt->receipt|_->T.fail "missing actual host receipt" in
+    T.require ((H.receipt_request receipt).id=plan.id) "actual receipt changed its handoff identity";
+    (match send(Service.Coordination_confirm_host_change receipt)with
+     |Coordination_host_confirmed(actual,false)->T.require(actual=receipt)"readback changed original receipt"
+     |_->T.fail "unused actual permission did not read back false");
+    (match send(Service.Coordination_apply_host_change receipt)with
+     |Coordination_host_applied id->T.require(id=plan.id)"actual consumed ACK changed identity"
+     |_->T.fail "missing actual consume ACK");
+    for _=1 to 2 do
+      (match send(Service.Coordination_confirm_host_change receipt)with
+       |Coordination_host_confirmed(actual,true)->T.require(actual=receipt)"readback changed consumed receipt"
+       |_->T.fail "actual consumed permission did not read back true")
+    done;
+    let id=Worker.send client(Service.Coordination_apply_host_change receipt) |> accepted in
+    let rec terminal ()=match Worker.For_testing.drain_events client ~max_events:64 |> List.find_map(function
+      |Worker.Response{request_id;outcome;_}when ID.Worker.Request_id.equal id request_id->Some outcome|_->None)with
+      |Some(Worker.Failed _)->()|Some _->T.fail "same host permit consumed twice"
+      |None->Worker.For_testing.await_output client;terminal() in terminal()))
+;;
+
+let test_managed_worker_starts_without_query_authority () =
+  T.with_managed(fun fixture->with_client fixture.config(fun client->
+    let id=Worker.send client Service.Get_graph_state |>accepted in
+    (match await_response client id with
+     |Service.Graph_state{phase=Logseq_db_worker.Graph_closed;graph_id=None;_}->()
+     |_->T.fail "managed worker opened a graph before account selection");
+    let id=Worker.send client(Service.Register_coordination 19L)|>accepted in
+    match await_response client id with
+    |Service.Coordination_registered baseline->
+      T.require(baseline.baseline.state.sync.account=None && baseline.baseline.state.residents=[])
+        "cold bootstrap invented execution authority before account selection"
+    |_->T.fail "managed worker did not publish its authoritative cold baseline"))
 ;;
 
 let test_managed_client_command_is_accepted () =
@@ -223,9 +286,54 @@ let asset_uuid suffix =
   |> Result.get_ok
 ;;
 
+let test_release_requires_physical_ack () =
+  T.with_managed(fun fixture->with_client fixture.config(fun client->
+    let request_id=Worker.send client
+      (Service.Release_asset_file{scope=asset_scope 1;handle="synthetic-unowned-lease"}) |> accepted in
+    let rec terminal () =
+      match Worker.For_testing.drain_events client ~max_events:64 |> List.find_map(function
+        | Worker.Response{request_id=actual;outcome;_}
+          when ID.Worker.Request_id.equal request_id actual -> Some outcome
+        | _->None) with
+      | Some outcome->outcome
+      | None->Worker.For_testing.await_output client;terminal() in
+    T.require (match terminal() with Worker.Failed _->true|_->false)
+      "retired scope cannot fabricate a successful physical release ACK"))
+;;
+
+let test_discarded_asset_result_keeps_actual_lease_owner () =
+  let scope=asset_scope 1 in
+  let actual=Service.Asset_file(Some("retained-lease","/synthetic/preview")) in
+  T.require(Service.discarded_asset_retain
+    (Acquire_asset_file{scope;handle="lookup-handle"})actual=Some(scope,"retained-lease"))
+    "discard cleanup used the lookup capability instead of the acquired lease";
+  let operation=asset_uuid 99 in
+  T.require(Service.discarded_asset_retain(Acquire_imported_file{scope;operation})actual=Some(scope,"retained-lease"))
+    "imported acquisition lost its exact lease owner";
+  let source:Logseq_db_types.Asset_import.t={operation;asset=asset_uuid 98;replace_reference=None;
+    target=asset_uuid 97;local_mutation=asset_uuid 96;metadata_mutation=asset_uuid 95;
+    source_file="/synthetic/source";title="source";file_type="text/plain"} in
+  let asset=Logseq_db_types.Asset_descriptor.create ~uuid:source.asset ~source:(Managed None)
+    ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+  let receipt:Logseq_db_worker.import_receipt={operation;graph_generation=scope.graph_generation;
+    scope;target=source.target;asset;file_type=source.file_type;preview=Some("import-preview-lease","/synthetic/preview")} in
+  T.require(Service.discarded_asset_retain(Import_asset{graph_generation=scope.graph_generation;source})
+    (Asset_imported(Ok receipt))=Some(scope,"import-preview-lease"))
+    "discarded import preview did not transfer the actual result lease";
+  T.require(Service.discarded_asset_retain(Acquire_asset_file{scope;handle="lookup-handle"})(Asset_file None)=None)
+    "missing resource fabricated a cleanup capability";
+  T.require(Service.discarded_asset_retain(Import_asset{graph_generation=scope.graph_generation;source})
+    (Asset_imported(Error "failed"))=None) "failed import fabricated a cleanup capability"
+;;
+
+let notice_descriptor asset =
+  Logseq_db_types.Asset_descriptor.create ~uuid:asset ~source:(Managed None)
+    ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok
+;;
+
 let availability scope consumer asset state =
   Service.Asset_notice
-    (scope, Asset_availability { consumer; asset; availability = state })
+    (scope, Asset_availability { consumer; asset; descriptor=notice_descriptor asset; availability = state })
 ;;
 
 let collect_asset_burst pushes =
@@ -251,7 +359,7 @@ let test_ready_survives_acceptance () =
     (collect_asset_burst [ ready; accepted ]
      = [ ( scope
          , Asset_availability
-             { consumer = "visible"; asset = asset_uuid 1; availability = Ready "cached" }
+             { consumer = "visible"; asset = asset_uuid 1; descriptor=notice_descriptor(asset_uuid 1); availability = Ready "cached" }
          )
        ; scope, Asset_demand_accepted "visible"
        ])
@@ -292,7 +400,7 @@ let test_retry_keeps_latest_fact_in_arrival_order () =
   T.require
     (collected
      = [ ( scope
-         , Asset_availability { consumer = "a"; asset; availability = Ready "retried" } )
+         , Asset_availability { consumer = "a"; asset; descriptor=notice_descriptor asset; availability = Ready "retried" } )
        ; scope, Asset_demand_accepted "a"
        ])
     "Retry should replace only the same fact, keeping Ready and latest admission ordered"
@@ -359,6 +467,140 @@ let control_wait label predicate =
     Unix.sleepf 0.001
   done;
   T.require (predicate ()) label
+;;
+
+(* A successful I/O result may be produced after cancellation was requested.
+   Only the Mailbox owner knows whether that result becomes externally visible. *)
+let test_discarded_success_is_settled ?(slow = false) ending () =
+  let started = Atomic.make false
+  and release = Atomic.make false in
+  let live = Atomic.make 0
+  and discarded = Atomic.make 0
+  and settled = Atomic.make 0 in
+  let cleanup_started = Atomic.make false
+  and cleanup_release = Atomic.make (not slow)
+  and shutdown_called = Atomic.make false in
+  let service =
+    Worker.Service.create
+      ~push_topic_count:1
+      ~concurrency:Serial
+      ~init:(fun context () -> Ok (Worker.Session_context.clock context))
+      ~handle:(fun context _ value ->
+        if ending = `Finalizer_failure
+        then
+          Eio.Switch.on_release (Worker.Request_context.switch context) (fun () ->
+            failwith "synthetic resource finalizer failure");
+        Eio.Cancel.protect (fun () ->
+          Atomic.incr live;
+          Atomic.set started true;
+          while not (Atomic.get release) do
+            Eio.Time.Mono.sleep (Worker.Request_context.clock context) 0.001
+          done;
+          Ok value))
+      ~discard_response:(fun clock ~request_id:_ request response ->
+        Atomic.set cleanup_started true;
+        while not (Atomic.get cleanup_release) do
+          Eio.Time.Mono.sleep clock 0.001
+        done;
+        T.require (request = response) "discard cleanup changed produced result";
+        Atomic.incr discarded;
+        Atomic.decr live)
+      ~request_settled:(fun _ ~request_id:_ _ ->
+        T.require (Atomic.get discarded = if ending = `Complete || ending = `Creator_failure then 0 else 1)
+          "creator completion overtook actual discard cleanup";
+        if ending=`Creator_failure then failwith "synthetic creator ledger failure";
+        Atomic.incr settled)
+      ~shutdown:(fun _ ->
+        Atomic.set shutdown_called true;
+        Atomic.set live 0)
+      ()
+  in
+  let client =
+    Worker_runtime.start ~runtime_epoch:(ID.Runtime.Epoch.of_int64 2190L) service ()
+    |> Result.get_ok
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      Atomic.set release true;
+      Atomic.set cleanup_release true;
+      Worker_runtime.stop client)
+    (fun () ->
+       let id = Worker.send client 7 |> accepted in
+       control_wait "protected resource operation started" (fun () -> Atomic.get started);
+       (match ending with
+        | `Cancel -> Worker.cancel client ~request_id:id
+        | `Stop -> Worker.Private.request_stop client
+        | `Complete | `Finalizer_failure | `Creator_failure -> ());
+       Atomic.set release true;
+       if slow
+       then (
+         control_wait "discard cleanup has started" (fun () -> Atomic.get cleanup_started);
+         T.require
+           (not (Atomic.get shutdown_called))
+           "Service shutdown overtook yielding discard cleanup";
+         T.require (Atomic.get settled=0) "creator was marked settled during physical discard cleanup";
+         T.require
+           (not
+              (List.exists
+                 (function
+                   | Worker.Response _ | Terminal _ -> true
+                   | _ -> false)
+                 (Worker.For_testing.drain_events client ~max_events:64)))
+           "terminal became visible before yielding discard cleanup settled";
+         Atomic.set cleanup_release true);
+       let terminal = ref None in
+       control_wait "resource operation reaches one visible terminal" (fun () ->
+         List.iter
+           (function
+             | Worker.Response { request_id; outcome; _ } when request_id = id ->
+               T.require (!terminal = None) "resource terminal published twice";
+               terminal := Some outcome;
+               T.require (Atomic.get settled=(if ending=`Creator_failure then 0 else 1))
+                 "accepted creator did not settle exactly once before its terminal";
+               T.require
+                 (Atomic.get discarded = if ending = `Complete then 0 else 1)
+                 "successful discarded result was not settled before terminal publication"
+             | _ -> ())
+           (Worker.For_testing.drain_events client ~max_events:64);
+         Option.is_some !terminal);
+       T.require
+         (match ending, !terminal with
+          | `Cancel, Some Worker.Cancelled
+          | `Stop, Some Shutdown
+          | `Complete, Some (Completed 7)
+          | (`Finalizer_failure | `Creator_failure), Some (Failed _) -> true
+          | _ -> false)
+         "cleanup changed cancellation/stop/normal delivery semantics";
+       T.require
+         (ending <> `Complete || Atomic.get live = 1)
+         "delivered resource was released as an orphan")
+;;
+
+(* Admission and the handler nursery are effect-owned. The public pure DB
+   reducers cannot witness a creator which was cancelled before its handler ran. *)
+let test_queued_creators_settle_without_starting () =
+  let entered=Atomic.make false and release=Atomic.make false in
+  let handled=Atomic.make 0 and settled=Array.init 4(fun _->Atomic.make 0) in
+  let service=Worker.Service.create ~push_topic_count:1 ~concurrency:Serial
+    ~init:(fun _ ()->Ok())
+    ~handle:(fun _ () value->
+      Atomic.incr handled;Atomic.set entered true;
+      while not(Atomic.get release) do Domain.cpu_relax() done;
+      Ok value)
+    ~request_settled:(fun () ~request_id:_ value->Atomic.incr settled.(value))
+    ~shutdown:(fun ()->()) () in
+  let client=Worker_runtime.start ~runtime_epoch:(ID.Runtime.Epoch.of_int64 2191L) service () |> Result.get_ok in
+  Fun.protect ~finally:(fun()->Atomic.set release true;Worker_runtime.stop client)(fun()->
+    ignore(Worker.send client 1 |> accepted);
+    control_wait "first creator entered" (fun()->Atomic.get entered);
+    let cancelled=Worker.send client 2 |> accepted in
+    Worker.cancel client ~request_id:cancelled;
+    ignore(Worker.send client 3 |> accepted);
+    Worker.Private.request_stop client;
+    Atomic.set release true;
+    control_wait "all accepted creators settled" (fun()->
+      Array.for_all(fun n->Atomic.get n=1)(Array.sub settled 1 3));
+    T.require(Atomic.get handled=1) "queued cancelled/stopped creator was executed")
 ;;
 
 type control_request =
@@ -1177,7 +1419,7 @@ let test_local_copy_presence mode () =
     let cache = Core.catalog_cache ~user_id:user ~graphs:[graph] ~selected_graph:None in
     Out_channel.with_open_bin (Filename.concat catalogs (name ^ ".json"))
       (fun output -> output_string output (Core.encode_catalog_cache cache));
-    if List.mem mode ["downloaded"; "corrupt"; "delete"; "busy"] then (
+    if List.mem mode ["downloaded"; "corrupt"; "delete"; "busy"; "handoff"] then (
       let mirrors = Filename.concat directory "synced-graphs" in
       Unix.mkdir mirrors 0o700;
       let mirror = Filename.concat mirrors (G.Uuid.to_string graph_id) in
@@ -1224,10 +1466,38 @@ let test_local_copy_presence mode () =
         T.require (actual = request) "presence result retains exact identity";
         (match mode, result with
          | "absent", Ok Service.Not_downloaded
-         | ("downloaded" | "corrupt" | "delete" | "busy"), Ok Service.Downloaded -> ()
+         | ("downloaded" | "corrupt" | "delete" | "busy" | "handoff"), Ok Service.Downloaded -> ()
          | ("stale" | "unauthorized"), Error _ -> ()
          | _ -> T.fail "unexpected presence result for %s" mode);
-        if List.mem mode ["delete"; "busy"] then (
+        if mode="handoff" then (
+          let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
+          let send request=await_response client(Worker.send client request |> accepted) in
+          let baseline=match send(Service.Register_coordination 72L)with
+            |Service.Coordination_registered value->value|_->T.fail "missing removal baseline" in
+          let plan:Logseq_db_worker.host_plan={version=baseline.baseline.version;
+            id=G.Uuid.of_string "94000000-0000-4000-8000-000000079072" |> Result.get_ok;
+            registration=72L;owner=Option.get baseline.baseline.state.sync.account;
+            change=H.Remove_graph(graph_id,H.Force);expected=Rrbvec.of_list(List.map fst baseline.baseline.state.residents)} in
+          let receipt=match send(Service.Coordination_prepare_host_change plan)with
+            |Service.Coordination_host_prepared value->value|_->T.fail "missing prepared copy receipt" in
+          T.require(Option.is_some(H.receipt_copy_generation receipt))"removal receipt lacks the actual held copy generation";
+          T.require(Sys.file_exists mirror_directory)"preparing permission removed its copy";
+          (match send(Service.Delete_local_copy request)with
+           |Service.Local_copy_deleted(_,Error _)->()|_->T.fail "legacy deletion bypassed the held host owner");
+          (match send(Service.Coordination_apply_host_change receipt)with
+           |Service.Coordination_host_applied id->T.require(id=plan.id)"removal ACK changed handoff identity"
+           |_->T.fail "actual prepared copy did not commit");
+          T.require(not(Sys.file_exists mirror_directory))"consumed removal did not retire the physical namespace";
+          Unix.mkdir mirror_directory 0o700;
+          let replacement=Filename.concat mirror_directory "replacement-fixture" in
+          Out_channel.with_open_bin replacement(fun output->output_string output "new synthetic incarnation");
+          let id=Worker.send client(Service.Coordination_apply_host_change receipt) |> accepted in
+          let rec terminal ()=match Worker.For_testing.drain_events client ~max_events:64 |> List.find_map(function
+            |Worker.Response{request_id;outcome;_}when ID.Worker.Request_id.equal id request_id->Some outcome|_->None)with
+            |Some(Worker.Failed _)->()|Some _->T.fail "old removal permission consumed twice"
+            |None->Worker.For_testing.await_output client;terminal() in terminal();
+          T.require(Sys.file_exists replacement)"old permission removed a replacement namespace")
+        else if List.mem mode ["delete"; "busy"] then (
           let lock = if mode <> "busy" then None else (
             let db = Sqlite3.db_open (Filename.concat mirror_directory ".logseq-overlay-owner.sqlite") in
             Sqlite3.Rc.check (Sqlite3.exec db "CREATE TABLE owner_primitive (protocol INTEGER NOT NULL); BEGIN IMMEDIATE");
@@ -1380,7 +1650,7 @@ let test_asset_failure_rows () =
   let module D=Logseq_db_types.Failure_diagnostic in
   let uuid=Logseq_db_types.Graph_types.Uuid.of_string "94000000-0000-4000-8000-000000000799" |> Result.get_ok in
   let download ?(retry=false) failure = Service.Asset_availability
-    {consumer="PRIVATE_SYNTHETIC_PAYLOAD";asset=uuid;
+    {consumer="PRIVATE_SYNTHETIC_PAYLOAD";asset=uuid;descriptor=notice_descriptor uuid;
      availability=A.Failed{failure;attempts=2;retry_scheduled=retry}} in
   let upload failure = Service.Upload_status{operation=uuid;asset=uuid;target=uuid;
     title="PRIVATE_SYNTHETIC_PAYLOAD";status=U.Failed_upload failure} in
@@ -1512,18 +1782,86 @@ let test_authoritative_detail_budget () =
 
 let test_resident_invalidations_survive_coalescing () =
   let scope=asset_scope 1 and other=asset_scope 2 in
-  let push n=Logseq_db_worker.Protocol.V2_changes_available {api_version=Logseq_db_worker.Protocol.api_version;
-    generation="generation:v1:1:1";through="change-window:v1:" ^ string_of_int n} in
+  let push n=Worker_pure_data.Changes_available {generation="generation:v1:1:1";through="change-window:v1:" ^ string_of_int n} in
   let merged=Service.coalesce_push ~topic:Service.invalidation_topic
     (Service.Graph_pushes [scope,push 1]) (Service.Graph_pushes [other,push 2]) in
   T.require (merged=Service.Graph_pushes [scope,push 1;other,push 2]) "hidden graph invalidation was overwritten";
   let latest=Service.coalesce_push ~topic:Service.invalidation_topic merged (Service.Graph_pushes [scope,push 3]) in
-  T.require (latest=Service.Graph_pushes [other,push 2;scope,push 3]) "latest update must replace only its exact graph scope"
+  T.require (latest=Service.Graph_pushes [other,push 2;scope,push 3]) "latest update must replace only its exact graph scope";
+  let resync=Worker_pure_data.Resync_required {generation="g";reason="retention gap"} in
+  let sticky=Service.coalesce_push ~topic:Service.invalidation_topic
+    (Service.Graph_pushes[scope,resync])(Service.Graph_pushes[scope,push 4;other,push 5]) in
+  T.require(sticky=Service.Graph_pushes[scope,resync;other,push 5])
+    "later availability hid the prerequisite resync for its physical owner"
+;;
+let test_observation_invalidations_are_bounded_latest_facts () =
+  let scope = asset_scope 1 in
+  let owner : Service.timeline_scope =
+    { startup = { account_generation = 1; presentation_generation = 1 }
+    ; graph_id = scope.graph_id
+    ; graph_generation = 1
+    }
+  in
+  let topic = ID.Worker.Push_topic.of_int 8 in
+  let fact registration n epoch =
+    Service.Observation_invalidated
+      { registration_id = registration
+      ; owner
+      ; epoch
+      ; observation_id =
+          Logseq_db_types.Graph_types.Uuid.of_string
+            (Printf.sprintf "9d000000-0000-4000-8000-%012d" n)
+          |> Result.get_ok
+      }
+  in
+  let push value = Service.Coordination_observations (Rrbvec.singleton value) in
+  let merge = Service.coalesce_push ~topic in
+  let latest = merge (push (fact 1L 1 4L)) (push (fact 1L 1 2L)) in
+  T.require (latest = push (fact 1L 1 4L)) "stale observation epoch replaced newer fact";
+  let separate = merge latest (push (fact 2L 1 1L)) in
+  T.require
+    (match separate with
+     | Service.Coordination_observations values -> Rrbvec.length values = 2
+     | _ -> false)
+    "binding identity was erased during observation coalescing";
+  let all = ref (Service.Coordination_observations Rrbvec.empty) in
+  for n = 1 to 512 do
+    all := merge !all (push (fact 1L n 1L))
+  done;
+  T.require
+    (match !all with
+     | Service.Coordination_observations values -> Rrbvec.length values = 512
+     | _ -> false)
+    "distinct live observations were overwritten";
+  let overflow = merge !all (push (fact 1L 513 1L)) in
+  let marker = push Service.Observations_resync in
+  T.require (overflow = marker) "overflow silently lost observation invalidations";
+  T.require
+    (merge overflow (push (fact 1L 1 9L)) = marker)
+    "later fact erased required observation resync";
+  T.require
+    (match !all with
+     | Service.Coordination_observations values -> Rrbvec.length values = 512
+     | _ -> false)
+    "coalescing modified an earlier immutable batch"
 ;;
 let () =
   T.run
     "lui worker service"
-    [ T.case "resident invalidations preserve all graphs" test_resident_invalidations_survive_coalescing
+    [ T.case "accepted queued creators settle without handler execution" test_queued_creators_settle_without_starting
+    ; T.case "discarded asset result keeps actual retained owner" test_discarded_asset_result_keeps_actual_lease_owner
+    ; T.case "release requires scoped physical ACK" test_release_requires_physical_ack
+    ; T.case "failed creator fact keeps unpublished result cleanup" (test_discarded_success_is_settled `Creator_failure)
+    ; T.case "cancelled successful result is settled before terminal" (test_discarded_success_is_settled `Cancel)
+    ; T.case "shutdown successful result is settled before terminal" (test_discarded_success_is_settled `Stop)
+    ; T.case "delivered successful result keeps ownership" (test_discarded_success_is_settled `Complete)
+    ; T.case "switch-finalizer discarded success is settled" (test_discarded_success_is_settled `Finalizer_failure)
+    ; T.case "slow cancel cleanup joins before terminal" (test_discarded_success_is_settled ~slow:true `Cancel)
+    ; T.case "slow stop cleanup joins before terminal and shutdown" (test_discarded_success_is_settled ~slow:true `Stop)
+    ; T.case "registered baseline and release fences" test_coordination_registration
+    ; T.case "real host receipt is single-use" test_host_handoff_real_service_single_use
+    ; T.case "resident invalidations preserve all graphs" test_resident_invalidations_survive_coalescing
+    ; T.case "observation invalidations bounded latest epochs" test_observation_invalidations_are_bounded_latest_facts
     ; T.case "typed asset failures reach ledger" test_asset_failure_rows
     ; T.case "safe worker failure rows" test_safe_worker_failure_rows
     ; T.case "authoritative integrity rows" test_authoritative_integrity_rows
@@ -1531,6 +1869,7 @@ let () =
     ; T.case "strict authoritative detail rows" test_authoritative_detail_rows
     ; T.case "authoritative category row allowlist" test_authoritative_diagnostic_rows
     ; T.case "ignored restore failure reaches scoped safe Diagnostics" test_restore_error_reaches_diagnostics
+    ; T.case "real one-use removal owns prepared copy" (test_local_copy_presence "handoff")
     ; T.case "local copy confirmed deletion awaits physical removal" (test_local_copy_presence "delete")
     ; T.case "local copy busy failure recovers" (test_local_copy_presence "busy")
     ; T.case "local copy absent metadata" (test_local_copy_presence "absent")
@@ -1605,8 +1944,8 @@ let () =
     ; T.case "pending asset facts are bounded" test_pending_asset_facts_have_hard_bound
     ; T.case "snapshot topics still replace" test_snapshot_topics_still_replace
     ; T.case
-        "managed worker starts closed with a v2 envelope"
-        test_managed_worker_starts_closed_and_replies_with_v2_envelope
+        "managed worker starts without query authority"
+        test_managed_worker_starts_without_query_authority
     ; T.case "ignored unlock is diagnosed without secrets" test_unlock_ignored_logging
     ; T.case "managed client command is accepted" test_managed_client_command_is_accepted
     ]

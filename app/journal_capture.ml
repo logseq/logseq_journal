@@ -101,7 +101,9 @@ type t =
   ; task_state : Journal_model.task_state
   ; phase : phase
   ; pending : Journal_graph_request.t option
+  ; submitted_source : string option
   ; retry_identity_locked : bool
+  ; retained_chain : Journal_graph_mutation_confirmation.Pure_insertion.t option
   ; pending_attachments : Journal_asset_import.staged list
   }
 
@@ -110,7 +112,9 @@ let create ~session_number ~source =
   ; task_state = Journal_model.No_status
   ; phase = Editing
   ; pending = None
+  ; submitted_source = None
   ; retry_identity_locked = false
+  ; retained_chain = None
   ; pending_attachments = []
   }
 ;;
@@ -137,6 +141,17 @@ let rebind t ~session_number =
 let phase t = t.phase
 let retry_identity_locked t = t.retry_identity_locked
 let lock_for_retry t = { t with retry_identity_locked = true }
+let release_rejected_attempt t = {t with retry_identity_locked=false;pending=None;submitted_source=None;retained_chain=None;phase=Editing}
+let begin_submission t = {t with submitted_source=Some(source t);phase=Saving;retry_identity_locked=true}
+let await_confirmation t =
+  if t.submitted_source=None then t else {t with phase=Saving;retry_identity_locked=true}
+let finish_submission t =
+  match t.submitted_source with
+  |Some submitted when submitted<>source t->
+    Some{t with submitted_source=None;phase=Editing;pending=None;retry_identity_locked=false;
+      retained_chain=None;pending_attachments=[]}
+  |_->None
+
 
 (* Unicode White_Space, shared by button admission and attachment-only naming.
    Do not trim meaningful drafts or treat format characters as whitespace. *)
@@ -161,7 +176,7 @@ let source_is_blank source =
 ;;
 
 let can_save t =
-  t.phase = Editing && ((not (source_is_blank (source t))) || t.pending_attachments <> [])
+  t.phase = Editing && t.submitted_source=None && ((not (source_is_blank (source t))) || t.pending_attachments <> [])
 ;;
 
 let replace_attempt t =
@@ -183,6 +198,12 @@ let submission_source t =
   match source_is_blank (source t), t.pending_attachments with
   | true, first :: _ -> Journal_asset_import.staged_title first
   | _ -> source t
+;;
+
+let admitted_source t = match t.submitted_source,t.pending_attachments with
+  |Some source,first::_ when source_is_blank source->Journal_asset_import.staged_title first
+  |Some source,_->source
+  |None,_->submission_source t
 ;;
 
 let add_attachment t staged =
@@ -209,6 +230,7 @@ let add_attachment t staged =
 ;;
 
 let remove_attachment t ~token =
+  if t.submitted_source<>None then t else
   { t with
     pending_attachments =
       List.filter
@@ -223,11 +245,10 @@ let clear_attachments t =
 ;;
 
 let update_source t ~source:new_source =
-  if t.retry_identity_locked || t.phase = Saving || String.equal (source t) new_source
-  then t
-  else (
-    let t = replace_attempt t in
-    { t with editor = Editor.replace t.editor ~source:new_source })
+  if String.equal (source t) new_source then t
+  else if t.submitted_source<>None then {t with editor=Editor.replace t.editor ~source:new_source}
+  else if t.retry_identity_locked || t.phase=Saving then t
+  else let t=replace_attempt t in {t with editor=Editor.replace t.editor ~source:new_source}
 ;;
 
 let with_task_state t task_state =
@@ -265,6 +286,7 @@ let toggle_task_intent t =
 
 let apply_text_edit t edit =
   match Editor.apply_text_edit t.editor edit with
+  | Some editor when t.submitted_source<>None -> {t with editor}
   | Some editor when t.phase <> Saving && not t.retry_identity_locked ->
     { t with editor; phase = Editing; pending = None }
   | Some _ -> t
@@ -292,7 +314,7 @@ let admit_save t ~mutation_id ~block_id ~sibling_order ~calendar_generation ~cre
       }
     in
     let request = Journal_graph_request.Capture { calendar_generation; command } in
-    { t with phase = Saving; pending = Some request }, Some request)
+    {(begin_submission t)with pending=Some request},Some request)
 ;;
 
 let fail t ~message =
@@ -300,9 +322,9 @@ let fail t ~message =
   | Some _ ->
     { t with
       phase = Failed message
-    ; retry_identity_locked =
-        t.retry_identity_locked || t.task_state <> Journal_model.No_status
+    ; retry_identity_locked = true
     }
+  | None when t.submitted_source<>None->{t with phase=Failed message;retry_identity_locked=true}
   | None -> t
 ;;
 
@@ -332,4 +354,24 @@ let retry t =
   match t.phase, t.pending with
   | Failed _, Some request -> { t with phase = Saving }, Some request
   | Failed _, None | Editing, _ | Saving, _ -> t, None
+;;
+
+let pending_command t = match t.pending with
+  | Some(Journal_graph_request.Capture{command;_})->Some command | _->None
+
+let retained_chain t = t.retained_chain
+let retain_chain t chain =
+  if Option.fold ~none:false ~some:(fun previous->previous==chain)t.retained_chain then t else
+  match pending_command t with
+  | Some command when Journal_graph_mutation_confirmation.Pure_insertion.matches_capture chain command ->
+    {t with retained_chain=Some chain;retry_identity_locked=true}
+  | _->t
+;;
+
+let retain_child_chain t ~command chain =
+  if Option.fold ~none:false ~some:(fun previous->previous==chain)t.retained_chain then t
+  else if Journal_graph_mutation_confirmation.Pure_insertion.matches_child chain command
+    && admitted_source t=command.Journal_graph_projection.source
+  then {t with retained_chain=Some chain;retry_identity_locked=true}
+  else t
 ;;

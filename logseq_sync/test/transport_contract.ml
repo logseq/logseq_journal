@@ -33,22 +33,34 @@ listener.listen(8); listener.settimeout(5); listener4.listen(8)
 with open(root+'/ready.tmp','w') as f: f.write(str(listener.getsockname()[1]))
 os.replace(root+'/ready.tmp', root+'/ready')
 report=[]; stalled=[]
-def observe_stalled_tls(raw, item):
+def observe_stalled_tls(raw, item, index):
   try:
-    while raw.recv(16384): pass
-    item['closed']=True
+    hello=b''
+    while True:
+      part=raw.recv(16384)
+      if not part:
+        item['closed']=True; break
+      if not item['client_hello']:
+        hello+=part
+        if len(hello)>5:
+          record_length=int.from_bytes(hello[3:5],'big')
+          if len(hello)>=5+record_length and hello[0]==22 and hello[5]==1:
+            item['client_hello']=True
+            path=root+'/client-hello-'+str(index)
+            with open(path+'.tmp','w') as f: f.write('ClientHello observed')
+            os.replace(path+'.tmp',path)
   except (ConnectionResetError, BrokenPipeError): item['closed']=True
   except socket.timeout: pass
   finally: raw.close()
 try:
-  for case in cases:
+  for index,case in enumerate(cases):
     ready,_,_=select.select([listener,listener4],[],[],5)
     if not ready: raise RuntimeError('no client connection')
     raw,_ = ready[0].accept()
     raw.settimeout(2)
     if case.get('stall_tls'):
-      item={'closed':False}; report.append(item)
-      worker=threading.Thread(target=observe_stalled_tls,args=(raw,item),daemon=True)
+      item={'closed':False,'client_hello':False}; report.append(item)
+      worker=threading.Thread(target=observe_stalled_tls,args=(raw,item,index),daemon=True)
       worker.start(); stalled.append(worker); continue
     time.sleep(case.get('tls_delay',0))
     try: conn=ctx.wrap_socket(raw,server_side=True)
@@ -1379,11 +1391,43 @@ let test_setup_cancel ~websocket ~dns () =
       (descriptors () <= before))
   else (
     let stalled = `Assoc [ "stall_tls", `Bool true ] in
-    ignore (with_peer [ stalled ] run);
-    Alcotest.(check bool)
-      "TLS setup cancellation joins within bound"
-      true
-      (Unix.gettimeofday () -. started < 1.))
+    let report=with_peer [stalled] (fun ~environment ~sw ~support ~origin->
+      let posted=ref [] and invalidations=ref 0 in
+      let t=runner ~environment ~sw ~support ~posted ~invalidations () in
+      Fun.protect ~finally:(fun()->Runner.shutdown t)(fun()->
+        let op=if websocket then websocket_start origin else operation ~download:false origin in
+        Runner.submit t op;
+        (* The peer has consumed a complete TLS record carrying ClientHello and
+           sends no handshake response. No process startup or polling guess is
+           part of the cancellation interval. *)
+        wait (Eio.Stdenv.clock environment)(fun()->
+          Sys.file_exists(Filename.concat support "client-hello-0"));
+        Alcotest.(check bool) "TLS setup is still pending when cancellation starts" true
+          (if websocket then not(List.exists(function Core.Websocket_closed _->true|_->false)!posted)
+           else Option.is_none(completed !posted));
+        let scope=Core.runner_effect_scope op in
+        let retired()=if websocket then
+          let connection=match op with Core.Start_websocket request->request.scope|_->assert false in
+          List.exists(function Core.Websocket_retired actual->actual=connection|_->false)!posted
+        else List.exists(function Core.IO_fence_completed(98001L,actual,Ok())->actual=scope|_->false)!posted in
+        let clock=Eio.Stdenv.mono_clock environment in
+        let began=Eio.Time.Mono.now clock in
+        let elapsed()=Mtime.Span.to_float_ns(Mtime.span began(Eio.Time.Mono.now clock))/.1e9 in
+        Runner.submit t(cancellation_effect scope);
+        if not websocket then (
+          let initialized,_=bootstrap origin in
+          let fence=Core.step initialized.next(Core.IO_fence_requested(98001L,scope)) in
+          List.iter(function Core.Run instruction->Runner.submit t instruction|_->())fence.effects);
+        (try Eio.Time.Timeout.run_exn(Eio.Time.Timeout.seconds clock 1.)(fun()->
+           while not(retired()) do Eio.Time.Mono.sleep clock 0.001 done)
+         with Eio.Time.Timeout->Alcotest.failf "%s TLS cancellation has no actual retirement after %.6fs"
+           (if websocket then "WebSocket" else "HTTP")(elapsed()));
+        Printf.printf "%s TLS cancel -> actual scope retirement: %.6fs\n%!"
+          (if websocket then "WebSocket" else "HTTP")(elapsed());
+        Alcotest.(check bool) "TLS cancellation reaches actual retirement within bound" true(elapsed()<1.))) in
+    check_retired report;
+    List.iter(fun row->Alcotest.(check bool) "peer received ClientHello before cancellation" true
+      Yojson.Basic.Util.(row |> member "client_hello" |> to_bool))Yojson.Basic.Util.(to_list report))
 ;;
 
 let test_alternate_address ~websocket () =
@@ -2808,7 +2852,9 @@ let test_downloaded_cache_corruption () =
     (fun _ origin request reopen ->
        let core, scope = cache_selection origin in
        let handle = cache_download request core scope "file" in
-       let _, path = cache_retain request core scope handle in
+       let lease, path = cache_retain request core scope handle in
+       cache_release request core scope lease;
+       cache_release request core scope handle;
        Runner_contract.cache_unit (request core scope Core.Close_asset_scope);
        Out_channel.with_open_bin path (fun output -> output_string output "bad!");
        reopen ();
@@ -2913,8 +2959,10 @@ let test_downloaded_cache_legacy_cleanup () =
     (fun _ origin request reopen ->
        let core, scope = cache_selection origin in
        let handle = cache_download request core scope "file" in
-       let _, path = cache_retain request core scope handle in
+       let lease, path = cache_retain request core scope handle in
        let legacy = Filename.chop_extension path ^ ".bin" in
+       cache_release request core scope lease;
+       cache_release request core scope handle;
        Sys.rename path legacy;
        Runner_contract.cache_unit (request core scope Core.Close_asset_scope);
        reopen ();
@@ -2929,12 +2977,13 @@ let test_downloaded_cache_isolation () =
     (fun _ origin request _ ->
        let first, first_scope = cache_selection origin in
        let second, second_scope = cache_selection ~user:"another" origin in
-       ignore (cache_download request first first_scope "file");
+       let first_handle=cache_download request first first_scope "file" in
        Alcotest.(check bool)
          "accounts isolated"
          true
          (cache_lookup request second second_scope "file" = None);
        ignore (cache_download request second second_scope "next");
+       cache_release request first first_scope first_handle;
        Runner_contract.cache_unit (Runner_contract.retire_cache (request first first_scope));
        Alcotest.(check bool)
          "deletion leaves other account"
@@ -2997,9 +3046,9 @@ let test_downloaded_cache_graph_cleanup () =
            ~selected_graph:{ graph with graph_id = Core_contract.other_graph_id }
            origin
        in
-       List.iter
-         (fun (core, scope) -> ignore (cache_download request core scope "file"))
-         [ first, scope; another, another_scope ];
+       let first_handle=cache_download request first scope "file" in
+       ignore(cache_download request another another_scope "file");
+       cache_release request first scope first_handle;
        Runner_contract.cache_unit (Runner_contract.retire_cache (request first scope));
        Runner_contract.cache_unit (Runner_contract.retire_cache (request first scope));
        Alcotest.(check bool)
@@ -4664,7 +4713,8 @@ let run ()=with_support(fun root->
    attached.next,starts @ List.filter_map(function C.Run(C.Start_websocket _ as runnable)->Some runnable|_->None) attached.effects)
    (configured.next,[]) graphs in
  require "two real graph connect instructions" (List.length starts=2);
- let core=ref current and events=Eio.Stream.create 128 and opened=ref [] and messages=ref [] in
+ let core=ref current and events=Eio.Stream.create 128 and opened=ref [] and messages=ref []
+ and retired=ref [] and io_fences=ref [] and expected_retirement=ref None in
  let cert=X509.Certificate.decode_pem(read(path "ephemeral-cert.pem")) |> Result.get_ok in
  let fingerprint=X509.Certificate.fingerprint `SHA256 cert in
  let authenticator=X509.Authenticator.cert_fingerprint ~time:(fun()->Some(Ptime_clock.now())) ~hash:`SHA256 ~fingerprint in
@@ -4688,12 +4738,16 @@ let run ()=with_support(fun root->
     | Websocket_closed(_,(Authentication_failure message|Protocol_failure message))->Printf.eprintf "CLOSED %s\n%!" message
     | _->());Eio.Stream.add events event) |> Result.get_ok in
  let run=function
-   | C.Start_websocket _ | Send_websocket _ | Close_websocket _ | Cancel_effects _ | Cancel_network_effects _ | Schedule_timer _ as op->R.submit runner op
+   | C.Await_io _ | Start_websocket _ | Send_websocket _ | Close_websocket _ | Cancel_effects _ | Cancel_network_effects _ | Schedule_timer _ as op->R.submit runner op
    | Request _ | Asset_io _ | Protected_io _ -> () in
  let running=ref true in
  Eio.Fiber.fork ~sw (fun()->while !running do
    let event=Eio.Stream.take events in
    (match event with C.Websocket_opened scope->opened:=scope::!opened
+    | Websocket_retired scope->retired:=scope::!retired
+    | IO_fence_completed(id,scope,result)->
+      let retired_at_ack=Option.exists(fun expected->List.mem expected !retired)!expected_retirement in
+      io_fences:=(id,(scope,result,retired_at_ack))::!io_fences
     | Websocket_message(scope,message)->messages:=(scope,message)::!messages|_->());
    let next=C.step !core event in core:=next.next;
    List.iter(function C.Run instruction->run instruction|_->()) next.effects
@@ -4709,6 +4763,15 @@ let run ()=with_support(fun root->
  Eio.Time.sleep clock 0.05;
  let removal=C.step !core (C.Resident_graphs_changed [b]) in core:=removal.next;
  List.iter(function C.Run instruction->run instruction|_->()) removal.effects;
+ let a_scope=List.find(fun(scope:C.connection_scope)->scope.graph.graph_id=a)!opened in
+ expected_retirement:=Some a_scope;
+ let io_scope={(C.effect_scope_of_graph a_scope.graph) with
+   presentation_generation=None;lifecycle_generation=None} in
+ let fence=C.step !core(C.IO_fence_requested(9001L,io_scope)) in core:=fence.next;
+ List.iter(function C.Run instruction->run instruction|_->()) fence.effects;
+ wait "A scope I/O fence finishes while B remains active" (fun()->List.mem_assoc 9001L !io_fences);
+ require "I/O fence receives exact successful payload only after actual retirement callback"
+   (List.assoc 9001L !io_fences=(io_scope,Ok(),true));
  wait "closing A retires only its real socket" (fun()->Sys.file_exists(path "retired-A"));
  let b_responses ()=List.length(List.filter(function (scope:C.connection_scope),Logseq_sync_pure_reducer.Sync_protocol.Server.Pull_ok _->scope.graph.graph_id=b|_->false) !messages) in
  let before=b_responses () in touch(path "after-A");

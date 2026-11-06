@@ -374,8 +374,8 @@ let view ?picker_signal props ~on_action =
   let body = match props with
     | Account_failure ->
       unavailable ~title:"Unable to prepare your account" ~symbol:"person.crop.circle.badge.exclamationmark"
-        ~message:"Retry to check your account and open your journal."
-        ~actions:(capsule ~id:"journal-startup-retry" ~command:Startup_retry "Retry" "arrow.clockwise")
+        ~message:""
+        ~actions:(V.empty ())
       |> toolbar "Journals"
           [ V.Toolbar.item ~key:(Ui.Key.string "startup-diagnostics")
               ~placement:Secondary_action diagnostics ]
@@ -392,7 +392,7 @@ let view ?picker_signal props ~on_action =
     | Failed { message; recovery; choose_graph = choose } ->
       let actions = match recovery with
         | Some Refresh -> capsule ~id:"graph-picker-retry" ~command:Refresh_catalog "Retry" "arrow.clockwise"
-        | Some (Retry_local id) -> capsule ~id:"graph-picker-retry" ~command:(Select_graph id) "Retry local open" "arrow.clockwise"
+        | Some (Retry_local _) -> V.empty ()
         | Some (Recover_online title) -> capsule ~id:"graph-picker-retry" ~command:Begin_online_recovery title "arrow.clockwise"
         | None -> V.empty () in
       let actions = if choose then V.column ~spacing:12. [actions; choose_graph] else actions in

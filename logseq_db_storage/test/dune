@@ -1,3 +1,9 @@
 (test
  (name test_asset_upload_store)
+ (modules test_asset_upload_store)
+ (libraries alcotest logseq_db_storage logseq_db_types sqlite3))
+
+(test
+ (name test_mutation_effect_store)
+ (modules test_mutation_effect_store)
  (libraries alcotest logseq_db_storage logseq_db_types sqlite3))

@@ -1,63 +1,94 @@
 (library
  (name logseq_db_worker_test_support)
  (modules test_support)
- (libraries logseq_db_types logseq_db_worker logseq_overlay_db unix yojson))
+ (libraries logseq_db_types logseq_db_worker logseq_overlay_db unix yojson
+  logseq_db_worker.typed_data))
 
 (tests
- (names test_protocol test_overlay_integration)
- (modules test_protocol test_overlay_integration)
+ (names test_protocol)
+ (modules test_protocol)
  (deps
-  (source_tree fixtures/protocol))
+  (source_tree fixtures/worker-data))
  (libraries
   datascript_ocaml.types
   datascript-ocaml-native
+  logseq_db_types
   logseq_db_worker
+  logseq_db_worker.contract
   logseq_db_worker_test_support
-  yojson))
+  rrbvec
+  unix
+  uri
+  yojson
+  logseq_db_worker.typed_data))
 
 (test
  (name test_pure_reducer)
  (modules test_pure_reducer)
- (libraries
+ (libraries logseq_db_worker.typed_read logseq_db_worker.identity
   alcotest
   logseq_db_types
   logseq_db_worker
+  logseq_db_worker.contract
   logseq_db_worker.pure_reducer
+  logseq_overlay_db
   logseq_sync.pure_reducer
-  uri))
+  uri
+  yojson
+  rrbvec
+  logseq_db_worker.typed_data))
 
 (test
  (name test_lui_service)
  (modules test_lui_service)
- (libraries
+ (libraries logseq_db_worker.identity
   datascript-ocaml-native
+  logseq_db_worker.typed_data
   datascript_ocaml
   datascript_ocaml.types
   logseq_db_worker
   logseq_db_worker.lui
   logseq_db_worker_test_support
-  logseq_sync.effect_runner))
+  logseq_sync.effect_runner
+  digestif
+  eio
+  logseq_db_storage
+  logseq_db_types
+  logseq_db_worker.pure_reducer
+  logseq_sync.pure_reducer
+  rrbvec
+  sqlite3
+  threads
+  unix
+  uri
+  yojson))
 
 (test
  (name test_effect_runner)
  (modules test_effect_runner)
- (libraries
+ (libraries datascript-ocaml-native logseq_db_worker.typed_data logseq_db_worker.typed_read logseq_db_worker.identity
   alcotest
-  datascript-ocaml-native
   datascript_ocaml
   datascript_ocaml.types
+  eio
   eio_main
   eio.unix
   sqlite3
   logseq_db_storage
   logseq_db_types
   logseq_db_worker
+  logseq_db_worker.contract
   logseq_db_worker.effect_runner
   logseq_db_worker.pure_reducer
   logseq_db_worker_test_support
+  logseq_overlay_db_test_support
   logseq_sync.effect_runner
   logseq_sync.pure_reducer
-  uri))
+  rrbvec
+  unix
+  uri
+  logseq_overlay_db
+  yojson))
 
 (library
  (name managed_sync_e2e_support)
@@ -78,11 +109,10 @@
 (executable
  (name test_managed_sync_e2e)
  (modules test_managed_sync_e2e managed_sync_protocol_probe)
- (libraries
+ (libraries datascript-ocaml-native worker_effect_authority journal_worker_coordination_impl logseq_journal.worker_coordination logseq_db_worker.identity
   bigstringaf
   ca-certs-nss
   cstruct
-  datascript-ocaml-native
   datascript_ocaml
   datascript_ocaml.types
   digestif
@@ -104,7 +134,12 @@
   sqlite3
   tls-eio
   uri
-  unix))
+  unix
+  eio
+  melange-transit-core
+  melange-transit-native
+  tls
+  logseq_db_worker.typed_data))
 
 (rule
  (alias managed-sync-online-e2e)
@@ -125,4 +160,4 @@
 (test
  (name test_asset_protocol)
  (modules test_asset_protocol)
- (libraries alcotest logseq_db_worker yojson))
+ (libraries alcotest logseq_db_worker logseq_db_worker.contract logseq_db_worker.typed_read logseq_db_worker.typed_data logseq_db_worker.identity logseq_db_types logseq_sync.pure_reducer uri yojson))

@@ -60,7 +60,7 @@ int32_t journal_ocaml_platform_failure(const char *d,int32_t n) { platform_calls
          str(ROOT / "apple-tests/platform-services/JournalRuntimeFailureTests.swift"),
          str(work / "bridge.o"), "-o", str(executable)])
     failures = []
-    for scenario in ["success", "rejected", "invalid-patch", "pump", "platform-event", "platform-response", "platform-failure", "stopped-response", "stopped-failure", "stop-retry", "stop-failure"]:
+    for scenario in ["success", "host-lifetime", "rejected", "invalid-patch", "pump", "platform-event", "platform-response", "platform-failure", "stopped-response", "stopped-failure", "stop-retry", "stop-failure"]:
         result = subprocess.run([str(executable), scenario], cwd=work, capture_output=True, text=True)
         print(f"runtime {scenario}: exit={result.returncode}")
         if result.returncode:

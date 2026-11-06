@@ -67,6 +67,7 @@ type instruction =
   | Notify of
       { consumer : string
       ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; descriptor : Asset.t
       ; availability : availability
       }
   | Backpressure of string

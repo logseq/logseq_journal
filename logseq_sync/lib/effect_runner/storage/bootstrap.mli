@@ -54,6 +54,9 @@ module Asset_cache : sig
   val path : t -> handle -> string option
   val retain : t -> handle -> handle option
   val release : t -> handle -> unit
+  val release_checked : t -> handle -> (unit, error) result
+  (** Preserve all retained handles and failed cleanup ownership on error. *)
+  val close_checked : t -> (unit,error) result
   val close : t -> unit
 
   (** Remove durable files for one origin/account after its live caches are closed. *)

@@ -16,7 +16,7 @@ val create : unit -> t
 val open_favorite
   :  t
   -> request_generation:int64
-  -> Logseq_db_worker.Protocol.v2_favorite_item
+  -> Worker_pure_data.favorite_item
   -> t * Journal_graph_request.t option
 
 val destination : t -> destination
@@ -130,13 +130,13 @@ module Favorites : sig
         }
     | Loaded of
         Journal_graph_request.favorites_request
-        * Logseq_db_worker.Protocol.v2_favorites_result
+        * Journal_worker_coordination.Worker_api.favorites
     | Failed of Journal_graph_request.favorites_request * bool * string
 
   val create : graph_generation:int -> t
   val step : t -> event -> t * Journal_graph_request.favorites_request list
   val revision : t -> int
-  val items : t -> Logseq_db_worker.Protocol.v2_favorite_item list
+  val items : t -> Worker_pure_data.favorite_item Rrbvec.t
   val loading : t -> bool
   val error : t -> string option
   val initialized : t -> bool
@@ -149,3 +149,26 @@ type retained_drafts
 val retained_attachments : retained_drafts -> Journal_asset_import.staged list
 val retain_drafts : interrupted:bool -> t -> retained_drafts
 val restore_drafts : t -> retained_drafts -> t
+
+val has_child_request : t -> Journal_graph_projection.create_child -> bool
+val preview_child_created : t -> command:Journal_graph_projection.create_child
+  -> child:Journal_model.t -> parent:Journal_model.t -> error:string option -> t
+val preview_child_failure : t -> command:Journal_graph_projection.create_child -> message:string -> t
+val child_projection_applied : t -> command:Journal_graph_projection.create_child
+  -> child:Journal_model.t -> parent:Journal_model.t -> error:string option -> bool
+val child_failure_applied : t -> command:Journal_graph_projection.create_child -> message:string -> bool
+val release_rejected_child : t -> command:Journal_graph_projection.create_child -> message:string -> t
+
+val child_chain : t -> command:Journal_graph_projection.create_child ->
+  Journal_graph_mutation_confirmation.Pure_insertion.t option
+val retain_child_chain : t -> command:Journal_graph_projection.create_child ->
+  Journal_graph_mutation_confirmation.Pure_insertion.t -> t
+
+val observation_missing : t -> entry_id:string -> request_generation:int64 -> block_id:string -> t
+val observation_recover : t -> entry_id:string -> request_generation:int64 -> block_id:string -> t
+
+val await_child_confirmation : t -> block_id:string -> t
+
+(** Failed retained submissions only, deduplicated by original mutation and latest
+    explicit status choice. The current editor text is not a submitted payload. *)
+val pending_child_submissions : t -> (Journal_graph_projection.create_child * Journal_graph_mutation_confirmation.Pure_insertion.t) Rrbvec.t

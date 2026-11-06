@@ -162,6 +162,12 @@ type graph_scope =
   ; graph_generation : graph_generation
   }
 
+(** Execution admission gate owned by a pending host handoff. It grants no
+    deletion authority. Release is exact-ID and cannot unfreeze a later round. *)
+type host_fence_target=One_graph of graph_id|All_graphs
+type host_fence={id:Logseq_db_types.Graph_types.Uuid.t;owner:account_scope;
+  target:host_fence_target;captured_scopes:graph_scope Rrbvec.t;previous:Logseq_db_types.Graph_types.Uuid.t option}
+
 type connection_scope =
   { graph : graph_scope
   ; connection_generation : connection_generation
@@ -301,6 +307,12 @@ type asset_action =
   | Release_asset_file of string
   | Release_staged_file of string
   | Prune_asset_staging of string list
+  (** Join already admitted actual asset I/O tasks and their callback posting.
+      This read-only barrier neither closes caches nor grants a host permit. *)
+  | Await_asset_operations
+  (** Checked scope close preserves retained handles and failed physical cleanup
+      on error. The caller releases its original handles and retries; cancellation
+      or scope retirement does not stand in for a physical release ACK. *)
   | Close_asset_scope
   (** Cancels every target generation and waits for operations/native leases.
       New target work remains blocked until its terminal action; lease release
@@ -443,6 +455,10 @@ type timer_request =
   }
 
 type runner_effect = private
+  (* Snapshot actual I/O owners before fork; wait off the serial consumer and
+      report after their physical task and callback posting finish. No host,
+      filesystem or data-admission permission is granted. *)
+  | Await_io of int64 * effect_scope
   | Asset_io of asset_ticket * asset_io_request
   | Protected_io of protected_ticket * protected_request
   | Request : 'a effect_ticket * 'a runner_request -> runner_effect
@@ -587,6 +603,10 @@ type timeline_scope =
   }
 
 type event =
+  | Host_fence_started of host_fence
+  | Host_fence_released of Logseq_db_types.Graph_types.Uuid.t
+  | IO_fence_requested of int64 * effect_scope
+  | IO_fence_completed of int64 * effect_scope * (unit,string) result
   | Asset_requested of asset_request
   | Protected_requested of protected_request
   | Restore_local_account of { user_id : string }
@@ -663,3 +683,19 @@ val catalog_cache_resident_graphs : catalog_cache -> graph_id list
 val state_for_scope : t -> graph_scope -> state option
 val asset_context_for_scope : t -> graph_scope -> asset_context option
 val event_graph_scope : t -> event -> graph_scope option
+
+type coordination_state =
+  { account : account_scope option
+  ; desired_residents : graph_id list
+  ; residents : (graph_scope * state) list
+  ; selected : timeline_scope option
+  ; deletion : (graph_scope * local_deletion) option
+  }
+
+(** One immutable owner read, including non-admitted resident lifetimes and the
+    exact local deletion flight. Execution identity excludes focus generations;
+    selected carries the current presentation separately. No IO or registration. *)
+val coordination_state : t -> coordination_state
+
+val host_fence_blocks : t -> graph_id -> bool
+val host_fence_active : t -> host_fence option

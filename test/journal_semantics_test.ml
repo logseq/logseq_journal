@@ -1099,7 +1099,7 @@ let test_file_cards_use_actual_metadata () =
 
 let test_attachment_unavailable_keeps_retry () =
   with_mounted
-    (media_view [ media_item 1 "jpg" (Failed "Not downloaded") None ])
+    (media_view [ media_item 1 "jpg" (Network_failed "Not downloaded") None ])
     (fun _ ops ->
        require
          (has_text (ops ()) "Not downloaded" && has_text (ops ()) "Retry")
@@ -2164,8 +2164,8 @@ let test_reactive_nonimage_structure_and_presentation () =
        update
          (Some (media_state [ { pdf with presentation = Failed "Unable to open file" } ]));
        require
-         (current_text (ops ()) "Unable to open file" && current_text (ops ()) "Retry")
-         "nonimage failure lost its current message or retry action";
+         (current_text (ops ()) "Unable to open file" && not(current_text (ops ()) "Retry"))
+         "local nonimage failure lost its error or exposed Retry";
        require
          (not (current_text (ops ()) "PDF attachment"))
          "nonimage failure kept its old file card";
@@ -3052,7 +3052,7 @@ let test_status_property_identity_preserved () =
            ~page
            ~time_context:context
            ~root
-           { G.items = children; continuation = None }
+           { Journal_graph_projection.items = children; continuation = None }
        in
        let detail =
          match detail with
@@ -3099,8 +3099,32 @@ let test_native_sync_entry_is_bound_and_scoped () =
         "unknown native event triggered sync")) [false; true]
 ;;
 
+(* These are renderer-owned controls; pure request reducers cannot express their presence. *)
+let test_local_error_views_have_no_retry () =
+  let noop _=() in
+  let check label view = with_mounted view (fun _ ops ->
+    require(not(has_text(ops()) "Retry") && not(has_text(ops()) "Retry local open")
+      && not(has_text(ops()) "Retry statuses")) "%s exposed a local Retry" label) in
+  List.iter(fun props->check "local manager" (Journal_manager_view.view props ~on_action:noop |> V.Body.Private.to_widget))
+    [Journal_manager_view.Account_failure;
+     Failed{message="Synthetic local open failed";recovery=Some(Retry_local "synthetic");choose_graph=true}];
+  check "local Detail" (Journal_detail_view.view
+    {content=Failed "Synthetic local read failed";scope="synthetic-detail";enabled=true;copy_enabled=false;
+     copy_feedback=None;import_request=Journal_asset_import.file_request ~id:1;import_completion=None;
+     render_title=(fun source->Journal_model.Title.render source);status_name=(fun _->"")}
+    ~render_media:(fun ~known_images:_ ~title:_ ~root:_ body->body)
+    ~on_scroll_completed:(Ui.Event.Handler.create ignore) ~on_action:noop |> V.Body.Private.to_widget);
+  check "local status catalog" (Journal_status_view.view
+    {catalog=Rrbvec.empty;page=0;error=Some "Synthetic catalog read failed";complete=false;
+     lookup_status=(fun _->None);current=Journal_model.No_status;id="synthetic";
+     tokens=Journal_visual_tokens.resolve ~brightness:Light ~high_contrast:false}
+    ~on_action:noop |> V.Body.Private.to_widget);
+  check "local attachment" (media_view [media_item 1 "jpg" (Failed "Synthetic local read failed") None])
+;;
+
 let tests =
-  [ "native sync entry binding", test_native_sync_entry_is_bound_and_scoped
+  [ "local error views have no Retry", test_local_error_views_have_no_retry
+  ; "native sync entry binding", test_native_sync_entry_is_bound_and_scoped
   ; ( "Database status identity preserves complete detail"
     , test_status_property_identity_preserved )
   ; ( "Typed properties omitted from Timeline"

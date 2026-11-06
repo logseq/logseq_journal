@@ -1,0 +1,26 @@
+(library
+ (name worker_effect_authority)
+ (package logseq_journal)
+ (wrapped false)
+ (modules worker_pure_api worker_effect_authority)
+ (private_modules worker_pure_api)
+ (libraries logseq_db_worker.typed_read logseq_db_worker.identity uri yojson digestif logseq_db_types logseq_db_worker
+  logseq_db_worker.contract logseq_db_worker.lui logseq_db_worker.pure_reducer
+  rrbvec logseq_db_worker.typed_data))
+
+(library
+ (name worker_pure_data_impl)
+ (public_name logseq_db_worker.typed_data.impl)
+ (implements worker_pure_data)
+ (modules worker_pure_data)
+ (libraries logseq_db_types ppx_deriving_yojson.runtime rrbvec yojson)
+ (preprocess
+  (pps ppx_deriving_yojson)))
+
+(library
+ (name journal_worker_coordination_impl)
+ (implements journal_worker_coordination)
+ (modules worker_api worker_pure_coordinator worker_effect_runner)
+ (libraries logseq_db_worker.identity worker_effect_authority logseq_db_types logseq_db_worker.lui
+  logseq_db_worker.contract
+  rrbvec logseq_db_worker.typed_data))

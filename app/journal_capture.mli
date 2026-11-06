@@ -76,3 +76,21 @@ val retry : t -> t * Journal_graph_request.t option
 val completed_by : t -> Journal_model.t -> bool
 val retry_identity_locked : t -> bool
 val lock_for_retry : t -> t
+(** Only after a known-not-applied outcome was consumed and acknowledged. *)
+val release_rejected_attempt : t -> t
+
+val pending_command : t -> Journal_graph_projection.capture option
+
+
+val retained_chain : t -> Journal_graph_mutation_confirmation.Pure_insertion.t option
+val retain_chain : t -> Journal_graph_mutation_confirmation.Pure_insertion.t -> t
+
+val retain_child_chain : t -> command:Journal_graph_projection.create_child ->
+  Journal_graph_mutation_confirmation.Pure_insertion.t -> t
+
+(** Freeze submission ownership independently of subsequent editor changes. *)
+val begin_submission : t -> t
+val await_confirmation : t -> t
+(** Consume only a settled submission. Retain newer text as an editable draft;
+    the caller transfers the original attachments before consuming this value. *)
+val finish_submission : t -> t option

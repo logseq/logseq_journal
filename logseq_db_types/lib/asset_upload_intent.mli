@@ -45,3 +45,10 @@ val prepare
 
 val advance : t -> phase -> (t, string) result
 val restore : t -> phase:phase -> revision:int -> (t, string) result
+
+(** Canonical durable checkpoint bytes. These pure codecs perform no file or
+    database access; decoding grants no runtime scope or staged-file authority. *)
+module Pure_codec : sig
+  val encode:t -> string
+  val decode:string -> (t,string)result
+end

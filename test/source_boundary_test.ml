@@ -544,7 +544,7 @@ let test_injected_logseq_sync_api_boundary root =
     ; "module Sync_runner = Logseq_sync_effect_runner.Effect_runner"
     ; "Db.create"
     ; "Db.post"
-    ; "Db.request"
+    ; "Db.read_for_scope"
     ];
   forbid_text
     root
@@ -721,7 +721,7 @@ let test_worker_owned_overlay_orchestration root =
   forbid_text
     root
     "logseq_db_worker/lib/effect_runner/effect_runner.ml"
-    [ "Logseq_db_worker_engine"; "Engine."; "Mutation."; "Datascript." ];
+    [ "Logseq_db_worker_engine"; "Engine."; "Logseq_db_types.Mutation"; "Datascript." ];
   forbid_worker_storage_access root "logseq_db_worker/lib/effect_runner/effect_runner.ml";
   require_text
     root
@@ -1045,11 +1045,11 @@ let test_deployed_managed_sync_e2e_boundary root =
     [ "https://api.logseq.io"
     ; "Service.service"
     ; "Worker_runtime.start"
-    ; "Service.Graph_request"
-    ; "V2_list_journals"
-    ; "V2_insert_blocks"
-    ; "V2_get_outline_block"
-    ; "V2_delete_blocks"
+    ; "W.Query"
+    ; "W.Journals"
+    ; "W.Insert_blocks"
+    ; "W.Outline_block"
+    ; "W.Delete_blocks"
     ; "swift/JournalE2EECrypto.swift"
     ; "LOGSEQ_JOURNAL_E2EE_TEST_FILE_KEYCHAIN"
     ; "DYLD_INSERT_LIBRARIES"
@@ -1290,7 +1290,6 @@ let () =
     root
     "app/application.ml"
     [ "Journal_header.view"
-    ; "arrow.clockwise"
     ; "V.Navigation_stack.create"
     ; "V.Sheet.create"
     ; "Journal_composer_view.content"
@@ -1556,7 +1555,8 @@ let () =
     ; "Request_local_cache_reset"
     ; "Action \"cancel\""
     ; "V.Confirmation.alert"
-    ; "Graph_service.Delete_local_copy"
+    ; "Wc.Graph_will_remove"
+    ; "Coordination_host.authorize_host_change"
     ; "Graph_service.Return_to_graph_picker"
     ; "Unsynced changes, drafts"
     ; "Your cloud copy will be"
@@ -1570,7 +1570,8 @@ let () =
   forbid_text
     root
     "app/application.ml"
-    [ "Ui.Material.dialog"
+    [ "Graph_service.Delete_local_copy"
+    ; "Ui.Material.dialog"
     ; "let page_body"
     ; "timeline_notice_view"
     ; "journal-delete-snackbar"
@@ -1886,7 +1887,7 @@ let () =
   require_text
     root
     "logseq_db_worker/lib/effect_runner/effect_runner.ml"
-    [ "Database.inspect_admission"; "V2_admission_outcome" ];
+    [ "Database.inspect_admission"; "|Admission->checked" ];
   forbid_text root "app/application.ml" [ "Database.inspect_admission" ];
   require_text
     root

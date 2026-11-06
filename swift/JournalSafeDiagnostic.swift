@@ -11,7 +11,7 @@ enum JournalSafeDiagnostic: String, Error, LocalizedError, Sendable {
   case noSpace, permissionDenied, sourceUnavailable, network, secureStorageUnavailable
   var errorDescription: String? {
     switch self {
-    case .unknown: "The native operation could not finish. Retry the operation."
+    case .unknown: "The native operation could not finish."
     case .missingPayload: "The required native payload is missing."
     case .typeMismatch: "A native field has an unexpected type."
     case .keyNotFound: "A required native field is missing."
@@ -19,13 +19,13 @@ enum JournalSafeDiagnostic: String, Error, LocalizedError, Sendable {
     case .dataCorrupted: "The native payload format is invalid."
     case .invalidPayload: "The native payload is unsupported."
     case .missingHandler: "The native runtime callback is not registered. Reopen Journal."
-    case .callbackFailed: "The native runtime callback failed. Retry opening Journal."
+    case .callbackFailed: "The native runtime callback failed."
     case .allocationFailed: "The native runtime could not allocate its response. Reopen Journal."
     case .invalidInput: "The native runtime received an invalid input."
     case .missingRoot: "The native runtime did not provide a root view. Reopen Journal."
     case .startupDecodeFailed: "The native startup configuration could not be decoded. Reopen Journal."
-    case .startupWorkerFailed: "The native graph worker could not start. Retry opening Journal."
-    case .startupMountFailed: "The native root view could not be mounted. Retry opening Journal."
+    case .startupWorkerFailed: "The native graph worker could not start."
+    case .startupMountFailed: "The native root view could not be mounted."
     case .invalidStartupConfiguration: "The native startup configuration is invalid. Reopen Journal."
     case .backendInvalidBatch: "The native backend rejected the patch or event batch."
     case .backendUnsupportedProperty: "The native backend rejected an unsupported property."
@@ -35,11 +35,11 @@ enum JournalSafeDiagnostic: String, Error, LocalizedError, Sendable {
     case .backendInvalidHierarchy: "The native node hierarchy is invalid."
     case .backendInvalidEvent: "The native event schema is invalid."
     case .backendRegistryInvalid: "The native extension registry is invalid."
-    case .noSpace: "There is not enough storage to finish the operation. Free some space and retry."
-    case .permissionDenied: "The native storage operation was denied access. Check access and retry."
-    case .sourceUnavailable: "The required local file is unavailable. Retry the operation."
+    case .noSpace: "There is not enough storage to finish the operation. Free some space."
+    case .permissionDenied: "The native storage operation was denied access. Check access."
+    case .sourceUnavailable: "The required local file is unavailable."
     case .network: "The native operation could not connect. Check your connection and retry."
-    case .secureStorageUnavailable: "Secure storage is unavailable. Unlock your device and retry."
+    case .secureStorageUnavailable: "Secure storage is unavailable. Unlock your device."
     }
   }
   static func classify(_ error: Error) -> Self {

@@ -1682,10 +1682,10 @@ Files to create:
 - `logseq_overlay_db/tool/fixture_generator.ml` and `.mli`.
 - `logseq_overlay_db/tool/performance_benchmark.ml`.
 - `logseq_overlay_db/tool/test_performance.sh`.
-- `logseq_db_worker/test/fixtures/protocol/v2-command-catalog.json`.
-- `logseq_db_worker/test/fixtures/protocol/v2-operation-contracts.json`.
-- `logseq_db_worker/test/fixtures/protocol/v2-outcome-catalog.json`.
-- `logseq_db_worker/test/test_overlay_integration.ml`.
+现行 Worker 由 `app/spec/worker_coordination/` 的 typed 契约定义；原 RPC 目录已退出。
+持久化 v1 intent 的编码与身份校验位于 `logseq_db_worker/contract/worker_pure_mutation.ml`，
+现有 Data codec 样本位于 `logseq_db_worker/test/fixtures/worker-data/block-records.json`。
+- `test/worker_coordination_runtime_test.ml` (current typed Service integration).
 
 Files to modify:
 
@@ -1964,7 +1964,7 @@ Files to modify:
 - `logseq_db_worker/test/test_effect_runner.ml`.
 - `logseq_db_worker/test/test_fixture_generator.ml`.
 - `logseq_db_worker/test/test_managed_sync_e2e.ml`.
-- `logseq_db_worker/test/test_overlay_integration.ml`.
+- `test/worker_coordination_runtime_test.ml` (current typed Service integration).
 - `logseq_db_worker/test/test_pure_reducer.ml`.
 - `logseq_db_worker/test/structural_fixture.ml`.
 - `logseq_db_worker/tool/fixture_generator.ml` and `.mli`.
@@ -2080,7 +2080,7 @@ Execution steps:
 13. Run `dune exec logseq_db_worker/test/test_protocol.exe`.
 14. Run `dune exec logseq_db_worker/test/test_pure_reducer.exe`.
 15. Run `dune exec logseq_db_worker/test/test_effect_runner.exe`.
-16. Run `dune exec logseq_db_worker/test/test_overlay_integration.exe`.
+16. Run `dune exec test/worker_coordination_runtime_test.exe`.
 17. Run `dune exec logseq_db_worker/test/test_bonsai_service.exe`.
 18. Run `dune exec logseq_sync/test/test_sync.exe`.
 19. Run `dune build @logseq_db_worker/test/managed-sync-online-e2e` with the dedicated credentials and verify the deployed stale-basis, frozen-request retry-to-Stale, normalized Pull, and delete-conflict ordering contract still passes after cutover.

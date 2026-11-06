@@ -11,6 +11,6 @@ type delivery =
 
 val deliver
   :  runtime:Journal_graph_runtime.t
-  -> send:(Logseq_db_worker.Protocol.request -> send_result)
+  -> send:(Logseq_db_types.Graph_types.Uuid.t -> send_result)
   -> Journal_graph_runtime.output
   -> delivery

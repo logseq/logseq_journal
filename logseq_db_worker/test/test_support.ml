@@ -44,13 +44,13 @@ let rec remove_tree path =
 let overlay_dependencies () =
   let limits =
     Logseq_overlay_db.Types.
-      { response_budget_bytes = Logseq_db_worker.Protocol.maximum_response_bytes
+      { response_budget_bytes = Worker_pure_data.maximum_response_bytes
       ; outbox_max_records = 4_096
       ; outbox_max_bytes = 8 * 1024 * 1024
-      ; change_max_items = Logseq_db_worker.Protocol.maximum_changed_uuids
-      ; change_max_bytes = Logseq_db_worker.Protocol.maximum_push_bytes
+      ; change_max_items = Worker_pure_data.maximum_changed_uuids
+      ; change_max_bytes = Worker_pure_data.maximum_push_bytes
       ; dispatcher_capacity = 256
-      ; wire_batch_max_bytes = Logseq_db_worker.Protocol.maximum_response_bytes
+      ; wire_batch_max_bytes = Worker_pure_data.maximum_response_bytes
       }
   in
   Logseq_overlay_db.Database.dependencies
@@ -77,8 +77,8 @@ let with_managed f =
            ~application_support_directory:support
            ~target:(Managed_sync { base_url = "https://api.logseq.io" })
            ~compatibility_profile:Logseq_65_33_or_newer
-           ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-           ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+           ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+           ~default_page_size:Worker_pure_data.default_page_size
          |> Result.get_ok
        in
        f { config; overlay = overlay_dependencies () })

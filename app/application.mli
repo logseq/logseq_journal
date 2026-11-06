@@ -18,6 +18,26 @@ module Admission_refresh = Journal_admission_refresh
 val format_bytes : int -> string
 val admission_rows : Admission_refresh.observation -> (string * string) list
 
+(** Pure account admission while previous runtime/resource owners retire.
+    Verified native frames are inputs; only a real retirement fact releases the
+    latest pending identity. Auth/catalog remain Application-owned. *)
+module Account_pure_lifecycle : sig
+  type verification={ticket:Journal_startup.Presentation.ticket;user_id:string option}
+  type claim
+  type instruction=Revoke of claim|Retire_previous|Install of claim
+  type t
+  val initial:t
+  val waiting:t -> bool
+  val verification:claim -> verification
+  (** Recheck on the actual queued interpretation turn, including None/ABA and stop. *)
+  val current:t -> claim -> bool
+  val invalidate:t -> t
+  val stop:t -> t
+  val resume:t -> t
+  val observe:t -> needs_retirement:bool -> verification -> t * instruction list
+  val retired:t -> t * instruction list
+end
+
 module For_testing : sig
   type detail_action =
     | Append
@@ -45,7 +65,7 @@ module For_testing : sig
     -> Journal_view.View.Body.t
 
   val favorites_page
-    :  Logseq_db_worker.Protocol.v2_favorite_item list
+    :  Journal_worker_coordination.Worker_api.favorites
     -> Journal_view.View.t
 
   val read_block_entropy : unit -> bytes

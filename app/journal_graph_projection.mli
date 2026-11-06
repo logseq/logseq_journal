@@ -50,14 +50,8 @@ type create_child =
   ; source : string
   ; task_state : Journal_model.task_state
   ; status_confirmation : bool
+  ; status_intent_revision : int64
   ; creation_time : Journal_time.t
-  }
-
-type update_source =
-  { mutation_id : string
-  ; block_id : string
-  ; expected_revision : string
-  ; source : string
   }
 
 type set_task_state =
@@ -80,10 +74,37 @@ type feed_cursor =
   ; skipped_day : int option
   }
 
+type child_cursor =
+  { after :
+      Worker_pure_data.child_member
+        Journal_worker_coordination.Worker_api.continuation
+  ; maximum_items : int
+  }
+
+(** A bounded remainder of one read packet plus its sealed server continuation.
+    The final server page can still retain items. Session/owner and page epoch
+    must be revalidated before replay; this value owns no Worker resource. *)
+type root_cursor =
+  { session : Journal_worker_coordination.Worker_api.session
+  ; budget : Journal_worker_coordination.Worker_api.read_budget
+  ; maximum_items : int
+  ; page : Logseq_db_types.Graph_types.Uuid.t
+  ; epoch : int64
+  ; after :
+      Worker_pure_data.tree_member
+        Journal_worker_coordination.Worker_api.continuation
+        option
+  ; remaining : Worker_pure_data.tree_member Rrbvec.t
+  }
+
+type block_continuation =
+  | Root_tree_cursor of root_cursor
+  | Child_cursor of child_cursor
+
 type block_cursor =
   { after_sibling_order : string
   ; after_block_id : string
-  ; protocol_cursor : Logseq_db_types.Graph_types.Cursor.t option
+  ; protocol_cursor : block_continuation option
   }
 
 type child_summary =
@@ -132,6 +153,11 @@ type block_member =
   ; revision : string
   }
 
+type children_page =
+  { items : block_member list
+  ; continuation : child_cursor option
+  }
+
 type tree_member =
   { block : Logseq_db_types.Graph_types.block
   ; revision : string
@@ -157,7 +183,8 @@ val block_on_page
   -> (block, string) result
 
 val timeline_entry_page
-  :  ?tag_titles:(Logseq_db_types.Graph_types.Uuid.t -> string list)
+  :  ?root_continuation:root_cursor
+  -> ?tag_titles:(Logseq_db_types.Graph_types.Uuid.t -> string list)
   -> page:page
   -> time_context:time_context
   -> tree_member Logseq_db_types.Graph_types.page_result
@@ -167,14 +194,22 @@ val detail
   :  page:page
   -> time_context:time_context
   -> root:block_member
-  -> block_member Logseq_db_types.Graph_types.page_result
+  -> children_page
   -> (detail, string) result
 
 val detail_on_page
   :  page:Logseq_db_types.Graph_types.page
   -> time_context:time_context
   -> root:block_member
-  -> block_member Logseq_db_types.Graph_types.page_result
+  -> children_page
   -> (detail, string) result
 
-val favorite : Logseq_db_worker.Protocol.v2_favorite_item -> favorite
+val favorite : Worker_pure_data.favorite_item -> favorite
+
+(** Canonical target projection retains the full raw child count while only
+    materializing the existing bounded preview. *)
+val timeline_target_entry
+  : page:page -> time_context:time_context -> root:tree_member
+  -> tag_titles:(Logseq_db_types.Graph_types.Uuid.t -> string list)
+  -> Worker_pure_data.child_member Rrbvec.t
+  -> (timeline_entry option,string) result

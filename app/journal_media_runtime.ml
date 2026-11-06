@@ -2,26 +2,46 @@ module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Asset = Logseq_db_types.Asset_descriptor
 module P = Journal_media
 module G = Logseq_db_types.Graph_types
-module Protocol = Logseq_db_worker.Protocol
 module Owners = Set.Make (String)
 
+module Worker = Journal_worker_coordination.Worker_api
+module Coordination = Journal_worker_coordination.Worker_pure_coordinator
+
+type demand_registration = Worker.asset_demand Coordination.ticket * Worker.asset_demand option
+
+type fact_ticket =
+  { block : string
+  ; request_id : G.Uuid.t
+  ; generation : int option
+  }
+
+type _ read_ticket =
+  | Listing : { root : string; epoch : int; request_id : G.Uuid.t }
+      -> Worker.asset_listing read_ticket
+  | Block_fact : fact_ticket -> Worker_pure_data.block_lookup read_ticket
+  | Page_fact : fact_ticket -> Worker_pure_data.page_lookup read_ticket
+
 type ticket =
-  | Query of
-      { root : string
-      ; epoch : int
-      ; request_id : G.Uuid.t
-      }
-  | Facts of
-      { block : string
-      ; request_id : G.Uuid.t
-      ; generation : int option
-      }
   | Lease of
       { root : string
       ; epoch : int
       ; consumer : string
       ; ticket : P.ticket
       }
+
+type read_result =
+  | Read_result :
+      { ticket : 'a read_ticket; query : 'a Worker.query; value : 'a }
+      -> read_result
+
+type read_request =
+  | Read :
+      { ticket : 'a read_ticket
+      ; maximum_items : int
+      ; query : 'a Worker.query
+      ; outcome : 'a -> read_result
+      }
+      -> read_request
 
 type item =
   { token : string
@@ -44,6 +64,16 @@ type controller =
   ; mutable owners : Owners.t
   }
 
+let read_ticket_id : type a. a read_ticket -> G.Uuid.t = function
+  | Listing { request_id; _ } -> request_id
+  | Block_fact { request_id; _ } | Page_fact { request_id; _ } -> request_id
+;;
+
+let read_request_id (Read request) = read_ticket_id request.ticket
+;;
+
+type local_import=Worker.imported
+
 type group =
   { root : string
   ; epoch : int
@@ -52,17 +82,28 @@ type group =
   ; mutable membership_changed : bool
   ; mutable invalidation : int
   ; mutable dependency_failed : bool
+  ; mutable listing_failed : bool
+  ; mutable listing_recovered : bool
+  ; mutable dependency_recovered : bool
+  ; mutable failed_dependencies : Owners.t
   ; mutable pending : G.Uuid.t option
-  ; mutable cursor : G.Cursor.t option
+  ; mutable cursor : Asset.t Worker.continuation option
   ; mutable error : string option
-  ; mutable local : Logseq_db_worker.import_receipt list
+  ; mutable local : local_import list
   ; mutable controllers : controller list
   ; mutable last_view : view option
   }
 
+type outgoing_request =
+  | Demand of {graph_generation:int;consumer:string;priority:Worker.asset_priority;assets:Asset.t list}
+  | Acquire of ticket * Worker.asset_file
+  | Retry_asset of {graph_generation:int;asset:G.Uuid.t}
+  | Perform_read of read_request
+  | Release_preview of Worker.file_lease
+  | Release_consumer of demand_registration
+
 type outgoing =
-  { ticket : ticket option
-  ; request : Service.request
+  { request : outgoing_request
   ; current : unit -> bool
   }
 
@@ -78,7 +119,16 @@ type page_fact =
   }
 
 type t =
-  { send : ticket option -> Service.request -> bool
+  { release_file : Worker.file_lease -> bool
+  ; release_consumer : demand_registration -> bool
+  ; bound_consumers : (string,demand_registration)Hashtbl.t
+  ; mutable resource_binding : Worker.binding option
+  ; read_port : read_request -> bool
+  ; read_planned : G.Uuid.t -> unit
+  ; read_retired : G.Uuid.t -> unit
+  ; demand : graph_generation:int -> name:string -> Worker.asset_priority -> Asset.t list -> Worker.asset_demand Coordination.ticket option
+  ; acquire : ticket -> Worker.asset_file -> bool
+  ; retry_asset : graph_generation:int -> G.Uuid.t -> bool
   ; changed : string -> view -> unit
   ; groups : (string, group) Hashtbl.t
   ; consumers : (string, group * controller) Hashtbl.t
@@ -95,8 +145,15 @@ type t =
   ; mutable queued : outgoing list
   }
 
-let create ~send ~changed =
-  { send
+let create_state ~release_file ~release_consumer ~read_port ~read_planned ~read_retired ~demand ~acquire ~retry_asset ~changed =
+  { release_file
+  ; release_consumer
+  ; bound_consumers=Hashtbl.create 32
+  ; resource_binding=None
+  ; read_port
+  ; read_planned
+  ; read_retired
+  ; demand;acquire;retry_asset
   ; changed
   ; groups = Hashtbl.create 16
   ; consumers = Hashtbl.create 32
@@ -114,21 +171,51 @@ let create ~send ~changed =
   }
 ;;
 
+let create ~release_file ~release_consumer ?(read_planned=fun _->())
+      ?(read_retired=fun _->()) ~read ~demand ~acquire ~retry_asset ~changed () =
+  create_state ~release_file ~release_consumer ~read_port:read ~read_planned ~read_retired ~demand ~acquire ~retry_asset ~changed
+;;
+
+let owns_read t request_id =
+  Hashtbl.fold
+    (fun _ actual found -> found || G.Uuid.equal actual request_id)
+    t.fact_requests
+    false
+  || Hashtbl.fold (fun _ g found -> found || g.pending = Some request_id) t.groups false
+;;
+
+let retire_outgoing t outgoing =
+  match outgoing.request with
+  | Perform_read (Read request) ->
+    (match request.ticket with
+     | Block_fact { block; request_id; _ } | Page_fact { block; request_id; _ } ->
+       if Hashtbl.find_opt t.fact_requests block = Some request_id
+       then Hashtbl.remove t.fact_requests block
+     | Listing { root; epoch; request_id } ->
+       (match Hashtbl.find_opt t.groups root with
+        | Some g when g.epoch = epoch && g.pending = Some request_id ->
+          g.pending <- None; g.membership_changed <- true
+        | _ -> ()));
+    t.read_retired (read_request_id (Read request))
+  | Demand _ | Acquire _ | Retry_asset _ | Release_preview _ | Release_consumer _ -> ()
+;;
+
 let empty_view = { items = []; more = false; error = None }
 
 let notify t g =
   let view =
     { items =
         List.filter_map
-          (fun (receipt : Logseq_db_worker.import_receipt) ->
+          (fun (local:local_import) ->
+         let receipt=Worker.import_data local in
              Option.map
-               (fun (_, path) ->
+               (fun lease ->
                   { token = "import:" ^ G.Uuid.to_string receipt.operation
                   ; asset = receipt.asset
                   ; file_type = receipt.file_type
-                  ; presentation = P.File path
+                  ; presentation = P.File (Worker.file_path lease)
                   })
-               receipt.preview)
+               (Worker.import_preview local))
           g.local
         @ List.map
             (fun c ->
@@ -149,8 +236,8 @@ let notify t g =
                (fun c ->
                   not
                     (List.exists
-                       (fun (local : Logseq_db_worker.import_receipt) ->
-                          local.asset.uuid = c.asset.uuid)
+                       (fun (local:local_import) ->
+                          (Worker.import_data local).asset.uuid = c.asset.uuid)
                        g.local))
                g.controllers)
     ; more = Option.is_some g.cursor
@@ -201,37 +288,51 @@ let dependency_failure t node message =
        if group_reaches t g node
        then (
          g.dependency_failed <- true;
+         g.failed_dependencies <- Owners.add node g.failed_dependencies;
          g.error <- Some message;
          notify t g))
     t.groups
 ;;
 
-let observe_request t (request : Protocol.request) =
-  if Hashtbl.mem t.sources request.request_id || Hashtbl.length t.sources < 4096
-  then Hashtbl.replace t.sources request.request_id (tick t)
-  else (
-    let fail uuid =
-      dependency_failure
-        t
-        (G.Uuid.to_string uuid)
-        "Attachment dependency requests are full. Retry."
-    in
-    match request.command with
-    | Protocol.V2_get_outline_block { block; _ } | V2_get_outline_block_summary { block; _ } -> fail block
-    | V2_get_children { parent; _ } -> fail parent
-    | V2_get_page { page; _ } ->
-      dependency_failure
-        t
-        ("page:" ^ G.Uuid.to_string page)
-        "Attachment page requests are full. Retry."
-    | V2_list_assets { roots; _ } -> List.iter fail roots
-    | _ -> ())
+let dependency_received t node =
+  Hashtbl.iter(fun _ g->
+    if Owners.mem node g.failed_dependencies then (
+      g.failed_dependencies<-Owners.remove node g.failed_dependencies;
+      if Owners.is_empty g.failed_dependencies then (
+        g.dependency_recovered<-false;
+        g.dependency_failed<-false;
+        if not g.listing_failed then g.error<-None)))t.groups
 ;;
+
+let observe_fact_request t ~request_id =
+  if Hashtbl.mem t.sources request_id || Hashtbl.length t.sources < 4096
+  then Hashtbl.replace t.sources request_id (tick t)
+;;
+
+
 
 let fact_needed t target =
   Hashtbl.to_seq_values t.groups
   |> Seq.exists (fun g ->
     g.visible && (not g.dependency_failed) && group_reaches t g target)
+;;
+
+let observe_query : type a. t -> request_id:G.Uuid.t -> a Worker.query -> unit =
+  fun t ~request_id query ->
+  if Hashtbl.mem t.sources request_id || Hashtbl.length t.sources < 4096
+  then observe_fact_request t ~request_id
+  else
+    let fail uuid = dependency_failure t (G.Uuid.to_string uuid)
+      "Attachment dependency requests are full." in
+    match query with
+    | Worker.Outline_block { uuid; _ } -> fail uuid
+    | Block_summary { block; _ } -> fail block
+    | Children { parent; _ } -> fail parent
+    | Child_members { parent; _ } -> fail parent
+    | Page { uuid; _ } -> dependency_failure t ("page:" ^ G.Uuid.to_string uuid)
+        "Attachment page requests are full."
+    | Assets { roots; _ } -> List.iter fail roots
+    | _ -> ()
 ;;
 
 let rec pump t =
@@ -240,25 +341,42 @@ let rec pump t =
   | next :: rest ->
     if not (next.current ())
     then (
-      (match next.ticket with
-       | Some (Facts { block; request_id; _ })
-         when Hashtbl.find_opt t.fact_requests block = Some request_id ->
-         Hashtbl.remove t.fact_requests block
-       | _ -> ());
+      retire_outgoing t next;
       t.queued <- rest;
       pump t)
-    else if t.send next.ticket next.request
+    else if
+      match next.request with
+      | Demand {graph_generation;consumer;priority;assets}->
+        (match t.demand ~graph_generation ~name:consumer priority assets with
+         |None->false|Some bound->Hashtbl.replace t.bound_consumers consumer (bound,None);true)
+      | Acquire(ticket,file)->t.acquire ticket file
+      | Retry_asset{graph_generation;asset}->t.retry_asset ~graph_generation asset
+      | Perform_read request -> t.read_port request
+      | Release_preview lease->t.release_file lease
+      | Release_consumer consumer->t.release_consumer consumer
     then (
       (match next.request with
-       | Service.Graph_request request -> observe_request t request
+       | Perform_read (Read request) ->
+         (match request.ticket with
+          | Block_fact _ -> observe_query t ~request_id:(read_ticket_id request.ticket) request.query
+          | Page_fact _ -> observe_query t ~request_id:(read_ticket_id request.ticket) request.query
+          | Listing _ -> ())
        | _ -> ());
       t.queued <- rest;
       pump t)
 ;;
 
-let enqueue t ?ticket ?(current = fun () -> true) request =
+let enqueue t ?(current = fun () -> true) request =
   t.queued
-  <- List.filter (fun item -> item.current ()) t.queued @ [ { ticket; request; current } ]
+  <- List.filter
+       (fun item ->
+          if item.current ()
+          then true
+          else (
+            retire_outgoing t item;
+            false))
+       t.queued
+     @ [ { request; current } ]
 ;;
 
 let current_group t g =
@@ -269,39 +387,29 @@ let current_group t g =
 
 let current_controller t g c = current_group t g && Hashtbl.mem t.consumers c.consumer
 
+let release_retained_file t lease =
+  enqueue t (Release_preview lease)
+;;
+
+let release_bound_consumer t consumer =
+  match Hashtbl.find_opt t.bound_consumers consumer with
+  | Some bound->Hashtbl.remove t.bound_consumers consumer;enqueue t(Release_consumer bound)
+  | None->()
+;;
+
 let instructions t g c effects =
   List.iter
     (function
-      | P.Demand { graph_generation; consumer; asset } ->
-        enqueue
-          t
-          ~current:(fun () ->
-            current_controller t g c && c.shown && P.descriptor c.state = Some asset)
-          (Service.Asset_command
-             { graph_generation
-             ; command =
-                 Replace_asset_demand
-                   { consumer; priority = Foreground; assets = [ asset ] }
-             })
-      | Release { graph_generation; consumer } ->
-        enqueue
-          t
-          (Service.Asset_command
-             { graph_generation; command = Release_asset_demand consumer })
-      | Retry { graph_generation; asset } ->
-        enqueue
-          t
-          ~current:(fun () -> current_controller t g c && c.shown)
-          (Service.Asset_command { graph_generation; command = Retry_asset asset })
-      | Acquire ticket ->
-        enqueue
-          t
-          ~ticket:
-            (Lease { root = g.root; epoch = g.epoch; consumer = c.consumer; ticket })
-          ~current:(fun () -> current_controller t g c && P.ticket_current c.state ticket)
-          (Service.Acquire_asset_file { scope = ticket.scope; handle = ticket.handle })
-      | Release_file { scope; lease } ->
-        enqueue t (Service.Release_asset_file { scope; handle = lease }))
+      | P.Demand {graph_generation;consumer;asset}->
+        enqueue t ~current:(fun()->current_controller t g c && c.shown && P.descriptor c.state=Some asset)
+          (Demand{graph_generation;consumer;priority=Worker.Foreground;assets=[asset]})
+      | Release{consumer;_}->release_bound_consumer t consumer
+      | Retry{graph_generation;asset}->
+        enqueue t ~current:(fun()->current_controller t g c && c.shown)(Retry_asset{graph_generation;asset})
+      | Acquire ticket->
+        enqueue t ~current:(fun()->current_controller t g c && P.ticket_current c.state ticket)
+          (Acquire(Lease{root=g.root;epoch=g.epoch;consumer=c.consumer;ticket},ticket.file))
+      | Release_file lease->release_retained_file t lease)
     effects
 ;;
 
@@ -311,21 +419,19 @@ let dispatch t g c event =
   instructions t g c effects
 ;;
 
-let release_import t (receipt : Logseq_db_worker.import_receipt) =
-  Option.iter
-    (fun (handle, _) ->
-       enqueue t (Service.Release_asset_file { scope = receipt.scope; handle }))
-    receipt.preview
+let release_import t local =
+  Option.iter(release_retained_file t)(Worker.import_preview local)
 ;;
 
 let handoff_imports t g =
   let completed, pending =
     List.partition
-      (fun (receipt : Logseq_db_worker.import_receipt) ->
+      (fun (local:local_import) ->
+         let receipt=Worker.import_data local in
          let token = "import:" ^ G.Uuid.to_string receipt.operation in
-         not
-           (Hashtbl.to_seq_values t.previews
-            |> Seq.exists (fun (_, root, asset) -> root = g.root && asset = token))
+         (not
+            (Hashtbl.to_seq_values t.previews
+             |> Seq.exists (fun (_, root, asset) -> root = g.root && asset = token)))
          (* Hidden controllers already released their File. Without a view
             owner, the durable intent/cache owns the bytes, not this UI lease. *)
          && ((not g.visible)
@@ -372,23 +478,27 @@ let read t g cursor =
     g.pending <- Some request_id;
     g.membership_changed <- false;
     g.error <- None;
-    enqueue
-      t
-      ~ticket:(Query { root = g.root; epoch = g.epoch; request_id })
-      ~current:(fun () -> current_group t g && g.pending = Some request_id)
-      (Service.Graph_request
-         { api_version = 2
-         ; request_id
-         ; command =
-             V2_list_assets { recursive = false; roots = [ root ]; limit = 16; cursor }
-         }))
+    let ticket = Listing { root = g.root; epoch = g.epoch; request_id } in
+    t.read_planned request_id;
+    let current () = current_group t g && g.pending = Some request_id in
+    let query = Worker.Assets { recursive = false; roots = [ root ]; after = cursor } in
+    let request = Read
+      { ticket; maximum_items = 16; query
+      ; outcome = (fun value -> Read_result { ticket; query; value }) }
+    in
+    t.queued <- List.filter
+      (fun item -> if item.current () then true else (retire_outgoing t item; false))
+      t.queued
+      @ [{ request = Perform_read request; current }])
   else if g.pending = None
-  then g.error <- Some "Attachment requests are busy. Retry shortly."
+  then g.error <- Some "Attachment requests are busy."
 ;;
 
 let ensure_fresh t g = if g.membership_changed && g.pending = None then read t g None
 
 let reset t ~graph_generation =
+  Hashtbl.iter (fun _ id -> t.read_retired id) t.fact_requests;
+  Hashtbl.iter (fun _ g -> Option.iter t.read_retired g.pending) t.groups;
   Hashtbl.iter
     (fun _ g ->
        clear t g;
@@ -425,8 +535,8 @@ let root_visible ?(owner = "default") t ~root visible =
       let removed =
         List.exists
           (fun queued ->
-             match queued.ticket with
-             | Some (Query { request_id; _ }) -> g.pending = Some request_id
+             match queued.request with
+             | Perform_read (Read { ticket = Listing { request_id; _ }; _ }) -> g.pending = Some request_id
              | _ -> false)
           t.queued
       in
@@ -462,6 +572,10 @@ let root_visible ?(owner = "default") t ~root visible =
          ; membership_changed = true
          ; invalidation = 0
          ; dependency_failed = false
+         ; listing_failed = false
+         ; listing_recovered = false
+         ; dependency_recovered = false
+         ; failed_dependencies = Owners.empty
          ; pending = None
          ; cursor = None
          ; error = None
@@ -486,6 +600,11 @@ let retain_visible_roots ?(owner = "default") t roots =
     t.groups
 ;;
 
+let unpin_preview t preview root asset =
+  Option.iter(fun g->Option.iter(fun c->dispatch t g c(P.Unpin_preview preview))
+    (List.find_opt(fun c->c.consumer=asset)g.controllers))(Hashtbl.find_opt t.groups root)
+;;
+
 let retain_owners t owners =
   let retained = Owners.of_list owners in
   Hashtbl.filter_map_inplace
@@ -493,6 +612,7 @@ let retain_owners t owners =
        if Owners.mem owner retained
        then Some (owner, root, asset)
        else (
+         unpin_preview t preview root asset;
          root_visible ~owner:preview t ~root false;
          None))
     t.previews;
@@ -550,7 +670,8 @@ let preview_visible t ~owner ~slot ~root ~asset visible =
   then (
     Hashtbl.remove t.previews preview;
     Option.iter
-      (fun (_, root, _) ->
+      (fun (_, root, asset) ->
+         unpin_preview t preview root asset;
          root_visible ~owner:preview t ~root false;
          Option.iter
            (fun g ->
@@ -572,13 +693,16 @@ let preview_visible t ~owner ~slot ~root ~asset visible =
                 | _ -> false)
              g.controllers
            || List.exists
-                (fun (receipt : Logseq_db_worker.import_receipt) ->
+                (fun (local:local_import) ->
+         let receipt=Worker.import_data local in
                    asset = "import:" ^ G.Uuid.to_string receipt.operation
-                   && Option.is_some receipt.preview)
+                   && Option.is_some(Worker.import_preview local))
                 g.local ->
       Hashtbl.replace t.previews preview selected;
       root_visible ~owner:preview t ~root true;
-      asset_visible ~owner:preview t ~root ~asset true
+      asset_visible ~owner:preview t ~root ~asset true;
+      Option.iter(fun c->dispatch t g c(P.Pin_preview preview))
+        (List.find_opt(fun c->c.consumer=asset)g.controllers)
     | _ -> ())
 ;;
 
@@ -623,6 +747,7 @@ let property_dependencies properties =
 ;;
 
 let request_fact t block =
+  Option.iter t.read_planned (Hashtbl.find_opt t.fact_requests block);
   if
     (not (Hashtbl.mem t.fact_requests block))
     && Hashtbl.length t.fact_requests < 64
@@ -637,22 +762,21 @@ let request_fact t block =
     | Ok uuid ->
       let request_id = next_request_id t in
       Hashtbl.add t.fact_requests block request_id;
+      t.read_planned request_id;
       let generation = t.generation in
-      enqueue
-        t
-        ~ticket:(Facts { block; request_id; generation })
-        ~current:(fun () ->
-          t.generation = generation
-          && fact_needed t block
-          && Hashtbl.find_opt t.fact_requests block = Some request_id)
-        (Service.Graph_request
-           { api_version = 2
-           ; request_id
-           ; command =
-               (if page
-                then V2_get_page { page = uuid; revision = None }
-                else V2_get_outline_block { block = uuid; revision = None })
-           }))
+      let fact = { block; request_id; generation } in
+      let current () =
+        t.generation = generation
+        && fact_needed t block
+        && Hashtbl.find_opt t.fact_requests block = Some request_id
+      in
+      let submit : type a. a read_ticket -> a Worker.query -> unit = fun ticket query ->
+        let request = Read { ticket; maximum_items = 1; query;
+          outcome = (fun value -> Read_result { ticket; query; value }) } in
+        t.queued <- t.queued @ [{ request = Perform_read request; current }]
+      in
+      if page then submit (Page_fact fact) (Worker.Page { uuid; revision = None })
+      else submit (Block_fact fact) (Worker.Outline_block { uuid; revision = None }))
 ;;
 
 let request_pending_pages t =
@@ -732,6 +856,7 @@ let invalidate t g at =
     g.invalidation <- at;
     g.membership_changed <- true;
     g.cursor <- None;
+    Option.iter t.read_planned g.pending;
     if g.visible && not g.dependency_failed then ensure_fresh t g)
 ;;
 
@@ -761,7 +886,7 @@ let reconcile_dependencies t =
   request_pending_pages t
 ;;
 
-let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
+let observe_fact_result t ~request_id apply =
   match Hashtbl.find_opt t.sources request_id with
   | None -> ()
   | Some issued ->
@@ -792,9 +917,10 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
             Hashtbl.to_seq_values t.groups |> Seq.exists (fun g -> group_reaches t g key)
         in
         Hashtbl.replace t.facts key { value; issued; edges_changed };
+        dependency_received t key;
         if Hashtbl.mem t.barriers key then changed := true)
       else if issued > barrier && issued >= prior && not (Hashtbl.mem t.facts key)
-      then dependency_failure t key "Attachment dependency cache is full. Retry."
+      then dependency_failure t key "Attachment dependency cache is full."
     in
     let remember_page uuid alive =
       let page = G.Uuid.to_string uuid in
@@ -815,47 +941,60 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
             | None -> true
           in
           Hashtbl.replace t.pages page { alive; issued };
+          dependency_received t ("page:" ^ page);
           if was_alive <> alive
           then
             Hashtbl.iter
               (fun _ g ->
                  if group_page t g = Some page then invalidate t g (max barrier issued))
               t.groups)
-        else dependency_failure t ("page:" ^ page) "Attachment page cache is full. Retry."
+        else dependency_failure t ("page:" ^ page) "Attachment page cache is full."
     in
-    let page_lookup = function
-      | Protocol.V2_present_page { page; _ } ->
-        remember_page page.uuid (not page.recycled)
-      | V2_missing_page { uuid; _ } -> remember_page uuid false
-    in
-    let block (record : Protocol.v2_block_record) =
-      remember record.block.uuid (Some record.block)
-    in
-    let lookup = function
-      | Protocol.V2_present_block { value; _ } -> block value
-      | V2_missing_block { uuid; _ } -> remember uuid None
-    in
-    (match outcome with
-     | Protocol.V2_block_outcome value -> lookup value
-     | V2_block_summary_outcome { lookup = value; page; items; _ } ->
-       lookup value;
-       Option.iter page_lookup page;
-       List.iter (fun (item : Protocol.v2_child_member) -> block item.value) items
-     | V2_children_outcome { items; _ } ->
-       List.iter (fun (item : Protocol.v2_child_member) -> block item.value) items
-     | V2_page_tree_outcome { items; _ } ->
-       List.iter (fun (item : Protocol.v2_tree_member) -> block item.value) items
-     | V2_page_outcome value -> page_lookup value
-     | V2_journals_outcome { items; _ } ->
-       List.iter
-         (fun (item : Protocol.v2_journal_item) ->
-            remember_page item.page.uuid (not item.page.recycled))
-         items
-     | _ -> ());
+    apply remember remember_page;
     if !changed
     then (
       reconcile_dependencies t;
       pump t)
+;;
+
+let remember_page_lookup remember_page = function
+  | Worker_pure_data.V2_present_page { page; _ } ->
+    remember_page page.uuid (not page.recycled)
+  | Worker_pure_data.V2_missing_page { uuid; _ } -> remember_page uuid false
+;;
+
+let remember_block remember (record : Worker_pure_data.block_record) =
+  remember record.block.uuid (Some record.block)
+;;
+
+let remember_block_lookup remember = function
+  | Worker_pure_data.V2_present_block { value; _ } -> remember_block remember value
+  | Worker_pure_data.V2_missing_block { uuid; _ } -> remember uuid None
+;;
+
+let observe_query_result
+    : type a. t -> request_id:G.Uuid.t -> a Worker.query -> a -> unit
+  = fun t ~request_id query value ->
+  observe_fact_result t ~request_id (fun remember remember_page ->
+    let page_lookup = remember_page_lookup remember_page in
+    let block = remember_block remember in
+    let lookup = remember_block_lookup remember in
+    match query with
+    | Worker.Outline_block _ -> lookup value
+    | Page _ -> page_lookup value
+    | Journal _ -> Option.iter (fun page ->
+        let page = Worker.page_data page in remember_page page.uuid (not page.recycled)) value
+    | Block_summary _ ->
+      lookup value.lookup;
+      Option.iter page_lookup value.page;
+      List.iter (fun (item : Worker_pure_data.child_member) -> block item.value) value.items
+    | Child_members _ ->
+      List.iter (fun (item : Worker_pure_data.child_member) -> block item.value) value.items
+    | Children _ -> List.iter (fun value -> block (Worker.block_data value)) value.items
+    | Tree _ -> List.iter (fun (item : Worker_pure_data.tree_member) -> block item.value) value.items
+    | Journals _ -> List.iter (fun (item : Worker_pure_data.journal_item) ->
+        remember_page item.page.uuid (not item.page.recycled)) value.items
+    | _ -> ())
 ;;
 
 (* Observation registers facts only. The changes owner determines which
@@ -875,6 +1014,29 @@ let chain_complete t g =
         || walk (depth + 1) (Owners.add node seen) parent)
   in
   walk 0 Owners.empty g.root
+;;
+
+let affected_by_changes t g windows =
+  let deps = dependencies t g in
+  (not (chain_complete t g))
+  || List.exists
+       (fun (window : Worker_pure_data.change_window) ->
+          List.exists (fun id -> Owners.mem (G.Uuid.to_string id) deps) window.block_uuids
+          || Option.exists
+               (fun page ->
+                  List.exists (fun id -> G.Uuid.to_string id = page) window.page_uuids)
+               (group_page t g))
+       windows
+;;
+
+let group_read_error g =
+  if g.visible && (g.dependency_failed || (g.listing_failed && g.pending = None))
+  then Some (Option.value g.error ~default:"Attachment reads could not finish")
+  else None
+;;
+
+let projection_read_error t ~root =
+  Option.bind (Hashtbl.find_opt t.groups root) group_read_error
 ;;
 
 let changes t windows =
@@ -906,17 +1068,17 @@ let changes t windows =
              if group_reaches t g key || not (chain_complete t g)
              then (
                g.dependency_failed <- true;
-               g.error <- Some "Attachment change dependencies are full. Retry.";
+               g.error <- Some "Attachment change dependencies are full.";
                notify t g))
           t.groups
   in
   (* Non-recursive membership does not depend on siblings or page-tree growth.
      The changed block identities carry holder/ancestor moves and deletion. *)
   List.iter
-    (fun (window : Protocol.v2_change_window) -> List.iter mark window.block_uuids)
+    (fun (window : Worker_pure_data.change_window) -> List.iter mark window.block_uuids)
     windows;
   List.iter
-    (fun (window : Protocol.v2_change_window) ->
+    (fun (window : Worker_pure_data.change_window) ->
        List.iter
          (fun uuid ->
             let page = G.Uuid.to_string uuid in
@@ -930,7 +1092,7 @@ let changes t windows =
                 dependency_failure
                   t
                   ("page:" ^ page)
-                  "Attachment page dependencies are full. Retry.")
+                  "Attachment page dependencies are full.")
          window.page_uuids)
     windows;
   reconcile_dependencies t;
@@ -965,7 +1127,24 @@ let changes t windows =
        if Hashtbl.find_opt t.barriers node = Some at
        then Hashtbl.replace t.facts node { fact with edges_changed = false })
     t.facts;
+  (* A user-initiated retry may already be queued/in flight before this batch is
+     re-delivered. It remains a read obligation until the real listing succeeds. *)
+  Hashtbl.iter
+    (fun _ g ->
+       if g.visible && g.listing_failed && affected_by_changes t g windows
+       then Option.iter t.read_planned g.pending)
+    t.groups;
   pump t
+;;
+
+let change_application_error t windows =
+  Hashtbl.fold
+    (fun _ g found ->
+       match found with
+       | Some _ -> found
+       | None -> if affected_by_changes t g windows then group_read_error g else None)
+    t.groups
+    None
 ;;
 
 let resync t =
@@ -1021,147 +1200,222 @@ let retry ?(owner = "default") t ~root ~asset =
     pump t
 ;;
 
-let release_stale t ticket result =
-  match result with
-  | None -> ()
-  | Some (lease, _) ->
-    enqueue t (Service.Release_asset_file { scope = ticket.P.scope; handle = lease })
+let recover_failed_reads t =
+  Hashtbl.iter(fun _ g ->
+    if g.visible then (
+      if g.dependency_failed && not g.dependency_recovered then (
+        g.dependency_recovered <- true;
+        retry t ~root:g.root ~asset:"")
+      ;
+      if g.listing_failed && g.pending=None && not g.listing_recovered then (
+        g.listing_recovered <- true;
+        retry t ~root:g.root ~asset:""))) t.groups
 ;;
 
-let receive t ticket response =
-  (match ticket with
-   | Facts { block; request_id; generation } ->
-     if
-       t.generation = generation
-       && Hashtbl.find_opt t.fact_requests block = Some request_id
-     then (
-       Hashtbl.remove t.fact_requests block;
-       match response with
-       | Service.Graph_response
-           (Protocol.V2_response { request_id = actual; outcome; _ } as raw)
-         when actual = request_id ->
-         let barrier =
-           if String.starts_with ~prefix:"page:" block
-           then
-             Hashtbl.find_opt
-               t.page_barriers
-               (String.sub block 5 (String.length block - 5))
-           else Hashtbl.find_opt t.barriers block
-         in
-         let superseded =
-           match Hashtbl.find_opt t.sources request_id, barrier with
-           | Some issued, Some at -> issued <= at
-           | _ -> false
-         in
-         observe_response t raw;
-         (match outcome with
-          | V2_block_outcome _ when superseded || Hashtbl.mem t.facts block -> ()
-          | V2_page_outcome _ when String.starts_with ~prefix:"page:" block -> ()
-          | _ ->
-            dependency_failure t block "Unable to load attachment dependencies. Retry.");
-         reconcile_dependencies t;
-         (match outcome with
-          | V2_block_outcome _ when superseded && fact_needed t block ->
-            request_fact t block
-          | _ -> ())
-       | _ ->
-         Hashtbl.remove t.sources request_id;
-         dependency_failure t block "Unable to load attachment dependencies. Retry.")
-   | Query { root; epoch; request_id } ->
-     (match Hashtbl.find_opt t.groups root with
-      | Some g when g.epoch = epoch && g.pending = Some request_id ->
-        Hashtbl.remove t.sources request_id;
-        g.pending <- None;
-        if g.membership_changed
-        then (if g.visible && not g.dependency_failed then ensure_fresh t g)
-        else (
-          match response with
-          | Service.Graph_response
-              (Protocol.V2_response
-                 { request_id = actual
-                 ; outcome = V2_assets_outcome { items; next_cursor; _ }
-                 ; _
-                 })
-            when actual = request_id && List.length items <= 16 ->
-            let old = g.controllers in
-            let controllers =
-              List.map
-                (fun asset ->
-                   match List.find_opt (fun c -> c.asset.uuid = asset.Asset.uuid) old with
-                   | Some c ->
-                     c.asset <- asset;
-                     if c.shown
-                     then (
-                       match t.generation with
-                       | Some graph_generation ->
-                         dispatch
-                           t
-                           g
-                           c
-                           (P.Show { graph_generation; consumer = c.consumer; asset })
-                       | None -> ());
-                     c
-                   | None ->
-                     t.serial <- t.serial + 1;
-                     { asset
-                     ; consumer = Printf.sprintf "media:%d:%d" epoch t.serial
-                     ; state = P.empty
-                     ; shown = false
-                     ; owners = Owners.empty
-                     })
-                items
-            in
-            List.iter
-              (fun c ->
-                 if not (List.exists (fun kept -> kept.consumer = c.consumer) controllers)
+let release_stale t result = Option.iter(release_retained_file t)result
+;;
+
+let receive_listing t ~root ~epoch ~request_id listing =
+  match Hashtbl.find_opt t.groups root with
+  | Some g when g.epoch = epoch && g.pending = Some request_id ->
+    Hashtbl.remove t.sources request_id;
+    g.pending <- None;
+    if g.membership_changed
+    then (if g.visible && not g.dependency_failed then ensure_fresh t g)
+    else (
+      match listing with
+      | Some (items, next_cursor) ->
+        g.listing_failed <- false;
+        g.listing_recovered <- false;
+        let old = g.controllers in
+        let controllers =
+          List.map
+            (fun asset ->
+               match List.find_opt (fun c -> c.asset.uuid = asset.Asset.uuid) old with
+               | Some c ->
+                 c.asset <- asset;
+                 if c.shown
                  then (
-                   c.shown <- false;
-                   c.owners <- Owners.empty;
-                   dispatch t g c Hide;
-                   Hashtbl.remove t.consumers c.consumer))
-              old;
-            g.controllers <- controllers;
-            g.cursor <- next_cursor;
-            if not g.dependency_failed then g.error <- None;
-            List.iter (fun c ->
-              Hashtbl.replace t.consumers c.consumer (g, c);
-              if g.visible && not c.shown
-                 && List.exists (fun (receipt : Logseq_db_worker.import_receipt) ->
-                      receipt.asset.uuid = c.asset.uuid) g.local
-              then match t.generation with
-                | None -> ()
-                | Some graph_generation ->
-                  c.shown <- true;
-                  c.owners <- g.owners;
-                  dispatch t g c (P.Show { graph_generation; consumer = c.consumer; asset = c.asset })) controllers
-          | _ -> g.error <- Some "Unable to load attachments. Retry.");
-        notify t g
-      | _ -> ())
-   | Lease { root; epoch; consumer; ticket } ->
-     let result =
-       match response with
-       | Service.Asset_file result -> result
-       | _ -> None
-     in
-     (match Hashtbl.find_opt t.groups root with
-      | Some g when g.epoch = epoch ->
-        (match List.find_opt (fun c -> c.consumer = consumer) g.controllers with
-         | Some c ->
-           dispatch t g c (Acquired (ticket, result));
-           handoff_imports t g;
-           notify t g
-         | None -> release_stale t ticket result)
-      | _ -> release_stale t ticket result));
+                   match t.generation with
+                   | Some graph_generation ->
+                     dispatch
+                       t
+                       g
+                       c
+                       (P.Show { graph_generation; consumer = c.consumer; asset })
+                   | None -> ());
+                 c
+               | None ->
+                 t.serial <- t.serial + 1;
+                 { asset
+                 ; consumer = Printf.sprintf "media:%d:%d" epoch t.serial
+                 ; state = P.empty
+                 ; shown = false
+                 ; owners = Owners.empty
+                 })
+            items
+        in
+        List.iter
+          (fun c ->
+             if not (List.exists (fun kept -> kept.consumer = c.consumer) controllers)
+             then (
+               c.shown <- false;
+               c.owners <- Owners.empty;
+               dispatch t g c Hide;
+               Hashtbl.remove t.consumers c.consumer))
+          old;
+        g.controllers <- controllers;
+        g.cursor <- next_cursor;
+        if not g.dependency_failed then g.error <- None;
+        List.iter
+          (fun c ->
+             Hashtbl.replace t.consumers c.consumer (g, c);
+             if
+               g.visible
+               && (not c.shown)
+               && List.exists
+                    (fun (local:local_import) ->
+         let receipt=Worker.import_data local in
+                       receipt.asset.uuid = c.asset.uuid)
+                    g.local
+             then (
+               match t.generation with
+               | None -> ()
+               | Some graph_generation ->
+                 c.shown <- true;
+                 c.owners <- g.owners;
+                 dispatch
+                   t
+                   g
+                   c
+                   (P.Show { graph_generation; consumer = c.consumer; asset = c.asset })))
+          controllers
+      | _ ->
+        g.listing_failed <- true;
+        g.error <- Some "Unable to load attachments.");
+    recover_failed_reads t;
+    notify t g;
+    true
+  | _ -> false
+;;
+
+let owns_fact t (fact : fact_ticket) =
+  t.generation = fact.generation
+  && Hashtbl.find_opt t.fact_requests fact.block = Some fact.request_id
+;;
+
+let complete_fact t (fact : fact_ticket) ~apply ~accepted ~refresh_superseded =
+  let { block; request_id; _ } = fact in
+  if not (owns_fact t fact) then false
+  else (
+    Hashtbl.remove t.fact_requests block;
+    let barrier =
+      if String.starts_with ~prefix:"page:" block
+      then Hashtbl.find_opt t.page_barriers (String.sub block 5 (String.length block - 5))
+      else Hashtbl.find_opt t.barriers block
+    in
+    let superseded = match Hashtbl.find_opt t.sources request_id, barrier with
+      | Some issued, Some at -> issued <= at
+      | _ -> false
+    in
+    apply ();
+    if not (accepted superseded) then
+      dependency_failure t block "Unable to load attachment dependencies.";
+    reconcile_dependencies t;
+    if refresh_superseded && superseded && fact_needed t block then request_fact t block;
+    true)
+;;
+
+let reject_fact t (fact : fact_ticket) =
+  if not (owns_fact t fact) then false
+  else (
+    Hashtbl.remove t.fact_requests fact.block;
+    Hashtbl.remove t.sources fact.request_id;
+    dependency_failure t fact.block "Unable to load attachment dependencies.";
+    true)
+;;
+
+let receive_read t (Read_result result) =
+  let consumed = match result.ticket with
+    | Listing { root; epoch; request_id } ->
+      receive_listing t ~root ~epoch ~request_id
+        (Some (result.value.items, result.value.next))
+    | Block_fact fact ->
+      complete_fact t fact
+        ~apply:(fun () -> observe_query_result t ~request_id:fact.request_id result.query result.value)
+        ~accepted:(fun superseded -> superseded || Hashtbl.mem t.facts fact.block)
+        ~refresh_superseded:true
+    | Page_fact fact ->
+      complete_fact t fact
+        ~apply:(fun () -> observe_query_result t ~request_id:fact.request_id result.query result.value)
+        ~accepted:(fun _ -> true) ~refresh_superseded:false
+  in
+  if consumed then (
+    (match result.ticket with Listing _ -> () | Block_fact _ | Page_fact _ -> recover_failed_reads t);
+    pump t);
+  consumed
+;;
+
+let reject_read : type a. t -> a read_ticket -> unit = fun t ticket ->
+  (match ticket with
+   | Listing { root; epoch; request_id } ->
+     ignore (receive_listing t ~root ~epoch ~request_id None : bool)
+   | Block_fact fact -> ignore (reject_fact t fact : bool)
+   | Page_fact fact -> ignore (reject_fact t fact : bool));
+  recover_failed_reads t;
   pump t
 ;;
 
-let reject t ticket = receive t ticket Service.Client_command_completed
+let receive_file t (Lease{root;epoch;consumer;ticket}) result =
+  (match Hashtbl.find_opt t.groups root with
+   |Some g when g.epoch=epoch->
+     (match List.find_opt(fun c->c.consumer=consumer)g.controllers with
+      |Some c->dispatch t g c(Acquired(ticket,result));handoff_imports t g;notify t g
+      |None->release_stale t result)
+   |_->release_stale t result);
+  recover_failed_reads t;pump t
+;;
+let demand_backpressured ?ticket t consumer =
+  let current=match ticket,Hashtbl.find_opt t.bound_consumers consumer with
+    |None,_->true
+    |Some ticket,Some(pending,_)->Worker.equal_request_id (Coordination.ticket_id pending)(Coordination.ticket_id ticket)
+    |Some _,None->false in
+  if current then Option.iter(fun(g,c)->dispatch t g c P.Demand_backpressured)
+    (Hashtbl.find_opt t.consumers consumer)
+;;
 
-let notice t scope = function
-  | Service.Asset_availability { consumer; asset; availability } ->
+(* A ticket is pending authority only. Checked ACKs/notices establish the exact
+   demand round; late results cannot replace a newer consumer registration. *)
+let retain_demand t consumer demand =
+  match Hashtbl.find_opt t.bound_consumers consumer with
+  | Some(ticket,previous) when Worker.equal_request_id (Coordination.ticket_id ticket)(Worker.asset_demand_round demand) ->
+    (match previous with
+     | Some previous -> Worker.equal_asset_demand previous demand
+     | None -> Hashtbl.replace t.bound_consumers consumer (ticket,Some demand);true)
+  | _ -> false
+
+let receive_demand t ticket demand =
+  if not(Worker.equal_request_id (Coordination.ticket_id ticket)(Worker.asset_demand_round demand)) then false else
+  let consumer=Hashtbl.to_seq t.bound_consumers |> Seq.find_map(fun(consumer,(pending,_))->
+    if Worker.equal_request_id (Coordination.ticket_id pending)(Coordination.ticket_id ticket)
+    then Some consumer else None) in
+  Option.fold ~none:false ~some:(fun consumer->retain_demand t consumer demand)consumer
+
+let current_demand_notice t notice =
+  match Worker.asset_notice_demand notice,Worker.asset_notice_data notice with
+  | Some demand,(Service.Asset_availability{consumer;_}|Asset_demand_accepted consumer|Asset_backpressure consumer) ->
+    retain_demand t consumer demand
+  | None,(Service.Upload_status _|Asset_capacity_available) -> true
+  | _ -> false
+
+let notice t notice =
+  if current_demand_notice t notice then
+  let scope=Worker.asset_notice_scope notice in
+  match Worker.asset_notice_data notice with
+  | Service.Asset_availability { consumer; asset; _ } ->
     (match Hashtbl.find_opt t.consumers consumer with
      | Some (g, c) when c.asset.uuid = asset ->
-       dispatch t g c (Availability { scope; consumer; availability });
+       dispatch t g c (Availability notice);
        notify t g;
        pump t
      | _ -> ())
@@ -1170,7 +1424,8 @@ let notice t scope = function
       (fun g ->
          let cancelled, pending =
            List.partition
-             (fun (receipt : Logseq_db_worker.import_receipt) ->
+             (fun (local:local_import) ->
+         let receipt=Worker.import_data local in
                 receipt.operation = operation && receipt.scope = scope)
              g.local
          in
@@ -1183,19 +1438,17 @@ let notice t scope = function
   | Asset_capacity_available ->
     Hashtbl.iter (fun _ (g, c) -> dispatch t g c P.Capacity_available) t.consumers;
     pump t
-  | Asset_backpressure consumer ->
-    Option.iter
-      (fun (g, c) -> dispatch t g c P.Demand_backpressured)
-      (Hashtbl.find_opt t.consumers consumer)
+  | Asset_backpressure consumer -> demand_backpressured t consumer
   | Asset_demand_accepted consumer ->
     Option.iter
       (fun (g, c) -> dispatch t g c P.Demand_accepted)
       (Hashtbl.find_opt t.consumers consumer)
 ;;
 
-let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
+let imported_local t ~current local =
+  let receipt=Worker.import_data local in
   if (not current) || t.generation <> Some receipt.graph_generation
-  then release_import t receipt
+  then release_import t local
   else (
     let root = G.Uuid.to_string receipt.target in
     let group =
@@ -1211,6 +1464,10 @@ let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
           ; membership_changed = true
           ; invalidation = 0
           ; dependency_failed = false
+          ; listing_failed = false
+         ; listing_recovered = false
+         ; dependency_recovered = false
+         ; failed_dependencies = Owners.empty
           ; pending = None
           ; cursor = None
           ; error = None
@@ -1224,31 +1481,68 @@ let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
       | None -> None
     in
     match group with
-    | None -> release_import t receipt
+    | None -> release_import t local
     | Some g ->
       let duplicate, retained =
         List.partition
-          (fun (old : Logseq_db_worker.import_receipt) ->
-             old.operation = receipt.operation)
+          (fun (old:local_import) ->
+             (Worker.import_data old).operation = receipt.operation)
           g.local
       in
       List.iter
         (fun old ->
            if
-             old.Logseq_db_worker.preview <> receipt.preview || old.scope <> receipt.scope
+             Worker.import_preview old <> Worker.import_preview local
            then release_import t old)
         duplicate;
       if List.length retained >= 16
       then (
-        release_import t receipt;
+        release_import t local;
         g.error <- Some "Too many open attachment previews")
       else (
-        g.local <- (retained @ if receipt.preview = None then [] else [ receipt ]);
-        if receipt.preview = None
+        g.local <- (retained @ if Worker.import_preview local = None then [] else [ local ]);
+        if Worker.import_preview local = None
         then g.error <- Some "Local attachment preview unavailable";
         if g.visible && g.pending = None then read t g None);
       notify t g);
   pump t
 ;;
+
+let retire_coordinated_previews t =
+  Hashtbl.iter(fun _ g->
+    let retiring=g.local in
+    if retiring<>[] then (
+      List.iter(release_import t)retiring;g.local<-[];g.membership_changed<-true;notify t g))t.groups;
+  pump t
+;;
+let retire_coordinated_resources t =
+  if t.resource_binding<>None then (
+    t.resource_binding<-None;
+    t.queued<-List.filter(fun outgoing->match outgoing.request with
+      |Release_preview _|Release_consumer _->true
+      |Demand _|Acquire _|Retry_asset _|Perform_read _->retire_outgoing t outgoing;false)t.queued;
+    Hashtbl.iter(fun _ id->t.read_retired id)t.fact_requests;
+    Hashtbl.clear t.fact_requests;Hashtbl.clear t.facts;Hashtbl.clear t.pages;
+    Hashtbl.clear t.page_barriers;Hashtbl.clear t.sources;Hashtbl.clear t.barriers;
+    retire_coordinated_previews t;
+    Hashtbl.iter(fun _ g->
+      Option.iter t.read_retired g.pending;g.pending<-None;g.cursor<-None;
+      g.membership_changed<-true;g.dependency_failed<-false;g.listing_failed<-false;g.error<-None;
+      List.iter(fun c->dispatch t g c P.Hide)g.controllers;
+      notify t g)t.groups;
+    pump t)
+;;
+let resume_coordinated_previews t =
+  Hashtbl.iter(fun _ g->if g.visible then ensure_fresh t g)t.groups;
+  pump t
+;;
+let bind_coordinated_resources t binding =
+  if Option.exists(fun previous->not(Worker.equal_binding previous binding))t.resource_binding
+  then retire_coordinated_resources t;
+  t.resource_binding<-Some binding;
+  resume_coordinated_previews t
+;;
+
+let imported t ~current imported=imported_local t ~current imported
 
 let idle t = t.queued = []

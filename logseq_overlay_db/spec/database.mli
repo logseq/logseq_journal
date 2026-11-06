@@ -42,6 +42,9 @@ val dependencies
   -> limits:Types.capability_limits
   -> (dependencies, Types.limits_error) result
 
+(** Immutable limits fixed by [dependencies], before any graph is opened. *)
+val dependency_limits : dependencies -> Types.capability_limits
+
 (** {1 Discovering a durable mirror}
 
     Opening begins with observation rather than mutation. An inspection records
@@ -195,6 +198,11 @@ val commit_mirror_deletion
 (** Releases an uncommitted preparation. Idempotent; a committed retirement is
     never restored, and its durable receipt is retained for coordinated recovery. *)
 val cancel_mirror_deletion : prepared_mirror_deletion -> unit
+
+(** Checked release for a handoff owner. A failed physical ownership close keeps
+    the exact preparation and its cleanup obligation; success is the release ACK.
+    This neither restores a committed namespace nor removes its durable proof. *)
+val cancel_mirror_deletion_checked : prepared_mirror_deletion -> (unit,string)result
 
 (** Collects eligible durable garbage without removing mutation receipts needed
     to classify late synchronization responses. *)
@@ -419,6 +427,58 @@ val commit_local
   -> expected:write_precondition
   -> Types.local_mutation
   -> (Types.local_commit_outcome, Types.local_commit_error) result
+
+(** Complete intent bytes are durable before the logical write. The namespace
+    identifies the logical origin/account/graph, independent of execution and
+    presentation generations. Reusing an identity requires identical payload,
+    mutation and preconditions. No original commit point is inferred from a
+    legacy idempotency receipt that did not store one. *)
+type local_intent
+type intent_commit
+type intent_resolution = Intent_pending | Intent_committed of intent_commit
+  | Intent_rejected of Types.local_commit_error
+
+val persist_local_intent
+  : t -> namespace:string -> payload:string -> expected:write_precondition
+  -> Types.local_mutation -> (local_intent, Types.local_commit_error) result
+val find_local_intent : t -> namespace:string -> mutation_id:Graph.Uuid.t
+  -> (local_intent option, Types.local_commit_error) result
+val local_intent_id : local_intent -> Graph.Uuid.t
+val local_intent_payload : local_intent -> string
+
+(** [Append_journal] resolves an existing non-recycled journal by day while
+    holding the state owner lock. Only when absent may its candidate page be
+    created. Trees are bounded to 2,000 unique nodes and depth 64. The complete
+    root/child/status payload, one outbox entry,
+    and original evidence commit together; no intermediate page or partial tree
+    is observable. A retry retains the original intent and proof even after ACK
+    or reopening. No client children scan or optimistic candidate UUID grants
+    ownership of the resolved page. *)
+
+(** Outbox publication and immutable original commit evidence share one SQLite
+    transaction. Retrying returns that same evidence, including after reopening;
+    it never replaces the commit revision with a current read revision. *)
+val commit_local_intent
+  : t -> local_intent -> (intent_commit, Types.local_commit_error) result
+val inspect_local_intent
+  : t -> local_intent -> (intent_resolution, Types.local_commit_error) result
+val intent_commit_outcome : intent_commit -> Types.local_commit
+val intent_commit_targets : intent_commit -> Graph.Uuid.t Rrbvec.t
+
+type local_intent_page = private { items : local_intent list; next : int64 option }
+
+val pending_local_intents
+  : t -> namespace:string -> after:int64 option -> limit:int
+  -> (local_intent_page, Types.local_commit_error) result
+
+(** Acknowledges only an existing immutable known-not-applied rejection. Pending
+    or committed intents cannot be discarded through this operation. *)
+val acknowledge_rejected_local_intent
+  : t -> local_intent -> (unit, Types.local_commit_error) result
+
+(** Retains the commit proof while removing this exact intent from recovery. *)
+val acknowledge_local_intent
+  : t -> intent_commit -> (unit, Types.local_commit_error) result
 
 (** Requeues an eligible blocked mutation after validating a fresh read set. *)
 val retry_blocked

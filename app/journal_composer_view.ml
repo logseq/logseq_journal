@@ -34,11 +34,7 @@ let live_region_text value =
 let can_submit ~capture ~saving ~enabled =
   enabled
   && (not saving)
-  && (Journal_capture.can_save capture
-      ||
-      match Journal_capture.phase capture with
-      | Failed _ -> true
-      | _ -> false)
+  && Journal_capture.can_save capture
 ;;
 
 let content { kind; capture; saving; enabled; error; assets } ~on_action =
@@ -104,7 +100,7 @@ let content { kind; capture; saving; enabled; error; assets } ~on_action =
               (List.map
                  (fun staged ->
                     Lui_element_combine.composer_attachment
-                      ~disabled:((not enabled) || saving)
+                      ~disabled:((not enabled) || saving || Journal_capture.retry_identity_locked capture)
                       ~key:(Journal_asset_import.staged_token staged)
                       ~path:(Journal_asset_import.staged_path staged)
                       ~title:(Journal_asset_import.staged_title staged)
@@ -112,7 +108,7 @@ let content { kind; capture; saving; enabled; error; assets } ~on_action =
                       ~on_remove:(fun _ ->
                         match assets with
                         | None -> ()
-                        | Some _ when enabled && not saving ->
+                        | Some _ when enabled && not saving && not(Journal_capture.retry_identity_locked capture) ->
                           on_action (Remove_attachment (Journal_asset_import.staged_token staged))
                         | Some _ -> ())
                       ())
@@ -135,22 +131,6 @@ let content { kind; capture; saving; enabled; error; assets } ~on_action =
     else []
   in
   let composer =
-    if Journal_capture.retry_identity_locked capture
-    then
-      V.column
-        ~spacing:12.
-        ([ V.text (Journal_capture.source capture)
-         ; live_region_text
-             "The entry may already be saved. Choose a status and retry to confirm it \
-              before editing."
-         ; V.row
-             ~spacing:8.
-             [ task
-             ; V.button ~enabled:can_submit ~child:(V.text "Retry") ~on_press:(Ui.Event.Handler.create ~name:"journal-action" (fun _ -> on_action Save)) ()
-             ]
-         ]
-         @ List.map live_region_text (Option.to_list error))
-    else
     V.composer
       ~key:(Ui.Key.string (scope ^ "-composer"))
       ~accessibility_identifier:(scope ^ "-composer")

@@ -1,10 +1,10 @@
+module Read = Worker_pure_read
 module Db = Logseq_db_worker
 module Pure = Logseq_db_worker_pure_reducer.Core
 module Worker_runner = Logseq_db_worker_effect_runner.Effect_runner
 module Sync = Logseq_sync_pure_reducer.Core
 module Unlock = Sync
 module Sync_runner = Logseq_sync_effect_runner.Effect_runner
-module Protocol = Db.Protocol
 module Overlay = Logseq_overlay_db.Database
 module ID = Journal_worker_ids
 module Authorized_graphs = Set.Make (String)
@@ -251,12 +251,14 @@ module Asset = struct
         }
 end
 
+type account_scope = Logseq_sync_pure_reducer.Core.account_scope
 type asset_scope = Logseq_sync_pure_reducer.Core.graph_scope
 
 type asset_notice = Logseq_db_worker_pure_reducer.Core.asset_notice =
   | Asset_availability of
       { consumer : string
       ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; descriptor : Logseq_db_types.Asset_descriptor.t
       ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
       }
   | Asset_demand_accepted of string
@@ -287,8 +289,98 @@ type local_copy_request =
   ; account_generation : int
   }
 
+type coordination_baseline =
+  { registration : int64
+  ; baseline : Logseq_db_worker.coordination_snapshot
+  ; authority_user : string option option
+  ; limits : Worker_pure_data.capability_limits
+  }
+
+type coordination_update =
+  | Coordination_snapshot of coordination_baseline
+  | Coordination_revoked of int64 * string
+
+let coordination_network (baseline:coordination_baseline) (scope:asset_scope) =
+  List.find_map(fun(owner,(state:Sync.state))->
+    if owner=scope then Some(sync_phase state.snapshot.sync_phase) else None)
+    baseline.baseline.state.sync.residents
+;;
+
+
+type observation_invalidation =
+  { registration_id : int64
+  ; owner : timeline_scope
+  ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+  ; epoch : int64
+  }
+
+type observation_signal =
+  | Observation_invalidated of observation_invalidation
+  | Observations_resync
 type request =
-  | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
+  | Coordination_prepare_host_change of Logseq_db_worker.host_plan
+  | Coordination_confirm_host_change of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
+  | Coordination_apply_host_change of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
+  | Coordination_quiesce_writers of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_recover_import_inputs of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       after:int64 option;maximum_items:int;maximum_bytes:int}
+  | Coordination_confirm_import_input of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;input:string}
+  | Coordination_acknowledge_import_input of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;input:string;prepared:string}
+  | Coordination_import of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       source:Logseq_db_types.Asset_import.t}
+  | Coordination_finalize_asset_demand of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
+  | Coordination_finalize_observation of
+      {registration:int64;owner:timeline_scope;observation_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_asset_demand of
+      {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       consumer:string;priority:Logseq_sync_pure_reducer.Asset_transfer.priority;
+       assets:Logseq_db_types.Asset_descriptor.t list}
+  | Coordination_release_asset_demand of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
+  | Coordination_observe of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      ; read : Worker_pure_read.packed_query
+      }
+  | Coordination_refresh_observation of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      }
+  | Coordination_release_observation of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      }
+  | Register_coordination of int64
+  | Release_coordination of int64
+  | Coordination_query of
+      { registration : int64; owner : timeline_scope; request_id : Logseq_db_types.Graph_types.Uuid.t; read : Worker_pure_read.packed_query }
+  | Coordination_acknowledge_changes of
+      { registration : int64; owner : timeline_scope; request_id : Logseq_db_types.Graph_types.Uuid.t; batch : Worker_pure_read.change_batch }
+  | Coordination_mutation of
+      { registration : int64; owner : timeline_scope;
+        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : Logseq_db_worker_contract.Worker_pure_mutation.durable_intent }
+  | Coordination_confirm of
+      { registration : int64; owner : timeline_scope; presentation : int64;
+        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : Logseq_db_worker_contract.Worker_pure_mutation.durable_intent;
+        original : string * string * string; read : Worker_pure_read.packed_query }
+  | Coordination_recover_mutations of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        after:int64 option; maximum_items:int; maximum_bytes:int }
+  | Coordination_acknowledge_mutation of
+      { registration:int64; owner:timeline_scope; presentation:int64;
+        request_id:Logseq_db_types.Graph_types.Uuid.t; intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent;
+        original:(string * string * string) option }
   | Get_graph_state_at of timeline_scope
   | Asset_command_at of timeline_scope * asset_command
   | Import_asset_at of timeline_scope * Logseq_db_types.Asset_import.t
@@ -299,7 +391,6 @@ type request =
       ; source : Logseq_db_types.Asset_import.t
       }
   | Client_command of client_command
-  | Graph_request of Protocol.request
   | Get_graph_state
   | Asset_command of
       { graph_generation : int
@@ -319,12 +410,67 @@ type request =
       }
 
 type response =
+  | Coordination_host_prepared of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
+  | Coordination_host_confirmed of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt * bool
+  | Coordination_host_applied of Logseq_db_types.Graph_types.Uuid.t
+  | Coordination_writers_quiesced of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_import_inputs_recovered of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       page:Logseq_db_types.Asset_import.Recovery.page}
+  | Coordination_import_input_confirmed of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       input:Logseq_db_types.Asset_import.Recovery.item option}
+  | Coordination_import_input_acknowledged of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_imported of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       result:(Logseq_db_worker.import_receipt,string)result}
+  | Coordination_asset_demand_finalized of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
+  | Coordination_observation_finalized of
+      {registration:int64;owner:timeline_scope;observation_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_asset_demand_accepted of {request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_asset_demand_released of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
+  | Coordination_mutations_recovered of
+      { request_id:Logseq_db_types.Graph_types.Uuid.t;
+        page:Logseq_db_worker_contract.Worker_pure_mutation.recovery_page }
+  | Coordination_mutation_acknowledged of {request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_confirmed of
+      {registration:int64;owner:timeline_scope;presentation:int64;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       answer:Worker_pure_read.answer}
+  | Coordination_query_revoked of
+      {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_queried of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        answer:Worker_pure_read.answer }
+  | Coordination_changes_acknowledged of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        result:(Worker_pure_read.change_ack,Worker_pure_read.error)result }
+  | Coordination_observed of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; epoch : int64
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      ; answer : Worker_pure_read.answer
+      }
+  | Coordination_observation_released of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      }
+  | Coordination_mutation_result of
+      { request_id : Logseq_db_types.Graph_types.Uuid.t;
+        outcome : Logseq_db_worker_contract.Worker_pure_mutation.outcome }
+  | Coordination_registered of coordination_baseline
+  | Coordination_released of int64
   | Local_copy_inspected of local_copy_request * (local_copy_presence, string) result
   | Local_copy_deleted of local_copy_request * (unit, string) result
   | Asset_imported of (Logseq_db_worker.import_receipt, string) result
   | Client_command_completed
   | Asset_file of (string * string) option
-  | Graph_response of Protocol.response
   | Graph_state of Db.graph_state
 
 type asset_fact =
@@ -346,11 +492,13 @@ type asset_notice_batch =
   }
 
 type push =
-  | Graph_pushes of (asset_scope * Logseq_db_worker.Protocol.push) list
+  | Coordination_observations of observation_signal Rrbvec.t
+  | Coordination_updates of coordination_update list
+  | Graph_pushes of (asset_scope * Worker_pure_data.changefeed_signal) list
   | Graph_states of (asset_scope * Logseq_db_worker.graph_state) list
   | Session_states of (asset_scope * state) list
   | Asset_notices of asset_notice_batch
-  | Graph_push of Protocol.push
+  | Graph_push of Worker_pure_data.changefeed_signal
   | Client_state_changed of state
   | Need_id_token of token_request
   | Bootstrap_progress of bootstrap_progress
@@ -366,6 +514,8 @@ let bootstrap_topic = ID.Worker.Push_topic.of_int 3
 let graph_state_topic = ID.Worker.Push_topic.of_int 4
 let asset_topic = ID.Worker.Push_topic.of_int 5
 let session_topic = ID.Worker.Push_topic.of_int 6
+let coordination_topic = ID.Worker.Push_topic.of_int 7
+let observation_topic = ID.Worker.Push_topic.of_int 8
 
 let asset_notices = function
   | Asset_notice (scope, notice) -> [ scope, notice ]
@@ -402,9 +552,61 @@ let merge_scoped previous next =
     List.filter (fun (owner,_) -> owner<>scope) entries @ [scope,value]) previous next in
   if List.length merged>128 then failwith "Worker pending graph scope limit exceeded";
   merged
+let merge_graph_pushes previous next =
+  List.fold_left(fun entries (scope,push)->
+    let push=match List.assoc_opt scope entries,push with
+      | Some(Worker_pure_data.Resync_required _ as required),Worker_pure_data.Changes_available _->required
+      | _->push in
+    merge_scoped entries [scope,push]) previous next
+;;
+module Observation_facts = Map.Make (struct
+    type t = int64 * Logseq_db_types.Graph_types.Uuid.t
+
+    let compare (registration, id) (other_registration, other_id) =
+      let order = Int64.compare registration other_registration in
+      if order = 0 then Logseq_db_types.Graph_types.Uuid.compare id other_id else order
+    ;;
+  end)
+
+let merge_observations previous next =
+  let add (facts, count, overflow) = function
+    | Observations_resync -> Observation_facts.empty, 0, true
+    | Observation_invalidated _ when overflow -> facts, count, true
+    | Observation_invalidated value ->
+      let key = value.registration_id, value.observation_id in
+      let old = Observation_facts.find_opt key facts in
+      if Option.exists (fun old -> old.epoch >= value.epoch) old
+      then facts, count, false
+      else (
+        let count = count + if old = None then 1 else 0 in
+        if count > 512
+        then Observation_facts.empty, 0, true
+        else Observation_facts.add key value facts, count, false)
+  in
+  let facts, _, overflow =
+    Rrbvec.fold_left
+      add
+      (Rrbvec.fold_left add (Observation_facts.empty, 0, false) previous)
+      next
+  in
+  if overflow
+  then Rrbvec.singleton Observations_resync
+  else
+    Observation_facts.to_seq facts
+    |> Seq.map (fun (_, value) -> Observation_invalidated value)
+    |> Rrbvec.of_seq
+;;
 let coalesce_push ~topic previous next =
   match previous,next with
-  | Graph_pushes previous,Graph_pushes next -> Graph_pushes (merge_scoped previous next)
+  | Coordination_observations previous,Coordination_observations next ->
+    Coordination_observations (merge_observations previous next)
+  | Coordination_updates previous,Coordination_updates next ->
+    let id = function Coordination_snapshot b->b.registration | Coordination_revoked(id,_)->id in
+    let merged=List.fold_left(fun entries update ->
+      update :: List.filter(fun old -> id old<>id update) entries) previous next in
+    if List.length merged>8 then failwith "Pending coordination binding limit exceeded";
+    Coordination_updates merged
+  | Graph_pushes previous,Graph_pushes next -> Graph_pushes (merge_graph_pushes previous next)
   | Graph_states previous,Graph_states next -> Graph_states (merge_scoped previous next)
   | Session_states previous,Session_states next -> Session_states (merge_scoped previous next)
   | _ -> if not (ID.Worker.Push_topic.equal topic asset_topic)
@@ -439,13 +641,13 @@ let dependencies ~overlay ~tls_authenticator ~secrets ~crypto =
 let production_dependencies () =
   let limits =
     Logseq_overlay_db.Types.
-      { response_budget_bytes = Protocol.maximum_response_bytes
+      { response_budget_bytes = Worker_pure_data.maximum_response_bytes
       ; outbox_max_records = 4_096
       ; outbox_max_bytes = 8 * 1024 * 1024
-      ; change_max_items = Protocol.maximum_changed_uuids
-      ; change_max_bytes = Protocol.maximum_push_bytes
+      ; change_max_items = Worker_pure_data.maximum_changed_uuids
+      ; change_max_bytes = Worker_pure_data.maximum_push_bytes
       ; dispatcher_capacity = 256
-      ; wire_batch_max_bytes = Protocol.maximum_response_bytes
+      ; wire_batch_max_bytes = Worker_pure_data.maximum_response_bytes
       }
   in
   let overlay =
@@ -778,6 +980,32 @@ let worker_dependency_error_message = function
   | Worker_runner.Invalid_dependency message -> message
 ;;
 
+let typed_asset_consumer_owner registration (scope:asset_scope) wire =
+  match String.split_on_char ':' wire with
+  | "journal-asset/v1"::epoch::generation::binding::account::lifecycle::graph::execution::round::names->
+    Int64.of_string_opt epoch<>None && Int64.of_string_opt generation<>None
+    && Int64.of_string_opt binding=Some registration
+    && int_of_string_opt account=Some scope.account.account_generation
+    && Int64.of_string_opt lifecycle=Some scope.account.lifecycle_generation
+    && Logseq_db_types.Graph_types.Uuid.of_string graph=Ok scope.graph_id
+    && int_of_string_opt execution=Some scope.graph_generation
+    && Result.is_ok(Logseq_db_types.Graph_types.Uuid.of_string round)
+    && let name=String.concat ":" names in name<>"" && String.length name<=128
+  | _->false
+let reserved_asset_command = function
+  | Replace_asset_demand{consumer;_}|Release_asset_demand consumer->String.starts_with ~prefix:"journal-asset/v1:" consumer
+  | Retry_asset _|Retry_upload _->false
+;;
+
+let discarded_asset_retain request response =
+  match request,response with
+  | (Acquire_asset_file{scope;_}|Acquire_imported_file{scope;_}),Asset_file(Some(handle,_))->Some(scope,handle)
+  | Coordination_import _,Coordination_imported{result=Ok receipt;_}
+  | (Import_asset_at _|Import_asset _),Asset_imported(Ok receipt)->
+    Option.map(fun(handle,_)->receipt.Db.scope,handle)receipt.preview
+  | _->None
+;;
+
 let create ~(dependencies : dependencies) =
   let module Session = struct
     type t =
@@ -792,13 +1020,26 @@ let create ~(dependencies : dependencies) =
       ; auth_sequence : int ref
       ; auth_enqueued_sequence : int ref
       ; auth_wake : Eio.Condition.t
+      ; mutable coordination_registration : int64 option
+      ; coordination_limits : Worker_pure_data.capability_limits
+      ; emit_observation : observation_signal -> unit
+      ; emit_coordination : coordination_update -> unit
       }
   end
   in
   Journal_worker.Service.create
-    ~push_topic_count:7
+    ~push_topic_count:9
     ~merge_push:coalesce_push
     ~concurrency:(Journal_worker.Service.Concurrent { max_in_flight = 2 })
+    ~discard_response:(fun session ~request_id:_ request response->
+      Option.iter(fun(scope,handle)->Db.abandon_asset_file session.Session.worker ~scope ~handle)
+        (discarded_asset_retain request response))
+    ~request_settled:(fun session ~request_id:_ -> function
+      | Coordination_observe{registration;observation_id;_}->
+        Db.observation_creator_finished session.Session.worker ~registration ~id:observation_id
+      | Coordination_asset_demand{registration;consumer;_}->
+        Db.asset_demand_creator_finished session.Session.worker ~registration ~consumer
+      | _->())
     ~data_directory:(fun config -> Ok config.Db.Config.application_support_directory)
     ~control_topic_count:2
     ~classify_control:(function
@@ -821,6 +1062,10 @@ let create ~(dependencies : dependencies) =
            request.request
            "host rejected request"
        | Client_command (Reconcile_authenticated_user { user_id }) ->
+         Option.iter (fun id -> session.Session.emit_coordination
+           (Coordination_revoked(id,"Authentication authority changed"))) session.coordination_registration;
+         session.coordination_registration<-None;
+         Db.revoke_coordination session.worker;
          session.Session.authenticated_user := user_id;
          (* Every admitted changed key revoked the old reply ticket, including
            A -> B -> A coalescing. Preserve that invalidation even when only
@@ -885,6 +1130,7 @@ let create ~(dependencies : dependencies) =
                    Ok
                      ( sync_config
                      , Worker_runner.sync_runner
+                         ~retire_account:(Sync_runner.retire_account runner)
                          ~submit:(Sync_runner.submit runner)
                          ~shutdown:(fun () -> Sync_runner.shutdown runner)
                          () ))))
@@ -960,22 +1206,261 @@ let create ~(dependencies : dependencies) =
                      ; auth_sequence
                      ; auth_enqueued_sequence
                      ; auth_wake
+                     ; coordination_registration=None
+                     ; coordination_limits=(let limits=Overlay.dependency_limits dependencies.overlay in
+                         {response_budget_bytes=min limits.response_budget_bytes
+                           (min config.response_budget_bytes Worker_pure_data.maximum_response_bytes);
+                          outbox_max_records=limits.outbox_max_records;outbox_max_bytes=limits.outbox_max_bytes;
+                          change_max_items=limits.change_max_items;change_max_bytes=limits.change_max_bytes;
+                          dispatcher_capacity=limits.dispatcher_capacity;wire_batch_max_bytes=limits.wire_batch_max_bytes})
+                     ; emit_observation=(fun signal -> Journal_worker.Session_context.emit context
+                         ~topic:observation_topic (Coordination_observations (Rrbvec.singleton signal)))
+                     ; emit_coordination=(fun update -> Journal_worker.Session_context.emit context
+                         ~topic:coordination_topic (Coordination_updates [update]))
                      }))))
     ~handle:(fun context session request ->
       let resolve (owner:timeline_scope) = List.find_opt (fun (scope:Sync.graph_scope) ->
         scope.account.account_generation=owner.startup.account_generation && scope.graph_id=owner.graph_id
           && scope.graph_generation=owner.graph_generation) (Db.graph_scopes session.worker) in
+      let with_import_input_owner ~registration ~(owner:asset_scope) action=
+        let timeline:timeline_scope={startup={account_generation=owner.account.account_generation;
+          presentation_generation=owner.account.presentation_generation};graph_id=owner.graph_id;graph_generation=owner.graph_generation} in
+        match resolve timeline with None->Error "The import source graph session is no longer open."
+        |Some scope->
+          let authorized()=Db.coordination_current session.worker ~registration && resolve timeline=Some scope
+            && scope.account.user_id=owner.account.user_id && Uri.equal scope.account.managed_sync_origin owner.account.managed_sync_origin
+            && scope.account.lifecycle_generation=owner.account.lifecycle_generation
+            && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+          if not(authorized())then Error "Import source authority retired" else
+          Result.bind(action scope authorized)(fun value->if authorized()then Ok value else Error "Import source authority retired") in
       match request with
-      | Graph_request_at (owner,request) ->
+      | Coordination_prepare_host_change plan->
+        if !(session.auth_seen) && !(session.authenticated_user)<>Some plan.owner.user_id
+        then Error "The host account authority has retired."
+        else Db.prepare_host_change session.worker plan |> Result.map(fun receipt->Coordination_host_prepared receipt)
+      | Coordination_confirm_host_change receipt->
+        Db.confirm_host_change session.worker receipt |> Result.map(fun consumed->Coordination_host_confirmed(receipt,consumed))
+      | Coordination_apply_host_change receipt->
+        let plan=Pure.Host_handoff.receipt_request receipt in
+        if !(session.auth_seen) && !(session.authenticated_user)<>Some plan.owner.user_id
+        then Error "The host account authority has retired."
+        else Db.apply_host_change session.worker receipt |> Result.map(fun()->Coordination_host_applied plan.id)
+      | Coordination_quiesce_writers{registration;owner;request_id}->
+        let timeline:timeline_scope={startup={account_generation=owner.account.account_generation;
+          presentation_generation=owner.account.presentation_generation};graph_id=owner.graph_id;graph_generation=owner.graph_generation} in
+        (match resolve timeline with
+         |Some scope when scope.account.user_id=owner.account.user_id
+           && Uri.equal scope.account.managed_sync_origin owner.account.managed_sync_origin
+           && scope.account.lifecycle_generation=owner.account.lifecycle_generation
+           && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id)->
+           Db.quiesce_writers session.worker ~registration ~scope
+           |> Result.map(fun()->Coordination_writers_quiesced{registration;owner=scope;request_id})
+         |_->Error "The writer fence account or graph owner retired.")
+      | Coordination_recover_import_inputs{registration;owner;request_id;after;maximum_items;maximum_bytes}->
+        with_import_input_owner ~registration ~owner(fun scope current->
+          Db.recover_import_inputs_for_scope session.worker ~scope ~after ~maximum_items ~maximum_bytes ~current
+          |> Result.map(fun page->Coordination_import_inputs_recovered{registration;owner=scope;request_id;page}))
+      | Coordination_confirm_import_input{registration;owner;request_id;input}->
+        with_import_input_owner ~registration ~owner(fun scope current->
+          Db.confirm_import_input_for_scope session.worker ~scope ~input ~current
+          |> Result.map(fun input->Coordination_import_input_confirmed{registration;owner=scope;request_id;input}))
+      | Coordination_acknowledge_import_input{registration;owner;request_id;input;prepared}->
+        with_import_input_owner ~registration ~owner(fun scope current->
+          Db.acknowledge_import_input_for_scope session.worker ~scope ~input ~prepared ~current
+          |> Result.map(fun()->Coordination_import_input_acknowledged{registration;owner=scope;request_id}))
+      | Coordination_import{registration;owner;request_id;source}->
+        let timeline:timeline_scope={startup={account_generation=owner.account.account_generation;
+          presentation_generation=owner.account.presentation_generation};graph_id=owner.graph_id;graph_generation=owner.graph_generation} in
+        (match resolve timeline with
+         |None->Error "The import graph session is no longer open."
+         |Some scope->
+           let authorized()=Db.coordination_current session.worker ~registration
+             && resolve timeline=Some scope
+             && scope.account.user_id=owner.account.user_id
+             && Uri.equal scope.account.managed_sync_origin owner.account.managed_sync_origin
+             && scope.account.lifecycle_generation=owner.account.lifecycle_generation
+             && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(authorized()) then Error "The import registration or account authority retired." else
+           Ok(Coordination_imported{registration;owner=scope;request_id;
+             result=Db.import_asset ~scope ~current:authorized session.worker ~graph_generation:scope.graph_generation source}))
+      | Coordination_finalize_asset_demand{registration;owner;request_id;consumer}->
+        if not(typed_asset_consumer_owner registration owner consumer) then Error "Asset finalization owner mismatch" else
+        Db.finalize_coordinated_asset_demand session.worker ~registration ~scope:owner ~consumer
+        |> Result.map(fun()->Coordination_asset_demand_finalized{registration;owner;request_id;consumer})
+      | Coordination_finalize_observation{registration;owner;observation_id}->
+        Db.finalize_observation session.worker ~registration ~id:observation_id ~owner
+        |> Result.map(fun()->Coordination_observation_finalized{registration;owner;observation_id})
+      | Coordination_asset_demand{registration;owner;request_id;consumer;priority;assets}->
         (match resolve owner with
-         | Some scope -> Ok (Graph_response (Db.request_for_scope session.worker ~scope request))
-         | None -> Error "The graph session is no longer open.")
+         | None->Error "The asset demand graph session is not open."
+         | Some scope when not(typed_asset_consumer_owner registration scope consumer)->Error "The asset demand namespace does not match its owner."
+         | Some scope when !(session.auth_seen) && !(session.authenticated_user)<>Some scope.account.user_id->Error "The asset account is no longer current."
+         | Some scope->Db.replace_coordinated_asset_demand session.worker ~registration ~scope ~consumer ~priority ~assets
+           |> Result.map(fun()->Coordination_asset_demand_accepted{request_id}))
+      | Coordination_release_asset_demand{registration;owner;request_id;consumer}->
+        if not(typed_asset_consumer_owner registration owner consumer) then Error "The asset cleanup namespace does not match its owner." else
+        Db.release_coordinated_asset_demand session.worker ~registration ~scope:owner ~consumer
+        |> Result.map(fun()->Coordination_asset_demand_released{registration;owner;request_id;consumer})
+      | Coordination_observe { registration; owner; observation_id; request_id; read }
+        ->
+        (match resolve owner with
+         | None -> Error "Observation graph session is not open"
+         | Some scope ->
+           let current () =
+             Db.coordination_current session.worker ~registration
+             && resolve owner = Some scope
+             && ((not !(session.auth_seen))
+                 || !(session.authenticated_user) = Some scope.account.user_id)
+             &&
+             match Db.graph_state_for_scope session.worker ~scope with
+             | Some { phase = Db.Graph_open; _ } -> true
+             | _ -> false
+           in
+           Db.register_observation
+             session.worker
+             ~registration
+             ~id:observation_id
+             ~scope
+             ~read
+             ~current
+             ~notify:(fun ~epoch ->
+               session.emit_observation
+                 (Observation_invalidated
+                    { registration_id = registration; owner; observation_id; epoch }))
+           |> Result.map (fun (epoch, answer) ->
+             Coordination_observed { registration; owner; observation_id; request_id; epoch; answer }))
+      | Coordination_refresh_observation { registration; owner; observation_id; request_id }
+        ->
+        (match resolve owner with
+         | None -> Error "Observation graph session is not open"
+         | Some scope ->
+           Db.refresh_observation
+             session.worker
+             ~registration
+             ~id:observation_id
+             ~scope
+           |> Result.map (fun (epoch, answer) ->
+             Coordination_observed { registration; owner; observation_id; request_id; epoch; answer }))
+      | Coordination_release_observation { registration; owner; observation_id } ->
+        let result=match Db.observation_scope session.worker ~registration ~id:observation_id with
+        | Some scope when scope.graph_id=owner.graph_id && scope.graph_generation=owner.graph_generation
+            && scope.account.account_generation=owner.startup.account_generation ->
+          Db.release_observation session.worker ~registration ~id:observation_id ~scope
+        | Some _ -> Error "Observation cleanup owner mismatch"
+        | None -> Db.release_unallocated_observation session.worker ~registration ~id:observation_id ~owner in
+        Result.map (fun () -> Coordination_observation_released {registration;owner;observation_id}) result
+      | Register_coordination registration ->
+        let baseline snapshot={registration;baseline=snapshot;limits=session.Session.coordination_limits;
+          authority_user=(if !(session.auth_seen) then Some !(session.authenticated_user) else None)} in
+        (match Db.register_coordination session.worker ~registration
+          ~notify:(fun snapshot -> session.emit_coordination (Coordination_snapshot(baseline snapshot))) with
+         | Error message -> Error message
+         | Ok snapshot ->
+           (match session.coordination_registration with
+            | Some id when id<>registration -> session.emit_coordination
+              (Coordination_revoked(id,"Coordination binding replaced"))
+            | _ -> ());
+           session.coordination_registration<-Some registration;
+           Ok(Coordination_registered(baseline snapshot)))
+      | Release_coordination registration ->
+        Result.map(fun()->
+          (match session.coordination_registration with
+           | Some id when id<=registration -> session.coordination_registration<-None | _ -> ());
+          Coordination_released registration)(Db.release_coordination session.worker ~registration)
+      | Coordination_query {registration;owner;request_id;read} ->
+        let Read.Read_query(budget,query)=read in
+        let source=Read.For_worker.read_budget_owner budget in
+        if Read.For_worker.binding_serial(Read.For_worker.session_binding source)<>registration
+           || not(Read.matches_scope source owner)
+        then Error "The query belongs to another coordination session"
+        else if not(Db.coordination_current session.worker ~registration) then
+          Ok(Coordination_query_revoked{registration;owner;request_id})
+        else (match resolve owner with
+          |None->Error "The graph session is no longer open."
+          |Some scope->
+            let authorized ()=Db.coordination_current session.worker ~registration && resolve owner=Some scope
+              && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+            if not(authorized()) then Error "Coordination account authority changed" else
+            (match Read.validate_query source budget query with
+             |Error _->Error "Invalid coordination query"
+             |Ok()->let answer=Db.read_for_scope session.worker ~scope read in
+               if authorized() then Ok(Coordination_queried{registration;owner;request_id;answer})
+               else if not(Db.coordination_current session.worker ~registration) then
+                 Ok(Coordination_query_revoked{registration;owner;request_id})
+               else Error "The graph session is no longer open."))
+      | Coordination_acknowledge_changes {registration;owner;request_id;batch} ->
+        (match resolve owner with
+         |None->Error "The graph session is no longer open."
+         |Some scope->
+           let authorized ()=Db.coordination_current session.worker ~registration && resolve owner=Some scope
+             && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(authorized()) then Error "Coordination account authority changed" else
+           let result=Db.acknowledge_change_batch session.worker ~registration ~scope ~batch ~current:authorized in
+           if authorized() then Ok(Coordination_changes_acknowledged{registration;owner;request_id;result})
+           else Error "Coordination binding retired")
+      | Coordination_mutation {registration;owner;request_id;intent} ->
+        let current ()=Db.coordination_current session.worker ~registration in
+        if not(current ()) then Error "Coordination binding retired"
+        else (match resolve owner with
+          | None -> Error "The graph session is no longer open."
+          | Some scope ->
+            let authorized ()=current () && resolve owner=Some scope &&
+              (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) &&
+              (match Db.graph_state_for_scope session.worker ~scope with
+               | Some {phase=Db.Graph_open;graph_id=Some id;generation;_} ->
+                 id=scope.graph_id && generation=scope.graph_generation
+               | _ -> false) in
+            if not(authorized ()) then Error "Coordination account authority changed" else
+            let response=Db.durable_mutation_for_scope session.worker ~scope ~intent
+              ~current:authorized in
+            if authorized () then Ok(Coordination_mutation_result{request_id;outcome=response}) else Error "Coordination binding retired")
+      | Coordination_confirm {registration;owner;presentation;request_id;intent;original;read} ->
+        (match resolve owner with
+         | None -> Error "The graph session is no longer open."
+         | Some scope ->
+           let current ()=Db.coordination_presentation_current session.worker ~registration ~presentation ~owner &&
+             resolve owner=Some scope &&
+             (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(current ()) then Error "The confirmation presentation retired."
+           else
+             let response=Db.confirm_mutation_for_scope session.worker ~scope ~read
+               ~intent ~original ~current in
+             if current () then Ok(Coordination_confirmed{registration;owner;presentation;request_id;answer=response})
+             else Error "The confirmation presentation retired.")
+      | Coordination_recover_mutations {registration;owner;request_id;after;maximum_items;maximum_bytes} ->
+        (match resolve owner with
+         | None -> Error "The graph session is no longer open."
+         | Some scope ->
+           let current ()=Db.coordination_current session.worker ~registration && resolve owner=Some scope &&
+             (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(current()) then Error "Durable recovery authority retired"
+           else if maximum_bytes>Logseq_db_worker_contract.Worker_pure_mutation.maximum_recovery_bytes
+           then Error "Invalid durable recovery byte budget"
+           else Result.bind(Db.recover_mutations_for_scope session.worker ~scope ~after
+             ~maximum_items ~maximum_bytes ~current)(fun page->
+             if current() then Ok(Coordination_mutations_recovered{request_id;page})
+             else Error "Durable recovery authority retired"))
+      | Coordination_acknowledge_mutation {registration;owner;presentation;request_id;intent;original} ->
+        (match resolve owner with
+         | None -> Error "The graph session is no longer open."
+         | Some scope ->
+           let current ()=Db.coordination_presentation_current session.worker ~registration ~presentation ~owner &&
+             resolve owner=Some scope &&
+             (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(current()) then Error "Durable acknowledgement presentation retired"
+           else Result.bind(Db.acknowledge_mutation_for_scope session.worker ~scope ~intent ~original ~current)(fun()->
+             if current() then Ok(Coordination_mutation_acknowledged{request_id})
+             else Error "Durable acknowledgement presentation retired"))
       | Get_graph_state_at owner ->
         (match Option.bind (resolve owner) (fun scope->Db.graph_state_for_scope session.worker ~scope) with
          | Some state -> Ok (Graph_state state) | None -> Error "The graph session is no longer open.")
       | Import_asset_at (owner,source) ->
-        (match resolve owner with Some scope -> Ok (Asset_imported (Db.import_asset session.worker ~graph_generation:scope.graph_generation source))
+        (match resolve owner with Some scope ->
+           let current()=resolve owner=Some scope && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(current()) then Error "The import account authority retired." else
+           Ok (Asset_imported (Db.import_asset ~scope ~current session.worker ~graph_generation:scope.graph_generation source))
          | None -> Error "The graph session is no longer open.")
+      | Asset_command_at (_,command) when reserved_asset_command command->Error "Use the typed asset coordination entry."
       | Asset_command_at (owner,command) ->
         (match resolve owner with
          | None -> Error "The graph session is no longer open."
@@ -1017,6 +1502,7 @@ let create ~(dependencies : dependencies) =
       | Import_asset { graph_generation; source } ->
         Ok (Asset_imported (Db.import_asset session.worker ~graph_generation source))
       | Get_graph_state -> Ok (Graph_state (Db.graph_state session.worker))
+      | Asset_command {command;_} when reserved_asset_command command->Error "Use the typed asset coordination entry."
       | Asset_command { graph_generation; command } ->
         let event =
           match command with
@@ -1041,12 +1527,12 @@ let create ~(dependencies : dependencies) =
         Db.post session.worker event;
         Ok Client_command_completed
       | Acquire_imported_file { scope; operation } ->
-        Ok (Asset_file (Db.retain_imported_file session.worker ~scope ~operation))
+        Eio.Cancel.protect(fun()->Ok (Asset_file (Db.retain_imported_file session.worker ~scope ~operation)))
       | Acquire_asset_file { scope; handle } ->
-        Ok (Asset_file (Db.retain_asset_file session.worker ~scope ~handle))
+        Eio.Cancel.protect(fun()->Ok (Asset_file (Db.retain_asset_file session.worker ~scope ~handle)))
       | Release_asset_file { scope; handle } ->
-        Db.release_asset_file session.worker ~scope ~handle;
-        Ok Client_command_completed
+        Result.map(fun()->Client_command_completed)
+          (Db.release_asset_file_checked session.worker ~scope ~handle)
       | Client_command (Provide_token { request; token }) ->
         Worker_runner.provide_id_token session.token_cache request.request token;
         Ok Client_command_completed
@@ -1079,7 +1565,7 @@ let create ~(dependencies : dependencies) =
         (match command with Submit_e2ee_password _ -> unlock_queue_log context | _ -> ());
         Db.post session.worker (client_event command);
         Ok Client_command_completed
-      | Graph_request request -> Ok (Graph_response (Db.request session.worker request)))
+      )
     ~shutdown:(fun session ->
       Worker_runner.shutdown_id_token_cache session.token_cache;
       Db.shutdown session.worker)

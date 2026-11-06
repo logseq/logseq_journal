@@ -2,6 +2,7 @@
 (name logseq_journal)
 (version 0.1.0)
 (generate_opam_files false)
+(implicit_transitive_deps false)
 (license MIT)
 
 (package

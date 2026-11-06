@@ -5,6 +5,10 @@
  (virtual_modules core asset_upload)
  (default_implementation logseq_db_worker_pure_reducer_impl)
  (libraries
+  rrbvec
+  logseq_db_worker.typed_read
+  logseq_db_worker.typed_data
   logseq_db_worker.contract
   logseq_db_types
+  logseq_overlay_db
   logseq_sync.pure_reducer))

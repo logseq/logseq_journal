@@ -1,8 +1,12 @@
+module Worker = Journal_worker_coordination.Worker_api
+
+type favorites_cursor = Worker_pure_data.favorite_item Worker.continuation
+
 type favorites_request =
   { graph_generation : int
   ; request_generation : int64
   ; limit : int
-  ; cursor : Logseq_db_types.Graph_types.Cursor.t option
+  ; cursor : favorites_cursor option
   }
 
 type admission_request =
@@ -19,7 +23,6 @@ type t =
       ; command : Journal_graph_projection.capture
       }
   | Create_child of Journal_graph_projection.create_child
-  | Update_source of Journal_graph_projection.update_source
   | Set_task_state of Journal_graph_projection.set_task_state
   | Delete_subtree of Journal_graph_projection.delete_subtree
   | Find_block of string
