@@ -22,10 +22,10 @@ enum JournalCognitoOAuth {
   static func data64(_ value: String) throws -> Data {
     guard !value.isEmpty, value.utf8.allSatisfy({
       (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || $0 == 45 || $0 == 95
-    }) else { throw JournalCognitoError.invalidToken }
+    }) else { throw JournalCognitoTokenValidator.failure(.base64Invalid) }
     let base = value.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
     guard let data = Data(base64Encoded: base + String(repeating: "=", count: (4 - base.count % 4) % 4))
-    else { throw JournalCognitoError.invalidToken }
+    else { throw JournalCognitoTokenValidator.failure(.base64Invalid) }
     return data
   }
   static func random() throws -> String {
@@ -97,13 +97,16 @@ struct JournalCognitoTokenResponse: Decodable {
 
 /// Verify both signatures against keys from the fixed user-pool issuer, never a JWT URL.
 struct JournalCognitoTokenValidator {
+  static func failure(_ reason: JournalAccountDiagnostic.Reason) -> JournalCognitoFailure {
+    JournalCognitoFailure(category: .invalidToken, detail: .init(source: .tokenValidation, reason: reason))
+  }
   struct Key: Decodable {
     let kty: String; let kid: String; let alg: String?; let use: String?; let n: String; let e: String
   }
   struct Keys: Decodable { let keys: [Key] }
   let keys: Keys
   init(jwks: Data) throws {
-    guard jwks.count <= 262144 else { throw JournalCognitoError.invalidToken }
+    guard jwks.count <= 262144 else { throw Self.failure(.responseTooLarge) }
     keys = try JSONDecoder().decode(Keys.self, from: jwks)
   }
   private struct Header: Decodable {
@@ -113,7 +116,7 @@ struct JournalCognitoTokenValidator {
     init(from decoder: Decoder) throws {
       // Reject the presence of an unsupported critical extension, including null.
       guard !(try decoder.container(keyedBy: Keys.self)).contains(.crit) else {
-        throw JournalCognitoError.invalidToken
+        throw JournalCognitoTokenValidator.failure(.criticalHeaderUnsupported)
       }
       fields = try Fields(from: decoder)
     }
@@ -124,17 +127,26 @@ struct JournalCognitoTokenValidator {
   }
 
   private func claims(_ token: String) throws -> Claims {
-    guard token.utf8.count <= 32768 else { throw JournalCognitoError.invalidToken }
+    guard token.utf8.count <= 32768 else { throw Self.failure(.tokenTooLarge) }
     let parts = token.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
-    guard parts.count == 3,
-      let header = try? JSONDecoder().decode(Header.self, from: JournalCognitoOAuth.data64(parts[0])),
-      header.fields.alg == "RS256",
-      keys.keys.filter({ $0.kid == header.fields.kid }).count == 1,
-      let key = keys.keys.first(where: { $0.kid == header.fields.kid }), key.kty == "RSA",
-      key.alg == nil || key.alg == "RS256", key.use == nil || key.use == "sig"
-    else { throw JournalCognitoError.invalidToken }
+    guard parts.count == 3 else { throw Self.failure(.tokenSegmentsInvalid) }
+    let header: Header
+    do { header = try JSONDecoder().decode(Header.self, from: JournalCognitoOAuth.data64(parts[0])) }
+    catch {
+      if let failure = error as? JournalCognitoFailure { throw failure }
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .tokenHeader, reason: .responseShape,
+        causes: JournalAccountDiagnostic.Cause.chain(error)))
+    }
+    guard header.fields.alg == "RS256" else { throw Self.failure(.algorithmUnsupported) }
+    let matches = keys.keys.filter { $0.kid == header.fields.kid }
+    guard !matches.isEmpty else { throw Self.failure(.signingKeyMissing) }
+    guard matches.count == 1 else { throw Self.failure(.signingKeyAmbiguous) }
+    let key = matches[0]
+    guard key.kty == "RSA" else { throw Self.failure(.signingKeyTypeInvalid) }
+    guard key.alg == nil || key.alg == "RS256" else { throw Self.failure(.signingKeyAlgorithmInvalid) }
+    guard key.use == nil || key.use == "sig" else { throw Self.failure(.signingKeyUseInvalid) }
     let n = try JournalCognitoOAuth.data64(key.n), e = try JournalCognitoOAuth.data64(key.e)
-    guard (256...1024).contains(n.count), (1...8).contains(e.count) else { throw JournalCognitoError.invalidToken }
+    guard (256...1024).contains(n.count), (1...8).contains(e.count) else { throw Self.failure(.signingKeySizeInvalid) }
     func tlv(_ tag: UInt8, _ data: Data) -> Data {
       let count = data.count
       var length = Data()
@@ -150,34 +162,61 @@ struct JournalCognitoTokenValidator {
       tlv(2, (data.first! >= 128 ? Data([0]) : Data()) + data)
     }
     let der = tlv(48, integer(n) + integer(e))
+    var importError: Unmanaged<CFError>?
     guard let publicKey = SecKeyCreateWithData(der as CFData,
-      [kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeyClass: kSecAttrKeyClassPublic] as CFDictionary, nil),
-      SecKeyVerifySignature(publicKey, .rsaSignatureMessagePKCS1v15SHA256,
+      [kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeyClass: kSecAttrKeyClassPublic] as CFDictionary, &importError)
+    else {
+      throw JournalCognitoFailure(category: .invalidToken,
+        detail: .init(source: .tokenValidation, reason: .signingKeyImportFailed,
+          causes: importError.map { JournalAccountDiagnostic.Cause.chain($0.takeRetainedValue() as Error) } ?? []))
+    }
+    var signatureError: Unmanaged<CFError>?
+    guard SecKeyVerifySignature(publicKey, .rsaSignatureMessagePKCS1v15SHA256,
         Data((parts[0] + "." + parts[1]).utf8) as CFData,
-        try JournalCognitoOAuth.data64(parts[2]) as CFData, nil),
-      let result = try? JSONDecoder().decode(Claims.self, from: JournalCognitoOAuth.data64(parts[1]))
-    else { throw JournalCognitoError.invalidToken }
-    return result
+        try JournalCognitoOAuth.data64(parts[2]) as CFData, &signatureError)
+    else {
+      throw JournalCognitoFailure(category: .invalidToken,
+        detail: .init(source: .tokenValidation, reason: .signatureInvalid,
+          causes: signatureError.map { JournalAccountDiagnostic.Cause.chain($0.takeRetainedValue() as Error) } ?? []))
+    }
+    do { return try JSONDecoder().decode(Claims.self, from: JournalCognitoOAuth.data64(parts[1])) }
+    catch {
+      if let failure = error as? JournalCognitoFailure { throw failure }
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .tokenClaims, reason: .responseShape,
+        causes: JournalAccountDiagnostic.Cause.chain(error)))
+    }
   }
   func validate(_ response: JournalCognitoTokenResponse, configuration: JournalCognitoConfiguration,
                 nonce: String?, previous: JournalCognitoTokens?, now: Date) throws -> JournalCognitoTokens {
     let id = try claims(response.id_token), access = try claims(response.access_token)
     func expiry(_ claims: Claims, use: String) throws -> Date {
-      guard claims.iss == configuration.issuer, claims.token_use == use,
-        claims.exp.isFinite, claims.exp > now.timeIntervalSince1970,
-        claims.iat.isFinite, claims.iat <= now.timeIntervalSince1970 + 60
-      else { throw JournalCognitoError.invalidToken }
+      guard claims.iss == configuration.issuer else {
+        throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .tokenValidation, reason: .issuerMismatch))
+      }
+      guard claims.exp.isFinite, claims.exp > now.timeIntervalSince1970 else {
+        throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .tokenValidation, reason: .tokenExpired))
+      }
+      guard claims.token_use == use else { throw Self.failure(.tokenUseMismatch) }
+      guard claims.iat.isFinite, claims.iat <= now.timeIntervalSince1970 + 60
+      else { throw Self.failure(.issuedAtInvalid) }
       return Date(timeIntervalSince1970: claims.exp)
     }
     let expiryID = try expiry(id, use: "id"), expiryAccess = try expiry(access, use: "access")
-    guard id.aud == configuration.clientID,
-      access.client_id == configuration.clientID,
-      !id.sub.isEmpty, id.sub.utf8.count <= 512,
-      access.sub == id.sub, previous == nil || previous?.userID == id.sub,
-      nonce == nil || id.nonce == nonce,
-      response.token_type.lowercased() == "bearer", response.expires_in > 0,
-      let refresh = response.refresh_token ?? previous?.refreshToken, !refresh.isEmpty,
-      refresh.utf8.count <= 32768 else { throw JournalCognitoError.invalidToken }
+    guard id.aud == configuration.clientID, access.client_id == configuration.clientID else {
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .tokenValidation, reason: .audienceMismatch))
+    }
+    guard nonce == nil || id.nonce == nonce else {
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .tokenValidation, reason: .nonceMismatch))
+    }
+    guard let refresh = response.refresh_token ?? previous?.refreshToken, !refresh.isEmpty else {
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .tokenValidation, reason: .refreshTokenMissing))
+    }
+    guard !id.sub.isEmpty, id.sub.utf8.count <= 512 else { throw Self.failure(.subjectInvalid) }
+    guard access.sub == id.sub else { throw Self.failure(.subjectMismatch) }
+    guard previous == nil || previous?.userID == id.sub else { throw Self.failure(.accountMismatch) }
+    guard response.token_type.lowercased() == "bearer" else { throw Self.failure(.tokenTypeInvalid) }
+    guard response.expires_in > 0 else { throw Self.failure(.expiresInInvalid) }
+    guard refresh.utf8.count <= 32768 else { throw Self.failure(.refreshTokenTooLarge) }
     return JournalCognitoTokens(idToken: response.id_token, accessToken: response.access_token,
       refreshToken: refresh, userID: id.sub, issuer: configuration.issuer, clientID: configuration.clientID,
       expiresAt: min(expiryID, expiryAccess, now.addingTimeInterval(TimeInterval(response.expires_in))))

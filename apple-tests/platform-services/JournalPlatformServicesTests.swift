@@ -88,11 +88,15 @@ import Foundation
       userInfo: [NSLocalizedDescriptionKey: "private-token-sentinel"])
     do { _ = try await reasonService.response(for: .authenticatedUser); fatalError("expected unknown failure") }
     catch { precondition((error as NSError).domain == "private-account-sentinel") }
-    precondition(reasonService.accountIssue == safeFallback, "unknown account error must keep safe fallback")
+    let unknownIssue = reasonService.accountIssue
+    precondition(unknownIssue?.kind == safeFallback.kind && unknownIssue?.stage == safeFallback.stage,
+      "unknown account error must keep recovery policy")
+    precondition(unknownIssue?.diagnostic.contains("cause.other · code 73") == true)
+    precondition(unknownIssue?.diagnostic.contains("private-") == false)
     reasonAuth.userFailure = CancellationError()
     do { _ = try await reasonService.response(for: .authenticatedUser); fatalError("expected cancellation") }
     catch is CancellationError {}
-    precondition(reasonService.accountIssue == safeFallback, "cancellation must not publish a new account issue")
+    precondition(reasonService.accountIssue == unknownIssue, "cancellation must not publish a new account issue")
     let existingIssue = JournalAccountIssue(kind: .unsupportedFormat, stage: .bindingRead, formatVersion: 9)
     precondition(JournalAccountIssue.classify(existingIssue, stage: .identityLookup) == existingIssue)
     let old = JournalLocalAccount(userID: "offline-user", managedSyncOrigin: origin)

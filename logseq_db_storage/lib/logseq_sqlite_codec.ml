@@ -9,6 +9,18 @@ type error =
   | Out_of_range_number of string
   | Malformed_storage_payload of string
 
+let diagnostic_error error =
+  let reason, source = match error with
+    | Unsupported_tag _ -> "codecUnsupportedTag", ""
+    | Malformed_transit message -> "codecMalformedTransit", message
+    | Out_of_range_number _ -> "codecNumberRange", ""
+    | Malformed_storage_payload message -> "codecMalformedPayload", message
+  in
+  Logseq_db_types.Failure_diagnostic.of_source
+    ~operation:"workerOperation" ~reason source
+  |> Logseq_db_types.Failure_diagnostic.encode
+;;
+
 type physical_entry =
   { address : Datascript.storage_address
   ; content : string
@@ -929,7 +941,7 @@ let encode_physical_batch ?(restore = fun _ -> None) ?metadata entries =
            let content, addresses =
              match encode_physical_payload payload with
              | Ok encoded -> encoded
-             | Error _ -> invalid_arg ("unable to encode storage address " ^ address)
+             | Error error -> invalid_arg (diagnostic_error error)
            in
            { address; content; addresses })
       entries)

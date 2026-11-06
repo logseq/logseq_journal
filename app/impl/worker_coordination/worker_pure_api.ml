@@ -121,7 +121,7 @@ type admission_error =
 
 type interruption =
   | Cancelled
-  | Transport_lost
+  | Transport_lost of error
   | Worker_stopped
 
 type 'a reply =

@@ -407,14 +407,8 @@ let stage_transact ?tx_meta t ~authoritative_before tx_ops =
   stage_transact_batch ?tx_meta t ~authoritative_before [ tx_ops ]
 ;;
 
-let storage_error_message = function
-  | Logseq_sqlite_storage.Pragma_mismatch message
-  | Corrupt_storage message
-  | Begin_failed message
-  | Commit_failed message
-  | Checkpoint_failed message
-  | Close_failed message -> message
-  | Write_failed { address; message } -> address ^ ": " ^ message
+let storage_error_message error =
+  Logseq_sqlite_storage.diagnostic_error ~operation:"workerOperation" error
 ;;
 
 let terminalize t message =
@@ -588,7 +582,12 @@ let close t =
      | Error checkpoint, Error close ->
        Error
          (Persistence_failed
-            (storage_error_message checkpoint ^ "; " ^ storage_error_message close)))
+            (let module D = Logseq_db_types.Failure_diagnostic in
+             let diagnostic error =
+               D.of_source ~operation:"closeDatabase" ~reason:"closeFailed"
+                 (storage_error_message error)
+             in
+             D.with_related (diagnostic checkpoint) (diagnostic close) |> D.encode)))
 ;;
 
 let is_fatal t =

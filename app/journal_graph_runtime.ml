@@ -12,6 +12,7 @@ module Coordination = Journal_worker_coordination.Worker_pure_coordinator
 type worker_read_result =
   | Query_result : 'a Worker.query * 'a -> worker_read_result
   | Read_failed of { code : Logseq_db_worker.Error.code; message : string }
+  | Read_error of Logseq_db_worker.Error.t
   | Changes_resync of string
   | Changes_retired
   | Changes_acknowledged of Worker.change_ack
@@ -160,6 +161,7 @@ type payload =
       ; block_id : string
       ; failure : failure_source
       }
+  | Diagnostic of worker_failure
   | Rejected of failure_source
 
 type response = { payload : payload }
@@ -523,6 +525,8 @@ let favorites_output (value : Favorites.output) =
         | Favorites_failed (request, stale, message) -> response (Favorites_failed (request, stale, message))
         | Favorites_invalidated -> response Favorites_invalidated
         | Rejected (Projection_rejection message) -> response (Rejected (Projection_failure message))
+        | Diagnostic { operation; request_id; error } ->
+          response (Diagnostic { operation; request_id; error })
         | Rejected (Worker_rejection { operation; request_id; error }) ->
           response (Rejected (Worker_failure { operation; request_id; error })))
       value.responses)
@@ -1805,10 +1809,10 @@ let operation_name = function
 let worker_error code request_id message =
   Error.create ~code ~message ~details:[]
   |> Result.fold ~ok:Fun.id ~error:(fun _ ->
-    Error.create
-      ~code:Unsupported_semantics
-      ~message:"The Worker request failed."
-      ~details:[]
+    let module D=Logseq_db_types.Failure_diagnostic in
+    let detail=D.of_source ~operation:"workerOperation" ~reason:"invalidContent" message in
+    Error.create ~code ~message:(D.message detail)
+      ~details:[Error.{name=D.detail_name;value=Detail_string(D.encode detail)}]
     |> Result.get_ok)
   |> fun error -> request_id, error
 ;;
@@ -1816,19 +1820,22 @@ let worker_error code request_id message =
 let failure_output
       ~source_epoch
       ?(code = Error.Unsupported_semantics)
+      ?error
       t
       operation
       request_id
       message
   =
-  let request_id, error = worker_error code request_id message in
+  let request_id, error = match error with
+    | Some error -> request_id,error
+    | None -> worker_error code request_id message in
   let worker_failure = { operation = operation_name operation; request_id; error } in
   match operation with
   | Task_catalog { epoch; _ } when epoch <> t.task_catalog_epoch -> empty
   | Task_catalog _ ->
     t.task_catalog_loading <- false;
     Hashtbl.clear t.task_catalog_deletions;
-    responses [ task_catalog_response ~error:message t ]
+    responses [ task_catalog_response ~error:message t; response(Diagnostic worker_failure) ]
   | Task_definitions ids ->
     let current = ref false in
     List.iter
@@ -1839,7 +1846,8 @@ let failure_output
            current := true;
            Hashtbl.remove t.task_lookup_epochs id))
       ids;
-    if !current then responses [ task_catalog_response ~error:message t ] else empty
+    if !current then responses [ task_catalog_response ~error:message t;
+      response(Diagnostic worker_failure) ] else empty
   | Favorite_read value ->
     Favorites.fail t.favorites value ~request_id ~code ~message ~error |> favorites_output
   | Feed_read operation ->
@@ -1850,7 +1858,8 @@ let failure_output
   | Mutation_refresh { page; refresh = Updated { block_id } } when code = Error.Conflict
     -> request_target_summary t page (Update_conflict_refresh { block_id })
   | Graph_info -> responses [ response (Open_failed worker_failure) ]
-  | Admission_info request -> responses [ response (Admission_unavailable request) ]
+  | Admission_info request -> responses [ response (Admission_unavailable request);
+      response(Diagnostic worker_failure) ]
   | Pull_changes _ | Acknowledge_changes _ ->
     responses [ response (Rejected (Worker_failure worker_failure)) ]
   | Detail_block { generation; block_id; _ } ->
@@ -1875,11 +1884,15 @@ let failure_output
              ; failure = Worker_failure worker_failure
              })
       ]
-  | Child_chain _ | Capture_chain _ -> child_step t request_id(fun chain->Child.interrupted chain ~index:0 ~round:1L message)
+  | Child_chain _ | Capture_chain _ ->
+    let output=child_step t request_id(fun chain->Child.interrupted chain ~index:0 ~round:1L message) in
+    {output with responses=response(Diagnostic worker_failure)::output.responses}
   | Child_write{root;index;round}|Child_ack{root;index;round;_}->
-    child_step t root(fun chain->Child.interrupted chain ~index ~round message)
+    let output=child_step t root(fun chain->Child.interrupted chain ~index ~round message) in
+    {output with responses=response(Diagnostic worker_failure)::output.responses}
   | Child_canonical{root;round}|Child_chain_parent{root;round;_}->
-    child_step t root(fun chain->Child.read_failed chain ~round message)
+    let output=child_step t root(fun chain->Child.read_failed chain ~round message) in
+    {output with responses=response(Diagnostic worker_failure)::output.responses}
   | Child_insert (command, _) ->
     responses
       [ response
@@ -1890,8 +1903,9 @@ let failure_output
              })
       ]
   | Reference_read { block_id; depth; _ } ->
-    Reference.read_failed t.references ~ports:(reference_ports t) ~source_epoch ~block_id ~depth
-    |> reference_output
+    let output=Reference.read_failed t.references ~ports:(reference_ports t) ~source_epoch ~block_id ~depth
+      |> reference_output in
+    {output with responses=response(Diagnostic worker_failure)::output.responses}
   | Changed_block { block_id; _ } | Changed_detail_block { block_id; _ } | Changed_point_context {block_id;_} ->
     let invalidation =
       Reference.shared_read_failed t.references ~ports:(reference_ports t)
@@ -1969,6 +1983,8 @@ let receive_result t ~origin ~request_id result =
          Feed.receive t.feed ~ports:(feed_ports t) ?origin operation query value
        | Feed_read operation,Read_failed{code;_} ->
          Feed.failed t.feed ~ports:(feed_ports t) operation ~code
+       | Feed_read operation,Read_error error ->
+         Feed.failed t.feed ~ports:(feed_ports t) operation ~code:(Error.code error)
        | _ -> None) with
      | Some planned -> feed_output t planned
      | _ -> (match result with
@@ -1978,15 +1994,19 @@ let receive_result t ~origin ~request_id result =
           Favorites.receive_list t.favorites ~ports:(favorites_ports t) read result
           |> favorites_output |> background_demands t
         | _ -> failure_output t operation request_id "Unexpected favorites response.")
-     | Read_failed { code; message } ->
+     | (Read_failed _ | Read_error _) as failed ->
+       let code,message,error=match failed with
+         | Read_failed{code;message}->code,message,None
+         | Read_error error->Error.code error,Error.message error,Some error
+         | _->assert false in
        (match operation with
         | Target_summary summary when code = Error.Stale_read_cursor ->
           (match Confirmation.retry_stale t.confirmations ~ports:(confirmation_ports t) summary with
            | Some planned -> confirmation_planning planned
-           | None -> failure_output ~code t operation request_id message)
+           | None -> failure_output ~code ?error t operation request_id message)
         | Delete_mutation command when code = Error.Conflict ->
           request_delete_summary t command.block_id
-        | _ -> failure_output ~code t operation request_id message)
+        | _ -> failure_output ~code ?error t operation request_id message)
      | Changes_resync reason -> failure_output t operation request_id reason
      | Changes_retired -> empty
      | Query_result (Worker.Graph_info, value) ->
@@ -2845,6 +2865,7 @@ let receive_delivery t ~origin ~request_id result =
     t.on_change(Coordination.Change_consumer_expanded(token,request_id,!children));
     let error=match result with
       | Read_failed{code;message}->Some(Worker.Service_failed(Error.code_string code ^ ": " ^ message))
+      | Read_error error->Some(Worker.Db_error error)
       | Changes_resync reason->Some(Worker.Resync_required reason)
       | _->List.find_map response_application_error output.responses in
     Option.iter(fun error->t.on_change(Coordination.Change_consumer_applied(token,request_id,Error error))) error;
@@ -3049,10 +3070,15 @@ let receive_mutation t (request:Graph.Uuid.t) progress =
        (* The known rejection is terminal evidence; only this branch may report
           that the choice did not apply. *)
        Hashtbl.replace t.pending key {pending with durable=None};
-       let code,message=match error with Worker.Db_error error->Error.code error,Error.message error
-         | Service_failed message->Error.Invalid_request,message
-         | _->Error.Invalid_request,"The change was rejected." in
-       let output=receive_worker_read t ~request_id:request (Read_failed{code;message}) in
+       let failure=match error with
+         | Worker.Db_error error->Read_error error
+         | Service_failed message | Invalid_input message | Protocol_mismatch message
+         | Unsupported_operation message | Stale_read message | Resync_required message->
+           Read_failed{code=Error.Invalid_request;message}
+         | Revoked_session->Read_failed{code=Error.Closed_session;message="The mutation session was revoked."}
+         | Host_change_in_progress->Read_failed{code=Error.Closed_session;message="The graph is closing; the mutation outcome is retained."}
+         | Response_budget_exceeded->Read_failed{code=Error.Response_too_large;message="The mutation result exceeded its response budget."} in
+       let output=receive_worker_read t ~request_id:request failure in
        Hashtbl.replace t.pending key {pending with durable=Some durable};
        List.iter(fun (request:Graph.Uuid.t)->let key=Graph.Uuid.to_string request in
          Option.iter(fun pending->Hashtbl.replace t.pending key {pending with durable=Some durable})
@@ -3092,7 +3118,7 @@ let child_projection_applied t ~root ~round ~presentation =
   dispatch_output t (child_step t root(fun chain->Child.applied chain ~round presentation))
 ;;
 
-let fail_request t (request : Graph.Uuid.t) ~message =
+let fail_request ?error t (request : Graph.Uuid.t) ~message =
   match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request) with
   | Some{operation=Capture_append command;_}->
     Hashtbl.remove t.pending(Graph.Uuid.to_string request);
@@ -3101,7 +3127,9 @@ let fail_request t (request : Graph.Uuid.t) ~message =
     Hashtbl.remove t.pending(Graph.Uuid.to_string request);
     responses[response(Child_not_admitted{command;message})]
   | Some{operation=(Child_chain _|Capture_chain _|Child_write _|Child_ack _);_}->mutation_waiting t request message
-  | _->receive_worker_read t ~request_id:request (Read_failed{code=Error.Closed_session;message})
+  | _->receive_worker_read t ~request_id:request
+      (match error with Some error->Read_error error
+       | None->Read_failed{code=Error.Closed_session;message})
 ;;
 
 let abandon t (request : Graph.Uuid.t) =

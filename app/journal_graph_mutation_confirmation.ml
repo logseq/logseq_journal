@@ -301,7 +301,7 @@ module Pure_insertion = struct
     then Error "The atomic Capture children do not match the admitted payload."
     else Result.bind(Graph.Uuid.of_string command.mutation_id)(fun mutation_id->
       match Worker.journal_day day with
-      |Error _->Error "Capture requires its admitted day and atomic Append payload."
+      |Error error->Error(Journal_worker_coordination_host.error_message error)
       |Ok journal_day->Result.map(fun(t,action)->{t with capture=Some command},action)
         (start_value ~command:(capture_command command) ~page:None ~resolved_status ~append_day:(Some day)
           (Append{mutation_id;day=journal_day;root})))

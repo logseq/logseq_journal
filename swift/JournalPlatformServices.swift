@@ -20,19 +20,63 @@ enum JournalCognitoError: String, Error, Equatable, Sendable, LocalizedError {
 struct JournalAccountDiagnostic: Equatable, Sendable {
   enum Source: String {
     case keychainLoad, keychainSave, keychainAdd, keychainClear, legacyClear, browser
-    case token, jwks, tokenValidation, revoke, network, secureStorage, recovery
+    case token, jwks, tokenValidation, tokenHeader, tokenClaims, sessionRestore, revoke, network, secureStorage, recovery
     case bindingLoad, bindingWrite, bindingAdd, bindingRestore, bindingClear
-    case recoveryLoad, recoveryWrite, recoveryAdd, recoveryClear
+    case recoveryLoad, recoveryWrite, recoveryAdd, recoveryClear, native
   }
   enum Reason: String {
     case status, wrongType, responseTooLarge, invalidRecord, operationInProgress
     case missingAnchor, startRejected, browserFailed, redirect, httpStatus, responseShape
     case transport, verificationFailed, unsupportedFormat
+    case nonceMismatch, audienceMismatch, issuerMismatch, signatureInvalid, tokenExpired, refreshTokenMissing
+    case base64Invalid, tokenTooLarge, tokenSegmentsInvalid, algorithmUnsupported, criticalHeaderUnsupported
+    case signingKeyMissing, signingKeyAmbiguous, signingKeyTypeInvalid, signingKeyAlgorithmInvalid
+    case signingKeyUseInvalid, signingKeySizeInvalid, signingKeyImportFailed
+    case tokenUseMismatch, issuedAtInvalid, subjectInvalid, subjectMismatch, accountMismatch
+    case tokenTypeInvalid, expiresInInvalid, refreshTokenTooLarge, idTokenMissing, accessTokenMissing
   }
   enum OAuth: String {
     case invalid_request, invalid_client, invalid_grant, unauthorized_client
     case unsupported_grant_type, invalid_scope, access_denied, server_error, temporarily_unavailable, unknown
     init(safeCode: String) { self = Self(rawValue: safeCode) ?? .unknown }
+  }
+  /// Bounded causal chain. Do not retain descriptions, coding keys, userInfo,
+  /// arbitrary domains, URLs or payloads, even for errors from unknown providers.
+  struct Cause: Equatable, Sendable {
+    enum Kind: String, Sendable {
+      case decodeTypeMismatch, decodeMissingKey, decodeMissingValue, decodeCorrupted
+      case encodeInvalidValue, cocoa, posix, url, osStatus, webAuthentication, other
+    }
+    let kind: Kind
+    var code: Int? = nil
+    var diagnostic: String { kind.rawValue + (code.map { " · code \($0)" } ?? "") }
+    static func chain(_ error: Error) -> [Self] {
+      switch error {
+      case DecodingError.typeMismatch: return [.init(kind: .decodeTypeMismatch)]
+      case DecodingError.keyNotFound: return [.init(kind: .decodeMissingKey)]
+      case DecodingError.valueNotFound: return [.init(kind: .decodeMissingValue)]
+      case DecodingError.dataCorrupted: return [.init(kind: .decodeCorrupted)]
+      case EncodingError.invalidValue: return [.init(kind: .encodeInvalidValue)]
+      default: break
+      }
+      var result: [Self] = []
+      var current: NSError? = error as NSError
+      // The limit also bounds malformed/cyclic NSUnderlyingErrorKey chains.
+      while let native = current, result.count < 4 {
+        let kind: Kind
+        switch native.domain {
+        case NSCocoaErrorDomain: kind = .cocoa
+        case NSPOSIXErrorDomain: kind = .posix
+        case NSURLErrorDomain: kind = .url
+        case NSOSStatusErrorDomain: kind = .osStatus
+        case "com.apple.AuthenticationServices.WebAuthenticationSession": kind = .webAuthentication
+        default: kind = .other
+        }
+        result.append(.init(kind: kind, code: native.code))
+        current = native.userInfo[NSUnderlyingErrorKey] as? NSError
+      }
+      return result
+    }
   }
   let source: Source
   let reason: Reason
@@ -40,12 +84,14 @@ struct JournalAccountDiagnostic: Equatable, Sendable {
   var urlCode: Int? = nil
   var osStatus: Int? = nil
   var oauth: OAuth? = nil
+  var causes: [Cause] = []
   var diagnostic: String {
     "\(source.rawValue).\(reason.rawValue)"
       + (httpStatus.map { " · http \($0)" } ?? "")
       + (urlCode.map { " · url \($0)" } ?? "")
       + (osStatus.map { " · osstatus \($0)" } ?? "")
       + (oauth.map { " · oauth.\($0.rawValue)" } ?? "")
+      + causes.map { " · cause.\($0.diagnostic)" }.joined()
   }
 }
 
@@ -112,7 +158,8 @@ struct JournalAccountIssue: Error, Equatable, Sendable, LocalizedError {
       return Self(kind: .secureStorageUnavailable, stage: stage,
         nativeDetail: .init(source: .secureStorage, reason: .status, osStatus: native.code))
     }
-    return Self(kind: .unavailable, stage: stage)
+    return Self(kind: .unavailable, stage: stage,
+      nativeDetail: .init(source: .native, reason: .status, causes: JournalAccountDiagnostic.Cause.chain(error)))
   }
 }
 

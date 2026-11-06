@@ -912,9 +912,15 @@ let fail_unrecoverable (Packed_client client) error =
 ;;
 
 let exception_message exception_ =
-  match exception_ with
-  | Failure message | Invalid_argument message -> message
-  | _ -> Printexc.to_string exception_
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let source = match exception_ with
+    | Failure message | Invalid_argument message -> message
+    | _ -> Printexc.to_string exception_ in
+  let detail = D.of_source ~operation:"workerOperation" ~reason:"resourceFailed" source in
+  let detail = if Option.is_some (D.decode source) || D.source_class detail <> "unknown"
+    then detail else
+    D.of_source ~operation:"workerOperation" ~reason:"resourceFailed" (Printexc.to_string exception_) in
+  D.message detail
 ;;
 
 type run_result =

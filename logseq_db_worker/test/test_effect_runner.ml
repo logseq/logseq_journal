@@ -511,6 +511,56 @@ let asset_sync_config () =
   let limits=Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024 ~submission_batch_size:1 |> Result.get_ok in
   Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits |> Result.get_ok
 ;;
+(* Scheduling failures belong to the effect runner, not the pure reducer. *)
+let test_worker_schedule_failure_completes
+    ?(failure=Unix.Unix_error (Unix.EACCES, "fork", "PRIVATE_SYNTHETIC_PAYLOAD"))
+    ?(expected_source="io-permission") ?(expected_reason="resourceFailed") () =
+  T.with_managed (fun fixture -> Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
+    let posted = ref [] in
+    let dependencies = Runner.dependencies
+      ~runtime:(Runner.runtime ~fork:(fun ~sw:_ _ ->
+        raise failure)
+        ~sleep:(fun _ -> ()) |> Result.get_ok)
+      ~config:fixture.config ~overlay:fixture.overlay
+      ~sync_runner:(Runner.sync_runner ~retire_account:(fun ~account:_ -> Ok ())
+        ~submit:(fun _ -> ()) ~shutdown:(fun () -> ()) ())
+      ~publish:(fun _ -> ()) |> Result.get_ok in
+    let runner = Runner.create ~sw dependencies
+      ~recovery_current:(fun _ -> false) ~upload_current:(fun _ -> false)
+      ~asset_current:(fun _ -> false) ~post:(fun event -> posted := event :: !posted)
+      |> Result.get_ok in
+    let state = Core.initial (Core.config ~worker:fixture.config ~sync:(asset_sync_config ())) |> Result.get_ok in
+    let state = (Core.step state (Core.Sync_event (Sync.Sign_in_requested
+      {account_generation=0;presentation_generation=0}))).next in
+    let signed_in = Core.step state (Core.Sync_event (Sync.Account_authenticated {user_id=Some "user-1"})) in
+    let graph : Sync.graph = {graph_id=(Logseq_db_types.Graph_types.Uuid.of_string "94000000-0000-4000-8000-000000000709" |> Result.get_ok);name="fixture";
+      schema={major=65;minor=33;exact=true};encrypted=false} in
+    let catalog = List.find_map (function
+      | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_catalog _)) ->
+        Some (Core.step signed_in.next (Core.Sync_event (Sync.Runner_completed
+          (Sync.Completion (ticket, Ok [graph])))))
+      | _ -> None) signed_in.effects |> Option.get in
+    let selected = Core.step catalog.next (Core.Sync_event (Sync.Graph_selected graph.graph_id)) in
+    let work = List.find (function Core.Run_worker _ -> true | _ -> false) selected.effects in
+    Runner.submit runner work;
+    match !posted with
+    | [Core.Runner_completed (Core.Sync_worker_effect_completed (_, Error error))] ->
+      let module E = Logseq_db_worker_contract.Error in
+      let module D = Logseq_db_types.Failure_diagnostic in
+      let detail = List.find_map (fun (item:E.detail) -> match item.value with
+        | E.Detail_string source when item.name=D.detail_name -> D.decode source
+        | _ -> None) (E.details error) |> Option.get in
+      Alcotest.(check string) "operation retained" "inspectMirror" (D.operation detail);
+      Alcotest.(check string) "source cause retained" expected_source (D.source_class detail);
+      Alcotest.(check string) "specific reason retained" expected_reason (D.reason detail);
+      let encoded=Yojson.Safe.to_string(E.to_yojson error) in
+      let marker="PRIVATE_SYNTHETIC_PAYLOAD" in
+      let rec contains offset = offset + String.length marker <= String.length encoded
+        && (String.sub encoded offset (String.length marker)=marker || contains (offset+1)) in
+      Alcotest.(check bool) "private exception argument excluded" false (contains 0)
+    | _ -> Alcotest.fail "Scheduling failure must post exactly one typed completion")))
+;;
+
 let admitted_asset_state graph_id =
   let initial=Sync.initial(asset_sync_config()) |> Result.get_ok in
   let graph : Sync.graph =
@@ -3104,7 +3154,13 @@ let () =
         ] )
     ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
-      , [ Alcotest.test_case "readonly import input recovery and exact proof ACK" `Quick test_import_input_readonly_recovery_and_proof_ack
+      , [ Alcotest.test_case "worker scheduling failure completes" `Quick (fun () -> test_worker_schedule_failure_completes ())
+        ; Alcotest.test_case "worker encoded exception preserves reason" `Quick
+            (test_worker_schedule_failure_completes
+              ~failure:(Invalid_argument (Logseq_db_storage.Logseq_sqlite_codec.diagnostic_error
+                (Logseq_db_storage.Logseq_sqlite_codec.Unsupported_tag "PRIVATE_SYNTHETIC_PAYLOAD")))
+              ~expected_source:"unknown" ~expected_reason:"codecUnsupportedTag")
+        ; Alcotest.test_case "readonly import input recovery and exact proof ACK" `Quick test_import_input_readonly_recovery_and_proof_ack
         ; Alcotest.test_case "initial observation snapshot joins real release" `Quick test_observation_release_waits_for_initial_snapshot
         ; Alcotest.test_case "host internal followup survives full actor queue" `Quick test_host_followup_survives_full_actor_queue
         ; Alcotest.test_case "host scope settlement preserves real lease" `Quick test_host_scope_settlement_preserves_live_lease

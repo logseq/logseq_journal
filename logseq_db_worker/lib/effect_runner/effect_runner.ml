@@ -656,6 +656,7 @@ let decrypt_protected_value t key source =
 ;;
 
 let asset_failure_message = function
+  | Sync.Asset_with_cause (_, detail) -> Logseq_db_types.Failure_diagnostic.message detail
   | Sync.Asset_invalid_content source ->
     let module D = Logseq_db_types.Failure_diagnostic in
     Option.value (D.decode source)
@@ -1008,9 +1009,8 @@ let effect_error message =
   match D.decode message with
   | None -> worker_error ~code:E.Storage_busy message
   | Some detail ->
-    E.create ~code:E.Storage_busy ~message:(D.message detail)
-      ~details:[ E.{name=D.detail_name;value=Detail_string (D.encode detail)} ]
-    |> Result.get_ok
+    diagnostic_error ~code:E.Storage_busy ~operation:(D.operation detail)
+      ~reason:(D.reason detail) ~source:(D.encode detail) ()
 ;;
 
 
@@ -1130,8 +1130,18 @@ let exception_failure ~operation ~reason error =
   let module D = Logseq_db_types.Failure_diagnostic in
   let literal = match error with Failure source | Invalid_argument source -> Some source | _ -> None in
   let detail = failure_detail ?source:literal ~operation ~reason () in
-  if D.source_class detail <> "unknown" then detail
+  if Option.is_some (Option.bind literal D.decode) || D.source_class detail <> "unknown"
+  then detail
   else failure_detail ~source:(Printexc.to_string error) ~operation ~reason ()
+;;
+
+let report_worker_error report error =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  List.iter (fun (item:Logseq_db_worker_contract.Error.detail) ->
+    match item.name,item.value with
+    | name,Detail_string source when name=D.detail_name ->
+      Option.iter (publish_failure report) (D.decode source)
+    | _ -> ()) (Logseq_db_worker_contract.Error.details error)
 ;;
 
 let asset_failure_detail ~operation failure =
@@ -1146,13 +1156,17 @@ let asset_failure_detail ~operation failure =
     | Asset_size_rejected -> "sizeRejected", None
     | Asset_revoked_access -> "revokedAccess", None
     | Asset_cancelled -> "cancelled", None
-    | Asset_invalid_content source -> "invalidContent", Some source in
+    | Asset_invalid_content source -> "invalidContent", Some source
+    | Asset_with_cause (_, detail) ->
+      let module D = Logseq_db_types.Failure_diagnostic in
+      D.reason detail, Some (D.encode detail) in
   failure_detail ?source ~operation ~reason ()
 ;;
 
-let report_asset_failure ?detail t scope operation = function
+let report_asset_failure ?detail t scope operation failure =
+  match Sync.asset_failure_kind failure with
   | Sync.Asset_cancelled -> ()
-  | failure ->
+  | _ ->
     let detail = match detail with
       | None -> asset_failure_detail ~operation failure
       | Some detail ->
@@ -1427,17 +1441,31 @@ let mutation_owner_matches (scope:Sync.graph_scope) intent =
 ;;
 
 let typed_read_error ?code error =
-  let fail code message = Read.Db_error(Logseq_db_worker_contract.Error.create ~code ~message ~details:[] |> Result.get_ok) in
-  let safe reason source=Logseq_db_types.Failure_diagnostic.of_source ~operation:"workerOperation" ~reason source
-    |> Logseq_db_types.Failure_diagnostic.message in
+  let module E = Logseq_db_worker_contract.Error in
+  let failure default reason ?source constructor message =
+    let detail = failure_detail ?source ~operation:"workerOperation" ~reason () in
+    let module D = Logseq_db_types.Failure_diagnostic in
+    let message = match source with None -> message | Some _ -> D.message detail in
+    let origin = E.create_cause ~component:E.Read_model ~operation:"read"
+      ~code:(Some constructor) ~message |> Result.get_ok in
+    Read.Db_error (E.create_with_origin ~code:(Option.value code ~default) ~message
+      ~origin ~details:[E.{name=D.detail_name;value=Detail_string(D.encode detail)}] |> Result.get_ok) in
   match error with
-  |Overlay.Stale_read_cursor->(match code with
-    |None->Read.Stale_read "The read continuation is no longer current."
-    |Some code->fail code "The read continuation is no longer current.")
-  |Invalid_read_request source->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Invalid_request) (safe "invalidRequest" source)
-  |Read_limit_exceeded->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Response_too_large) "The read exceeded its resource limit."
-  |Database_closed|Snapshot_released|Snapshot_generation_invalidated->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Closed_session) "The read snapshot is no longer available."
-  |Fatal_read_state source->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Corrupt_storage) (safe "fatalState" source)
+  | Overlay.Stale_read_cursor -> (match code with
+    | None -> Read.Stale_read "The read continuation is no longer current."
+    | Some code -> failure code "stateError" "Stale_read_cursor" "The read continuation is no longer current.")
+  | Invalid_read_request source -> failure E.Invalid_request "invalidRequest" ~source
+      "Invalid_read_request" "The read request is invalid."
+  | Read_limit_exceeded -> failure E.Response_too_large "limitExceeded"
+      "Read_limit_exceeded" "The read exceeded its resource limit."
+  | Database_closed -> failure E.Closed_session "databaseClosed"
+      "Database_closed" "The read database is closed."
+  | Snapshot_released -> failure E.Closed_session "stateError"
+      "Snapshot_released" "The read snapshot was released."
+  | Snapshot_generation_invalidated -> failure E.Closed_session "generationInvalidated"
+      "Snapshot_generation_invalidated" "The read snapshot generation was invalidated."
+  | Fatal_read_state source -> failure E.Corrupt_storage "fatalState" ~source
+      "Fatal_read_state" "The read storage requires recovery."
 ;;
 
 (* A single pinned snapshot supplies each canonical value, including enrichment
@@ -1462,7 +1490,7 @@ let read_typed
     loop limit in
   let with_snapshot read =
     match (match snapshot with Some value->Ok value|None->Database.current_snapshot database) with
-    |Error _->fail Closed_session "The graph snapshot is unavailable."
+    |Error error->Error(typed_read_error error)
     |Ok snapshot->Fun.protect ~finally:(fun()->if release_snapshot then Database.release_snapshot snapshot)(fun()->
       let exception Enrichment_failed of Read.error in
       let titles=Hashtbl.create 16 in
@@ -1486,7 +1514,8 @@ let read_typed
     match query with
     |Read.Changes{generation;after}->fit (fun limit->changes ~generation ~after ~limit)
     |Admission->checked(match Database.inspect_admission database with
-      |Error _->fail Closed_session "Admission information is unavailable."
+      |Error Overlay.Admission_database_closed->Error(typed_read_error Overlay.Database_closed)
+      |Error (Overlay.Admission_fatal_state source)->Error(typed_read_error (Overlay.Fatal_read_state source))
       |Ok value->Ok Worker_pure_data.{active_records=value.active_records;active_bytes=value.active_bytes;
         protected_wire_bytes=value.protected_wire_bytes;retained_origin_evidence_bytes=value.retained_origin_evidence_bytes;
         maximum_records=value.maximum_records;maximum_bytes=value.maximum_bytes})
@@ -1736,7 +1765,7 @@ let register_observation
                       | None -> Error "Observation graph is no longer attached"
                       | Some session ->
                         (match Database.listen session.database with
-                         | Error _ -> Error "Observation listener could not register"
+                         | Error error -> Error (Logseq_db_worker_contract.Error.message (listen_error error))
                          | Ok (subscription, snapshot) ->
                            slot.subscription <- Some subscription;
                            (match sample_observation ~snapshot t slot with
@@ -1747,10 +1776,12 @@ let register_observation
                                    subscription
                                    ~notify:(invalidate_observation t slot)
                                with
-                               | Error _ -> Error "Observation replay could not activate"
+                               | Error error -> Error (Logseq_db_worker_contract.Error.message (listen_error error))
                                | Ok () -> Ok (0L, response))))
                     with
-                    | _ -> Error "Observation registration failed");
+                    | error -> Error (Logseq_db_types.Failure_diagnostic.message
+                        (exception_failure ~operation:"workerOperation" ~reason:"resourceFailed" error)));
+
                 !result))))
 ;;
 let refresh_observation t ~registration ~id ~scope =
@@ -1876,19 +1907,24 @@ let run_durable_mutation t ~(scope:Sync.graph_scope) ~intent ~current =
     let existing()=Database.find_local_intent session.database ~namespace:(Mutation.namespace intent)
       ~mutation_id:(Mutation.mutation_id intent)in
     let matching prepared=Database.local_intent_payload prepared=payload in
+    let report error = if not t.stopped && current () then
+      report_worker_error (report_current_graph t scope) error in
+    let report_commit error = report (local_commit_error error) in
+    let report_read error = match typed_read_error error with
+      | Read.Db_error error -> report error | _ -> () in
     let reject error=Mutation.Rejected(local_commit_error error)in
     let prepare()=match existing()with
-      |Error _->Error Mutation.Unknown
+      |Error error->report_commit error; Error Mutation.Unknown
       |Ok(Some prepared)when matching prepared->Ok prepared
       |Ok(Some _)->Error(reject Overlay.Mutation_identity_conflict)
       |Ok None->
         let append_title=match intent with
           |Mutation.Append_intent append->
             (match Database.current_snapshot session.database with
-             |Error _->Error Mutation.Unknown
+             |Error error->report_read error; Error Mutation.Unknown
              |Ok snapshot->Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
                match Database.graph_info snapshot with
-               |Error _->Error Mutation.Unknown
+               |Error error->report_read error; Error Mutation.Unknown
                |Ok info->Ok(Some(journal_append_title info.journal_title_format
                   (Logseq_db_worker_contract.Worker_pure_day.value(Mutation.append_parameters append).day)))))
           |Mutation.Mutation_intent _->Ok None in
@@ -1903,14 +1939,18 @@ let run_durable_mutation t ~(scope:Sync.graph_scope) ~intent ~current =
             |Error(Overlay.Invalid_local_mutation _ as error)
             |Error(Overlay.Mutation_identity_conflict as error)->
               (match existing()with Ok(Some prepared)when matching prepared->Ok prepared|_->Error(reject error))
-            |Error _->Error Mutation.Unknown)in
+            |Error error->report_commit error; Error Mutation.Unknown)in
     match prepare()with
     |Error outcome->outcome
     |Ok prepared->
       if t.stopped || not(current())then Mutation.Unknown else
       match Database.commit_local_intent session.database prepared with
-      |Error _->(match Database.inspect_local_intent session.database prepared with
-        |Ok(Database.Intent_rejected error)->reject error|_->Mutation.Unknown)
+      |Error error->
+        report_commit error;
+        (match Database.inspect_local_intent session.database prepared with
+         | Ok(Database.Intent_rejected error)->reject error
+         | Error error->report_commit error; Mutation.Unknown
+         | Ok _->Mutation.Unknown)
       |Ok proof->Mutation.Committed(commit_proof(Database.intent_commit_outcome proof))
 ;;
 
@@ -1934,7 +1974,12 @@ let durable_mutation t ~scope ~intent ~current =
             Fun.protect ~finally:(fun()->
               Eio.Semaphore.release t.durable_slots;finish_writer t job)
               (fun()->
-                let outcome=try run_durable_mutation t ~scope ~intent ~current with _->Wire.Unknown in
+                let outcome=try run_durable_mutation t ~scope ~intent ~current with
+                  | Eio.Cancel.Cancelled _ -> Wire.Unknown
+                  | error ->
+                    if not t.stopped && current () then publish_failure (report_current_graph t scope)
+                      (exception_failure ~operation:"commitLocal" ~reason:"resourceFailed" error);
+                    Wire.Unknown in
                 ignore(Eio.Promise.try_resolve resolve outcome:bool)));
           submitted:=true);
         Eio.Promise.await promise)
@@ -2340,7 +2385,7 @@ let finish_local_retirement ?(on_diagnostic = fun _ -> ()) t scope deletion capt
       on_diagnostic (failure_detail ~source ~operation:"deleteMirror" ~reason:"persistenceFailed" ()); source)
     else Ok () in
   asset_unit ~on_failure:(fun failure ->
-    if failure <> Sync.Asset_cancelled then on_diagnostic (asset_failure_detail ~operation:"deleteMirror" failure))
+    if Sync.asset_failure_kind failure <> Sync.Asset_cancelled then on_diagnostic (asset_failure_detail ~operation:"deleteMirror" failure))
     ~on_diagnostic:(fun detail ->
       let module D = Logseq_db_types.Failure_diagnostic in
       on_diagnostic (D.of_source ~operation:"deleteMirror" ~reason:"cleanupFailed" (D.encode detail))) t ~scope
@@ -2595,7 +2640,7 @@ let handle_sync_worker_effect t = function
             let* () = match asset_call t ~scope (Sync.Prepare_graph_asset_deletion retirement) with
               | Ok (Sync.Asset_deletion_prepared actual) when actual=deletion -> Ok ()
               | Error error ->
-                if error <> Sync.Asset_cancelled then report (asset_failure_detail ~operation:"deleteMirror" error);
+                if Sync.asset_failure_kind error <> Sync.Asset_cancelled then report (asset_failure_detail ~operation:"deleteMirror" error);
                 Error (asset_failure_message error)
               | _ ->
                 report (failure_detail ~source:"Unexpected attachment retirement response." ~operation:"deleteMirror" ~reason:"invalidContent" ());
@@ -2709,8 +2754,19 @@ let handle_sync_worker_effect t = function
     let owned=Hashtbl.fold (fun (scope:Sync.graph_scope) id result ->
       if scope.account.user_id=account.user_id && scope.account.managed_sync_origin=account.managed_sync_origin
          && scope.account.account_generation=account.account_generation then (scope,id)::result else result) t.attachments [] in
-    List.iter (fun (scope,id)->ignore(close_database_by_id ~scope t id)) owned;
-    Ok (sync_result ())
+    let closed = List.fold_left (fun result (scope,id) ->
+      let next = try close_database_by_id ~scope t id with
+        | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
+        | error ->
+          let detail=exception_failure ~operation:"closeDatabase" ~reason:"closeFailed" error in
+          Error (diagnostic_error ~operation:"closeDatabase" ~reason:"closeFailed"
+            ~source:(Logseq_db_types.Failure_diagnostic.encode detail) ()) in
+      (match next with
+       | Ok () -> ()
+       | Error error -> report_worker_error
+           (fun signal -> t.dependencies.publish (Core.Diagnostic signal)) error);
+      match result with Error _ -> result | Ok () -> next) (Ok ()) owned in
+    Result.map (fun () -> sync_result ()) closed
   | Inspect_sync scope ->
     (match attached_session t scope with
      | None -> Error (effect_error "The overlay database is unavailable.")
@@ -2790,8 +2846,7 @@ let handle_sync_worker_effect t = function
                         ())
                  | Ok (Authoritative_applied commit) ->
                    (match Database.inspect_sync session.database with
-                    | Error _ ->
-                      Error (effect_error "The overlay Sync view is unavailable.")
+                    | Error error -> Error (sync_read_error error)
                     | Ok sync ->
                       Ok
                         (sync_result
@@ -2813,15 +2868,39 @@ let run_request t (type a) (request : a Core.runner_request)
   | Handle_sync_worker_effect worker_effect -> handle_sync_worker_effect t worker_effect
 ;;
 
+let request_operation : type a. a Core.runner_request -> string = function
+  | Core.Execute_request _ -> "workerOperation"
+  | Close_database _ -> "closeDatabase"
+  | Handle_sync_worker_effect worker_effect -> (match worker_effect with
+    | Sync.Inspect_mirror _ -> "inspectMirror" | Attach_graph _ -> "attachGraph"
+    | Inspect_sync _ -> "inspectSync" | Activate_snapshot _ -> "activateSnapshot"
+    | Apply_authoritative_batch _ -> "applyAuthoritative"
+    | Apply_outbox_transition _ -> "applyOutbox" | Detach_graph _ -> "closeDatabase"
+    | Reset_managed_account _ -> "resetAccount" | Delete_mirror _ -> "deleteMirror")
+;;
+
+let request_exception request error =
+  let operation = request_operation request in
+  let detail = exception_failure ~operation ~reason:"resourceFailed" error in
+  diagnostic_error ~operation ~reason:"resourceFailed"
+    ~source:(Logseq_db_types.Failure_diagnostic.encode detail) ()
+;;
+
+let post_worker_result : type a. t -> Core.ticket -> a Core.runner_request
+  -> (a, Core.effect_error) result -> unit = fun t ticket request result ->
+  let completion = match request with
+    | Core.Execute_request _ -> Core.Execute_request_completed (ticket, result)
+    | Close_database _ -> Core.Close_database_completed (ticket, result)
+    | Handle_sync_worker_effect _ -> Core.Sync_worker_effect_completed (ticket, result) in
+  t.post (Core.Runner_completed completion)
+;;
+
 let complete t ?writer (Core.Request (ticket, request)) =
   Fun.protect ~finally:(fun()->Option.iter(finish_writer t)writer)(fun()->
-    match request with
-    |Core.Execute_request _->let result=run_request t request in
-      t.post(Core.Runner_completed(Core.Execute_request_completed(ticket,result)))
-    |Close_database _->let result=run_request t request in
-      t.post(Core.Runner_completed(Core.Close_database_completed(ticket,result)))
-    |Handle_sync_worker_effect _->let result=run_request t request in
-      t.post(Core.Runner_completed(Core.Sync_worker_effect_completed(ticket,result))))
+    let result = try run_request t request with
+      | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
+      | error -> Error (request_exception request error) in
+    post_worker_result t ticket request result)
 ;;
 let worker_operation_scope t (Core.Request(_,request)) =
   match request with
@@ -2840,19 +2919,32 @@ let worker_operation_scope t (Core.Request(_,request)) =
      |Reset_managed_account _|Delete_mirror _->None)
 ;;
 let submit_worker t (Core.Request(ticket,request) as packed) =
-  let fork ?writer ()=
-    try t.dependencies.runtime.fork ~sw:t.sw(fun()->complete t ?writer packed)
-    with error->Option.iter(finish_writer t)writer;raise error in
+  let fork ?writer () =
+    let started = ref false in
+    try t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+      started := true; complete t ?writer packed)
+    with error ->
+      if !started then raise error;
+      Option.iter (finish_writer t) writer;
+      match error with
+      | Eio.Cancel.Cancelled _ -> raise error
+      | _ -> post_worker_result t ticket request (Error (request_exception request error)) in
   match worker_operation_scope t packed with
-  |None->fork()
-  |Some(scope,cleanup)->match reserve_writer ~cleanup t scope with
-    |Ok writer->fork ~writer ()
-    |Error message->let error=effect_error message in
-      let result=match request with
-        |Core.Execute_request _->Core.Execute_request_completed(ticket,Error error)
-        |Close_database _->Core.Close_database_completed(ticket,Error error)
-        |Handle_sync_worker_effect _->Core.Sync_worker_effect_completed(ticket,Error error) in
-      t.post(Core.Runner_completed result)
+  | None -> fork ()
+  | Some(scope,cleanup) -> match reserve_writer ~cleanup t scope with
+    | Ok writer -> fork ~writer ()
+    | Error message -> post_worker_result t ticket request (Error (effect_error message))
+;;
+
+let rec upload_failure = function
+  | Sync.Asset_with_cause (failure, _) -> upload_failure failure
+  | Asset_network -> Upload.Network
+  | Asset_authentication | Asset_locked -> Authentication
+  | Asset_missing_source | Asset_not_found -> Missing_source
+  | Asset_size_rejected -> Size_rejected
+  | Asset_revoked_access -> Revoked_access
+  | Asset_checksum_mismatch | Asset_storage_full | Asset_cancelled
+  | Asset_invalid_content _ -> Invalid_content
 ;;
 
 let run_upload t (context : Sync.asset_context) instruction =
@@ -2974,20 +3066,10 @@ let run_upload t (context : Sync.asset_context) instruction =
            on_diagnostic ticket (failure_detail ~operation:"assetUpload" ~reason:"invalidContent" ());
            Error Upload.Invalid_content
          | Error failure ->
-           if current ticket && failure <> Sync.Asset_cancelled then
+           if current ticket && Sync.asset_failure_kind failure <> Sync.Asset_cancelled then
              on_diagnostic ticket (Option.value !detail
                ~default:(asset_failure_detail ~operation:"assetUpload" failure));
-           Error
-             (match failure with
-              | Sync.Asset_network -> Upload.Network
-              | Asset_authentication | Asset_locked -> Authentication
-              | Asset_missing_source | Asset_not_found -> Missing_source
-              | Asset_size_rejected -> Size_rejected
-              | Asset_revoked_access -> Revoked_access
-              | Asset_checksum_mismatch
-              | Asset_storage_full
-              | Asset_cancelled
-              | Asset_invalid_content _ -> Invalid_content))
+           Error (upload_failure failure))
         Upload.Put_succeeded)
   | Await_publication (ticket, intent) ->
     let rec await () =
@@ -3039,7 +3121,8 @@ let submit_upload t (context : Sync.asset_context) instruction =
          with error->Hashtbl.remove t.upload_operations ticket;finish_writer t job;raise error))
 ;;
 
-let transfer_failure = function
+let rec transfer_failure = function
+  | Sync.Asset_with_cause (failure, _) -> transfer_failure failure
   | Sync.Asset_network -> Logseq_sync_pure_reducer.Asset_transfer.Network
   | Asset_not_found | Asset_missing_source -> Not_found
   | Asset_checksum_mismatch -> Checksum_mismatch
@@ -3136,7 +3219,11 @@ let release_orphan_work t work =
   let result=try Eio.Cancel.protect(fun()->
     release_asset_file_result t ~scope:resource.scope ~handle:resource.handle
       ~report_failure:(Core.Orphan_cleanup.first_attempt work))
-    with _->Error "Attachment cleanup was interrupted." in
+    with error ->
+      let detail=exception_failure ~operation:"assetRelease" ~reason:"cleanupFailed" error in
+      if Core.Orphan_cleanup.first_attempt work then
+        publish_failure (report_current_graph t resource.scope) detail;
+      Error (Logseq_db_types.Failure_diagnostic.message detail) in
   t.orphan_cleanup<-Core.Orphan_cleanup.completed t.orphan_cleanup work result;
   let key=resource.scope,resource.handle in
   let waiters=Option.value(Hashtbl.find_opt t.resource_release_waiters key)~default:[] in
@@ -3440,11 +3527,15 @@ let run_asset t (context : Sync.asset_context) instruction =
       | Ok Sync.Asset_retry_elapsed when not t.stopped ->
         t.post (Core.Asset_completed (context.scope, Transfer.Retry_elapsed id))
       | Error Sync.Asset_cancelled -> ()
-      | Ok _ | Error _ ->
+      | (Ok _ | Error _) as result ->
         (match t.latest_snapshot with
          | Some snapshot when not t.stopped
              && snapshot.startup.account_generation=context.scope.account.account_generation
              && snapshot.startup.graph_generation=context.scope.graph_generation ->
+           (match result with
+            | Error failure -> report_asset_failure t context.scope "assetDownload" failure
+            | Ok _ -> publish_failure (report_current_graph t context.scope)
+                (failure_detail ~operation:"assetDownload" ~reason:"invalidContent" ()));
            t.dependencies.publish (Core.Diagnostic "asset.retryTimer")
          | _ -> ()))
   | Notify _ | Backpressure _ | Capacity_available -> ()
@@ -3688,7 +3779,7 @@ let prepare_import_unlocked
         with
         | Ok (Sync.Asset_staged { file; checksum; size }) -> Ok (file, checksum, size)
         | Error failure ->
-          if failure <> Sync.Asset_cancelled then
+          if Sync.asset_failure_kind failure <> Sync.Asset_cancelled then
             on_diagnostic (Option.value !detail ~default:(asset_failure_detail ~operation:"assetMetadata" failure));
           Error (asset_failure_message failure)
         | Ok _ -> source_error "invalidContent" (Error "Unexpected staging completion")

@@ -193,3 +193,25 @@ let connect_diagnosed ~on_diagnostic ~sw ~authenticator ~network ~clock ~host ~p
 let connect ~sw ~authenticator ~network ~clock ~host ~port =
   connect_diagnosed ~on_diagnostic:(fun _ -> ()) ~sw ~authenticator ~network ~clock ~host ~port
 ;;
+
+(* Only finite TLS alert constructors and classified exception identities cross
+   the transport boundary; certificate names, payloads and socket paths do not. *)
+let transport_failure ~operation:operation_name error =
+  let alert_name = function
+    | Tls.Packet.UNKNOWN _ -> "unknown"
+    | alert -> Tls.Packet.alert_type_to_string alert in
+  let source = match error with
+    | Tls_eio.Tls_alert alert -> "TLS alert: " ^ alert_name alert
+    | Tls_eio.Tls_failure failure ->
+      let _, alert = Tls.Engine.alert_of_failure failure in
+      "TLS failure: " ^ alert_name alert
+    | Eio.Io (Eio.Net.E (Eio.Net.Connection_failure (Eio.Net.Refused _)), _) ->
+      "Unix.Unix_error(Unix.ECONNREFUSED,,)"
+    | Eio.Io (Eio.Net.E (Eio.Net.Connection_failure Eio.Net.Timeout), _) ->
+      "Unix.Unix_error(Unix.ETIMEDOUT,,)"
+    | Eio.Io (Eio.Net.E (Eio.Net.Connection_reset _), _) ->
+      "Unix.Unix_error(Unix.ECONNRESET,,)"
+    | error -> Printexc.to_string error in
+  Logseq_db_types.Failure_diagnostic.(
+    of_source ~operation:operation_name ~reason:"networkFailed" source |> encode)
+;;

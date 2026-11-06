@@ -3,6 +3,7 @@ type send_result =
   | Full
   | Not_ready
   | Stopping
+  | Refused of Logseq_db_worker.Error.t
 
 type delivery =
   { responses : Journal_graph_runtime.response list

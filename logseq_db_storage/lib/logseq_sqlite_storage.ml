@@ -109,14 +109,61 @@ let verify_writable_pragmas db =
     "NORMAL"
 ;;
 
+(* Keep address/path/value text inside storage; expose only the typed stage and
+   the bounded source classification across the existing string boundary. *)
+let diagnostic_error ~operation error =
+  let reason,source=match error with
+    | Pragma_mismatch s -> "pragmaMismatch",s
+    | Corrupt_storage s -> "storageCorrupt",s
+    | Begin_failed s -> "storageBeginFailed",s
+    | Write_failed{message;_} -> "storageWriteFailed",message
+    | Commit_failed s -> "storageCommitFailed",s
+    | Checkpoint_failed s -> "storageCheckpointFailed",s
+    | Close_failed s -> "storageCloseFailed",s in
+  Logseq_db_types.Failure_diagnostic.of_source ~operation ~reason source
+  |> Logseq_db_types.Failure_diagnostic.encode
+;;
+
+let commit_stage_error reason source =
+  Commit_failed
+    (Logseq_db_types.Failure_diagnostic.of_source ~operation:"workerOperation" ~reason source
+     |> Logseq_db_types.Failure_diagnostic.encode)
+;;
+
+let exception_source exn =
+  match exn with
+  | Invalid_argument source | Failure source
+    when Option.is_some (Logseq_db_types.Failure_diagnostic.decode source) -> source
+  | _ -> Printexc.to_string exn
+;;
+
+let map_error_source f = function
+  | Pragma_mismatch source -> Pragma_mismatch (f source)
+  | Corrupt_storage source -> Corrupt_storage (f source)
+  | Begin_failed source -> Begin_failed (f source)
+  | Write_failed { address; message } -> Write_failed { address; message = f message }
+  | Commit_failed source -> Commit_failed (f source)
+  | Checkpoint_failed source -> Checkpoint_failed (f source)
+  | Close_failed source -> Close_failed (f source)
+;;
+
+let rollback_preserving callbacks error =
+  try callbacks.rollback (); Error error with
+  | exn ->
+    let module D = Logseq_db_types.Failure_diagnostic in
+    let primary = D.of_source ~operation:"workerOperation" ~reason:"persistenceFailed"
+        (diagnostic_error ~operation:"workerOperation" error) in
+    let secondary = D.of_source ~operation:"workerOperation" ~reason:"storageRollbackFailed"
+        (exception_source exn) in
+    let source = D.with_related primary secondary |> D.encode in
+    Error (map_error_source (fun _ -> source) error)
+;;
+
 let commit_batch ?outbox_delta callbacks batch =
   match callbacks.begin_immediate () with
   | Error message -> Error (Begin_failed message)
   | Ok () ->
-    let rollback error =
-      callbacks.rollback ();
-      Error error
-    in
+    let rollback = rollback_preserving callbacks in
     let rec write_all = function
       | [] -> Ok ()
       | write :: rest ->
@@ -133,7 +180,7 @@ let commit_batch ?outbox_delta callbacks batch =
          | Some metadata -> callbacks.upsert_sync_metadata metadata
        in
        (match metadata with
-        | Error message -> rollback (Commit_failed message)
+        | Error message -> rollback (commit_stage_error "storageMetadataFailed" message)
         | Ok () ->
           let outbox =
             match outbox_delta, batch.sync_outbox with
@@ -142,7 +189,7 @@ let commit_batch ?outbox_delta callbacks batch =
             | None, Some records -> callbacks.replace_sync_outbox records
           in
           (match outbox with
-           | Error message -> rollback (Commit_failed message)
+           | Error message -> rollback (commit_stage_error "storageOutboxFailed" message)
            | Ok () ->
              let receipts =
                match batch.mutation_receipts with
@@ -150,7 +197,7 @@ let commit_batch ?outbox_delta callbacks batch =
                | Some rows -> callbacks.upsert_mutation_receipts rows
              in
              (match receipts with
-              | Error message -> rollback (Commit_failed message)
+              | Error message -> rollback (commit_stage_error "storageMutationReceiptFailed" message)
               | Ok () ->
                 let terminal_receipts =
                   match batch.terminal_batch_receipts with
@@ -158,7 +205,7 @@ let commit_batch ?outbox_delta callbacks batch =
                   | Some rows -> callbacks.upsert_terminal_batch_receipts rows
                 in
                 (match terminal_receipts with
-                 | Error message -> rollback (Commit_failed message)
+                 | Error message -> rollback (commit_stage_error "storageTerminalReceiptFailed" message)
                  | Ok () ->
                    (match callbacks.commit () with
                     | Ok () -> Ok ()
@@ -177,6 +224,7 @@ let commit_sync_metadata callbacks metadata =
 ;;
 
 let unreachable_addresses (callbacks : callbacks) =
+  try
   let storage = callbacks.storage in
   let reachable = Hashtbl.create 256 in
   let rec visit address =
@@ -209,6 +257,7 @@ let unreachable_addresses (callbacks : callbacks) =
       List.filter (fun address -> not (Hashtbl.mem reachable address)) addresses
     in
     Ok (Hashtbl.length reachable, addresses, unreachable)
+  with exn -> Error (Corrupt_storage (exception_source exn))
 ;;
 
 let garbage_stats callbacks =
@@ -233,10 +282,7 @@ let collect_garbage (callbacks : callbacks) =
       match callbacks.begin_immediate () with
       | Error message -> Error (Begin_failed message)
       | Ok () ->
-        let rollback error =
-          callbacks.rollback ();
-          Error error
-        in
+        let rollback = rollback_preserving callbacks in
         (match
            try
              callbacks.storage.storage_delete unreachable;
@@ -253,15 +299,19 @@ let collect_garbage (callbacks : callbacks) =
 ;;
 
 let checkpoint callbacks =
-  match callbacks.checkpoint () with
-  | Ok () -> Ok ()
-  | Error message -> Error (Checkpoint_failed message)
+  try
+    match callbacks.checkpoint () with
+    | Ok () -> Ok ()
+    | Error message -> Error (Checkpoint_failed message)
+  with exn -> Error (Checkpoint_failed (exception_source exn))
 ;;
 
 let close callbacks =
-  match callbacks.close () with
-  | Ok () -> Ok ()
-  | Error message -> Error (Close_failed message)
+  try
+    match callbacks.close () with
+    | Ok () -> Ok ()
+    | Error message -> Error (Close_failed message)
+  with exn -> Error (Close_failed (exception_source exn))
 ;;
 
 let rc_result db rc =
@@ -359,7 +409,7 @@ let open_database path =
                     Logseq_sqlite_codec.decode_physical_payload ~content ~addresses
                   with
                   | Ok payload -> Some payload
-                  | Error _ -> invalid_arg ("invalid storage payload at " ^ address))
+                  | Error error -> invalid_arg (Logseq_sqlite_codec.diagnostic_error error))
                | DONE -> None
                | rc ->
                  Sqlite3.Rc.check rc;
@@ -473,14 +523,7 @@ let open_database path =
             (match encoded with
              | Error error ->
                Error
-                 (match error with
-                  | Unsupported_tag tag ->
-                    "unable to encode staged physical storage batch: unsupported tag "
-                    ^ tag
-                  | Malformed_transit message
-                  | Out_of_range_number message
-                  | Malformed_storage_payload message ->
-                    "unable to encode staged physical storage batch: " ^ message)
+                 (Logseq_sqlite_codec.diagnostic_error error)
              | Ok encoded ->
                Ok
                  { writes =
@@ -556,7 +599,7 @@ let open_database path =
           ; upsert_terminal_batch_receipts =
               Mutation_receipt_store.upsert_terminal_batches sqlite
           ; commit = exec "COMMIT"
-          ; rollback = (fun () -> ignore (Sqlite3.exec sqlite "ROLLBACK"))
+          ; rollback = (fun () -> Sqlite3.Rc.check (Sqlite3.exec sqlite "ROLLBACK"))
           ; unreachable_address_count =
               (fun () ->
                 match unreachable_address_count_sql with
@@ -592,7 +635,7 @@ let open_database path =
         in
         Ok { sqlite; storage; callbacks })
   with
-  | exn -> Error (Begin_failed (Printexc.to_string exn))
+  | exn -> Error (Begin_failed (exception_source exn))
 ;;
 
 let datascript_storage connection = connection.storage
@@ -601,6 +644,7 @@ let verify_connection_pragmas connection = verify_writable_pragmas connection.sq
 
 let startup_metadata connection =
   let corrupt message = Error (Corrupt_storage message) in
+  try
   match
     ( connection.storage.storage_restore Datascript.Storage.root_address
     , connection.storage.storage_restore Datascript.Storage.tail_address )
@@ -621,6 +665,7 @@ let startup_metadata connection =
   | Some (Storage_root _), None -> corrupt "storage tail address 1 is missing"
   | Some _, _ -> corrupt "storage root address 0 has the wrong payload"
   | None, _ -> corrupt "storage root address 0 is missing"
+  with exn -> corrupt (exception_source exn)
 ;;
 
 let sync_metadata connection = Sync_checkpoint_store.read_database connection.sqlite
@@ -662,10 +707,10 @@ let validate_storage_header connection =
           | Some (Datascript.Storage_tail _) -> Ok ()
           | Some _ -> corrupt "storage tail address 1 has the wrong payload"
           | None -> corrupt "storage tail address 1 is missing")
-       | Ok (Datascript.Storage_root _), Error _ ->
-         corrupt "storage root index metadata is malformed"
+       | Ok (Datascript.Storage_root _), Error error ->
+         corrupt (Logseq_sqlite_codec.diagnostic_error error)
        | Ok _, _ -> corrupt "storage root address 0 has the wrong payload"
-       | Error _, _ -> corrupt "storage root metadata is malformed")
+       | Error error, _ -> corrupt (Logseq_sqlite_codec.diagnostic_error error))
   with
   | Invalid_argument message -> corrupt message
   | exn -> corrupt (Printexc.to_string exn)
@@ -683,19 +728,4 @@ let restore_database connection =
      with
      | Invalid_argument message -> corrupt message
      | exn -> corrupt (Printexc.to_string exn))
-;;
-
-(* Keep address/path/value text inside storage; expose only the typed stage and
-   the bounded source classification across the existing string boundary. *)
-let diagnostic_error ~operation error =
-  let reason,source=match error with
-    | Pragma_mismatch s -> "pragmaMismatch",s
-    | Corrupt_storage s -> "storageCorrupt",s
-    | Begin_failed s -> "storageBeginFailed",s
-    | Write_failed{message;_} -> "storageWriteFailed",message
-    | Commit_failed s -> "storageCommitFailed",s
-    | Checkpoint_failed s -> "storageCheckpointFailed",s
-    | Close_failed s -> "storageCloseFailed",s in
-  Logseq_db_types.Failure_diagnostic.of_source ~operation ~reason source
-  |> Logseq_db_types.Failure_diagnostic.encode
 ;;

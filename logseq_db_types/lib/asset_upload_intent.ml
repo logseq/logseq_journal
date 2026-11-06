@@ -173,7 +173,12 @@ let decode payload =
         Json_codec.decode
           checkpoint_of_yojson
           (Yojson.Safe.from_string payload)
-        |> Result.map_error (fun _ -> "Upload checkpoint shape is invalid")
+        |> Result.map_error (fun source ->
+          let diagnostic = Failure_diagnostic.of_source
+              ~operation:"restoreUploads" ~reason:"invalidContent" source in
+          if Failure_diagnostic.source_class diagnostic = "unknown"
+          then "Upload checkpoint shape is invalid"
+          else Failure_diagnostic.encode diagnostic)
       in
       if value.format_version <> 1
       then Error "Unsupported upload checkpoint format"

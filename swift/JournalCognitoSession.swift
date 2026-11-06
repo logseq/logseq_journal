@@ -45,9 +45,15 @@ import OSLog
     let value = try await storage.load()
     try check(version, network: network)
     if let value {
-      guard value.issuer == configuration.issuer, value.clientID == configuration.clientID,
-        !value.userID.isEmpty, !value.idToken.isEmpty, !value.accessToken.isEmpty, !value.refreshToken.isEmpty
-      else { throw JournalCognitoError.invalidToken }
+      func invalid(_ reason: JournalAccountDiagnostic.Reason) -> JournalCognitoFailure {
+        JournalCognitoFailure(category: .invalidToken, detail: .init(source: .sessionRestore, reason: reason))
+      }
+      guard value.issuer == configuration.issuer else { throw invalid(.issuerMismatch) }
+      guard value.clientID == configuration.clientID else { throw invalid(.audienceMismatch) }
+      guard !value.userID.isEmpty else { throw invalid(.subjectInvalid) }
+      guard !value.idToken.isEmpty else { throw invalid(.idTokenMissing) }
+      guard !value.accessToken.isEmpty else { throw invalid(.accessTokenMissing) }
+      guard !value.refreshToken.isEmpty else { throw invalid(.refreshTokenMissing) }
     }
     // A concurrent restore may have completed a refresh or sign-in already.
     if !loaded { tokens = value; loaded = true }
@@ -212,7 +218,8 @@ import OSLog
       if JournalCognitoFailure.category(of: error) != nil { throw error }
       let prior = JournalAccountIssue.classify(error, stage: .identityLookup)
       throw JournalCognitoFailure(category: .request, detail: .init(source: source,
-        reason: .transport, urlCode: prior.nativeDetail?.urlCode, osStatus: prior.nativeDetail?.osStatus),
+        reason: .transport, urlCode: prior.nativeDetail?.urlCode, osStatus: prior.nativeDetail?.osStatus,
+        causes: JournalAccountDiagnostic.Cause.chain(error)),
         accountKind: prior.kind)
     }
   }
@@ -242,7 +249,8 @@ import OSLog
     }
     do { return try JSONDecoder().decode(JournalCognitoTokenResponse.self, from: data) }
     catch {
-      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .token, reason: .responseShape, httpStatus: response.statusCode))
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .token, reason: .responseShape, httpStatus: response.statusCode,
+        causes: JournalAccountDiagnostic.Cause.chain(error)))
     }
   }
   private func validate(_ response: JournalCognitoTokenResponse, nonce: String?, previous: JournalCognitoTokens?) async throws -> JournalCognitoTokens {
@@ -261,13 +269,16 @@ import OSLog
     let validator: JournalCognitoTokenValidator
     do { validator = try JournalCognitoTokenValidator(jwks: data) }
     catch {
-      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .jwks, reason: .responseShape, httpStatus: http.statusCode))
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .jwks, reason: .responseShape, httpStatus: http.statusCode,
+        causes: JournalAccountDiagnostic.Cause.chain(error)))
     }
     do {
       return try validator.validate(response, configuration: configuration,
         nonce: nonce, previous: previous, now: now())
     } catch {
-      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .tokenValidation, reason: .verificationFailed))
+      if let failure = error as? JournalCognitoFailure { throw failure }
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .tokenValidation, reason: .verificationFailed,
+        causes: JournalAccountDiagnostic.Cause.chain(error)))
     }
   }
 }

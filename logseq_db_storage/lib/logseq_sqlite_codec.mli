@@ -43,3 +43,6 @@ val encode_physical_batch
   -> ?metadata:root_index_metadata
   -> (Datascript.storage_address * Datascript.storage_payload) list
   -> (physical_entry list, error) result
+
+(** Preserve the typed codec category without retaining input values or tags. *)
+val diagnostic_error : error -> string

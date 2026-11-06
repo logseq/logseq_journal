@@ -95,6 +95,7 @@ try:
       try: conn.sendall(wire[offset:offset+step])
       except (ssl.SSLError, OSError): break
       if step<32: time.sleep(.0005)
+    if case.get('corrupt_tls'): os.write(conn.fileno(), b'\x17\x03\x03\x00\x20' + bytes(32))
     with open(root+'/sent','w') as f: f.write('sent')
     if case.get('eof'):
       if case.get('reset'): conn.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack('ii',1,0))
@@ -432,7 +433,7 @@ let asset_collect t core posted =
   collect core [] posted
 ;;
 
-let asset_run t ~clock ~posted core scope operation action =
+let asset_run ?(with_cause = false) t ~clock ~posted core scope operation action =
   let core = asset_current_core t core scope in
   posted := [];
   let transition = Core.step core (Core.Asset_requested { scope; operation; action }) in
@@ -460,7 +461,8 @@ let asset_run t ~clock ~posted core scope operation action =
       outputs)
   in
   match outputs with
-  | [ output ] -> output.Core.result
+  | [ output ] -> if with_cause then output.Core.result
+    else Result.map_error Core.asset_failure_kind output.Core.result
   | _ -> Alcotest.fail "asset request did not publish exactly one typed outcome"
 ;;
 
@@ -1968,7 +1970,7 @@ let asset_upload ~status ~refresh () =
       let clock = Eio.Stdenv.clock environment in
       let file = asset_stage runner ~clock ~posted selected.next scope source_file in
       let result =
-        asset_run
+        asset_run ~with_cause:true
           runner
           ~clock
           ~posted
@@ -1985,7 +1987,7 @@ let asset_upload ~status ~refresh () =
         | 413 -> Error Core.Asset_size_rejected
         | _ -> Error Core.Asset_network
       in
-      Alcotest.(check bool) "explicit upload result" true (result = expected);
+      Alcotest.(check bool) "explicit upload result" true (Result.map_error Core.asset_failure_kind result = expected);
       (match status, !diagnostics with
        | 200, [] -> ()
        | 200, _ -> Alcotest.fail "successful retry must not emit a failure diagnostic"
@@ -1993,6 +1995,11 @@ let asset_upload ~status ~refresh () =
          Alcotest.(check string) "finite diagnostic operation" "assetUpload" operation;
          Alcotest.(check string) "exact request identity" "upload" request_operation;
          let module D = Logseq_db_types.Failure_diagnostic in
+         let result_cause = match result with
+           | Error failure -> Core.asset_failure_cause failure
+           | Ok _ -> None in
+         Alcotest.(check (option string)) "typed completion preserves exact diagnostic"
+           (Some (D.encode detail)) (Option.map D.encode result_cause);
          Alcotest.(check bool) "safe numeric HTTP status survives" true
            (String.ends_with ~suffix:(Printf.sprintf "(http=%d)." status) (D.message detail));
          Alcotest.(check bool) "source status preserved by strict carrier" true
@@ -3428,7 +3435,7 @@ type socket_peaks =
   ; mutable attempts : int
   }
 
-let metered_network ?(fail_first = false) network peaks =
+let metered_network ?(fail_first = false) ?(before_read = fun () -> ()) network peaks =
   let module Socket = struct
     type t =
       { flow : [ `Generic | `Unix ] Eio.Net.stream_socket_ty Eio.Resource.t
@@ -3441,7 +3448,11 @@ let metered_network ?(fail_first = false) network peaks =
       ]
 
     let read_methods = []
-    let single_read t = Eio.Flow.single_read t.flow
+    let single_read t buffer =
+      before_read ();
+      let count = Eio.Flow.single_read t.flow buffer in
+      before_read ();
+      count
     let single_write t = Eio.Flow.single_write t.flow
     let copy t ~src = Eio.Flow.copy src t.flow
     let shutdown t = Eio.Flow.shutdown t.flow
@@ -4203,7 +4214,7 @@ let scenarios = scenarios @
 ;;
 
 
-let test_external_http_contract kind ~success body () =
+let test_external_http_contract ?expected_error kind ~success body () =
   ignore
     (with_peer
        [ case (unlock_json_wire body) ]
@@ -4270,7 +4281,13 @@ let test_external_http_contract kind ~success body () =
                       | Core.Runner_completed (Core.Completion (_, result)) ->
                         Result.is_ok result
                       | _ -> false)
-                    !posted)))
+                    !posted);
+               Option.iter (fun expected ->
+                 let actual = List.find_map (function
+                   | Core.Runner_completed (Core.Completion (_, Error (Core.Effect_failed message | Core.Crypto_failed (_, message)))) -> Some message
+                   | _ -> None) !posted in
+                 Alcotest.(check (option string)) "safe decoder field cause reaches caller"
+                   (Some expected) actual) expected_error))
      : Yojson.Basic.t)
 ;;
 
@@ -4797,4 +4814,122 @@ end
 let scenarios=scenarios @ [Alcotest.test_case
   "resident real TLS channels keep hidden pull and retirement independent"
   `Quick Resident_network_fixture.run]
+;;
+
+(* The peer close status is owned by frame transport; a reducer receives only
+   the already-decoded termination and cannot reproduce loss of this status. *)
+let test_websocket_close_retains_status () =
+  List.iter (fun code ->
+    let payload = String.init 2 (function
+      | 0 -> Char.chr (code lsr 8) | _ -> Char.chr (code land 255))
+      ^ "PRIVATE_GRAPH_CONTENT" in
+    let report = with_peer [case ~ws:true (frame 8 payload)]
+      (fun ~environment ~sw ~support ~origin ->
+        let posted = ref [] and invalidations = ref 0 in
+        let t = runner ~environment ~sw ~support ~posted ~invalidations () in
+        Runner.submit t (websocket_start origin);
+        let closed () = List.find_map (function
+          | Core.Websocket_closed (_, reason) -> Some reason | _ -> None) !posted in
+        wait (Eio.Stdenv.clock environment) (fun () -> Option.is_some (closed ()));
+        let message = match Option.get (closed ()) with
+          | Core.Protocol_failure message -> Some message
+          | Core.Recoverable_close {message; _} -> message
+          | _ -> None in
+        Alcotest.(check (option string)) "close code survives without peer reason text"
+          (Some (Printf.sprintf "WebSocket peer closed with status %d" code)) message;
+        Runner.shutdown t) in
+    check_retired report) [1000;1008;1011]
+;;
+let scenarios = scenarios @ [Alcotest.test_case
+  "WebSocket peer close retains status" `Quick test_websocket_close_retains_status]
+;;
+
+(* The fault occurs after TLS setup in the real transport owner. A reducer only
+   receives its completed error and cannot reproduce loss of errno/TLS status. *)
+let test_transport_runtime_cause ~websocket error expected () =
+  let armed = ref false and injected = ref false in
+  let peaks = {sockets=0;socket_peak=0;dials=0;dial_peak=0;owner_peak=0;attempts=0} in
+  let wire = if websocket then frame 9 "probe"
+    else response ~headers:"Content-Length: 8192\r\n" (String.make 8192 'x') in
+  let config = case ~ws:websocket ~segment:16 wire in
+  let config = if websocket then match config with
+    | `Assoc fields -> `Assoc (("frame_delay", `Float 0.05) :: fields) | _ -> config
+    else config in
+  let report = with_peer [config]
+    (fun ~environment ~sw ~support ~origin ->
+      let network = metered_network (Eio.Stdenv.net environment) peaks
+        ~before_read:(fun () -> if !armed then (injected := true; raise error)) in
+      let posted = ref [] and invalidations = ref 0 in
+      let t = runner ~network ~environment ~sw ~support ~posted ~invalidations
+        ~on_post:(function
+          | Core.Websocket_opened _ when websocket -> armed := true
+          | Core.Snapshot_download_progress {received_bytes; _}
+            when not websocket && received_bytes > 0L -> armed := true
+          | _ -> ()) () in
+      Runner.submit t (if websocket then websocket_start origin else operation ~download:true origin);
+      let failure () = List.find_map (function
+        | Core.Websocket_closed (_, Core.Recoverable_close {message; _}) -> message
+        | Core.Runner_completed (Core.Completion (_, Error (Core.Effect_failed message))) -> Some message
+        | _ -> None) !posted in
+      wait (Eio.Stdenv.clock environment) (fun () -> Option.is_some (failure ()));
+      Alcotest.(check bool) "failure occurred after transport setup" true !injected;
+      let module D = Logseq_db_types.Failure_diagnostic in
+      let source = Option.get (failure ()) in
+      let actual = Option.map D.message (D.decode source) in
+      let operation = if websocket then "websocketTransport" else "httpTransport" in
+      let expected = D.of_source ~operation ~reason:"networkFailed" expected in
+      Alcotest.(check (option string)) "transport retains bounded concrete cause"
+        (Some (D.message expected)) actual;
+      Runner.shutdown t) in
+  check_retired report
+;;
+let scenarios = scenarios @ List.concat_map (fun websocket ->
+  let prefix = if websocket then "WebSocket" else "HTTP" in
+  [ Alcotest.test_case (prefix ^ " runtime preserves errno") `Quick
+      (test_transport_runtime_cause ~websocket
+        (Unix.Unix_error (Unix.EACCES, "PRIVATE_OPERATION", "PRIVATE_PATH"))
+        "Unix.Unix_error(Unix.EACCES,PRIVATE_OPERATION,PRIVATE_PATH)")
+  ]) [false;true]
+;;
+
+let test_transport_tls_cause websocket () =
+  let config = match case ~ws:websocket "" with
+    | `Assoc fields -> `Assoc (("corrupt_tls", `Bool true) :: fields)
+    | _ -> assert false in
+  let report = with_peer [config] (fun ~environment ~sw ~support ~origin ->
+    let posted = ref [] and invalidations = ref 0 in
+    let t = runner ~environment ~sw ~support ~posted ~invalidations () in
+    Runner.submit t (if websocket then websocket_start origin else operation ~download:false origin);
+    let failure () = List.find_map (function
+      | Core.Websocket_closed (_, Core.Recoverable_close {message; _}) -> message
+      | Core.Runner_completed (Core.Completion (_, Error (Core.Effect_failed message))) -> Some message
+      | _ -> None) !posted in
+    wait (Eio.Stdenv.clock environment) (fun () -> Option.is_some (failure ()));
+    let module D = Logseq_db_types.Failure_diagnostic in
+    let actual = Option.map D.message (D.decode (Option.get (failure ()))) in
+    let operation = if websocket then "websocketTransport" else "httpTransport" in
+    let expected = D.of_source ~operation ~reason:"networkFailed" "TLS failure: bad record mac" in
+    Alcotest.(check (option string)) "TLS record authentication cause survives transport"
+      (Some (D.message expected)) actual;
+    Runner.shutdown t) in
+  check_retired report
+;;
+let scenarios = scenarios @ [
+  Alcotest.test_case "HTTP runtime preserves TLS record cause" `Quick (test_transport_tls_cause false);
+  Alcotest.test_case "WebSocket runtime preserves TLS record cause" `Quick (test_transport_tls_cause true)]
+;;
+
+let scenarios = scenarios @ [
+  Alcotest.test_case "graph key decoder preserves field cause" `Quick
+    (test_external_http_contract `Graph_key ~success:false
+      ~expected_error:"E2EE graph key response: field encrypted-aes-key is missing or has an invalid type"
+      {|{"encrypted-aes-key":false,"PRIVATE_FIELD":"PRIVATE_CONTENT"}|});
+  Alcotest.test_case "user keys decoder preserves field cause" `Quick
+    (test_external_http_contract `User_keys ~success:false
+      ~expected_error:"E2EE user keys response: field encrypted-private-key is missing or has an invalid type"
+      {|{"public-key":"PRIVATE_KEY","encrypted-private-key":false}|});
+  Alcotest.test_case "catalog decoder preserves nested field cause" `Quick
+    (test_external_http_contract `Catalog ~success:false
+      ~expected_error:"graph catalog: field graph-name is missing or has an invalid type"
+      {|{"graphs":[{"graph-id":"11111111-1111-4111-8111-111111111111","graph-name":false,"graph-ready-for-use?":true}]}|})]
 ;;

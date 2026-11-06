@@ -33,7 +33,7 @@ let phase = function
   | W.Confirmed _ -> 3
 let reply = function
   | W.Not_admitted _ -> 0
-  | W.Interrupted (W.Cancelled | W.Transport_lost | W.Worker_stopped) -> 1
+  | W.Interrupted (W.Cancelled | W.Transport_lost _ | W.Worker_stopped) -> 1
   | W.Answered (Error _) -> 2
   | W.Answered (Ok progress) -> phase progress
 """,
@@ -103,7 +103,7 @@ let journal view (ticket : W.page option C.ticket) session budget =
   | Some (W.Answered (Ok None)) -> `Empty
   | Some (W.Not_admitted (W.Full | W.Not_ready | W.Stopping)) -> `Retry
   | Some (W.Not_admitted (W.Unsupported_request operation)) -> `Unsupported operation
-  | Some (W.Interrupted (W.Cancelled | W.Transport_lost | W.Worker_stopped)) -> `Interrupted
+  | Some (W.Interrupted (W.Cancelled | W.Transport_lost _ | W.Worker_stopped)) -> `Interrupted
   | Some (W.Answered (Error error)) -> `Error error
 let rows (slice : W.block W.slice) =
   List.map (fun block -> W.block_uuid block, W.block_title block) slice.items

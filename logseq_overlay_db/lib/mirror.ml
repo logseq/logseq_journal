@@ -172,9 +172,9 @@ let close_storage staged =
     | Ok () ->
       staged.storage_closed <- true;
       Ok ()
-    | Error _ ->
+    | Error error ->
       Printf.eprintf "journal: phase=cleanup operation=closeSnapshotStorage code=closePending recovery=reopen\n%!";
-      Error "snapshot storage cannot be closed")
+      Error (Storage.diagnostic_error ~operation:"activateSnapshot" error))
 ;;
 
 let initialize_plaintext_table sqlite =

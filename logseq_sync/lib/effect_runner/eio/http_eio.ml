@@ -23,9 +23,7 @@ let exception_message = function
   | Transport_error message -> message
   | End_of_file -> "premature HTTP EOF"
   | Eio.Time.Timeout -> "HTTP transport timed out"
-  | Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _ -> "TLS transport terminated"
-  | Sys_error _ | Unix.Unix_error _ -> "transport file or socket operation failed"
-  | _ -> "HTTP transport failed"
+  | error -> Tls_client_eio.transport_failure ~operation:"httpTransport" error
 ;;
 
 let tls_stream_socket flow =

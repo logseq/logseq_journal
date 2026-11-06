@@ -1179,13 +1179,15 @@ let back_state state =
   { state with routes; timeline }
 ;;
 
-let coordinated_error_message = function
-  | Journal_worker_coordination.Worker_api.Db_error error -> Logseq_db_worker.Error.message error
-  | Invalid_input message | Service_failed message | Unsupported_operation message
-  | Protocol_mismatch message | Stale_read message | Resync_required message -> message
-  | Revoked_session -> "The graph session changed."
-  | Host_change_in_progress -> "The graph is closing. The outcome is retained."
-  | Response_budget_exceeded -> "The result exceeded its response budget."
+let coordinated_error_message = Journal_worker_coordination_host.error_message
+;;
+let report_coordination_error state ~operation ~phase ?recovery error =
+  let error=Journal_worker_coordination_host.diagnostic_error error in
+  let latest=List.find_opt(fun (entry:worker_error_occurrence)->
+    entry.active && entry.operation=operation && entry.phase=Some phase
+    && entry.graph_generation=state.graph_state.generation)state.worker_errors in
+  if Option.exists(fun entry->entry.error=error)latest then state
+  else record_worker_error state ~operation ~phase ?recovery error
 ;;
 let owns_capture state command =
   Option.bind state.direct_capture Journal_capture.pending_command=Some command
@@ -1198,6 +1200,8 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
       | Block_captured{timeline_entry_update=Some entry;_}->
         Journal_timeline_state.prepend_timeline_entry state.timeline entry
       | _->state.timeline in
+    let state=Option.fold ~none:state ~some:(report_coordination_error state
+      ~operation:"appendJournal" ~phase:"presentation") failure in
     let message=Option.map coordinated_error_message failure in
     {state with timeline;direct_capture=Option.map Journal_capture.lock_for_retry state.direct_capture;
       capture_error=Option.map(fun message->Local_capture_failure message)message;
@@ -1217,16 +1221,19 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
     (match failure with
      | Some error when not insert_rejected->
        let state=apply_worker_response ~settling:true ~discard state {payload=result}in
-       report_ui_error state ~operation:"captureTaskStatus" ~phase:"mutation"
-         ~message:(coordinated_error_message error) ~recovery:"The stored entry is retained."
+       report_coordination_error state ~operation:"captureTaskStatus" ~phase:"mutation"
+         ~recovery:"The stored entry is retained." error
      | Some error->let message=coordinated_error_message error in
+       let state=report_coordination_error state ~operation:"appendJournal" ~phase:"mutation" error in
        {state with direct_capture=Option.map(fun capture->
          Journal_capture.release_rejected_attempt capture)state.direct_capture;
          capture_error=Some(Local_capture_failure message);capture_error_owner=Some Timeline_composer}
      | None->apply_worker_response ~settling:true ~discard state {payload=result})
   | Child_projection_ready {command;result;failure;_} ->
     if not(Journal_routes.has_child_request state.routes command) then state
-    else (match result with
+    else (let state=Option.fold ~none:state ~some:(report_coordination_error state
+      ~operation:"insertChild" ~phase:"presentation") failure in
+      match result with
       | Child_created{child;parent;_}->
         {state with routes=Journal_routes.preview_child_created state.routes ~command ~child ~parent
           ~error:(Option.map coordinated_error_message failure)}
@@ -1246,12 +1253,13 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
     if not(Journal_routes.has_child_request state.routes command) then state
     else (match failure with
       | Some failure when insert_rejected ->
+        let state=report_coordination_error state ~operation:"insertChild" ~phase:"mutation" failure in
         {state with routes=Journal_routes.release_rejected_child state.routes ~command
           ~message:(coordinated_error_message failure)}
       | Some failure ->
         let state=apply_worker_response ~settling:true ~discard state {payload=result}in
-        report_ui_error state ~operation:"childTaskStatus" ~phase:"mutation"
-          ~message:(coordinated_error_message failure) ~recovery:"The stored child and attachments are retained."
+        report_coordination_error state ~operation:"childTaskStatus" ~phase:"mutation"
+          ~recovery:"The stored child and attachments are retained." failure
       | None->apply_worker_response ~settling:true ~discard state {payload=result})
   | Mutation_settled(intent,presentation,payload)->
     let next=apply_worker_response ~settling:true ~discard state {payload} in
@@ -1724,6 +1732,7 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
           ; timeline_notice = Some (Delete_failed message)
           }
         | _ -> state))
+  | Diagnostic failure -> record_runtime_worker_failure state failure
   | Rejected failure ->
     let state = record_failure_source state failure in
     show_sync_error
@@ -1743,7 +1752,16 @@ let application_error_rows errors =
        ; "Code", Logseq_db_worker.Error.code_string (Logseq_db_worker.Error.code occurrence.error)
        ; "Scope", Printf.sprintf "graph generation=%d" occurrence.graph_generation
        ; "Recovery", occurrence.recovery
-       ])
+       ] @
+       let trace=Logseq_db_worker.Error.trace occurrence.error in
+       let rows prefix (cause:Logseq_db_worker.Error.cause)=
+         [prefix ^ " component",Logseq_db_worker.Error.component_string cause.component;
+          prefix ^ " operation",cause.operation;
+          prefix ^ " code",Option.value cause.code ~default:"unknown"]
+         @ (if String.equal cause.message (Logseq_db_worker.Error.message occurrence.error)
+            then [] else [prefix ^ " reason",cause.message]) in
+       List.concat(List.mapi(fun i cause->rows ("Context " ^ string_of_int(i+1)) cause)trace.contexts)
+       @ rows "Origin" trace.origin)
     errors
 ;;
 
@@ -3170,30 +3188,29 @@ let dispose_context context =
   context.running := false;
   current_app := None;
   Worker.Private.request_stop context.client;
-  (try context.release_staging () with _ ->
-     report_cleanup_warning "journal: operation=releaseDraftStaging code=cleanupPending\n");
-  (try ignore (Lui_app.dispose context.app) with _ ->
-     report_cleanup_warning "journal: operation=disposeApplication code=cleanupPending\n")
+  let warning operation error =
+    let module D=Logseq_db_types.Failure_diagnostic in
+    let detail=D.of_source ~operation:"closeDatabase" ~reason:"cleanupFailed" (Printexc.to_string error) in
+    report_cleanup_warning ("journal: operation=" ^ operation ^ " " ^ D.message detail ^ "\n") in
+  (try context.release_staging () with error -> warning "releaseDraftStaging" error);
+  (try ignore (Lui_app.dispose context.app) with error -> warning "disposeApplication" error)
 ;;
 
 let decode_extension_values payload =
-  let json =
-    try Yojson.Safe.from_string payload with
-    | _ -> `Null
-  in
-  match json with
-  | `Assoc fields ->
-    List.fold_left
-      (fun map (key, value) ->
-         match value with
-         | `String s -> Lui_protocol.String_map.add key (Lui_protocol.StringValue s) map
-         | `Bool b -> Lui_protocol.String_map.add key (Lui_protocol.BoolValue b) map
-         | `Int i -> Lui_protocol.String_map.add key (Lui_protocol.IntValue i) map
-         | `Float f -> Lui_protocol.String_map.add key (Lui_protocol.FloatValue f) map
-         | _ -> map)
-      Lui_protocol.String_map.empty
-      fields
-  | _ -> Lui_protocol.String_map.empty
+  let decode = function
+    | `Assoc fields ->
+      List.fold_left(fun result (key,value)->Result.bind result(fun map->
+        let value=match value with
+          | `String text->Ok(Lui_protocol.StringValue text)
+          | `Bool flag->Ok(Lui_protocol.BoolValue flag)
+          | `Int number->Ok(Lui_protocol.IntValue number)
+          | `Float number->Ok(Lui_protocol.FloatValue number)
+          | _->Error "invalid JSON value" in
+        Result.map(fun value->Lui_protocol.String_map.add key value map)value))
+        (Ok Lui_protocol.String_map.empty)fields
+    | _->Error "Native event shape is invalid" in
+  try Logseq_db_types.Json_codec.decode decode (Yojson.Safe.from_string payload)
+  with Yojson.Json_error _->Error "Native event JSON syntax is invalid"
 ;;
 
 (* Platform request tags map to the tag carried by their response envelope;
@@ -3421,8 +3438,8 @@ let start
           List.find_opt(Wc.matches_asset_scope session)manager.resident_scopes)in
         Option.iter(fun scope->run_owned(Some(timeline_owner_of_scope scope))(fun()->
           match !set_state_ref with None->Effect.ignore|Some set_state->set_state(fun state->
-            report_ui_error state ~operation:"recoverImportSource" ~phase:"readback"
-              ~message:(coordinated_error_message error) ~recovery:"The original attachment input is retained.")))scope))!coordination_host;
+            report_coordination_error state ~operation:"recoverImportSource" ~phase:"readback"
+              ~recovery:"The original attachment input is retained." error)))scope))!coordination_host;
     Rrbvec.iter(fun recipient->
       Rrbvec.iter(fun intent->
         Option.iter(fun proof->Coordination_host.post recipient(Coordination.Import_source_reconciled proof))
@@ -3503,7 +3520,7 @@ let start
                !mutation_acknowledgements_changed();
                !retained_insertions_changed());
              !coordination_lifecycle_changed()) with
-         | Error _->Error "Unable to bind the graph reader. Try Copy again."
+         | Error error->Error(coordinated_error_message error)
          | Ok host->coordination_host_id:=Some id;coordination_host:=Some(identity,host);Ok host)
   in
   let route_coordination_event event =
@@ -3642,7 +3659,7 @@ let start
                  ~maximum_bytes:(Wc.capabilities session).limits.response_budget_bytes in
                let requested=Result.bind budget(fun budget->Coordination_host.request host session(Wc.Query(budget,query))) in
                match requested with
-               | Error _->fail "The copy read could not be admitted. Try again."
+               | Error error->fail(coordinated_error_message error)
                | Ok ticket->
                  copy_cancel:=Some(fun()->Coordination_host.post host(Coordination.Cancel ticket);
                    Coordination_host.post host(Coordination.Forget ticket));
@@ -3655,10 +3672,11 @@ let start
                        | Wc.Answered(Ok value)->Ok(convert value)
                        | Answered(Error(Response_budget_exceeded))->Error "The selected block is too large to copy."
                        | Answered(Error(Stale_read _ | Resync_required _ | Revoked_session))->Error "The graph changed while copying. Try again."
-                       | Answered(Error _)|Not_admitted _|Interrupted _->Error "The copy read failed or was interrupted. Try again." in
+                       | (Answered(Error _)|Not_admitted _|Interrupted _) as failed->
+                         Error(Coordination_host.reply_error_message ~fallback:"The copy read failed." failed) in
                      completed result))
           | Awaiting_baseline|Bootstrap_not_ready _->()
-          | Bootstrap_failed _|Binding_revoked _->fail "The graph reader could not prepare. Try Copy again."
+          | Bootstrap_failed error|Binding_revoked error->fail(coordinated_error_message error)
         in
         copy_poll:=Some await;
         let view=Coordination_host.view host in
@@ -3888,7 +3906,11 @@ let start
           (!media_changes_cell)(Ok()) in
       consumed,application,result))
       ~f:(fun(consumed,application,result)->
-        let flush=match !set_state_ref with None->Effect.ignore|Some set_state->flush_media set_state in
+        let flush=match !set_state_ref with None->Effect.ignore|Some set_state->
+          Effect.bind (match consumed,result with
+            |true,Error error->set_state(fun state->report_coordination_error state
+                ~operation:"readMedia" ~phase:"read" error)
+            |_->Effect.ignore) ~f:(fun()->flush_media set_state) in
         Effect.bind flush ~f:(fun()->
           Option.iter(fun token->Option.iter(fun(_,host)->Coordination_host.post host
             (if consumed then Coordination.Change_consumer_applied(token,request_id,result)
@@ -3904,14 +3926,18 @@ let start
         List.find_map(fun resident->if resident.Wc.phase=Wc.Open && Wc.matches_scope resident.session owner
           then Some(owner,host,resident.session) else None)(Wc.residents projection))
     |_->None in
+  let report_asset_coordination owner operation error =
+    if runtime_owner_is_live !state_ref owner then
+      run_owned (Some owner) (fun () -> set_state (fun state ->
+        report_coordination_error state ~operation ~phase:"asset" error)) in
   asset_demand := (fun ~graph_generation ~name priority assets ->
     match coordinated_asset_context() with
     |Some(owner,host,session) when owner.graph_generation=graph_generation->
       (match Wc.asset_consumer session ~name with
-       |Error _->None
+       |Error error->report_asset_coordination owner "replaceAssetDemand" error;None
        |Ok consumer->
          match Coordination_host.request host session(Wc.Replace_asset_demand(consumer,priority,assets)) with
-         |Error _->None
+         |Error error->report_asset_coordination owner "replaceAssetDemand" error;None
          |Ok ticket->
            let media_runtime= !media_runtime_cell and asset_runtime= !asset_runtime_cell in
            Coordination_host.watch host ticket ~f:(function
@@ -3921,7 +3947,10 @@ let start
                if not(media || assets) then
                  ignore(release_coordinated_consumer(ticket,Some demand):bool)
              |Answered(Error Revoked_session)|Interrupted Cancelled|Interrupted Worker_stopped->()
-             |_->if runtime_owner_is_live !state_ref owner then
+             |failed->
+               Option.iter (report_asset_coordination owner "replaceAssetDemand")
+                 (Coordination_host.reply_error failed);
+               if runtime_owner_is_live !state_ref owner then
                run_owned(Some owner)(fun()->Effect.of_thunk(fun()->
                  Journal_media_runtime.demand_backpressured ~ticket media_runtime name;
                  Journal_asset_runtime.demand_backpressured ~ticket asset_runtime name)));
@@ -3931,16 +3960,21 @@ let start
     match coordinated_asset_context() with
     |Some(owner,host,session) when owner.graph_generation=graph_generation->
       (match Coordination_host.request host session(Wc.Retry_asset asset) with
-       |Error _->false|Ok ticket->Coordination_host.watch host ticket ~f:(fun _->());true)
+       |Error error->report_asset_coordination owner "retryAsset" error;false
+       |Ok ticket->Coordination_host.watch host ticket ~f:(fun reply->
+         Option.iter (report_asset_coordination owner "retryAsset")
+           (Coordination_host.reply_error reply));true)
     |_->false);
   media_acquire := (fun ticket file ->
     match coordinated_asset_context() with
     |Some(owner,host,session)->
       (match Coordination_host.request host session(Wc.Acquire_asset_file file) with
-       |Error _->false
+       |Error error->report_asset_coordination owner "acquireAssetFile" error;false
        |Ok acquire->
          let runtime= !media_runtime_cell in
          Coordination_host.watch host acquire ~f:(fun reply->
+           Option.iter (report_asset_coordination owner "acquireAssetFile")
+             (Coordination_host.reply_error reply);
            let lease=match reply with Wc.Answered(Ok lease)->lease|_->None in
            if runtime_owner_is_live !state_ref owner then run_owned(Some owner)(fun()->
              Effect.bind(Effect.of_thunk(fun()->Journal_media_runtime.receive_file runtime ticket lease))
@@ -3956,7 +3990,7 @@ let start
       (match Coordination_host.plan_query_when_available host ~owner
          ~maximum_items:request.maximum_items
          ~maximum_bytes:Worker_pure_data.maximum_response_bytes request.query with
-       | Error _->false
+       | Error error->report_asset_coordination owner "readMedia" error;false
        | Ok ticket->
          Coordination_host.watch_read host ticket ~f:(fun origin reply->
            if runtime_owner_is_live !state_ref owner then run_owned (Some owner)(fun()->
@@ -3964,7 +3998,9 @@ let start
                | Some(session,_),Wc.Answered(Ok value)
                  when Coordination_host.validate_session ~owner host session=Ok()->Ok value
                | _,Wc.Answered(Error error)->Error error
-               | _->Error(Wc.Service_failed "The media listing was interrupted or retired") in
+               | _,(Wc.Not_admitted _ | Wc.Interrupted _) ->
+                 Error(Option.get(Coordination_host.reply_error reply))
+               | _->Error(Wc.Service_failed "The media listing belongs to a retired session") in
              (* The business ID is carried by its private request ticket. *)
              let request_id=Journal_media_runtime.read_request_id original in
              apply_media_read ~request_id ~result:(Result.map(fun _->())value) ~f:(fun()->
@@ -3983,7 +4019,11 @@ let start
         match result,Journal_media_runtime.projection_read_error (!media_runtime_cell) ~root with
         | Ok(),Some message->Error(Wc.Service_failed message)|_->result)(!media_changes_cell)result in
       consumed,application,result)) ~f:(fun(consumed,application,result)->
-      let flush=match !set_state_ref with None->Effect.ignore|Some set_state->flush_media set_state in
+      let flush=match !set_state_ref with None->Effect.ignore|Some set_state->
+        Effect.bind (match consumed,result with
+          |true,Error error->set_state(fun state->report_coordination_error state
+              ~operation:"readOfflineAssets" ~phase:"read" error)
+          |_->Effect.ignore) ~f:(fun()->flush_media set_state) in
       Effect.bind flush ~f:(fun()->
         Option.iter(fun token->Option.iter(fun(_,host)->Coordination_host.post host
           (if consumed then Coordination.Change_consumer_applied(token,request_id,result)
@@ -3995,7 +4035,7 @@ let start
       (match Coordination_host.plan_query_when_available host ~owner
           ~maximum_items:request.maximum_items
           ~maximum_bytes:Worker_pure_data.maximum_response_bytes request.query with
-       | Error _->false
+       | Error error->report_asset_coordination owner "readMedia" error;false
        | Ok ticket ->
          let shared = match request.query with
            | Wc.Journals _ -> true
@@ -4010,7 +4050,8 @@ let start
                | Some(session,_),Wc.Answered(Ok value)
                  when Coordination_host.validate_session ~owner host session=Ok()->Ok value
                | _,Wc.Answered(Error error)->Error error
-               | _->Error(Wc.Service_failed "The offline attachment read was interrupted or retired") in
+               | _,failed->Error(Option.value(Coordination_host.reply_error failed)
+                   ~default:(Wc.Service_failed "The offline attachment read belongs to a retired session.")) in
              apply_asset_read ~request_id:request.request_id ~result:(Result.map(fun _->())value) ~f:(fun()->
                let owned=Journal_asset_runtime.owns_read (!asset_runtime_cell) request.request_id in
                match value with
@@ -4224,6 +4265,8 @@ let start
     |Confirmation_ticket ticket->
       Coordination_host.watch host ticket ~f:(fun reply->f(map_reply(fun confirmation->Wc.Confirmed confirmation)reply))
   in
+  let refuse_coordination error=Journal_graph_transport.Refused
+    (Coordination_host.diagnostic_error error) in
   let send_coordinated_read request read =
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host ->
@@ -4243,16 +4286,13 @@ let start
             | Answered(Error(Wc.Resync_required message)) when is_changes ->Ok(Journal_graph_runtime.Changes_resync message)
             | Answered(Error(Wc.Stale_read message))->Ok(Journal_graph_runtime.Read_failed{code=Logseq_db_worker.Error.Stale_read_cursor;message})
             | Answered(Error Wc.Response_budget_exceeded)->Ok(Journal_graph_runtime.Read_failed{code=Logseq_db_worker.Error.Response_too_large;message="The read exceeded its response budget."})
-            | Answered(Error(Wc.Db_error error))->Ok(Journal_graph_runtime.Read_failed
-                {code=Logseq_db_worker.Error.code error;message=Logseq_db_worker.Error.message error})
-            | Answered(Error(Wc.Service_failed message|Resync_required message))->Error message
-            | Answered(Error Revoked_session)->Error "The graph execution changed before the read completed."
-            | Answered(Error _)->Error "The typed graph read could not be validated."
-            | Not_admitted Full->Error "Worker request queue is full"
-            | Not_admitted Not_ready->Error "Worker is not ready"
-            | Not_admitted Stopping->Error "Worker is stopping"
-            | Not_admitted(Unsupported_request message)->Error message
-            | Interrupted _->Error "Worker read was interrupted" in
+            | Answered(Error(Wc.Db_error error))->Ok(Journal_graph_runtime.Read_error error)
+            | Answered(Error error)->Ok(Journal_graph_runtime.Read_error
+                (Coordination_host.diagnostic_error error))
+            | Not_admitted reason->Ok(Journal_graph_runtime.Read_error
+                (Coordination_host.admission_diagnostic reason))
+            | Interrupted reason->Ok(Journal_graph_runtime.Read_error
+                (Coordination_host.interruption_diagnostic reason)) in
           !coordinated_read_finished owner request application origin result)
       in
       (match read with
@@ -4266,11 +4306,11 @@ let start
                   && Wc.matches_scope resident.session owner then Some resident.session else None)(Wc.residents projection) in
                 (match session with None->Some Journal_graph_transport.Not_ready|Some session->
                   match Wc.read_budget session ~maximum_items:read.maximum_items ~maximum_bytes:Worker_pure_data.maximum_response_bytes with
-                  | Error _->Some Journal_graph_transport.Not_ready
+                  | Error error->Some(refuse_coordination error)
                   | Ok budget->
                     observe_projection_query ~request_id:request read.query;
                     match Coordination_host.request host session(Wc.Observe(budget,read.query)) with
-                    | Error _->Some Journal_graph_transport.Not_ready
+                    | Error error->Some(refuse_coordination error)
                     | Ok ticket->
                       let context:Detail_observation.context={entry_id;request_generation=generation;root=uuid;
                         owner;original=request;maximum_children} in
@@ -4292,7 +4332,7 @@ let start
             observe_projection_query ~request_id:request read.query;
             watch None ticket (fun value->Journal_graph_runtime.Query_result(read.query,value));
             Journal_graph_transport.Accepted
-          | Error _->Journal_graph_transport.Not_ready)
+          | Error error->refuse_coordination error)
        | Confirm_readback read ->
          (match Coordination_host.reconcile_mutation host ~presentation:read.presentation read.intent with
           | Ok ticket->
@@ -4305,12 +4345,13 @@ let start
              |Submission_ticket ticket->watch (Some(Wc.presentation_session read.presentation)) ticket (fun _->
                Journal_graph_runtime.Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="The change is awaiting confirmation."}));
             Journal_graph_transport.Accepted
-          | Error _->Journal_graph_transport.Not_ready)
+          | Error error->refuse_coordination error)
        | Acknowledge read ->
          (match Coordination_host.request host (Wc.change_batch_session read.batch)(Wc.Acknowledge_changes read.batch) with
           | Ok ticket->watch(Some(Wc.change_batch_session read.batch))ticket (fun ack->Journal_graph_runtime.Changes_acknowledged ack);Journal_graph_transport.Accepted
-          | Error _->Journal_graph_transport.Not_ready)
+          | Error error->refuse_coordination error)
        )
+    | _,Error message->refuse_coordination(Wc.Service_failed message)
     | _->Journal_graph_transport.Not_ready in
   let coordinated_mutation_finished=ref(fun (_:Graph_service.timeline_scope)
     (_:Wc.Uuid.t) (_:(Wc.mutation_progress,string)result)->()) in
@@ -4330,12 +4371,13 @@ let start
                 | Wc.Answered(Ok(Wc.Committed_pending_presentation _))->
                   (match Coordination_host.reconcile_mutation host ~presentation intent with
                    | Ok ticket->watch ticket
-                   | Error _-> !coordinated_mutation_finished owner request(Error "The change is awaiting a current presentation."))
+                   | Error error-> !coordinated_mutation_finished owner request(Error(coordinated_error_message error)))
                 | Answered(Ok progress)-> !coordinated_mutation_finished owner request(Ok progress)
-                | _-> !coordinated_mutation_finished owner request(Error "The change could not be confirmed.")) in
+                | failed-> !coordinated_mutation_finished owner request(Error
+                    (Coordination_host.reply_error_message ~fallback:"The change could not be confirmed." failed))) in
             let dispatch ()=match Coordination_host.reconcile_mutation host ~presentation intent with
               | Ok ticket->watch ticket;Journal_graph_transport.Accepted
-              | Error _->Journal_graph_transport.Not_ready in
+              | Error error->refuse_coordination error in
             let snapshot=match Journal_graph_runtime.capture_snapshot (!graph_runtime_cell) request with
               | Some(command,chain)->Some(`Capture(command,chain))
               | None->Option.map(fun(command,chain)->`Child(command,chain))
@@ -4362,11 +4404,12 @@ let start
       (match Option.bind(Coordination.projection(Coordination_host.view host))Wc.selected with
        | Some presentation when Wc.matches_scope(Wc.presentation_session presentation)owner ->
          (match Coordination_host.settle_applied_mutation host ~presentation ~applied_presentation intent with
-          | Error _->Journal_graph_transport.Not_ready
+          | Error error->refuse_coordination error
           | Ok(Coordination.Acknowledgement ticket)->
             Coordination_host.watch host ticket ~f:(fun reply->
               let result=match reply with Wc.Answered(Ok())->Ok()
-                | _->Error "The child result is applied, but its acknowledgement could not finish." in
+                | failed->Error(Coordination_host.reply_error_message
+                    ~fallback:"The child result is applied, but its acknowledgement could not finish." failed) in
               !coordinated_child_ack_finished owner request presentation result);
             Journal_graph_transport.Accepted
           | Ok(Coordination.Reconciliation ticket)->
@@ -4376,9 +4419,10 @@ let start
               | Wc.Answered(Ok(Wc.Committed_pending_presentation _)) when bound ->
                 (match Coordination_host.reconcile_mutation host ~presentation intent with
                  | Ok ticket->watch ticket
-                 | Error _-> !coordinated_mutation_finished owner request(Error "The child awaits a current presentation."))
+                 | Error error-> !coordinated_mutation_finished owner request(Error(coordinated_error_message error)))
               | Answered(Ok progress) when bound -> !coordinated_mutation_finished owner request(Ok progress)
-              | _-> !coordinated_mutation_finished owner request(Error "The child could not be reconciled.")) in
+              | failed-> !coordinated_mutation_finished owner request(Error
+                  (Coordination_host.reply_error_message ~fallback:"The child could not be reconciled." failed))) in
             watch ticket;Journal_graph_transport.Accepted)
        | _->Journal_graph_transport.Not_ready)
     | _->Journal_graph_transport.Not_ready in
@@ -4486,9 +4530,9 @@ let start
                  | Wc.Answered(Ok(Wc.Committed_pending_presentation _))->
                    (match Coordination_host.reconcile_mutation host ~presentation intent with
                     | Ok ticket->watch ticket
-                    | Error _->finish(Error "The change is awaiting a current presentation."))
+                    | Error error->finish(Error(coordinated_error_message error)))
                  | Wc.Answered(Ok progress)->finish(Ok progress)
-                 | _->finish(Error "The change could not be confirmed.")) in
+                 | failed->finish(Error(Coordination_host.reply_error_message ~fallback:"The change could not be confirmed." failed))) in
                watch ticket))) in
   mutation_acknowledgements_changed:=(fun()->
     match !coordination_host,timeline_scope !state_ref with
@@ -4725,7 +4769,7 @@ let start
                ~request_id:request query value;
              Journal_asset_runtime.observe_query_result (!asset_runtime_cell)
                ~request_id:request query value
-           | Read_failed _ | Changes_acknowledged _ | Changes_resync _ | Changes_retired ->
+           | Read_failed _ | Read_error _ | Changes_acknowledged _ | Changes_resync _ | Changes_retired ->
              forget_projection_request request);
           asset_projection_error :=
             (if asset_error_before=None then Journal_asset_runtime.projection_read_error (!asset_runtime_cell)
@@ -5417,18 +5461,21 @@ let start
       (match session with
        |None->Error "The destination is not ready for imports."
        |Some session->(match Wc.asset_import_intent session source with
-         |Error _->Error "The attachment source or immutable identity is invalid."
+         |Error error->Error(coordinated_error_message error)
          |Ok intent->(match Coordination_host.request host session(Wc.Import intent) with
-           |Error _->Error "Import is temporarily unavailable."
+           |Error error->Error(coordinated_error_message error)
            |Ok ticket->
              Coordination_host.watch host ticket ~f:(fun reply->
                let result=match reply with
                  |Wc.Answered(Ok(Wc.Imported imported))->Ok imported
-                 |Answered(Error(Wc.Service_failed message|Invalid_input message))->Error message
-                 |_->let _,operation,_=pending in
-                   Error(if Hashtbl.mem (!capture_staged_items_cell) operation
-                     then "Import was interrupted. Your journal entry and attachment input are retained."
-                     else "Import was interrupted. Select the file again.") in
+                 |failed->let _,operation,_=pending in
+                   let recovery=if Hashtbl.mem (!capture_staged_items_cell) operation
+                     then "Import outcome is unknown. Your journal entry and attachment input are retained."
+                     else "Import outcome is unknown. Select the file again." in
+                   let cause=Coordination_host.reply_error_message ~fallback:recovery failed in
+                   Error(match failed with
+                     | Wc.Interrupted _ when cause<>recovery -> cause ^ ". " ^ recovery
+                     | _ -> cause) in
                if runtime_owner_is_live !state_ref owner then
                  run_owned(Some owner)(fun()->complete_import(Some pending)result)
                else Result.iter(fun imported->Option.iter(fun lease->ignore(release_coordinated_file lease:bool))(Wc.import_preview imported))result);
@@ -8369,14 +8416,14 @@ let create
     latest_patch := "";
     Printexc.record_backtrace true;
     (match decode_config (Bytes.of_string payload) with
-     | Error _ -> failwith "application.decodeStartup.failed"
+     | Error source -> raise (Journal_bridge.initialization_failure Decode_startup source)
      | Ok config ->
        let runtime_epoch =
          Journal_worker_ids.Runtime.Epoch.of_int64
            (Int64.of_float (Unix.gettimeofday () *. 1e6))
        in
        (match Journal_worker_runtime.start ~runtime_epoch service config with
-        | Error _ -> failwith "application.startWorker.failed"
+        | Error source -> raise (Journal_bridge.initialization_failure Start_worker source)
         | Ok client ->
           (try
              ignore
@@ -8389,12 +8436,13 @@ let create
                   ~host_code);
              Option.iter (fun observe -> observe client) on_client
            with
-           | _ ->
+           | error ->
+             let backtrace=Printexc.get_raw_backtrace () in
              (match !current_app with
               | Some context when context.client == client -> dispose_context context
               | _ -> ());
              Journal_worker_runtime.stop client;
-             failwith "application.initialize.failed")));
+             Printexc.raise_with_backtrace (Journal_bridge.initialization_exception error) backtrace)));
     !latest_patch
   in
   let dispatch event =
@@ -8420,7 +8468,10 @@ let create
          (fun () ->
            (match Lui_runtime.extension_identifier (Lui_app.runtime app) node with
         | Some identifier ->
-          let values = decode_extension_values values in
+          (match decode_extension_values values with
+          | Error source->send_action(Update(fun state->
+              report_decode_error state ~operation:"decodeExtensionEvent" source,Effect.ignore))
+          | Ok values->
           let report operation = send_action (Update (fun state ->
             report_ui_error state ~operation ~phase:"native", Effect.ignore)) in
           (match name, Lui_protocol.String_map.find_opt "id" values,
@@ -8436,7 +8487,7 @@ let create
            | "event", _, _ -> report "decodeNativeEvent"
            | _ ->
              ignore (Lui_app.dispatch_event app
-               (Lui_protocol.ExtensionEvent (node, identifier, name, values))))
+               (Lui_protocol.ExtensionEvent (node, identifier, name, values)))))
         | None -> ());
            ignore (Lui_app.flush app))
      | None -> ());

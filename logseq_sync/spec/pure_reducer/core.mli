@@ -339,6 +339,12 @@ type asset_failure =
   | Asset_revoked_access
   | Asset_cancelled
   | Asset_invalid_content of string
+  | Asset_with_cause of asset_failure * Logseq_db_types.Failure_diagnostic.t
+
+(** Preserve the retry category independently of bounded diagnostic context. *)
+val asset_failure_kind : asset_failure -> asset_failure
+val asset_failure_cause : asset_failure -> Logseq_db_types.Failure_diagnostic.t option
+val asset_failure_with_cause : asset_failure -> Logseq_db_types.Failure_diagnostic.t -> asset_failure
 
 type asset_value =
   | Asset_unit

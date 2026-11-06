@@ -234,7 +234,7 @@ let view ?picker_signal props ~on_action =
                  else (
                    match presence owner with
               | Some (Ok Graph_service.Not_downloaded) -> "Download and open"
-              | Some (Error _) -> "Unable to check local copy"
+              | Some (Error message) -> message
                    | _ -> "")
                in
           let selection_enabled owner = owner.deleting = None in

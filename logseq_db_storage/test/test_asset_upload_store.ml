@@ -187,7 +187,9 @@ let generated_checkpoint_validation () =
         (replace "[\"Prepared\"]" "\"prepared\"" !payload);
       reject
         "invalid UUID rejected"
-        "Upload checkpoint shape is invalid"
+        (Logseq_db_types.Failure_diagnostic.create ~operation:"restoreUploads"
+           ~reason:"invalidContent" ~source:"invalid UUID" ()
+         |> Logseq_db_types.Failure_diagnostic.encode)
         (replace (U.to_string original.graph) "not-a-uuid" !payload);
       reject "negative asset size rejected" "Upload checkpoint intent is invalid" (replace "\"size\":4" "\"size\":-1" !payload);
       reject
@@ -528,13 +530,34 @@ let legacy_capture_never_captures_new_input_rows () =
       (Option.is_some(get(R.read db ~owner ~operation:(uuid 887))))))
 ;;
 
+(* The pure checkpoint codec owns generated JSON field validation, not a reducer. *)
+let checkpoint_field_error_survives () =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let payload = I.Pure_codec.encode (intent 991) in
+  let before = "\"title\":\"Fixture image\"" in
+  let rec replace offset =
+    if offset + String.length before > String.length payload then Alcotest.fail "title fixture missing"
+    else if String.sub payload offset (String.length before) = before then
+      String.sub payload 0 offset ^ "\"title\":[\"SECRET-invalid-title\"]"
+      ^ String.sub payload (offset + String.length before)
+          (String.length payload - offset - String.length before)
+    else replace (offset + 1) in
+  match I.Pure_codec.decode (replace 0) with
+  | Ok _ -> Alcotest.fail "invalid title was accepted"
+  | Error source ->
+    let diagnostic = D.of_source ~operation:"restoreUploads" ~reason:"invalidContent" source in
+    Alcotest.(check string) "concrete failing field" "upload-checkpoint-field-title" (D.source_class diagnostic);
+    Alcotest.(check bool) "raw field value excluded" false (String.contains (D.encode diagnostic) 'S')
+;;
+
 let () =
   Alcotest.run
     "asset upload storage"
     [ ( "SQLite"
       , List.map
           (fun (n, f) -> Alcotest.test_case n `Quick f)
-          [ "account cleanup rollback", account_cleanup_rolls_back_on_checkpoint_failure
+          [ "checkpoint field cause", checkpoint_field_error_survives
+          ; "account cleanup rollback", account_cleanup_rolls_back_on_checkpoint_failure
           ; "account cleanup retires complete inputs", account_cleanup_retires_complete_inputs
           ; "foreign persisted input evidence rejected", input_persisted_foreign_evidence_is_not_adoption
           ; "legacy manifest preserves new source records", legacy_capture_never_captures_new_input_rows

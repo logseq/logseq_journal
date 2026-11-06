@@ -50,8 +50,10 @@ type event =
 val decode_event : string -> (event, string) result
 
 (** Best-effort removal of a staged temp copy created for this pick; a no-op
-    for paths outside the staged temp-file naming contract. *)
-val discard_staged_file : staged -> unit
+    for paths outside the staged temp-file naming contract or already absent files.
+    Other failures reach [on_failure] as a bounded diagnostic carrier; the default
+    writes the same safe cause to the local diagnostic stream. *)
+val discard_staged_file : ?on_failure:(string -> unit) -> staged -> unit
 
 val is_dismissal : string -> bool
 

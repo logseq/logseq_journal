@@ -121,7 +121,7 @@ private final class JournalNativeAccountStorage: Sendable {
       recovery = try JSONDecoder().decode(Recovery.self, from: bytes)
     } catch {
       throw JournalAccountIssue(kind: .unavailable, stage: .bindingWrite,
-        nativeDetail: .init(source: .recovery, reason: .invalidRecord))
+        nativeDetail: .init(source: .recovery, reason: .invalidRecord, causes: JournalAccountDiagnostic.Cause.chain(error)))
     }
     guard recovery.version == 1 else {
       throw JournalAccountIssue(kind: .unavailable, stage: .bindingWrite, formatVersion: recovery.version,

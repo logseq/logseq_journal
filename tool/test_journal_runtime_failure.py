@@ -30,14 +30,14 @@ public struct LUIAppleExtensionRegistry { public init() {} }
     bridge.write_text('''
 #include <stdint.h>
 static int mode;
-int32_t journal_ocaml_failure_reason(int32_t operation) { return 2; }
+int32_t journal_ocaml_failure_reason(int32_t operation) { return mode >= 500 ? mode : 2; }
 static int stops;
 static int platform_calls;
 int32_t fixture_platform_count(void) { return platform_calls; }
 int32_t fixture_stop_count(void) { return stops; }
 void fixture_set_mode(int32_t value) { mode = value; }
 int32_t lui_ocaml_start(void (*patch)(const char *), int32_t p, int32_t h, const char *d, int32_t n) {
-  if (mode == 1) return 0;
+  if (mode == 1 || mode >= 500) return 0;
   patch(mode == 2 ? "invalid" : "valid"); return 1;
 }
 int32_t lui_ocaml_stop(void) { stops++; return mode == 7 ? 0 : 1; }
@@ -60,7 +60,7 @@ int32_t journal_ocaml_platform_failure(const char *d,int32_t n) { platform_calls
          str(ROOT / "apple-tests/platform-services/JournalRuntimeFailureTests.swift"),
          str(work / "bridge.o"), "-o", str(executable)])
     failures = []
-    for scenario in ["success", "host-lifetime", "rejected", "invalid-patch", "pump", "platform-event", "platform-response", "platform-failure", "stopped-response", "stopped-failure", "stop-retry", "stop-failure"]:
+    for scenario in ["startup-truncated", "startup-magic", "worker-permission", "worker-space", "success", "host-lifetime", "rejected", "invalid-patch", "pump", "platform-event", "platform-response", "platform-failure", "stopped-response", "stopped-failure", "stop-retry", "stop-failure"]:
         result = subprocess.run([str(executable), scenario], cwd=work, capture_output=True, text=True)
         print(f"runtime {scenario}: exit={result.returncode}")
         if result.returncode:

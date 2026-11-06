@@ -4,7 +4,7 @@ import Foundation
 enum JournalSafeDiagnostic: String, Error, LocalizedError, Sendable {
   case unknown, missingPayload, typeMismatch, keyNotFound, valueNotFound, dataCorrupted, invalidPayload
   case missingHandler, callbackFailed, allocationFailed, invalidInput, missingRoot
-  case startupDecodeFailed, startupWorkerFailed, startupMountFailed
+  case startupDecodeFailed, startupWorkerFailed, startupMountFailed, startupInitializeFailed
   case invalidStartupConfiguration
   case backendInvalidBatch, backendUnsupportedProperty, backendUnknownNode, backendUnknownExtension
   case backendFingerprintMismatch, backendInvalidHierarchy, backendInvalidEvent, backendRegistryInvalid
@@ -25,6 +25,7 @@ enum JournalSafeDiagnostic: String, Error, LocalizedError, Sendable {
     case .missingRoot: "The native runtime did not provide a root view. Reopen Journal."
     case .startupDecodeFailed: "The native startup configuration could not be decoded. Reopen Journal."
     case .startupWorkerFailed: "The native graph worker could not start."
+    case .startupInitializeFailed: "The native application could not initialize."
     case .startupMountFailed: "The native root view could not be mounted."
     case .invalidStartupConfiguration: "The native startup configuration is invalid. Reopen Journal."
     case .backendInvalidBatch: "The native backend rejected the patch or event batch."

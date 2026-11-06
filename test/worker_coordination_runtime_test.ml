@@ -381,6 +381,108 @@ let with_client ?epoch_ms ?favorites ?assets ?statuses ?change_max_items ?prepar
 
 (* The pure route reducer has no manager push or host handoff input.
    Drive public mounted hooks over the actual Service, DB and resource owners. *)
+(* These failures originate in mailbox-outcome decoding, outside the pure
+   reducer. Exercise the public runner with a real admitted request, then replace
+   only its transport outcome; the reducer never receives a fabricated error. *)
+let test_cleanup_transport_causes () =
+  let failures=ref [] in
+  let check condition message=if not condition then failures:=message::!failures in
+  let run stage outcome suffix = with_client (fun client ->
+    let events=Queue.create () and state=ref(C.initial ~client_id) in
+    let runner=R.create ~client ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+      ~post:(fun event->Queue.add event events) ~publish:(fun _->()) |> Result.get_ok in
+    let injecting=ref false and captured=ref [] and delivery_errors=ref [] and imported=ref None in
+    Mailbox.on_event client(fun event->
+      let event=match event,!injecting with
+        |Mailbox.Response response,true->Mailbox.Response{response with outcome}
+        |_->event in
+      let delivery=R.on_event runner event in
+      if !injecting then delivery_errors:=delivery.error::!delivery_errors);
+    let apply transition=state:=transition.C.next;List.iter(fun instruction->
+      (match instruction,stage with
+       |C.Release_observation_registration _,"Observation release"
+       |C.Finalize_observation_registration _,"Observation finalization"
+       |C.Release_binding _,"Binding unregister"
+       |C.Send(_,_,W.Import _),"Import"->injecting:=true
+       |_->());R.submit runner instruction)transition.instructions in
+    let pump ()=
+      Mailbox.Private.deliver client ~max_events:64;
+      let count=Queue.length events in
+      for _=1 to count do
+        let event=Queue.take events in
+        if !injecting then captured:=event::!captured else apply(C.step !state event)
+      done in
+    let wait message predicate=
+      let deadline=Unix.gettimeofday()+.4. in
+      while not(predicate()) && Unix.gettimeofday()<deadline do pump();Thread.delay 0.001 done;
+      require(predicate())message in
+    wait "cleanup fixture registration" (fun()->match C.bootstrap(C.view !state)with W.Bootstrap_not_ready _->true|_->false);
+    ignore(Mailbox.send client(Service.Client_command(Restore_local_account{user_id="user-1"})));
+    let session ()=Option.bind(C.projection(C.view !state))(fun projection->
+      List.find_map(fun resident->if resident.W.phase=W.Open then Some resident.session else None)(W.residents projection)) in
+    wait "cleanup fixture session" (fun()->Option.is_some(session()));
+    let session=Option.get(session()) in
+    pump();
+    let push notice=R.on_event runner(Mailbox.Push{
+      runtime_epoch=Mailbox.runtime_epoch client;worker_generation=Mailbox.worker_generation client;
+      push_sequence=Id.Worker.Push_sequence.of_int64 999L;topic=Service.asset_topic;
+      payload=Service.Asset_notice(Read.For_worker.session_asset_scope session,notice)}) in
+    require((push Service.Asset_capacity_available).error=None)
+      "valid asset notice became a transport error";
+    check((push(Service.Asset_demand_accepted "foreign-demand-owner")).error=Some W.Revoked_session)
+      "asset notice decoding erased its typed ownership cause";
+    if stage="Binding unregister" then apply(C.step !state C.Shutdown_requested)
+    else if stage="Import" then (
+      let source:Logseq_db_types.Asset_import.t={
+        operation=uuid "9c000000-0000-4000-8000-000000009921";
+        asset=uuid "9c000000-0000-4000-8000-000000009922";target=Test_support.authoritative_block_uuid;
+        local_mutation=uuid "9c000000-0000-4000-8000-000000009923";
+        metadata_mutation=uuid "9c000000-0000-4000-8000-000000009924";
+        replace_reference=None;source_file="/synthetic-missing/import.png";title="Synthetic import";file_type="png"} in
+      let intent=W.asset_import_intent session source |> Result.get_ok in
+      imported:=Some intent;
+      let _,plan=C.request !state session(W.Import intent) |> Result.get_ok in apply plan)
+    else (
+      let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+      let ticket,plan=C.request !state session(W.Observe(budget,W.Graph_info)) |> Result.get_ok in
+      apply plan;wait "cleanup fixture observation" (fun()->Option.is_some(C.reply(C.view !state)ticket));
+      let handle=match C.reply(C.view !state)ticket with Some(W.Answered(Ok value))->value.W.observation
+        |_->failwith "cleanup fixture observation failed" in
+      apply(C.step !state(C.Forget ticket));
+      let released,plan=C.request !state session(W.Release handle) |> Result.get_ok in
+      apply plan;
+      if stage="Observation finalization" then (
+        wait "cleanup fixture release" (fun()->Option.is_some(C.reply(C.view !state)released));
+        apply(C.step !state(C.Forget released));
+        apply(C.step !state(C.Observation_returned handle))));
+    if stage="Import" then (
+      wait "Import completion missing" (fun()->List.exists(function C.Completed _->true|_->false)!captured);
+      check(List.mem (Some(W.Service_failed("Import: "^suffix))) !delivery_errors)
+        "Import transport failure erased its diagnostic cause";
+      check(List.exists(function
+        |C.Completed(_,W.Interrupted(W.Transport_lost cause))->cause=W.Service_failed("Import: "^suffix)
+        |_->false)!captured) "Import reply erased its typed interruption cause";
+      List.iter(fun event->state:=(C.step !state event).next)(List.rev !captured);
+      check(C.import_progress(C.view !state)(Option.get !imported)=Some W.Import_unknown)
+        "Import transport failure falsely settled its unknown outcome")
+    else (
+    let result=function
+      |C.Observation_release_completed(_,_,result) when stage="Observation release"->Some result
+      |C.Observation_finalize_completed(_,_,result) when stage="Observation finalization"->Some result
+      |C.Binding_release_completed(_,result) when stage="Binding unregister"->Some result
+      |_->None in
+    wait (stage^" completion missing") (fun()->List.exists(fun event->Option.is_some(result event))!captured);
+    check(List.exists(fun event->result event=Some(Error(W.Service_failed(stage^": "^suffix))))!captured)
+      (stage^" erased its backend cause"))) in
+  List.iter(fun stage->List.iter(fun(outcome,suffix)->run stage outcome suffix)
+    [Mailbox.Failed "synthetic cleanup backend refused retirement","synthetic cleanup backend refused retirement";
+     Mailbox.Cancelled,"cancelled before retirement acknowledgement";
+     Mailbox.Shutdown,"worker stopped before retirement acknowledgement"])
+    ["Observation release";"Observation finalization";"Binding unregister"];
+  run "Import" (Mailbox.Failed "synthetic import transport lost") "synthetic import transport lost";
+  require(!failures=[]) (String.concat "; " (List.rev !failures))
+;;
+
 let test_application_current_close ~replacement () =
   let third=uuid "9c000000-0000-4000-8000-000000000004"
   and fourth=uuid "9c000000-0000-4000-8000-000000000005" in
@@ -4423,6 +4525,8 @@ let test_retired_query_has_correlated_response () =
 ;;
 
 let () =
+  test_cleanup_transport_causes();
+  if Array.mem "--cleanup-causes-only" Sys.argv then exit 0;
   if Array.mem "--read-revocation-only" Sys.argv then (test_retired_query_has_correlated_response();exit 0);
   if Array.mem "--application-close-only" Sys.argv then (test_application_current_close ~replacement:false();test_application_current_close ~replacement:true();exit 0);
   test_application_current_close ~replacement:false();

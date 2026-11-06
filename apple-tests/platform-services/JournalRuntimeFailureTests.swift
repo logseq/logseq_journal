@@ -26,8 +26,10 @@ let journalAppIcons: [String: String] = [:]
 
 @MainActor @main struct JournalRuntimeFailureTests {
   static func main() async throws {
+    precondition(JournalRuntime.safeDescription(JournalPlatformWire.Failure.invalidPacket,
+      operation: "lifecycle").contains("invalidPayload"), "lifecycle packet cause lost")
     let scenario = CommandLine.arguments[1]
-    let modes = ["rejected":1, "invalid-patch":2, "pump":3, "platform-event":4, "platform-response":5, "platform-failure":6, "stop-retry":7, "stop-failure":7]
+    let modes = ["rejected":1, "invalid-patch":2, "pump":3, "platform-event":4, "platform-response":5, "platform-failure":6, "stop-retry":7, "stop-failure":7, "startup-truncated":501, "startup-magic":503, "worker-permission":615, "worker-space":617]
     setMode(Int32(modes[scenario] ?? 0))
     let platform = JournalApplicationPlatform()
     let runtime = try JournalRuntime(platform: platform, startupPayload: Data(),
@@ -86,8 +88,11 @@ let journalAppIcons: [String: String] = [:]
       let message = reported!.localizedDescription
       precondition(!message.contains("SENSITIVE"), "Native failure must exclude raw renderer details")
       precondition(message.contains("runtime."), "Native failure must identify its fixed stage/code")
-      precondition(message.contains(scenario == "invalid-patch" ? "backendUnsupportedProperty" : "callbackFailed"),
+      let detail = ["startup-truncated": "startupPayloadTruncated", "startup-magic": "startupMagicInvalid",
+        "worker-permission": "permissionDenied", "worker-space": "noSpace"]
+      precondition(message.contains(detail[scenario] ?? (scenario == "invalid-patch" ? "backendUnsupportedProperty" : "callbackFailed")),
         "native runtime must preserve the safe producer reason")
+
     }
     print("PASS runtime \(scenario)")
   }

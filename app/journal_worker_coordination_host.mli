@@ -2,6 +2,17 @@ module Worker = Journal_worker_coordination.Worker_api
 module Core = Journal_worker_coordination.Worker_pure_coordinator
 module Runner = Journal_worker_coordination.Worker_effect_runner
 
+(** Presentation text plus the complete typed diagnostic for error ledgers.
+    Database causes and context are retained without reconstructing them. *)
+val error_message : Worker.error -> string
+val diagnostic_error : Worker.error -> Logseq_db_worker.Error.t
+val admission_error : Worker.admission_error -> Worker.error
+val admission_diagnostic : Worker.admission_error -> Logseq_db_worker.Error.t
+val interruption_error : Worker.interruption -> Worker.error
+val interruption_diagnostic : Worker.interruption -> Logseq_db_worker.Error.t
+val reply_error : 'a Worker.reply -> Worker.error option
+val reply_error_message : fallback:string -> 'a Worker.reply -> string
+
 module Pure_source_recovery : sig
   type t
   type read = private {session:Worker.session;intent:Worker.asset_import_intent;attempt:int}

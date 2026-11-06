@@ -165,11 +165,16 @@ let extension =
 
 (* Staged picks live under the host temp directory as [journal-import-*];
    delete only files matching that contract so a user path is never removed. *)
-let discard_staged_file (staged : staged) =
+let discard_staged_file ?(on_failure=fun message->
+    try prerr_endline ("journal: operation=discardStagedFile " ^ message) with _->()) (staged : staged) =
   if String.starts_with ~prefix:"journal-import-" (Filename.basename staged.source_file)
   then (
-    try Sys.remove staged.source_file with
-    | _ -> ())
+    try Unix.unlink staged.source_file with
+    | Unix.Unix_error(Unix.ENOENT,_,_)->()
+    | error->
+      let module D=Logseq_db_types.Failure_diagnostic in
+      let detail=D.of_source ~operation:"assetRelease" ~reason:"cleanupFailed" (Printexc.to_string error) in
+      on_failure(D.encode detail))
 ;;
 
 let is_dismissal payload =

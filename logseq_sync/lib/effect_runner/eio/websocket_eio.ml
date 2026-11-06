@@ -74,10 +74,11 @@ let peer_termination payload =
   if String.length payload < 2
   then Core.Recoverable_close { message = None; attention = Requires_attention }
   else (
-    match (Char.code payload.[0] lsl 8) lor Char.code payload.[1] with
-    | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 ->
-      Core.Protocol_failure "WebSocket peer rejected the protocol or policy"
-    | _ -> Core.Recoverable_close { message = None; attention = Requires_attention })
+    let status = (Char.code payload.[0] lsl 8) lor Char.code payload.[1] in
+    let message = Printf.sprintf "WebSocket peer closed with status %d" status in
+    match status with
+    | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 -> Core.Protocol_failure message
+    | _ -> Core.Recoverable_close { message = Some message; attention = Requires_attention })
 ;;
 
 let closed_reason t =
@@ -437,8 +438,7 @@ let failure_message = function
   | Protocol_error message -> message
   | End_of_file -> "WebSocket peer EOF"
   | Eio.Time.Timeout -> "WebSocket establishment timed out"
-  | Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _ -> "WebSocket TLS termination"
-  | _ -> "WebSocket transport failed"
+  | error -> Tls_client_eio.transport_failure ~operation:"websocketTransport" error
 ;;
 
 let failure_reason = function

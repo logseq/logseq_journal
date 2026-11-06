@@ -991,7 +991,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
               child(3).font(.footnote).frame(maxWidth: .infinity)
             }
           }
+          #if os(iOS)
           .listSectionSpacing(16)
+          #endif
           .scrollDismissesKeyboard(.interactively)
           #if os(iOS)
           .toolbar(.hidden, for: .navigationBar)
