@@ -3180,7 +3180,8 @@ let lookup_local_asset t ~scope ~asset ~checksum ~current ~diagnostic call =
           in
           let published_diagnostic = !diagnostic in
           (match published with
-           | Error Sync.Asset_storage_full -> Ok (Sync.Asset_cached (Some lease))
+           | Error failure when Sync.asset_failure_kind failure = Sync.Asset_storage_full ->
+             Ok (Sync.Asset_cached (Some lease))
            | _ ->
              (match call (Sync.Release_asset_file lease) with
               | Error failure when current () -> report_asset_failure t scope "assetRelease" failure
@@ -3189,8 +3190,9 @@ let lookup_local_asset t ~scope ~asset ~checksum ~current ~diagnostic call =
              (match published with
               | Ok Sync.Asset_unit ->
                 call (Sync.Check_asset_cache (asset, intent.version))
-              | Error (Sync.Asset_missing_source | Asset_checksum_mismatch) ->
-                Ok (Sync.Asset_cached None)
+              | Error failure when (match Sync.asset_failure_kind failure with
+                  | Sync.Asset_missing_source | Asset_checksum_mismatch -> true
+                  | _ -> false) -> Ok (Sync.Asset_cached None)
               | Error _ as error -> error
               | Ok _ ->
                 Error (Sync.Asset_invalid_content "Unexpected publication completion")))

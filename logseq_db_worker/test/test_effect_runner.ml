@@ -14,7 +14,7 @@ let account ?(generation = 1) user_id : Sync.account_scope =
 
 module Sync_runner = Logseq_sync_effect_runner.Effect_runner
 
-let asset_io_runner ?(fork=(fun ~sw:_ task->task())) ?on_asset_diagnostic ?(token_failure = "test must not use network") ~env ~sw ~support ~post () =
+let asset_io_runner ?(pending_budget_bytes=16L) ?(fork=(fun ~sw:_ task->task())) ?on_asset_diagnostic ?(token_failure = "test must not use network") ~env ~sw ~support ~post () =
   let module R = Sync_runner in
   let dependencies =
     R.dependencies
@@ -31,7 +31,7 @@ let asset_io_runner ?(fork=(fun ~sw:_ task->task())) ?on_asset_diagnostic ?(toke
         (R.local_store
            ~asset_cache_budget_bytes:16L
            ~asset_maximum_file_bytes:16
-           ~asset_pending_budget_bytes:16L
+           ~asset_pending_budget_bytes:pending_budget_bytes
            ~application_support_directory:support
            ()
          |> Result.get_ok)
@@ -620,7 +620,7 @@ type asset_bridge_fixture =
   ; fixture_asset : Sync.asset_action -> Sync.asset_value
   }
 
-let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
+let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) ?(pending_budget_bytes=16L) run =
   T.with_managed (fun fixture ->
     Eio_main.run (fun env ->
       Eio.Switch.run (fun sw ->
@@ -676,7 +676,7 @@ let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
         in
         io_runner
         := Some
-             (asset_io_runner
+             (asset_io_runner ~pending_budget_bytes
                 ~fork:(fun ~sw task->if asynchronous_io then Eio.Fiber.fork ~sw task else task())
                 ~on_asset_diagnostic:(fun ~scope ~operation ~request_operation detail ->
                   Runner.report_asset_diagnostic (Option.get !active_runner)
@@ -819,6 +819,87 @@ let picker_import support ordinal : Logseq_db_types.Asset_import.t =
   ; title = "Cancellation fixture"
   ; file_type = "bin"
   }
+;;
+
+(* Local staging publication and lease ownership live in the runner, not the
+   transfer reducer. Exercise real cache pressure and filesystem failures. *)
+let test_wrapped_local_asset_fallback mode () =
+  with_asset_bridge ~asynchronous:true ~pending_budget_bytes:32L (fun fixture ->
+    let module Transfer=Logseq_sync_pure_reducer.Asset_transfer in
+    let scope=fixture.context.scope in
+    let source=picker_import fixture.support 400 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true)
+      |> Result.get_ok in
+    let filler=picker_import fixture.support 410 in
+    let remote_bytes=String.make 16 'r' in
+    Out_channel.with_open_bin filler.source_file(fun output->output_string output remote_bytes);
+    let checksum,file=match fixture.fixture_asset(Sync.Stage_asset_file
+      {operation=filler.operation;file_type=filler.file_type;source_file=filler.source_file}) with
+      | Sync.Asset_staged {checksum;file;_}->checksum,file | _->Alcotest.fail "remote cache staging failed" in
+    let version=Logseq_db_types.Asset_descriptor.version ~checksum ~file_type:"bin" |> Result.get_ok in
+    ignore(fixture.fixture_asset(Sync.Publish_staged_asset{asset=prepared.asset;version;file}));
+    let pinned=match fixture.fixture_asset(Sync.Check_asset_cache(prepared.asset,version)) with
+      | Sync.Asset_cached(Some handle)->handle | _->Alcotest.fail "remote cache did not fill budget" in
+    Alcotest.(check bool) "original version actually evicted" true
+      (fixture.fixture_asset(Sync.Check_asset_cache(prepared.asset,prepared.version))=Sync.Asset_cached None);
+    let descriptor=Logseq_db_types.Asset_descriptor.create ~uuid:prepared.asset
+      ~source:(Managed(Some version)) ~current_checksum:(Some prepared.version.checksum)
+      ~size:None ~dimensions:None |> Result.get_ok in
+    let transfer=Transfer.create(Transfer.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:0 |> Result.get_ok)
+      ~scope ~online:true ~unlocked:true in
+    let _,work=Transfer.step transfer(Replace{consumer="wrapped-local-fallback";priority=Foreground;assets=[descriptor]}) in
+    let lookup=List.find_map(function Transfer.Check_cache ticket->Some ticket|_->None)work |> Option.get in
+    fixture.set_asset_current(fun ticket->ticket=Transfer.Lookup lookup);
+    let completed,resolve=Eio.Promise.create() in
+    fixture.on_asset_completed(function Transfer.Cache_checked(_,result)->
+      ignore(Eio.Promise.try_resolve resolve result:bool)|_->());
+    let publication_failure=ref None and retained_lease=ref None and gated=ref false in
+    let releases handle=List.fold_left(fun count->function
+      | Sync.Release_asset_file actual when actual=handle -> count+1 | _->count) 0 !(fixture.actions) in
+    let remote_checks ()=List.fold_left(fun count->function
+      | Sync.Check_asset_cache(asset,actual) when asset=prepared.asset && actual=version -> count+1
+      | _->count) 0 !(fixture.actions) in
+    let before_remote=remote_checks () in
+    let reached=fixture.gate (fun output -> match output.Sync.request.action with
+      | Sync.Retain_staged_file file when file=prepared.staged_file && not !gated ->
+        retained_lease:=(match output.result with Ok(Sync.Asset_retained(Some(lease,_)))->Some lease|_->None);
+        gated:=true;true
+      | Sync.Publish_staged_asset _ ->
+        (match output.result with Error failure->publication_failure:=Some failure|_->());false
+      | _->false) ~deliver_first:false in
+    Runner.submit fixture.runner(Core.Run_asset(fixture.context,Transfer.Check_cache lookup));
+    Eio.Promise.await reached;
+    let path=Option.get !(fixture.held_path) in
+    (match mode with
+     | `Full->()
+     | `Missing->Unix.unlink path
+     | `Checksum->Out_channel.with_open_bin path(fun output->output_string output "fake")
+     | `Oversize->Out_channel.with_open_bin path(fun output->output_string output (String.make 17 'x')));
+    fixture.deliver_held ~keep_gate:true ();
+    let result=Eio.Promise.await completed in
+    let failure=Option.get !publication_failure in
+    let expected=match mode with `Full->Sync.Asset_storage_full | `Missing->Asset_missing_source
+      | `Checksum->Asset_checksum_mismatch | `Oversize->Asset_size_rejected in
+    Alcotest.(check bool) "actual publication error is wrapped with cause" true
+      (Sync.asset_failure_kind failure=expected && Option.is_some(Sync.asset_failure_cause failure));
+    Alcotest.(check int) "outer staging lease released only on non-full branch"
+      (if mode=`Full then 0 else 1) (releases (Option.get !retained_lease));
+    Alcotest.(check int) "only missing/checksum consult remote cache"
+      (if mode=`Missing || mode=`Checksum then 1 else 0) (remote_checks () - before_remote);
+    if mode=`Oversize then
+      Alcotest.(check bool) "nonfallback failure category reaches transfer unchanged" true
+        (result=Error(Transfer.Invalid_content "Asset size exceeds the limit"))
+    else (
+    let handle=match result with Ok(Some handle)->handle
+      | _->Alcotest.fail "wrapped local publication failure broke preview/cache fallback" in
+    let lease,readable=match fixture.fixture_asset(Sync.Retain_asset_file handle) with
+      | Sync.Asset_retained(Some file)->file | _->Alcotest.fail "fallback returned an unreadable lease" in
+    Alcotest.(check string) "fallback owns correct readable bytes"
+      (if mode=`Full then "file" else remote_bytes)
+      (In_channel.with_open_bin readable In_channel.input_all);
+    ignore(fixture.fixture_asset(Sync.Release_asset_file lease));
+    ignore(fixture.fixture_asset(Sync.Release_asset_file handle)));
+    ignore(fixture.fixture_asset(Sync.Release_asset_file pinned)))
 ;;
 
 let cancelled_stage_output deliver_first () =
@@ -3154,7 +3235,11 @@ let () =
         ] )
     ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
-      , [ Alcotest.test_case "worker scheduling failure completes" `Quick (fun () -> test_worker_schedule_failure_completes ())
+      , [ Alcotest.test_case "wrapped local publication storage full retains staging" `Quick (test_wrapped_local_asset_fallback `Full)
+        ; Alcotest.test_case "wrapped missing staging falls back to remote cache" `Quick (test_wrapped_local_asset_fallback `Missing)
+        ; Alcotest.test_case "wrapped checksum failure falls back to remote cache" `Quick (test_wrapped_local_asset_fallback `Checksum)
+        ; Alcotest.test_case "wrapped nonfallback publication failure releases lease" `Quick (test_wrapped_local_asset_fallback `Oversize)
+        ; Alcotest.test_case "worker scheduling failure completes" `Quick (fun () -> test_worker_schedule_failure_completes ())
         ; Alcotest.test_case "worker encoded exception preserves reason" `Quick
             (test_worker_schedule_failure_completes
               ~failure:(Invalid_argument (Logseq_db_storage.Logseq_sqlite_codec.diagnostic_error
