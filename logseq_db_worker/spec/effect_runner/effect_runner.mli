@@ -1,4 +1,23 @@
-(** Eio interpreter for Worker requests and typed overlay transitions. *)
+(** {1 TLDR}
+
+    Interpret Worker instructions and typed overlay transitions with Eio.
+    The serial reducer owns policy and state; {!create} supplies an I/O runner,
+    and {!submit} executes its instructions and posts later typed completion
+    events. Database attachments, observations, file retains and cleanup ledgers
+    remain owned until their real release/join acknowledgements. Admission or
+    cancellation alone is not cleanup, rollback or host action permission.
+
+    Dependencies and typed callback inputs appear below. Primary excerpts:
+    {[
+      val create : sw:Eio.Switch.t -> dependencies
+        -> post:(Logseq_db_worker_pure_reducer.Core.event -> unit)
+        -> recovery_current:(Logseq_db_worker_pure_reducer.Core.upload_recovery_ticket -> bool)
+        -> upload_current:(Logseq_db_worker_pure_reducer.Asset_upload.ticket -> bool)
+        -> asset_current:(Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool)
+        -> (t, create_error) result
+      val submit : t -> Logseq_db_worker_pure_reducer.Core.instruction -> unit
+      val shutdown : t -> unit
+    ]} *)
 
 type t
 type runtime
@@ -6,8 +25,34 @@ type sync_runner
 type dependencies
 type dependency_error = Invalid_dependency of string
 type create_error = Invalid_create of string
+
+(** {1 Minimal usage example}
+
+    The caller supplies [sw], validated [dependencies], a reducer-produced
+    [instruction], a serialized event-queue [post], and predicates reading the
+    installed reducer state:
+    {[
+      match create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_current with
+      | Error error -> Error error
+      | Ok runner ->
+        Fun.protect
+          ~finally:(fun () -> shutdown runner)
+          (fun () ->
+            submit runner instruction;
+            run_until_retired runner;
+            Ok ())
+    ]}
+    [run_until_retired] is the caller's loop, not a runner method. It preserves
+    pump/callback delivery and the enclosing switch until actual scoped writer,
+    listener, resource and Sync barriers finish. [submit] does not return their
+    results; checked cleanup failures retain their original owner for retry. *)
+
+(** {1 Construction and validation} *)
+
 type id_token_request
 type id_token_cache
+
+(** {2 Identity-token exchange} *)
 
 val id_token_request_id : id_token_request -> string
 
@@ -33,6 +78,8 @@ val invalidate_id_token
 
 val reconcile_authenticated_user : id_token_cache -> user_id:string option -> unit
 val shutdown_id_token_cache : id_token_cache -> unit
+
+(** {2 Runner dependencies} *)
 
 val runtime
   :  fork:(sw:Eio.Switch.t -> (unit -> unit) -> unit)
@@ -63,6 +110,8 @@ val create
   -> asset_current:(Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool)
   -> (t, create_error) result
 
+(** {1 Capability details} *)
+
 val submit : t -> Logseq_db_worker_pure_reducer.Core.instruction -> unit
 
 (** Accept a bounded diagnostic only for its live scoped asset request. The
@@ -82,7 +131,7 @@ val await_reply
   -> post:(unit -> unit)
   -> Worker_pure_read.answer
 
-val shutdown : t -> unit
+(** {2 Assets and durable mutations} *)
 
 val retain_asset_file
   :  t
@@ -159,6 +208,8 @@ val acknowledge_mutation : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent -> original:(string * string * string) option
   -> current:(unit -> bool) -> (unit,string) result
 
+(** {2 Observations and changefeed} *)
+
 (** Actual paused-listener/predecessor-snapshot registration on the existing DB.
     A sampled typed error remains registered and can recover on the next
     invalidation/Refresh; only allocation or activation failure aborts registration.
@@ -220,6 +271,8 @@ val acknowledge_change_batch : t -> registration:int64 -> scope:Logseq_sync_pure
 
 val retire_changefeed : t -> registration:int64 -> unit
 
+(** {1 Lifecycle and recovery} *)
+
 (** Permanently stop new physical graph-operation admission for this incarnation,
     join already reserved protected tasks even if Service waiters canceled, then
     join their actual serial reducer callback barrier. This is only writer evidence;
@@ -258,6 +311,8 @@ val bind_host_copy:t -> handoff_id:Logseq_db_types.Graph_types.Uuid.t
   -> Logseq_sync_pure_reducer.Core.mirror_deletion -> (unit,Logseq_db_worker_pure_reducer.Core.effect_error)result
 val release_host_copy:t -> registration:int64 -> (unit,string)result
 
+(** {2 Import source recovery} *)
+
 (** Read-only complete source recovery: missing store is known empty; no schema,
     staging, acquisition or execution is performed. Cursor pages obey both item
     and canonical encoded byte budgets. Every proof rechecks its logical owner. *)
@@ -273,3 +328,8 @@ val confirm_import_input:t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
     evidence, under the existing writer fence. Complete bytes and proof remain. *)
 val acknowledge_import_input:t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> input:string -> prepared:string -> current:(unit -> bool) -> (unit,string)result
+
+(** Stop this runner and its delegated Sync runner. Actual scoped cleanup and
+    callback barriers above remain the lifecycle owner's obligation; a unit
+    return is not a checked release or permission to discard an unsettled owner. *)
+val shutdown : t -> unit

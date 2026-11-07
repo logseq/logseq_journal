@@ -1,6 +1,40 @@
-(** Pure query values shared by the coordinator and Worker. Constructor tags
-    preserve the canonical JSON identity of persisted mutation payloads. *)
+(** {1 TLDR}
+
+    Define pure query DTOs shared by the App coordinator and Worker.
+    Constructor tags preserve canonical JSON identity for persisted mutation
+    payloads; this module performs no I/O and grants no execution authority.
+    The mutually recursive data family below includes revision preconditions,
+    explicit present/missing lookups, bounded page members and change windows.
+    {!valid_append_node} validates append trees; requests execute through
+    [Worker_api.Query] and [Worker_pure_coordinator.request], not through DTOs. *)
+
 open Logseq_db_types.Graph_types
+
+type changefeed_signal =
+  | Changes_available of { generation : string; through : string }
+  | Resync_required of { generation : string; reason : string }
+
+(** {1 Minimal usage example}
+
+    The caller supplies a [session], a [budget] validated by [Worker_api.read_budget],
+    the coordinator [state] and the runner's [interpret]. This read consumes the
+    DTOs through their public owner:
+    {[
+      match Worker_pure_coordinator.request !state session
+              (Worker_api.Query (budget, Worker_api.Admission)) with
+      | Error error -> Error error
+      | Ok (ticket, transition) ->
+        state := transition.next;
+        List.iter interpret transition.instructions;
+        Ok ticket
+    ]}
+    [interpret] queues completion events for later serialized turns. The caller
+    reads the eventual typed reply through [Worker_pure_coordinator.reply]. *)
+
+(** {1 Construction and validation}
+
+    These bounds are part of request, response and tree validation. A valid
+    DTO alone does not prove that its session, revisions or budgets are current. *)
 
 val maximum_request_bytes : int
 val maximum_response_bytes : int
@@ -14,6 +48,12 @@ val maximum_roots : int
 val maximum_changed_uuids : int
 val maximum_property_values : int
 val maximum_filter_values : int
+
+(** {1 Capability details}
+
+    This recursive family is kept together to preserve its generated JSON
+    representation. Lookups distinguish missing records from an empty page;
+    version strings and preconditions must be passed back to their owning API. *)
 
 type precondition_scope = V2_children_scope of Uuid.t
 
@@ -144,8 +184,6 @@ and admission_inspection =
   }
 [@@deriving yojson]
 
-type changefeed_signal =
-  | Changes_available of { generation : string; through : string }
-  | Resync_required of { generation : string; reason : string }
+(** {1 Observation and helpers} *)
 
 val valid_append_node : append_node -> bool

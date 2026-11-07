@@ -1,4 +1,50 @@
-(** Pure Logseq DB worker lifecycle and request-routing policy. *)
+(** {1 TLDR}
+
+    Own pure DB Worker lifecycle and request routing, including graph state,
+    pending requests, Sync delegation and resource cleanup ledgers. The host owns
+    {!state}; {!initial} validates construction, and {!step} returns a {!transition}
+    with [next] and ordered [effects]. Install [next] before interpreting effects;
+    callbacks queue exact completion events for a later serialized turn. No DB,
+    network, clock or callback I/O occurs in this reducer.
+
+    The runner GADT and dependent instruction/event families remain below.
+    These are accurate entry-point excerpts, not additional declarations:
+    {[
+      val initial : config -> (state, create_error) result
+      val step : state -> event -> transition
+      val view : state -> view
+    ]}
+    Cleanup admission is not a physical ACK. Scope/attempt identity must still be
+    checked at runtime; process-local tickets do not replace durable intent. *)
+
+(** {1 Minimal usage example}
+
+    The caller supplies validated [config] and the worker runner's [interpret]:
+    {[
+      match initial config with
+      | Error error -> Error error
+      | Ok first ->
+        let state = ref first in
+        let transition = step !state Start in
+        state := transition.next;
+        List.iter interpret transition.effects;
+        Ok state
+    ]}
+    [interpret] queues real completions, preserving the original effect ticket.
+    The host applies later events with the same install-before-interpret order.
+    On retirement feed [Shutdown], then continue processing admitted cleanup and
+    callback barriers; the view's shutdown flag alone is not a physical join. *)
+
+(** {1 Construction and validation} *)
+
+type config
+
+val config
+  :  worker:Logseq_db_worker_contract.Config.t
+  -> sync:Logseq_sync_pure_reducer.Core.config
+  -> config
+
+(** {1 Capability details} *)
 
 type graph_phase =
   | Graph_closed
@@ -13,6 +59,8 @@ type graph_state =
   ; phase : graph_phase
   ; error : Logseq_db_worker_contract.Error.t option
   }
+
+(** {2 Request and execution identities} *)
 
 type request_id
 
@@ -96,6 +144,8 @@ type output =
   | Scoped_graph_push of Logseq_sync_pure_reducer.Core.graph_scope * Worker_pure_data.changefeed_signal
   | Diagnostic of string
 
+(** {2 Upload recovery and instructions} *)
+
 type upload_recovery_ticket = private
   { scope : Logseq_sync_pure_reducer.Core.graph_scope
   ; after : Logseq_db_types.Graph_types.Uuid.t option
@@ -121,13 +171,6 @@ type instruction =
 val instruction_diagnostic : instruction -> string
 val equal_instruction : instruction -> instruction -> bool
 val equal_instructions : instruction list -> instruction list -> bool
-
-type config
-
-val config
-  :  worker:Logseq_db_worker_contract.Config.t
-  -> sync:Logseq_sync_pure_reducer.Core.config
-  -> config
 
 type view =
   { graph : graph_state
@@ -213,6 +256,8 @@ type coordination_state =
   }
 val coordination_state : state -> coordination_state
 val import_context_for_scope : state -> Logseq_sync_pure_reducer.Core.graph_scope -> Logseq_sync_pure_reducer.Core.asset_context option
+
+(** {1 Lifecycle and recovery} *)
 
 (** Pure admission/epoch/tombstone ownership for real query subscriptions.
     Physical listeners and snapshot leases remain with the effect owner. A
@@ -314,6 +359,8 @@ module Observation_registry : sig
   val retire_registration : t -> registration:int64 -> t
 end
 
+(** {2 Changefeed ownership} *)
+
 (** One registered changefeed consumer for one physical DB session.
     Registered replacements require actual prior retirement.
     An unapplied pull is retained verbatim until its exact ACK succeeds. *)
@@ -362,6 +409,7 @@ module Changefeed_owner : sig
   val retire : t -> registration:int64 -> t
 end
 
+(** {2 Orphan resource cleanup} *)
 
 (** Cleanup ownership transferred by the real Mailbox's exactly-once discarded
     success callback. Any unsettled physical release blocks new acquisition;
@@ -445,6 +493,8 @@ module Registration_retirement : sig
   val released:t -> registration:int64 -> t
 end
 
+(** {2 Host handoff} *)
+
 (** Pure one-use host permission policy. External settlement inputs are supplied
     only after actual I/O/resource owners have acknowledged. This model itself
     performs no quiescence, callbacks, randomness, file inspection or deletion. *)
@@ -488,6 +538,8 @@ module Host_handoff : sig
   val receipt_request:receipt -> request
   val receipt_copy_generation:receipt -> Logseq_overlay_db.Types.mirror_generation option
 end
+
+(** {1 Observation and helpers} *)
 
 val host_fence_blocks : state -> Logseq_db_types.Graph_types.Uuid.t -> bool
 val host_fence_active : state -> Logseq_sync_pure_reducer.Core.host_fence option

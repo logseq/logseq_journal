@@ -1,10 +1,38 @@
-(** Typed application-level WebSocket protocol shared by the sync client and server. *)
+(** {1 TLDR}
+
+    Define and encode the bounded application WebSocket protocol in both
+    directions, without network I/O or persistence. {!Client.message} travels
+    client to server; {!Server.message} travels server to client. Codecs return
+    typed {!codec_error}s and reject negative cursors and malformed fields.
+
+    Message variants depend on the payload types below. Primary signature excerpts:
+    {[
+      val encode_client_message : Client.message -> (string, codec_error) result
+      val decode_client_message : string -> (Client.message, codec_error) result
+      val encode_server_message : Server.message -> (string, codec_error) result
+      val decode_server_message : string -> (Server.message, codec_error) result
+    ]} *)
 
 (** A non-negative authoritative transaction cursor. Codec functions reject negative values. *)
 type cursor = Logseq_db_types.Server_cursor.t
 
 (** A 16-character hexadecimal entity checksum. *)
 type checksum = string
+
+(** {1 Minimal usage example}
+
+    A sender encodes a typed message; the receiving endpoint decodes that same
+    direction. Both failures remain structured rather than exposing raw payloads:
+    {[
+      match encode_client_message Client.Ping with
+      | Error error -> Error (error_to_string error)
+      | Ok wire ->
+        match decode_client_message wire with
+        | Ok message -> Ok message
+        | Error error -> Error (error_to_string error)
+    ]} *)
+
+(** {1 Capability details} *)
 
 (** A server transaction rejection category. *)
 type rejection_reason =
@@ -98,6 +126,8 @@ module Server : sig
     | Pong
     | Error of { message : string }
 end
+
+(** {1 Observation and helpers} *)
 
 (** The direction in which a rejected wire message travels. *)
 type direction =

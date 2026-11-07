@@ -1,4 +1,56 @@
-(** Pure synchronization policy and protocol state. *)
+(** {1 TLDR}
+
+    Own pure account, graph and synchronization policy. The host owns {!t};
+    {!initial} validates construction and {!step} returns a {!transition} whose
+    [next] must be installed before interpreting ordered [effects]. [Run] goes
+    to the Sync runner, [Delegate] to the Worker and [Publish] to observers.
+    Actual I/O, persistence and callback posting remain with those interpreters.
+    {!state} exposes startup, unlock, resident graph, network and failure facts.
+
+    The runner GADT and dependent event families appear below. Primary excerpts:
+    {[
+      val initial : config -> (t, create_error) result
+      val step : t -> event -> transition
+      val state : t -> state
+      val scope_for_graph : t -> graph_id:graph_id -> graph_scope option
+    ]}
+    Execution, presentation and lifecycle generations are separate. Cancellation
+    or [Shutdown] is not rollback or a physical join; exact cleanup completions
+    and [Websocket_retired] acknowledge their actual retained owners. *)
+
+(** {1 Minimal usage example}
+
+    The caller supplies validated [config], input [event] and [interpret], which
+    dispatches Run/Delegate/Publish to their existing owners:
+    {[
+      match initial config with
+      | Error error -> Error error
+      | Ok first ->
+        let reducer = ref first in
+        let transition = step !reducer event in
+        reducer := transition.next;
+        List.iter interpret transition.effects;
+        Ok reducer
+    ]}
+    Interpreters queue typed completions for later serialized turns rather than
+    recursively calling [step]. On retirement feed [Shutdown] and interpret its
+    effects, while keeping the real I/O and callback owners alive to finish cleanup. *)
+
+(** {1 Construction and validation} *)
+
+type limits
+type config
+type config_error = Invalid_config of string
+
+val limits
+  :  maximum_response_bytes:int
+  -> maximum_artifact_bytes:int
+  -> submission_batch_size:int
+  -> (limits, config_error) result
+
+val config : managed_sync_origin:Uri.t -> limits:limits -> (config, config_error) result
+
+(** {1 Capability details} *)
 
 type graph_id = Logseq_db_types.Graph_types.Uuid.t
 type graph = Logseq_db_types.Managed_graph.t
@@ -124,18 +176,6 @@ type state =
   ; diagnostics : diagnostics
   }
 
-type limits
-type config
-type config_error = Invalid_config of string
-
-val limits
-  :  maximum_response_bytes:int
-  -> maximum_artifact_bytes:int
-  -> submission_batch_size:int
-  -> (limits, config_error) result
-
-val config : managed_sync_origin:Uri.t -> limits:limits -> (config, config_error) result
-
 type bootstrap_progress =
   { graph_id : graph_id
   ; received_bytes : int64
@@ -147,6 +187,14 @@ type invalidation =
   ; changed_uuids : graph_id list
   ; changed_uuids_truncated : bool
   }
+
+(** {1 Lifecycle and recovery}
+
+    Core allocates execution generations and effect tickets for current owners;
+    runners hold the original tickets and return matching completions. Scope data
+    is not authority by itself. Account replacement, graph retirement and lifecycle
+    changes invalidate ordinary work; retained cleanup owners still require exact
+    acknowledgements. Process-local tickets are not restart recovery evidence. *)
 
 type account_scope =
   { managed_sync_origin : Uri.t
@@ -230,6 +278,8 @@ val catalog_cache_graphs : catalog_cache -> graph list
 val catalog_cache_selected_graph : catalog_cache -> graph_id option
 val encode_catalog_cache : catalog_cache -> string
 val decode_catalog_cache : string -> (catalog_cache, string) result
+
+(** {2 Protected values and assets} *)
 
 type encryption_batch =
   { scope : graph_scope
@@ -408,6 +458,8 @@ type protected_ticket
 
 val protected_ticket_id : protected_ticket -> string
 
+(** {2 Runner requests and completions} *)
+
 type _ runner_request =
   | Load_catalog : account_scope -> catalog_cache option runner_request
   | Save_catalog :
@@ -485,6 +537,8 @@ type runner_completion =
 val runner_effect_scope : runner_effect -> effect_scope
 val equal_runner_effect : runner_effect -> runner_effect -> bool
 val runner_effect_diagnostic : runner_effect -> string
+
+(** {2 Worker delegation} *)
 
 type mirror_request =
   { graph : graph
@@ -608,6 +662,8 @@ type timeline_scope =
   ; graph_generation : graph_generation
   }
 
+(** {2 Serialized events and transitions} *)
+
 type event =
   | Host_fence_started of host_fence
   | Host_fence_released of Logseq_db_types.Graph_types.Uuid.t
@@ -685,6 +741,8 @@ type transition =
   }
 
 val step : t -> event -> transition
+
+(** {1 Observation and helpers} *)
 
 (** Ordered, currently resident graphs; at most three unique authorized entries. *)
 val resident_graphs : t -> graph_id list

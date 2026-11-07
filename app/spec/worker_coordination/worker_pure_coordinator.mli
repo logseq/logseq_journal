@@ -1,6 +1,23 @@
-(** Pure Worker request/observation/resource coordination, not the whole App.
-    Navigation/feed/Favorites algorithms, Capture editing and media UI stay with
-    their current business owners. step performs no DB/network/clock/callback IO. *)
+(** {1 TLDR}
+
+    Coordinate App requests, observations and resource ownership for one Worker
+    binding. The caller owns {!t}; {!step} and {!request} perform no I/O or
+    persistence. Each returns a private {!transition}: install [next] before
+    interpreting [instructions] in order. The runner queues later typed events.
+    Queue admission, durable outcomes and presentation confirmation are separate;
+    cancellation does not prove rollback. {!shutdown_state} reaches [Stopped]
+    only after real cleanup acknowledgements, not merely [Shutdown_requested].
+
+    The indexed event/instruction families depend on the capabilities below.
+    These are excerpts of the actual entry points, not additional APIs:
+    {[
+      val initial : client_id:Worker.Uuid.t -> t
+      val step : t -> event -> transition
+      val request : t -> Worker.session -> 'a Worker.request
+        -> ('a ticket * transition, Worker.error) result
+      val reply : view -> 'a ticket -> 'a Worker.reply option
+    ]} *)
+
 module Worker = Worker_api
 
 type t
@@ -12,6 +29,27 @@ val initial : client_id:Worker.Uuid.t -> t
 val view : t -> view
 val bootstrap : view -> Worker.bootstrap_state
 val projection : view -> Worker.projection option
+
+(** {1 Minimal usage example}
+
+    The caller supplies a coordinator [state] that has installed its real binding
+    and Ready bootstrap projection, an Open resident [session], validated [budget]
+    and [query], and the runner's [interpret]:
+    {[
+      let apply transition =
+        state := transition.next;
+        List.iter interpret transition.instructions
+      in
+      match request !state session (Worker.Query (budget, query)) with
+      | Error error -> Error error
+      | Ok (ticket, transition) -> apply transition; Ok ticket
+    ]}
+    The host establishes [state] by applying the real [Worker_bound] and bootstrap
+    events through [step] before this flow. [interpret] queues all callbacks for
+    later serialized turns. Read [reply (view !state) ticket] after
+    completion; feed [Forget ticket] once its result has been consumed. *)
+
+(** {1 Capability details} *)
 
 (** Latest original notifications accepted by Core for current residents since
     the previous view. Stale/foreign notices never reach this outlet; it retains
@@ -98,6 +136,8 @@ val change_application_ready : view -> Worker.change_batch -> bool
 val change_application_error : view -> Worker.change_batch -> Worker.error option
 val equal_view : view -> view -> bool
 
+(** {1 Lifecycle and recovery} *)
+
 type shutdown_state =
   | Active
   | Draining
@@ -181,6 +221,8 @@ type event =
 (* Return means no presentation consumer retains the capability. It is not an
     I/O ACK: failed/in-flight cleanup and metadata finalization stay owned until
     their matching real completions. Cleanup retries remain possible while owned. *)
+(** {2 Cleanup instructions} *)
+
 (** Cleanup identity allocated by Core before sending a replacement. It records
     an obligation, not successful registration. Runner may inspect it but cannot
     construct or retarget it; cancellation can clean up even if no handle arrived. *)
@@ -257,6 +299,8 @@ val request
   -> 'a Worker.request
   -> ('a ticket * transition, Worker.error) result
 
+(** {2 Mutation reconciliation} *)
+
 type mutation_reconciliation =
   | Submission_ticket of Worker.submission_outcome ticket
   | Confirmation_ticket of Worker.confirmation ticket
@@ -279,6 +323,8 @@ type mutation_settlement =
 val settle_applied_mutation
   : t -> presentation:Worker.presentation -> applied_presentation:Worker.presentation -> Worker.durable_intent
   -> (mutation_settlement * transition, Worker.error) result
+
+(** {2 Applying change windows} *)
 
 (** Start application of an actually delivered batch. An active successful
     attempt cannot be replaced by a duplicate pull; an explicit retry after a
