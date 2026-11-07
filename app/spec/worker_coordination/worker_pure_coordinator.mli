@@ -5,7 +5,7 @@
     persistence. Each returns a private {!transition}: install [next] before
     interpreting [instructions] in order. The runner queues later typed events.
     Queue admission, durable outcomes and presentation confirmation are separate;
-    cancellation does not prove rollback. {!shutdown_state} reaches [Stopped]
+    cancellation does not prove rollback. {!val-shutdown_state} reaches [Stopped]
     only after real cleanup acknowledgements, not merely [Shutdown_requested].
 
     The indexed event/instruction families depend on the capabilities below.
