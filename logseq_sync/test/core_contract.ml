@@ -537,6 +537,7 @@ let warm_encrypted_graph_loads_key_before_attach_and_protects_outbox () =
       { mutation_id
       ; fingerprint
       ; state = Logseq_overlay_db.Types.Queued
+      ; operation = Logseq_overlay_db.Types.Save_block_operation
       ; dependency_eligible = true
       ; attempt_count = 0
       ; plaintext_bytes = 16
@@ -1356,6 +1357,7 @@ let submitted_core () =
                 ^ Logseq_db_types.Graph_types.Uuid.to_string mutation_id)
              |> Result.get_ok
          ; state = Overlay.Queued
+         ; operation = Overlay.Save_block_operation
          ; dependency_eligible = true
          ; attempt_count = 0
          ; plaintext_bytes = 16
@@ -1904,6 +1906,7 @@ let canonical_overlay_happy_path () =
     { mutation_id
     ; fingerprint
     ; state = Overlay.Queued
+    ; operation = Overlay.Save_block_operation
     ; dependency_eligible = true
     ; attempt_count = 0
     ; plaintext_bytes = 16
@@ -2732,6 +2735,7 @@ let submitted_delete_recovery_fixture () =
         Overlay.Mutation_fingerprint.of_string "mutation-fingerprint:v1:delete-recovery"
         |> Result.get_ok
     ; state = Overlay.Queued
+    ; operation = Overlay.Delete_blocks_operation
     ; dependency_eligible = true
     ; attempt_count = 0
     ; plaintext_bytes = 128
@@ -4056,6 +4060,7 @@ let rejected_submission_feedback () =
                 ^ Logseq_db_types.Graph_types.Uuid.to_string mutation_id)
              |> Result.get_ok
          ; state = Overlay.Blocked
+         ; operation = Overlay.Save_block_operation
          ; dependency_eligible = false
          ; attempt_count = 1
          ; plaintext_bytes = 16
@@ -6720,4 +6725,194 @@ let snapshot_metadata_keeps_safe_field_cause () =
 let scenarios = scenarios @ [
   Alcotest.test_case "cache decoder keeps safe field cause" `Quick cache_decoder_keeps_safe_field_cause;
   Alcotest.test_case "snapshot metadata keeps safe field cause" `Quick snapshot_metadata_keeps_safe_field_cause]
+;;
+
+(* The sync reducer owns batching: descriptors arrive through its public inspected
+   view, rather than injecting a rejected storage transition. *)
+let submission_operation_batches operations expected_lengths () =
+  let descriptors =
+    List.mapi (fun index operation ->
+      { Overlay.mutation_id =
+          Logseq_db_types.Graph_types.Uuid.of_string
+            (Printf.sprintf "00000000-0000-4000-8000-%012d" (index + 1))
+          |> Result.get_ok
+      ; fingerprint = token Overlay.Mutation_fingerprint.of_string
+          (Printf.sprintf "mutation-fingerprint:v1:batch-%d" index)
+      ; operation
+      ; state = Overlay.Queued
+      ; dependency_eligible = true
+      ; attempt_count = 0
+      ; plaintext_bytes = 16
+      ; protected_bytes = Some 16
+      }) operations
+  in
+  let sync ordinal submissions = recovery_sync () ordinal submissions in
+  let core, connection = restore_recovery_core (sync 0 []) in
+  let inspecting = Core.step core Core.Local_outbox_changed in
+  let first_event = Core.Sync_inspected
+    { scope = connection.graph; sync = sync 1 descriptors } in
+  let first = Core.step inspecting.next first_event in
+  ignore (check_replay "operation batch" inspecting.next first_event first);
+  let rec drain (planned : Core.transition) ordinal checkpoint remaining = function
+    | [] ->
+      Alcotest.(check int) "no stranded mutations" 0 (List.length remaining);
+      require_no_new_submission planned.effects
+    | count :: counts ->
+      let request = recovery_request planned.effects in
+      let rec split n acc xs = match n, xs with
+        | 0, _ | _, [] -> List.rev acc, xs
+        | _, x :: tail -> split (n - 1) (x :: acc) tail in
+      let expected, rest = split count [] remaining in
+      Alcotest.(check bool) "ordered contiguous submission"
+        true (request.transition = Overlay.Submit_group
+          (List.map (fun (item : Overlay.submission_descriptor) -> item.mutation_id) expected));
+      let batch_id = token Overlay.Submission_batch_id.of_string
+        (Printf.sprintf "submission-batch:v1:operation-%d" ordinal) in
+      let wires = List.map (fun (item : Overlay.submission_descriptor) ->
+        Overlay.submission_wire ~maximum_bytes:1024 ~mutation_id:item.mutation_id
+          ~operation:item.operation ~protected_transaction:"[]" |> Result.get_ok) expected in
+      let batch = Overlay.submission_batch ~maximum_wires:32 ~maximum_bytes:4096
+        ~batch_id ~t_before:(recovery_cursor checkpoint) ~wires |> Result.get_ok in
+      let view state ordinal = recovery_sync () ~checkpoint ordinal
+        (List.map (fun (item : Overlay.submission_descriptor) -> {item with state}) expected @ rest) in
+      let submitted = Core.step planned.next
+        (recovery_commit request (view (Overlay.Submitted batch_id) (ordinal + 1)) (Some batch)) in
+      let through = checkpoint + count in
+      let acknowledged = Core.step submitted.next
+        (Core.Websocket_message (connection, Protocol.Server.Tx_batch_ok
+          {t = server_cursor_of_int through; checksum = Some "0123456789abcdef"})) in
+      let accept = recovery_request acknowledged.effects in
+      let accepted = Core.step acknowledged.next
+        (recovery_commit accept
+           (view (Overlay.Accepted_pending_authoritative batch_id) (ordinal + 2)) None) in
+      require_no_new_submission accepted.effects;
+      let pulled = Core.step accepted.next
+        (Core.Websocket_message (connection, Protocol.Server.Pull_ok
+          { t = server_cursor_of_int through; checksum = Some "0123456789abcdef"
+          ; txs = List.init count (fun i -> Protocol.Server.
+              {t = server_cursor_of_int (checkpoint + i + 1); tx = "[]"; outliner_op = None}) })) in
+      let applied = recovery_apply pulled.next connection
+        (recovery_sync () ~checkpoint:through (ordinal + 3) rest) in
+      drain applied (ordinal + 4) through rest counts
+  in
+  drain first 1 0 descriptors expected_lengths
+;;
+
+let scenarios = scenarios @
+  let open Overlay in
+  let normal = Append_journal_operation and delete = Delete_blocks_operation in
+  List.map (fun (name, operations, groups) ->
+    Alcotest.test_case name `Quick (submission_operation_batches operations groups))
+    [ "delete first stays singleton", [delete; normal; normal], [1; 2]
+    ; "delete middle preserves normal batches", [normal; normal; delete; normal; normal], [2; 1; 2]
+    ; "delete last stays singleton", [normal; normal; delete], [2; 1]
+    ; "two deletes drain as singletons", [delete; delete], [1; 1]
+    ; "normal mutations retain batching", [Save_block_operation; Insert_blocks_operation;
+        Append_journal_operation; Create_journal_page_operation; Set_task_status_operation;
+        Clear_task_status_operation; Publish_asset_operation], [7]
+    ; "normal batch count cap remains", List.init 34 (fun _ -> normal), [32; 2]
+    ; "delete at batch cap remains singleton", List.init 32 (fun _ -> normal) @ [delete; normal], [32; 1; 1]
+    ]
+;;
+
+let nonresident_scoped_outbox_notice () =
+  let core, connection = restore_recovery_core (recovery_sync () 0 []) in
+  let scope = connection.graph in
+  let changed = Core.step core (Core.Local_graph_outbox_changed scope) in
+  check_instructions "matching scoped notice" [Core.Delegate (Core.Inspect_sync scope)] changed.effects;
+  List.iter (fun stale ->
+    let event = Core.Local_graph_outbox_changed stale in
+    let ignored = Core.step core event in
+    check_instructions "stale scoped notice" [] ignored.effects;
+    check_observed "stale scoped notice" "state unchanged" (observe core) (observe ignored.next))
+    [ {scope with graph_id = other_graph_id}
+    ; {scope with graph_generation = scope.graph_generation + 1}
+    ; {scope with account = {scope.account with account_generation = scope.account.account_generation + 1}}
+    ; {scope with account = {scope.account with lifecycle_generation = Int64.succ scope.account.lifecycle_generation}} ]
+;;
+let scenarios = scenarios @ [Alcotest.test_case "nonresident scoped outbox notice is fenced"
+  `Quick nonresident_scoped_outbox_notice]
+;;
+
+let submission_keeps_dependency_eligibility () =
+  let make index operation dependency_eligible : Overlay.submission_descriptor =
+    { mutation_id = Logseq_db_types.Graph_types.Uuid.of_string
+        (Printf.sprintf "00000000-0000-4000-8000-%012d" index) |> Result.get_ok
+    ; fingerprint = token Overlay.Mutation_fingerprint.of_string
+        (Printf.sprintf "mutation-fingerprint:v1:dependency-%d" index)
+    ; operation; dependency_eligible; state = Overlay.Queued; attempt_count = 0
+    ; plaintext_bytes = 16; protected_bytes = Some 16 }
+  in
+  let ineligible = make 1 Overlay.Delete_blocks_operation false in
+  let eligible = make 2 Overlay.Append_journal_operation true in
+  List.iter (fun (descriptors, expected) ->
+    let core, connection = restore_recovery_core (recovery_sync () 0 []) in
+    let inspecting = Core.step core Core.Local_outbox_changed in
+    let planned = Core.step inspecting.next (Core.Sync_inspected
+      {scope = connection.graph; sync = recovery_sync () 1 descriptors}) in
+    match expected with
+    | [] -> require_no_new_submission planned.effects
+    | ids -> Alcotest.(check bool) "ineligible descriptors are never submitted"
+        true ((recovery_request planned.effects).transition = Overlay.Submit_group ids))
+    [ [ineligible], []; [ineligible; eligible], [eligible.mutation_id] ]
+;;
+let scenarios = scenarios @ [Alcotest.test_case "submission respects dependency eligibility"
+  `Quick submission_keeps_dependency_eligibility]
+;;
+
+let superseded_outbox_request_recovers kind () =
+  let first=List.hd mutation_ids in
+  let descriptor state : Overlay.submission_descriptor =
+    {mutation_id=first;fingerprint=token Overlay.Mutation_fingerprint.of_string "mutation-fingerprint:v1:superseded";
+     operation=Overlay.Append_journal_operation;state;dependency_eligible=true;attempt_count=0;
+     plaintext_bytes=16;protected_bytes=Some 16} in
+  let pending = match kind with
+    | `Submit | `Retry ->
+      let state=match kind with `Retry->Overlay.Submitted(token Overlay.Submission_batch_id.of_string "submission-batch:v1:superseded")|_->Overlay.Queued in
+      let core,connection=restore_recovery_core(recovery_sync() 80 []) in
+      let inspecting=Core.step core Core.Local_outbox_changed in
+      Core.step inspecting.next(Core.Sync_inspected{scope=connection.graph;sync=recovery_sync() 81 [descriptor state]})
+    | `Accept | `Reject ->
+      let core,connection=submitted_core()in
+      let message=match kind with
+        |`Accept->Protocol.Server.Tx_batch_ok{t=server_cursor_of_int 3;checksum=Some "0123456789abcdef"}
+        |_->Protocol.Server.Tx_reject{reason=Db_transact_failed;t=Some(server_cursor_of_int 1);
+          checksum=Some "0123456789abcdef";success_tx_ids=[first];failed_tx_id=Some(List.nth mutation_ids 1);
+          missing_block_uuids=[];error_detail=None;data=None} in
+      Core.step core(Core.Websocket_message(connection,message)) in
+  let request=recovery_request pending.effects in
+  let fresh=recovery_sync() 82 [descriptor Overlay.Queued] in
+  let superseded request sync=Core.Outbox_transition_superseded{request;sync} in
+  let changed=Core.step pending.next(superseded request fresh) in
+  let retry=recovery_request changed.effects in
+  Alcotest.(check bool) "recovery advances only to observed fresh token" true
+    (Overlay.sync_token_equal retry.expected(Overlay.sync_view_token fresh));
+  Alcotest.(check bool) "same graph and key retained" true (retry.scope=request.scope && retry.key=request.key);
+  (match kind with
+   |`Accept|`Reject->Alcotest.(check bool) "exact validated server outcome retained" true (retry.transition=request.transition)
+   |`Submit|`Retry->Alcotest.(check bool) "submission replans from current queued descriptors" true
+       (retry.transition=Overlay.Submit_group[first]));
+  check_instructions "superseded completion cannot replay after token advances" []
+    (Core.step changed.next(superseded request fresh)).effects;
+  let same_token=Overlay.sync_view ~token:request.expected ~checkpoint:(recovery_cursor 0) ~submissions:[] in
+  check_instructions "unchanged token never retries" [] (Core.step pending.next(superseded request same_token)).effects;
+  List.iter(fun stale->check_instructions "wrong pending owner ignored" []
+    (Core.step pending.next(superseded stale fresh)).effects)
+    [{request with scope={request.scope with graph_generation=request.scope.graph_generation+1}};
+     {request with scope={request.scope with account={request.scope.account with lifecycle_generation=Int64.succ request.scope.account.lifecycle_generation}}};
+     {request with expected=Overlay.sync_view_token fresh};
+     {request with transition=Overlay.Submit_group[]}];
+  let inspecting=Core.step pending.next Core.Local_outbox_changed in
+  let latest=recovery_sync() 83 [descriptor Overlay.Queued] in
+  let observed=Core.step inspecting.next(Core.Sync_inspected{scope=request.scope;sync=latest}) in
+  let recovered=Core.step observed.next(superseded request fresh) in
+  Alcotest.(check bool) "late superseded result cannot replace independently refreshed sync view" true
+    (Overlay.sync_token_equal(recovery_request recovered.effects).expected(Overlay.sync_view_token latest));
+  let signed_out=Core.step pending.next(Core.Account_authenticated{user_id=None})in
+  check_instructions "retired account ignores superseded preparation" []
+    (Core.step signed_out.next(superseded request fresh)).effects
+;;
+let scenarios=scenarios @ List.map(fun(name,kind)->Alcotest.test_case name `Quick(superseded_outbox_request_recovers kind))
+ ["superseded submit replans and fences",`Submit;"superseded retry replans and fences",`Retry;
+  "superseded accept preserves outcome",`Accept;"superseded reject preserves partition",`Reject]
 ;;

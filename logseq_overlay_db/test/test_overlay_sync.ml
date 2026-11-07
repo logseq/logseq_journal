@@ -4695,6 +4695,76 @@ let database_cases =
     ]
 ;;
 
+(* Sync's pure reducer carries opaque transactions and cannot execute this
+   retirement/rebase decision. Exercise its owning public Database boundary. *)
+let queued_delete_survives_own_append_echo ?(existing_block=false) ?(remote_later=false) ~remote_change db =
+ let behavior="queued delete follows own append echo" in
+ let root=if existing_block then T.authoritative_block_uuid else T.mutation_uuid 9001 in
+ let append=Types.Append_journal {mutation_id=T.mutation_uuid 9002;page=T.mutation_uuid 9003;
+ title="2026-11-07";journal_day=20261107;
+ root={uuid=root;title="Synthetic capture";task_status=None;children=Rrbvec.empty}} in
+ let mutation = if existing_block then
+   Types.Save_block {mutation_id=T.mutation_uuid 9002;block=root;title="Own saved title"}
+   else append in
+ let expected = if existing_block then T.delete_precondition db ~block:root ~behavior
+   else T.empty_precondition ~behavior in
+ let intent=Database.persist_local_intent db ~namespace:(String.make 64 'a') ~payload:"append"
+ ~expected mutation |> T.require_ok ~behavior in
+ let proof=Database.commit_local_intent db intent |> T.require_ok ~behavior in
+ let local=Database.intent_commit_outcome proof in
+ let deletion=Types.Delete_blocks{mutation_id=T.mutation_uuid 9004;root} in
+ ignore(T.commit_mutation db ~expected:(T.delete_precondition db ~block:root ~behavior) deletion ~behavior);
+ let submitted=submit_one db local behavior in
+ let wire=server_transaction ~mutation_id:local.mutation_id ~operation:"append-journal" submitted in
+ let barrier={through=server_cursor 1;checksum=checksum "1111111111111111"} in
+ let sync=Database.inspect_sync db |> T.require_ok ~behavior in
+ let prepared,_=Database.begin_outbox_transition db ~expected:(sync_view_token sync)
+ (Accept_group{batch_id=submission_batch_id submitted;barrier}) |> T.require_ok ~behavior in
+ ignore(Database.apply_outbox_transition db prepared ~encrypted:None |> T.require_ok ~behavior);
+ let transactions = [authoritative_transaction ~cursor:(server_cursor 1)
+   ~transaction:(encoded ~maximum_bytes:65536 wire)] in
+ let transactions = if not remote_change then transactions else
+   transactions @ [authoritative_transaction ~cursor:(server_cursor 2)
+     ~transaction:(encoded (Printf.sprintf
+       "[[\"~:db/add\",[\"~:block/uuid\",\"~u%s\"],\"~:block/updated-at\",1704067200999]]"
+       (Graph.Uuid.to_string root)))] in
+ let batch=authoritative_batch ~maximum_count:16 ~maximum_bytes:65536
+ ~transactions
+ ~through:(server_cursor (if remote_change then 2 else 1)) ~checksum:(Some barrier.checksum) |> T.require_ok ~behavior in
+ let sync=Database.inspect_sync db |> T.require_ok ~behavior in
+ let prepared,crypto=Database.begin_authoritative db ~expected:(sync_view_token sync) batch |> T.require_ok ~behavior in
+ let decrypted=Option.map(fun req->decrypt_submitted_request req behavior)crypto in
+ let commit=match Database.apply_authoritative db prepared ~decrypted |> T.require_ok ~behavior with
+ |Authoritative_applied c->c|_->failwith "deferred" in
+ let remote_won = List.exists (fun terminal -> match terminal.receipt with
+   | Remote_won_receipt r -> Graph.Uuid.equal r.mutation_id (T.mutation_uuid 9004)
+   | _ -> false) commit.terminal_receipts in
+ T.require (remote_won = remote_change) "own echo was mistaken for a remote delete conflict";
+ let sync=Database.inspect_sync db |> T.require_ok ~behavior in
+ T.require (List.length (sync_view_submissions sync) = if remote_change then 0 else 1)
+   "queued delete was lost or genuine remote conflict was ignored";
+ let snapshot=Database.current_snapshot db |> T.require_ok ~behavior in
+ let present=match Database.get_outline_blocks snapshot [root] |> T.require_ok ~behavior with
+   | [Present_block _] -> true | _ -> false in
+ Database.release_snapshot snapshot;
+ T.require (present = remote_change) "own echo resurrected locally deleted block";
+ if remote_later then (
+   let remote = Printf.sprintf
+     "[[\"~:db/add\",[\"~:block/uuid\",\"~u%s\"],\"~:block/updated-at\",1704067200999]]"
+     (Graph.Uuid.to_string root) in
+   let later = commit_plain_authoritative db ~cursor:(server_cursor 2) remote behavior in
+   T.require (List.exists (fun terminal -> match terminal.receipt with
+     | Remote_won_receipt r -> Graph.Uuid.equal r.mutation_id (T.mutation_uuid 9004)
+     | _ -> false) later.terminal_receipts)
+     "real remote change in a later batch did not win")
+ else if not remote_change then (
+   let prepared, request, _ = prepare_submit db [T.mutation_uuid 9004] behavior in
+   let protected = protect request behavior in
+   let sent = Database.apply_outbox_transition db prepared ~encrypted:(Some protected)
+     |> T.require_ok ~behavior in
+   T.require (Option.is_some sent.submission_batch) "preserved delete cannot submit")
+;;
+
 let () =
   Alcotest.run
     "logseq_overlay_db sync"
@@ -4713,6 +4783,15 @@ let () =
       ; Alcotest.test_case "storage failure rolls back mixed batch" `Quick (empty_authoritative_failure_is_atomic ~storage:true)
       ; T.database_case "empty payload keeps both token guards" empty_authoritative_keeps_token_guards
       ; T.database_case "malformed neighbours and empty outer batch reject" empty_authoritative_keeps_invalid_input_rejection ]
+    ; "queued delete own echoes", [
+        T.database_case "queued delete survives own append echo"
+          (queued_delete_survives_own_append_echo ~remote_change:false);
+        T.database_case "queued delete still yields to remote edit after own echo"
+          (queued_delete_survives_own_append_echo ~remote_change:true);
+        T.database_case "queued delete yields to later remote batch after own echo"
+          (queued_delete_survives_own_append_echo ~remote_later:true ~remote_change:false);
+        T.database_case "queued delete survives earlier local save echo"
+          (queued_delete_survives_own_append_echo ~existing_block:true ~remote_change:false)]
     ; "validated wire inputs", pure_cases
     ; "protected same-value rewrites", protected_retraction_cases
     ; "durable sync view", database_cases ]

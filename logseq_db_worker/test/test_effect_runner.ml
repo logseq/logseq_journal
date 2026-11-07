@@ -3181,10 +3181,237 @@ let test_authoritative_rejection_diagnostics kind () =
                   @ if String.length payload > 30 then [ payload ] else []))))))
 ;;
 
+(* The pure reducer can consume an outbox notice, but cannot reproduce a missing
+   notice from the physical commit owner. Exercise that public runner boundary
+   against isolated synthetic mirrors, then drain its real events. *)
+let test_durable_commit_notifies_own_graph ~resident () =
+  let module Mutation=Logseq_db_worker_contract.Worker_pure_mutation in
+  let require condition message=Alcotest.(check bool) message true condition in
+  T.with_managed(fun fixture->
+    let graph_id=Test_support.graph_uuid in
+    let other_id=Test_support.mutation_uuid 29800 in
+    List.iter(fun graph_id->ignore(Test_support.seed_mirror ~graph_id fixture.config.application_support_directory))
+      (if resident then [graph_id;other_id] else [graph_id]);
+    Eio_main.run(fun _->Eio.Switch.run(fun sw->
+      let graph graph_id : Sync.graph={graph_id;name="Durable notification fixture";
+        encrypted=false;schema={major=65;minor=33;exact=true}} in
+      let state=ref(Core.initial(Core.config ~worker:fixture.config ~sync:(asset_sync_config())) |> Result.get_ok) in
+      let events=Queue.create() and connections=ref [] and inspections=ref [] in
+      let authority=ref true and retire_on_projection=ref false in
+      let post event=
+        (match event with Core.Projection_push_for_scope _ when !retire_on_projection->authority:=false|_->());
+        Queue.add event events in
+      let sync_runner=Runner.sync_runner ~retire_account:(fun ~account:_->Ok()) ~shutdown:(fun()->())
+        ~submit:(function
+          |Sync.Request(ticket,Sync.Fetch_catalog _)->post(Core.Sync_event(Sync.Runner_completed
+            (Sync.Completion(ticket,Ok(List.map graph (if resident then [graph_id;other_id] else [graph_id]))))))
+          |Sync.Request(ticket,Sync.Save_catalog _)->post(Core.Sync_event(Sync.Runner_completed(Sync.Completion(ticket,Ok()))))
+          |Sync.Start_websocket request->connections:=request.scope :: !connections
+          |_->())() in
+      let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
+        ~runtime:(Runner.runtime ~fork:(fun ~sw:_ task->task()) ~sleep:(fun _->()) |> Result.get_ok)
+        ~publish:(fun _->()) |> Result.get_ok in
+      let runner=Runner.create ~sw dependencies ~post ~recovery_current:(fun _->false)
+        ~upload_current:(fun _->false) ~asset_current:(fun _->false) |> Result.get_ok in
+      let drain ()=while not(Queue.is_empty events)do
+        let transition=Core.step !state(Queue.take events)in state:=transition.next;
+        List.iter(fun instruction->
+          (match instruction with
+           |Core.Run_worker(Core.Request(_,Core.Handle_sync_worker_effect(Sync.Inspect_sync scope)))->
+             inspections:=scope :: !inspections
+           |_->());
+          Runner.submit runner instruction)transition.effects done in
+      let drive event=post(Core.Sync_event event);drain() in
+      let notices ()=Queue.fold(fun scopes->function
+        |Core.Sync_event(Sync.Local_graph_outbox_changed scope)->scope::scopes
+        |Core.Sync_event Sync.Local_outbox_changed->Alcotest.fail "durable mutation emitted an unscoped notice"
+        |_->scopes)[] events in
+      let intent ?(title="Durable notification") n=
+        Mutation.create_append ~origin:(Uri.of_string "https://api.logseq.io") ~user:"fixture-user" ~graph:graph_id
+          ~mutation_id:(Test_support.mutation_uuid n) ~page:(Test_support.mutation_uuid 29801)
+          ~day:(Logseq_db_worker_contract.Worker_pure_day.create 20261107 |> Result.get_ok)
+          ~root:{block_id=Test_support.mutation_uuid(n+100);title;task_status=None;children=Rrbvec.empty}
+          |> Result.get_ok |> fun value->Mutation.Append_intent value in
+      Fun.protect ~finally:(fun()->Runner.shutdown runner)(fun()->
+        drive(Sync.Sign_in_requested{account_generation=0;presentation_generation=0});
+        drive(Sync.Account_authenticated{user_id=Some "fixture-user"});
+        if resident then (
+          drive(Sync.Resident_graphs_changed[graph_id;other_id]);
+          drive(Sync.Visible_graph_changed other_id))
+        else drive(Sync.Graph_selected graph_id);
+        List.iter(fun connection->drive(Sync.Websocket_opened connection))!connections;
+        let connection=List.find(fun (value:Sync.connection_scope)->value.graph.graph_id=graph_id)!connections in
+        let scope=connection.graph in
+        if resident then require((Core.view !state).sync.snapshot.selected_graph=Some other_id)
+          "mutation fixture must keep another resident visible";
+        inspections:=[];
+        let mutate intent=Runner.durable_mutation runner ~scope ~intent ~current:(fun()-> !authority) in
+        let first=intent 29810 in
+        let proof=match mutate first with Mutation.Committed proof->proof|_->Alcotest.fail "synthetic append did not commit" in
+        require(notices()=[scope]) "committed append posts exactly its own scoped sync notice";
+        drain();
+        require(!inspections=[scope]) "committed append automatically inspects only its own graph";
+        require(match mutate first with Mutation.Committed replay->replay=proof|_->false)
+          "idempotent replay retains original commit proof";
+        require(notices()=[scope]) "replayed commit can repair a lost sync notification";
+        drain();
+        require(match mutate(intent ~title:"Conflicting payload" 29810)with Mutation.Rejected _->true|_->false)
+          "conflicting intent is rejected";
+        require(notices()=[]) "rejected mutation never notifies sync";
+        authority:=false;
+        require(mutate(intent 29811)=Mutation.Unknown) "retired authority cannot commit";
+        require(notices()=[]) "unknown mutation never notifies sync";
+        authority:=true;retire_on_projection:=true;
+        require(match mutate(intent 29812)with Mutation.Committed _->true|_->false)
+          "physical commit retains evidence when presentation retires";
+        require(not !authority) "fixture retires authority during actual commit publication";
+        require(notices()=[scope]) "caller retirement cannot strand a successfully committed outbox"))))
+;;
+
+let test_durable_commit_during_protection ?(resident=false) mode () =
+  let module Mutation=Logseq_db_worker_contract.Worker_pure_mutation in
+  let require condition message=Alcotest.(check bool) message true condition in
+  T.with_managed(fun fixture->
+    let graph_id=Test_support.graph_uuid in
+    let other_id=Test_support.mutation_uuid 29800 in
+    List.iter(fun graph_id->ignore(Test_support.seed_mirror ~graph_id fixture.config.application_support_directory))
+      (if resident then [graph_id;other_id] else [graph_id]);
+    Eio_main.run(fun env->Eio.Switch.run(fun sw->
+      let graph graph_id : Sync.graph={graph_id;name="Durable notification fixture";
+        encrypted=true;schema={major=65;minor=33;exact=true}} in
+      let state=ref(Core.initial(Core.config ~worker:fixture.config ~sync:(asset_sync_config())) |> Result.get_ok) in
+      let events=Queue.create() and connections=ref [] and inspections=ref [] in
+      let authority=ref true and retire_on_projection=ref false in
+      let held=ref None and running=ref 0 and failures=ref [] and inspected=ref None and closes=ref 0 in
+      let hold_crypto=ref(mode<>`Ack) and hold_ack=ref(mode=`Ack) and held_ack=ref None in
+      let sends=ref 0 and superseded=ref 0 and applied=ref None in
+      let post event=
+        (match event with Core.Projection_push_for_scope _ when !retire_on_projection->authority:=false|_->());
+        Queue.add event events in
+      let sync_runner=Runner.sync_runner ~retire_account:(fun ~account:_->Ok()) ~shutdown:(fun()->())
+        ~submit:(function
+          |Sync.Request(ticket,Sync.Fetch_catalog _)->post(Core.Sync_event(Sync.Runner_completed
+            (Sync.Completion(ticket,Ok(List.map graph (if resident then [graph_id;other_id] else [graph_id]))))))
+          |Sync.Request(ticket,Sync.Save_catalog _)->post(Core.Sync_event(Sync.Runner_completed(Sync.Completion(ticket,Ok()))))
+          |Sync.Request(ticket,Sync.Load_and_unlock_graph_key scope)->
+            post(Core.Sync_event(Sync.Runner_completed(Sync.Completion(ticket,Ok(Sync.graph_key_handle ~id:"synthetic-key" ~scope)))))
+          |Sync.Request(ticket,Sync.Fetch_and_unlock_graph_key request)->
+            post(Core.Sync_event(Sync.Runner_completed(Sync.Completion(ticket,Ok(Sync.graph_key_handle ~id:"synthetic-key" ~scope:request.scope)))))
+          |Sync.Protected_io(ticket,request)->
+            if !hold_crypto then held:=Some(ticket,request) else
+            let values=match request.Sync.protected_action with Sync.Encrypt_values(_,values)->values|_->assert false in
+            post(Core.Sync_event(Sync.Runner_completed(Sync.Protected_completion(ticket,
+              Ok(Sync.Encrypted_values(List.map(fun value->String.make 12 'i',value)values))))))
+          |Sync.Send_websocket {message=Logseq_sync_pure_reducer.Sync_protocol.Client.Tx_batch _;_}->incr sends
+          |Sync.Close_websocket _->incr closes
+          |Sync.Start_websocket request->connections:=request.scope :: !connections
+          |_->())() in
+      let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
+        ~runtime:(Runner.runtime ~fork:(fun ~sw task->incr running;Eio.Fiber.fork ~sw(fun()->Fun.protect ~finally:(fun()->decr running)task)) ~sleep:(fun _->()) |> Result.get_ok)
+        ~publish:(fun _->()) |> Result.get_ok in
+      let runner=Runner.create ~sw dependencies ~post ~recovery_current:(fun _->false)
+        ~upload_current:(fun _->false) ~asset_current:(fun _->false) |> Result.get_ok in
+      let drain ()=while not(Queue.is_empty events)do
+        let event=Queue.take events in
+        (match event with
+         |Core.Runner_completed(Core.Sync_worker_effect_completed(_,Error error))->failures:=error:: !failures
+         |Core.Runner_completed(Core.Sync_worker_effect_completed(_,Ok{event=Some(Sync.Sync_inspected{sync;_});_}))->inspected:=Some sync
+         |Core.Runner_completed(Core.Sync_worker_effect_completed(_,Ok{event=Some(Sync.Outbox_transition_superseded _);_}))->incr superseded
+         |Core.Runner_completed(Core.Sync_worker_effect_completed(_,Ok{event=Some(Sync.Outbox_transition_applied result);_}))->applied:=Some result
+         |_->());
+        let transition=Core.step !state event in state:=transition.next;
+        List.iter(fun instruction->
+          (match instruction with
+           |Core.Run_worker(Core.Request(_,Core.Handle_sync_worker_effect(Sync.Inspect_sync scope)))->
+             inspections:=scope :: !inspections
+           |_->());
+          match instruction with
+          |Core.Run_worker(Core.Request(_,Core.Handle_sync_worker_effect(Sync.Apply_outbox_transition request)))
+            when !hold_ack && (match request.transition with Logseq_overlay_db.Types.Accept_group _->true|_->false)->
+              held_ack:=Some(instruction,request)
+          |_->Runner.submit runner instruction)transition.effects done in
+      let until condition=Eio.Time.with_timeout_exn(Eio.Stdenv.clock env)3.(fun()->
+        while not(condition())do drain();Eio.Fiber.yield()done;drain()) in
+      let settle ()=until(fun()-> !running=0 && Queue.is_empty events) in
+      let drive event=post(Core.Sync_event event);settle() in
+      let intent ?(title="Durable notification") n=
+        Mutation.create_append ~origin:(Uri.of_string "https://api.logseq.io") ~user:"fixture-user" ~graph:graph_id
+          ~mutation_id:(Test_support.mutation_uuid n) ~page:(Test_support.mutation_uuid 29801)
+          ~day:(Logseq_db_worker_contract.Worker_pure_day.create 20261107 |> Result.get_ok)
+          ~root:{block_id=Test_support.mutation_uuid(n+100);title;task_status=None;children=Rrbvec.empty}
+          |> Result.get_ok |> fun value->Mutation.Append_intent value in
+      Fun.protect ~finally:(fun()->Runner.shutdown runner)(fun()->
+        drive(Sync.Sign_in_requested{account_generation=0;presentation_generation=0});
+        drive(Sync.Account_authenticated{user_id=Some "fixture-user"});
+        if resident then (
+          drive(Sync.Resident_graphs_changed[graph_id;other_id]);
+          drive(Sync.Visible_graph_changed other_id))
+        else drive(Sync.Graph_selected graph_id);
+        List.iter(fun connection->drive(Sync.Websocket_opened connection))!connections;
+        let connection=List.find(fun (value:Sync.connection_scope)->value.graph.graph_id=graph_id)!connections in
+        let scope=connection.graph in
+        if resident then require((Core.view !state).sync.snapshot.selected_graph=Some other_id)
+          "mutation fixture must keep another resident visible";
+        inspections:=[];
+        let mutate intent=Runner.durable_mutation runner ~scope ~intent ~current:(fun()-> !authority) in
+        require(match mutate(intent 29810)with Mutation.Committed _->true|_->false) "first append commits";
+        (match mode with
+         |`Ack->
+           settle();require(!sends=1) "first capture reaches actual submission";
+           drive(Sync.Websocket_message(connection,Logseq_sync_pure_reducer.Sync_protocol.Server.Tx_batch_ok
+             {t=Logseq_db_types.Server_cursor.of_int64 1L |> Result.get_ok;checksum=Some "0123456789abcdef"}));
+           let instruction,request=Option.get !held_ack in
+           require(match mutate(intent 29811)with Mutation.Committed _->true|_->false) "second append commits before ACK preparation starts";
+           settle();hold_ack:=false;Runner.submit runner instruction;settle();
+           let result=Option.get !applied in
+           require(result.commit.transition=request.transition) "ACK recovery preserves its exact server barrier";
+           let records=Logseq_overlay_db.Types.sync_view_submissions result.sync in
+           require(List.length records=2 && List.exists(fun (item:Logseq_overlay_db.Types.submission_descriptor)->
+             match item.state with Accepted_pending_authoritative _->true|_->false)records)
+             "ACK settles only its submitted capture while later capture stays durable"
+         |`Crypto|`Malformed|`Crypto_error->
+           until(fun()-> !held<>None);
+           require(!running>0) "first outbox preparation is suspended in protected IO";
+           if mode=`Crypto then (
+             require(match mutate(intent 29811)with Mutation.Committed _->true|_->false) "second append commits while protection waits";
+             until(fun()-> !running=1 && Queue.is_empty events);
+             let queued=Logseq_overlay_db.Types.sync_view_submissions(Option.get !inspected) in
+             require(List.length queued=2 && List.for_all(fun (item:Logseq_overlay_db.Types.submission_descriptor)->item.state=Queued)queued)
+               "both rapid captures remain durably queued before crypto release");
+           let ticket,request=Option.get !held in
+           let encrypted=match request.Sync.protected_action with
+             |Sync.Encrypt_values(_,values)->List.map(fun value->String.make 12 'i',value)values
+             |_->Alcotest.fail "expected encryption request" in
+           hold_crypto:=false;
+           let result=match mode with
+             |`Crypto_error->Error(Sync.Crypto_failed(Sync.Invalid_key_material,"synthetic invalid key"))
+             |`Malformed->Ok(Sync.Encrypted_values [])
+             |_->Ok(Sync.Encrypted_values encrypted) in
+           post(Core.Sync_event(Sync.Runner_completed(Sync.Protected_completion(ticket,result))));
+           settle());
+        if mode=`Malformed || mode=`Crypto_error then (
+          require(List.length !failures=1 && !closes=1) "genuine crypto failure remains visible and closes connection";
+          require(!superseded=0 && !sends=0) "genuine crypto failure is never retried or sent")
+        else (
+          require(!failures=[] && !closes=0) "concurrent durable commit recovers without failing or closing sync";
+          require(!superseded=1) "exactly one revision-driven recovery";
+          require(!sends=1) "capture submits once after recovery");
+        require((Core.view !state).graph.phase=Core.Graph_open) "concurrent durable commit preserves attached graph"))))
+;;
+
 let () =
   Alcotest.run
     "logseq db worker effect runner"
-    [ ( "authoritative diagnostics", [
+    [ ( "durable protection race", [
+        Alcotest.test_case "second append during protected preparation" `Quick (test_durable_commit_during_protection `Crypto);
+        Alcotest.test_case "second append before ACK preparation" `Quick (test_durable_commit_during_protection `Ack);
+        Alcotest.test_case "genuine crypto failure is not retried" `Quick (test_durable_commit_during_protection `Crypto_error);
+        Alcotest.test_case "malformed crypto result is not retried" `Quick (test_durable_commit_during_protection `Malformed);
+        Alcotest.test_case "hidden resident protection race" `Quick (test_durable_commit_during_protection ~resident:true `Crypto)])
+    ; ( "durable sync notification", [
+        Alcotest.test_case "single graph commit and replay" `Quick (test_durable_commit_notifies_own_graph ~resident:false);
+        Alcotest.test_case "hidden resident commit and replay" `Quick (test_durable_commit_notifies_own_graph ~resident:true) ])
+    ; ( "authoritative diagnostics", [
         Alcotest.test_case "real own echo mismatch retains safe integrity reason" `Quick (test_authoritative_rejection_diagnostics `Integrity);
         Alcotest.test_case "real cursor rejection reaches Diagnostics" `Quick (test_authoritative_rejection_diagnostics `Cursor);
         Alcotest.test_case "real format rejection reaches Diagnostics" `Quick (test_authoritative_rejection_diagnostics `Format);

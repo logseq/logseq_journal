@@ -562,6 +562,7 @@ type submission_descriptor =
   { mutation_id : Graph.Uuid.t
   ; fingerprint : mutation_fingerprint
   ; state : transport_state
+  ; operation : outliner_operation
   ; dependency_eligible : bool
   ; attempt_count : int
   ; plaintext_bytes : int

@@ -1951,7 +1951,12 @@ let run_durable_mutation t ~(scope:Sync.graph_scope) ~intent ~current =
          | Ok(Database.Intent_rejected error)->reject error
          | Error error->report_commit error; Mutation.Unknown
          | Ok _->Mutation.Unknown)
-      |Ok proof->Mutation.Committed(commit_proof(Database.intent_commit_outcome proof))
+      |Ok proof->
+        (* A durable commit (including replay) must wake its own graph even if
+           the caller registration retired while storage was committing. The
+           scoped sync owner rejects retired graph/account generations. *)
+        if not t.stopped then t.post(Core.Sync_event(Sync.Local_graph_outbox_changed scope));
+        Mutation.Committed(commit_proof(Database.intent_commit_outcome proof))
 ;;
 
 let durable_mutation t ~scope ~intent ~current =
@@ -2778,13 +2783,24 @@ let handle_sync_worker_effect t = function
     (match attached_session t request.scope with
      | None -> Error (effect_error "The overlay database is unavailable.")
      | Some session ->
+       let failed error =
+         match error with
+         | Overlay.Outbox_sync_token_conflict | Outbox_commit_token_conflict
+         | Outbox_crypto_error Overlay.Crypto_result_stale ->
+           (* These failures precede persistence. A newer observed revision, not
+              the error text alone, is required before asking policy to replan. *)
+           (match Database.inspect_sync session.database with
+            | Ok sync when not(Overlay.sync_token_equal request.expected(Overlay.sync_view_token sync))->
+              Ok(sync_result ~event:(Sync.Outbox_transition_superseded{request;sync})())
+            | Ok _ | Error _ -> Error(outbox_transition_error error))
+         | _ -> Error(outbox_transition_error error) in
        (match
           Database.begin_outbox_transition
             session.database
             ~expected:request.expected
             request.transition
         with
-        | Error error -> Error (outbox_transition_error error)
+        | Error error -> failed error
         | Ok (prepared, crypto) ->
           let encrypted =
             match crypto with
@@ -2797,7 +2813,7 @@ let handle_sync_worker_effect t = function
              (match
                 Database.apply_outbox_transition session.database prepared ~encrypted
               with
-              | Error error -> Error (outbox_transition_error error)
+              | Error error -> failed error
               | Ok commit ->
                 (match Database.inspect_sync session.database with
                  | Error error -> Error (sync_read_error error)

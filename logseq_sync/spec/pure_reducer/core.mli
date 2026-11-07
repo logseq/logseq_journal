@@ -646,6 +646,11 @@ type event =
   | Graph_attachment_failed of scoped_error
   | Sync_inspected of sync_inspection
   | Outbox_transition_applied of outbox_transition_result
+  (** An uncommitted preparation lost its token to a newer durable revision.
+      The exact pending request and a changed token fence recovery; this is not
+      evidence of a commit or permission to repeat an unchanged failed request. *)
+  | Outbox_transition_superseded of
+      { request : outbox_transition_request; sync : Logseq_overlay_db.Types.sync_view }
   | Outbox_transition_failed of outbox_transition_failure
   | Authoritative_batch_applied of authoritative_commit_result
   | Authoritative_batch_deferred of authoritative_deferred_result
