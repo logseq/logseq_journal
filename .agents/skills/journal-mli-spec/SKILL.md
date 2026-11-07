@@ -1,81 +1,85 @@
 ---
 name: journal-mli-spec
-description: 编写、修改或审查 Journal 的 OCaml .mli 规格接口，以 TLDR 和紧随其后的使用示例组织面向人的契约。适用于所有 spec/ 下的 .mli，以及其他目录中承担规格契约的 .mli。
+description: Write, change or review Journal OCaml .mli specifications as readable English contracts, starting with TLDR and an immediate usage example. Applies to every .mli under spec/ and other .mli files serving as specification contracts.
 ---
 
 # Journal MLI Spec
 
-让读者只看前两部分就能理解模块的职责、核心对象、输入输出、使用顺序和关键生命周期。遵守仓库现有的契约修改授权边界；本 skill 本身不授权修改 spec、实现、Dune 或其他接口。
+Let readers understand the module's responsibility, core objects, inputs, outputs, usage order and essential lifecycle from the first two sections. Follow the repository's existing contract-change authorization boundaries; this skill does not itself authorize changes to specifications, implementations, Dune files or other interfaces.
 
-## 固定结构
+## Language
 
-每份规格接口按下列顺序组织，使用 odoc 章节。前两部分必需；第 3–6 部分仅在适用时保留，不添加空章节。
+Use English throughout the template and the resulting `.mli` declarations, documentation, comments, section headings and explanatory text in examples. Preserve externally defined names and domain data where required; do not translate literals whose exact value is part of a contract.
 
-| 顺序 | 章节 | 内容 |
+## Fixed structure
+
+Organize each specification in this order using odoc sections. The first two sections are required. Include sections 3-6 only when applicable; do not add empty sections.
+
+| Order | Section | Contents |
 | --- | --- | --- |
-| 1 | TLDR | 一句话职责、核心类型、输入输出、主入口、影响正确使用的关键约束 |
-| 2 | 最小使用示例 | 一个典型流程，包含必要的结果处理、状态安装或资源清理 |
-| 3 | 构造与校验 | 配置、限制、参数和受校验值的构造 |
-| 4 | 能力细节 | 按业务能力展开，每组放相关输入、结果、错误和操作 |
-| 5 | 生命周期与恢复 | 取消、释放、重试、持久化、失效与过期事件处理 |
-| 6 | 观察与辅助 | 状态投影、比较、诊断、编码等辅助接口 |
+| 1 | TLDR | One-sentence responsibility, core types, inputs, outputs, primary entry points and constraints essential to correct use |
+| 2 | Minimal usage example | One typical flow, including necessary result handling, state installation or resource cleanup |
+| 3 | Construction and validation | Configuration, limits, parameters and constructors for validated values |
+| 4 | Capability details | Group related inputs, results, errors and operations by business capability |
+| 5 | Lifecycle and recovery | Cancellation, release, retry, persistence, invalidation and stale-event handling |
+| 6 | Observation and helpers | State projections, comparison, diagnostics, codecs and other helpers |
 
-文件开头的模块简介属于 TLDR，不另设排在 TLDR 前面的章节。纯类型或能力接口的第二部分展示如何消费该值，或如何接入真实 owner 的执行入口；不要为凑示例增加 API。
+The opening module synopsis belongs to TLDR; do not introduce a separate section before it. For interfaces exporting only types or capabilities, the second section shows how to consume the value or reach its actual owner's execution entry point. Do not add APIs merely to produce an example.
 
-## TLDR 的内容与边界
+## TLDR contents and boundaries
 
-- 优先使用真实导出声明，展示少量核心定义和主入口。关键业务 record、variant 和错误应直接可读；内部状态和受控句柄可以抽象。不要把所有输入输出都隐藏成没有语义说明的抽象类型。
-- 通常约 30–60 行，小接口可以更短；这是阅读目标，不是硬性行数限制。不要压缩排版、删掉关键保证或添加无用声明来迎合行数。
-- 明确模块负责什么、状态或资源由谁持有、是否执行 I/O、是否持久化，以及正常调用顺序。只在相关时写出这些信息。
-- 把影响理解或正确使用的事实留在 TLDR，例如成功仅代表入队、取消不证明回滚、关闭需要真实完成 ACK。具体字段限制和完整异常分支放到展开部分。
-- 不重复声明 TLDR 已导出的名字。OCaml 类型必须先于其使用，不能先声明抽象类型，再在后面展开同名类型。优先移动依赖允许的声明；大型现有 GADT 等依赖阻碍时，可在 TLDR 文档代码块中摘录主签名并用 `{!name}` 指向真实声明。摘录必须与真实接口一致，不能伪装成额外 API。
-- 不为排版新增包装层、改变类型相等关系、削弱抽象边界或重设协议。需要改变契约才能实现的结构调整，应先明确契约问题和理由，并遵守已有授权。
+- Prefer actual exported declarations showing a small set of core definitions and primary entry points. Make essential business records, variants and errors directly readable; internal state and controlled handles may remain abstract. Do not hide every input and output behind unexplained abstract types.
+- Aim for roughly 30-60 lines; small interfaces can be shorter. This is a reading goal, not a hard limit. Do not compress formatting, remove essential guarantees or add unnecessary declarations to meet a line count.
+- State the module's responsibility, ownership of state or resources, whether it performs I/O or persists data, and the normal call order. Include these facts only where relevant.
+- Keep facts that affect understanding or correct use in TLDR: success may mean only queue admission, cancellation may not prove rollback, and shutdown may require an actual completion ACK. Put detailed field limits and exhaustive failure branches in later sections.
+- Do not redeclare names already exported in TLDR. OCaml types must be declared before use; an abstract type cannot be expanded under the same name later in the signature. Move declarations when dependencies permit. If dependencies such as an existing large GADT prevent this, summarize the primary signatures in a TLDR documentation code block and link to the actual declarations with `{!name}`. Keep excerpts accurate and distinguish them from additional APIs.
+- Do not add wrappers, change type equalities, weaken abstraction or redesign a protocol for layout. If a structural change requires a contract change, identify the issue and rationale and follow the existing authorization boundary.
 
-不同角色应在 TLDR 突出不同定义：
+Emphasize the definitions appropriate to the interface's role:
 
-| 接口角色 | 核心定义 |
+| Interface role | Core definitions |
 | --- | --- |
-| 领域数据 | 核心 record/variant、校验入口、主要转换 |
-| 纯 reducer | 可观察阶段、事件、指令、`initial` / `step` 及转换结果 |
-| I/O 或资源 | handle、主要错误、创建/使用/关闭入口、成功与关闭的含义 |
-| UI | `props` / `action` / `view`，以及状态与事件的 owner |
-| 协议或 codec | 消息方向、核心消息、编码/解码入口和失败结果 |
+| Domain data | Core records/variants, validation entry points and primary conversions |
+| Pure reducer | Observable phases, events, instructions, `initial` / `step` and transition results |
+| I/O or resources | Handles, principal errors, create/use/close entry points and the meaning of success and closure |
+| UI | `props` / `action` / `view`, with the owner of state and event handling |
+| Protocol or codec | Message direction, core messages, encode/decode entry points and failure results |
 
-## 第二部分：最小使用示例
+## Second section: minimal usage example
 
-紧跟 TLDR，展示一个完整的典型流程；特殊分支的示例放在对应能力旁边。
+Place one complete typical flow immediately after TLDR. Put examples for special branches beside the relevant capability.
 
-- 使用真实公开入口，不绕过 `.mli`、制造 sealed 值或调用实现内部函数。
-- 对 reducer 展示先安装返回状态、再按序解释指令；若回调必须排到后续串行回合，写明这一点。
-- 对资源接口展示获取、使用和必要的释放；对 I/O 展示成功和错误如何传播。仅在类型或 API 确实如此时使用 `Fun.protect`、`result` 或特定关闭协议。
-- 示例引用后文声明是允许的。明确例子由调用者提供的变量或回调；不要把未导出的方便函数写得像模块 API。
-- 示例反映该模块真实的持久化和所有权语义，不套用其他层的保证。
+- Use actual public entry points. Do not bypass `.mli` boundaries, manufacture sealed values or call implementation internals.
+- For reducers, show installation of the returned state before ordered interpretation of instructions. State when callbacks must queue a later serialized turn.
+- For resource interfaces, show acquisition, use and required release. For I/O, show how success and errors propagate. Use `Fun.protect`, `result` or a particular close protocol only when supported by the actual types and API.
+- Examples may reference declarations appearing later in the file. Identify caller-supplied variables and callbacks; do not present unexported convenience functions as module APIs.
+- Reflect the module's actual persistence and ownership semantics rather than borrowing guarantees from another layer.
 
-## 展开部分的写法
+## Detailed sections
 
-按业务能力或生命周期分组，相关类型、错误和函数尽量相邻。使用章节改善导航；只有独立概念或所有者需要时才拆模块。不要把所有类型和所有函数机械地分成两大块。
+Group by business capability or lifecycle, keeping related types, errors and functions close together. Use sections for navigation; split modules only for distinct concepts or owners. Do not mechanically place all types in one block and all functions in another.
 
-注释说明类型表达不了的契约：前置条件、成功保证、失败后保留的状态/资源、后续动作和生命周期。短操作不必机械填写全部项目。
+Document contracts that types cannot express: preconditions, success guarantees, state/resources retained on failure, subsequent actions and lifecycle. Short operations need not mechanically fill every category.
 
-对 session、continuation、ticket、receipt、lease 等句柄，在定义附近交代创建者、持有者、绑定范围、失效条件和是否跨重启保存。区分编译期类型保证与运行时 owner/generation 校验；抽象类型或 GADT 本身不证明当前授权有效。
+Near each session, continuation, ticket, receipt or lease definition, explain its creator, holder, binding scope, invalidation conditions and whether it survives restart. Distinguish compile-time type guarantees from runtime owner/generation validation; an abstract type or GADT does not itself prove current authority.
 
-分别表达状态、输入事件、输出指令和操作结果。复杂状态机补充关键转换规则，尤其是过期或重复事件、取消竞争、未知结果、清理失败和真实结束条件。不能仅列阶段名称就声称协议完整。
+Represent state, input events, output instructions and operation results separately. For complex state machines, add essential transition rules, especially stale or duplicate events, cancellation races, unknown outcomes, cleanup failures and actual termination conditions. Enumerating phases alone does not describe the complete protocol.
 
-保留各层真实差异。例如单次 admission、执行结果、持久化结果与呈现确认不能混为一谈；`None`、空页、缺失项和带 continuation 的部分结果也必须按实际语义解释。
+Preserve real differences between layers. Admission, execution results, durable outcomes and presentation confirmation are separate facts. Explain `None`, empty pages, missing items and partial results with continuations according to their actual semantics.
 
-用 `(** ... *)`、`{1 ...}`、`{2 ...}`、`{!name}` 和 `{[ ... ]}`，让源码和 odoc 文档都有清晰导航。不要在函数注释里塞入无关的模块级规则。
+Use `(** ... *)`, `{1 ...}`, `{2 ...}`, `{!name}` and `{[ ... ]}` so both source and odoc output are navigable. Keep unrelated module-wide rules out of individual function comments.
 
-## 模板示意
+## Illustrative template
 
-下面是一个异步有界读取 reducer 的组织示例，不是对项目现有接口的替换要求。采用真实模块的名称、类型和行为，不照搬示意协议。
+This asynchronous bounded-read reducer illustrates the organization. It is not a replacement contract for an existing interface. Use the actual module's names, types and behavior rather than copying the illustrative protocol.
 
 ```ocaml
-(** 协调有界读取及其完成事件。
+(** Coordinate bounded reads and their completion events.
 
     {1 TLDR}
 
-    本模块拥有进程内请求状态，runner 拥有实际 I/O。
-    step 是纯函数，不持久化状态。 *)
+    This module owns process-local request state; the runner owns actual I/O.
+    [step] is pure and does not persist state. *)
 
 type t
 type ticket
@@ -101,46 +105,47 @@ type transition = private
 
 val initial : t
 
-(** 先安装 next，再按序解释 instructions。 *)
+(** Install [next] before interpreting [instructions] in order. *)
 val step : t -> event -> transition
 val phase : t -> phase
 
-(** Shutdown 进入 Draining，待实际读取及其回调结束后才为 Stopped。 *)
+(** Shutdown enters [Draining]; [Stopped] requires actual reads and callbacks
+    to have finished. *)
 
-(** {1 最小使用示例}
+(** {1 Minimal usage example}
 
-    调用者提供 state 引用、输入 event 和 runner 的 interpret：
+    The caller supplies the [state] reference, input [event] and runner's [interpret]:
     {[
       let transition = step !state event in
       state := transition.next;
       List.iter interpret transition.instructions
     ]}
-    interpret 将完成事件排入后续串行回合。 *)
+    [interpret] queues completion events for a later serialized turn. *)
 
-(** {1 构造与校验} *)
+(** {1 Construction and validation} *)
 
 val maximum_limit : int
 
-(** key 非空，limit 在 1..maximum_limit 内。 *)
+(** Require a nonempty [key] and [limit] within [1..maximum_limit]. *)
 val request : key:string -> limit:int -> (request, error) result
 
-(** {1 生命周期与恢复}
+(** {1 Lifecycle and recovery}
 
-    完成事件匹配原 ticket。无关或重复完成不改变状态。
-    Draining 继续接收完成事件，不接纳新请求。 *)
+    Completions match the original ticket. Unrelated or duplicate completions
+    leave state unchanged. [Draining] accepts completions but no new requests. *)
 
-(** {1 观察与辅助} *)
+(** {1 Observation and helpers} *)
 
 val pending_count : t -> int
 val error_message : error -> string
 ```
 
-## 验收
+## Acceptance
 
-1. 遮住第二部分之后的内容，读者仍能说清职责、核心对象、输入输出和基本使用流程。
-2. 第一部分是 TLDR，第二部分是使用示例；示例和摘要都与真实声明一致。
-3. 类型依赖合法，没有重复声明、伪造 API、弱化 sealed/private 边界或改变协议语义。
-4. 详细部分能找到调用所需的限制、失败处理和结束条件；句柄的持久化与失效语义明确。
-5. 只整理任务授权的目标接口，不自动迁移其他 `.mli`。检查按仓库 [最终验证范围](../journal-code-review/references/validation.md#final-validation) 选择。
+1. Hide everything after the second section: a reader can still explain the responsibility, core objects, inputs, outputs and basic usage flow.
+2. TLDR is first and the usage example is second. Both agree with the actual declarations. All explanatory text and headings in the `.mli` are in English.
+3. Type dependencies are valid, without duplicate declarations, invented APIs, weakened sealed/private boundaries or changed protocol semantics.
+4. Detailed sections expose the limits, failure handling and termination conditions needed by callers. Handle persistence and invalidation are explicit.
+5. Organize only interfaces within the authorized task; do not automatically migrate other `.mli` files. Choose checks using the repository's [final validation scope](../journal-code-review/references/validation.md#final-validation).
 
-项目参考：[紧凑纯接口](../../../logseq_db_types/lib/squuid.mli)、[UI 输入与动作](../../../app/journal_composer_view.mli)、[按生命周期展开的数据库契约](../../../logseq_overlay_db/spec/database.mli)。这些文件提供结构参考，并不表示已全部符合本模板。
+Project references: [compact pure interface](../../../logseq_db_types/lib/squuid.mli), [UI inputs and actions](../../../app/journal_composer_view.mli), and [database contract organized by lifecycle](../../../logseq_overlay_db/spec/database.mli). These illustrate useful structure; they are not assertions that every reference already conforms to this template.
