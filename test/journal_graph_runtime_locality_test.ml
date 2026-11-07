@@ -82,7 +82,7 @@ module Worker_producer = struct
        | Ok(W.Answered(Error W.Response_budget_exceeded))->Production_runtime.receive_worker_read runtime ~request_id:request
            (Production_runtime.Read_failed{code=Logseq_db_worker.Error.Response_too_large;message="oversized fixture"})
        | Ok(W.Answered(Error(W.Db_error error)))->Production_runtime.receive_worker_read runtime ~request_id:request
-           (Production_runtime.Read_failed{code=Logseq_db_worker.Error.code error;message=Logseq_db_worker.Error.message error})
+           (Production_runtime.Read_error error)
        | _->Production_runtime.fail_request runtime request ~message:"Typed fixture response rejected")
     |Some(Production_runtime.Acknowledge{batch})->
       let operation=W.Acknowledge_changes batch in
@@ -5628,6 +5628,88 @@ let test_favorite_epoch_preserves_new_queue () =
 
 (* Worker admission belongs to transport. Test only that missing boundary,
    with a real Runtime output; do not duplicate DB/effect-runner coverage. *)
+(* Transport owns admission refusal, and Runtime owns preservation of the
+   correctly typed DB completion. Neither is produced by Root_navigation. *)
+let test_timeline_admission_keeps_refusal_cause () =
+  let module E=Logseq_db_worker.Error in
+  List.iter (fun (refusal,expected) ->
+    let runtime=Production_runtime.create () in
+    set_calendar runtime;
+    let output=Production_runtime.submit runtime (Journal_graph_request.Load_feed
+      {cursor=None;day_limit=7;root_limit=32;request_generation=1L}) in
+    let delivery=Journal_graph_transport.deliver ~runtime ~send:(fun _->refusal) output in
+    match delivery.responses with
+    | [{Production_runtime.payload=Feed_failed {failure=Worker_failure failure;_}}] ->
+      Alcotest.(check string) "date read operation" "listTimelineDates" failure.operation;
+      Alcotest.(check (option string)) "precise admission cause" (Some expected)
+        (E.trace failure.error).origin.code;
+      if refusal=Journal_graph_transport.Full then
+        Alcotest.(check bool) "queue full is not database closed" false
+          (E.code failure.error=E.Closed_session)
+    | _ -> Alcotest.fail "expected original feed failure")
+    Journal_graph_transport.[Full,"queueFull";Not_ready,"notReady";Stopping,"stopping"]
+;;
+
+let test_timeline_read_preserves_typed_origin () =
+  let module E=Logseq_db_worker.Error in
+  List.iter(fun category->
+    let runtime=Production_runtime.create () in
+    set_calendar runtime;
+    let output=Production_runtime.submit runtime(Journal_graph_request.Load_feed
+      {cursor=None;day_limit=7;root_limit=32;request_generation=1L}) in
+    let request=only "timeline dates" output.requests in
+    let origin=E.create_cause ~component:E.Read_model ~operation:"snapshot"
+      ~code:(Some category) ~message:("Typed cause: " ^ category) |> Result.get_ok in
+    let original=E.create_with_origin ~code:E.Closed_session ~message:"Timeline read unavailable"
+      ~details:[E.{name="phase";value=Detail_string "snapshot"}] ~origin |> Result.get_ok in
+    let result=Production_runtime.receive_worker_read runtime ~request_id:request
+      (Production_runtime.Read_error original) in
+    match result.responses with
+    | [{Production_runtime.payload=Feed_failed {failure=Worker_failure failure;_}}] ->
+      Alcotest.(check string) "same error including trace and details"
+        (Yojson.Safe.to_string(E.to_yojson original))
+        (Yojson.Safe.to_string(E.to_yojson failure.error));
+      Alcotest.(check int) "late failure remains retired" 0
+        (List.length(Production_runtime.receive_worker_read runtime ~request_id:request
+          (Production_runtime.Read_error original)).responses)
+    | _ -> Alcotest.fail "expected typed feed failure")
+    ["Database_closed";"Snapshot_released";"Snapshot_generation_invalidated"]
+;;
+
+let test_reference_and_favorites_preserve_typed_origin () =
+  let module E=Logseq_db_worker.Error in
+  let module A=Application.Root_navigation in
+  let check runtime request =
+    let origin=E.create_cause ~component:E.Storage ~operation:"sqliteStep"
+      ~code:(Some "SQLITE_CORRUPT") ~message:"SQLite reported corrupt storage"
+      |> Result.get_ok in
+    let original=E.create_with_origin ~code:E.Corrupt_storage
+      ~message:"Read failed" ~details:[] ~origin |> Result.get_ok in
+    let output=deliver_sample runtime (sample request (failed_sample (W.Db_error original))) in
+    let response=List.filter(fun (response:Runtime.response)->match response.payload with
+      | Diagnostic _ -> true | _ -> false) output.responses
+      |> only "typed diagnostic event" in
+    (match response.payload with
+     | Diagnostic failure->
+       Alcotest.(check string) "original cause remains intact"
+         (Yojson.Safe.to_string(E.to_yojson original))
+         (Yojson.Safe.to_string(E.to_yojson failure.error))
+     | _ -> assert false);
+    let state,_=A.step (A.create ~graph_generation:7) (Completed response) in
+    Alcotest.(check (option string)) "visible diagnostic retains storage cause"
+      (Some "SQLITE_CORRUPT") (List.assoc_opt "Origin code" (A.diagnostic_rows state))
+  in
+  let reference_runtime=Runtime.create () in
+  let request=reference_feed reference_runtime reference |> check_target_request reference_runtime in
+  check reference_runtime request;
+  let favorites_runtime=Runtime.create () in
+  set_calendar favorites_runtime;
+  let request=Runtime.submit favorites_runtime (Load_favorites
+    {graph_generation=7;request_generation=1L;limit=50;cursor=None})
+    |> fun output->only "favorites read" output.requests in
+  check favorites_runtime request
+;;
+
 let test_rejected_delivery_retires_unsent_queue () =
   List.iter (fun refusal ->
     let runtime = Runtime.create () in
@@ -8431,6 +8513,9 @@ let () =
         Alcotest.test_case "typed insertion admission" `Quick test_child_typed_insert_admission;
         Alcotest.test_case "unknown Child preserves wire across reset" `Quick (fun ()->test_child_unknown_wire_survives_reset ());
         Alcotest.test_case "unknown Child status preserves preconditions across reset" `Quick (fun ()->test_child_unknown_wire_survives_reset ~status:true ());
+        Alcotest.test_case "reference and favorites typed origins reach Diagnostics" `Quick test_reference_and_favorites_preserve_typed_origin;
+        Alcotest.test_case "timeline read preserves typed origin" `Quick test_timeline_read_preserves_typed_origin;
+        Alcotest.test_case "timeline admission retains cause" `Quick test_timeline_admission_keeps_refusal_cause;
         Alcotest.test_case "typed admission refusal retains graph" `Quick test_typed_child_planning_refusal_retains_transport;
         Alcotest.test_case "failed physical continuations retire before delayed recovery" `Quick test_child_error_continuations_retire;
         Alcotest.test_case "unbound child refusal remains known not admitted" `Quick test_unbound_child_refusal_is_not_admitted])

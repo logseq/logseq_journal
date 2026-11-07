@@ -85,7 +85,77 @@ let platform_failure payload = (hooks ()).platform_failure payload
 let dispose () = (hooks ()).dispose ()
 let root_node () = (hooks ()).root_node ()
 
+type initialization_stage = Decode_startup | Start_worker | Initialize
+
+(* Stable bounded codes shared with JournalRuntime; zero is an explicit unknown.
+   No strings from producers or exceptions are retained by the exception. *)
+exception Initialization_failure of initialization_stage * int
+
+let initialization_cause = function
+  | "startup payload is truncated" -> 1
+  | "startup payload exceeds 1 MiB" -> 2
+  | "invalid startup magic" -> 3
+  | "startup configuration length is invalid" -> 4
+  | "startup payload has trailing or missing bytes" -> 5
+  | "startup configuration must be valid UTF-8 JSON" -> 6
+  | "invalid startup configuration: application_support_directory must be a bounded canonical absolute path" -> 7
+  | "invalid startup configuration: response_budget_bytes is outside the protocol bounds" -> 8
+  | "invalid startup configuration: default_page_size is outside the protocol bounds" -> 9
+  | "invalid startup configuration: sync base URL must be one HTTPS origin without credentials or fragments" -> 10
+  | "worker.start.failure" -> 12
+  | "worker.start.invalidArgument" -> 13
+  | "worker.start.systemError" -> 14
+  | "worker.start.permissionDenied" -> 15
+  | "worker.start.missingFile" -> 16
+  | "worker.start.noSpace" -> 17
+  | "worker.start.busy" -> 18
+  | "worker.start.io" -> 19
+  | "worker.start.unixError" -> 20
+  | "worker.start.outOfMemory" -> 21
+  | "worker.start.stackOverflow" -> 22
+  | "worker.start.endOfFile" -> 23
+  | "worker.start.matchFailure" -> 24
+  | "worker.start.assertFailure" -> 25
+  | "worker.start.notFound" -> 26
+  | "application.mount.failed" -> 27
+  | "Worker Domain subsystem is stopped" | "Worker Domain has stopped" -> 28
+  | "Worker Domain subsystem is terminal" -> 29
+  | "Worker Domain session is already attached" -> 30
+  | "Worker Domain did not start" -> 31
+  | _ -> 0
+;;
+
+let initialization_failure stage source =
+  Initialization_failure (stage, initialization_cause source)
+;;
+
+let initialization_exception = function
+  | Initialization_failure _ as error -> error
+  | error ->
+    let cause = match error with
+      | Failure message when message = "application.mount.failed" -> 27
+      | Failure _ -> 12
+      | Invalid_argument _ -> 13
+      | Sys_error _ -> 14
+      | Unix.Unix_error ((Unix.EACCES | Unix.EPERM), _, _) -> 15
+      | Unix.Unix_error (Unix.ENOENT, _, _) -> 16
+      | Unix.Unix_error (Unix.ENOSPC, _, _) -> 17
+      | Unix.Unix_error ((Unix.EBUSY | Unix.EAGAIN), _, _) -> 18
+      | Unix.Unix_error (Unix.EIO, _, _) -> 19
+      | Unix.Unix_error _ -> 20
+      | Out_of_memory -> 21
+      | Stack_overflow -> 22
+      | End_of_file -> 23
+      | Match_failure _ -> 24
+      | Assert_failure _ -> 25
+      | Not_found -> 26
+      | _ -> 0
+    in Initialization_failure (Initialize, cause)
+;;
+
 let classify_exception = function
+  | Initialization_failure (stage, cause) ->
+    (match stage with Decode_startup -> 500 | Start_worker -> 600 | Initialize -> 700) + cause
   | Failure message when message = "application.decodeStartup.failed" -> 5
   | Failure message when message = "application.startWorker.failed" -> 6
   | Failure message when message = "application.mount.failed" -> 7

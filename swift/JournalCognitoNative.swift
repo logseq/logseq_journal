@@ -47,14 +47,14 @@ private final class JournalCognitoKeychain: Sendable {
         throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainLoad, reason: .responseTooLarge))
       }
       do { return try JSONDecoder().decode(JournalCognitoTokens.self, from: data) }
-      catch { throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainLoad, reason: .invalidRecord)) }
+      catch { throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainLoad, reason: .invalidRecord, causes: JournalAccountDiagnostic.Cause.chain(error))) }
     }
   }
   func save(_ tokens: JournalCognitoTokens) async throws {
     try await perform {
       let data: Data
       do { data = try JSONEncoder().encode(tokens) }
-      catch { throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainSave, reason: .invalidRecord)) }
+      catch { throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainSave, reason: .invalidRecord, causes: JournalAccountDiagnostic.Cause.chain(error))) }
       guard data.count <= 131072 else {
         throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainSave, reason: .responseTooLarge))
       }
@@ -115,7 +115,8 @@ private final class JournalCognitoKeychain: Sendable {
               self?.finish(id, .failure(CancellationError()))
             } else {
               self?.finish(id, .failure(JournalCognitoFailure(category: .unavailable,
-                detail: .init(source: .browser, reason: .browserFailed))))
+                detail: .init(source: .browser, reason: .browserFailed,
+                  causes: error.map { JournalAccountDiagnostic.Cause.chain($0) } ?? []))))
             }
           }
         }

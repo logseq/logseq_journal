@@ -68,6 +68,10 @@ import Security
       .queryItems!.map { ($0.name, $0.value ?? "") })
   }
   func token(_ use: String) throws -> String {
+    if defect == "tokenSize" { return String(repeating: "a", count: 32769) }
+    if defect == "tokenShape" { return "a.b" }
+    if defect == "base64" { return "%.b.c" }
+
     var claims: [String: Any] = ["iss": defect == "issuer" ? "https://evil.example" : config.issuer,
       "sub": "fixture-user", "exp": now.addingTimeInterval(lifetime).timeIntervalSince1970,
       "iat": now.timeIntervalSince1970, "token_use": use]
@@ -75,7 +79,15 @@ import Security
       claims["aud"] = defect == "audience" ? "other" : config.clientID
       claims["nonce"] = defect == "nonce" ? "wrong" : query(authorization!)["nonce"]
     } else { claims["client_id"] = config.clientID }
-    let input = Self.url64(try JSONSerialization.data(withJSONObject: ["alg": "RS256", "kid": "test-key"]))
+    if defect == "claims" { claims["iss"] = 42 }
+    if defect == "use" { claims["token_use"] = "unexpected" }
+    if defect == "issued" { claims["iat"] = now.addingTimeInterval(61).timeIntervalSince1970 }
+    if defect == "subject" { claims["sub"] = "" }
+    if defect == "subjectMismatch" && use == "access" { claims["sub"] = "other" }
+    var header: [String: Any] = ["alg": defect == "header" ? 42 : "RS256", "kid": "test-key"]
+    if defect == "algorithm" { header["alg"] = "HS256" }
+    if defect == "critical" { header["crit"] = NSNull() }
+    let input = Self.url64(try JSONSerialization.data(withJSONObject: header))
       + "." + Self.url64(try JSONSerialization.data(withJSONObject: claims))
     var signature = SecKeyCreateSignature(key, .rsaSignatureMessagePKCS1v15SHA256, Data(input.utf8) as CFData, nil)! as Data
     if defect == "signature" { signature[0] ^= 1 }
@@ -111,6 +123,9 @@ import Security
             var object: [String: Any] = ["id_token": try self.token("id"), "access_token": try self.token("access"),
               "expires_in": Int(self.lifetime), "token_type": "Bearer"]
             if !self.omitRefresh { object["refresh_token"] = "synthetic-refresh+&=" }
+            if self.defect == "tokenType" { object["token_type"] = "unexpected" }
+            if self.defect == "expires" { object["expires_in"] = 0 }
+            if self.defect == "refreshSize" { object["refresh_token"] = String(repeating: "a", count: 32769) }
             data = try JSONSerialization.data(withJSONObject: object)
           }
         }
@@ -187,11 +202,11 @@ import Security
       switch mode {
       case "tokenHTTP": f.status = 503; f.tokenError = "server_error"; expected = ["token.httpStatus", "http 503", "oauth.server_error"]
       case "unknownOAuth": f.status = 401; f.tokenError = "private-token-sentinel"; expected = ["token.httpStatus", "http 401", "oauth.unknown"]
-      case "tokenShape": f.tokenData = Data("{\"id_token\":\"private-token-sentinel\"}".utf8); expected = ["token.responseShape"]
+      case "tokenShape": f.tokenData = Data("{\"id_token\":\"private-token-sentinel\"}".utf8); expected = ["token.responseShape", "decodeMissingKey"]
       case "tokenSize": f.tokenData = Data(repeating: 65, count: 131073); expected = ["token.responseTooLarge"]
       case "redirect": f.redirect = true; expected = ["token.redirect"]
       case "jwksHTTP": f.jwksStatus = 502; expected = ["jwks.httpStatus", "http 502"]
-      case "jwksShape": f.jwksData = Data("private-token-sentinel".utf8); expected = ["jwks.responseShape"]
+      case "jwksShape": f.jwksData = Data("private-token-sentinel".utf8); expected = ["jwks.responseShape", "decodeCorrupted"]
       default: f.jwksData = Data(repeating: 65, count: 262145); expected = ["jwks.responseTooLarge"]
       }
       do { try await f.session().signIn(); preconditionFailure("Expected \(mode) rejection") }
@@ -207,7 +222,7 @@ import Security
     for (error, expectedKind, reason) in [
       (URLError(.timedOut) as Error, JournalAccountIssue.Kind.network, "url -1001"),
       (NSError(domain: NSOSStatusErrorDomain, code: -25308) as Error, .secureStorageUnavailable, "osstatus -25308"),
-      (NSError(domain: "private-token-sentinel", code: 77) as Error, .unavailable, "token.transport")] {
+      (NSError(domain: "private-token-sentinel", code: 77) as Error, .unavailable, "cause.other · code 77")] {
       let f = try Issuer(); f.transportError = error
       do { try await f.session().signIn(); preconditionFailure("transport failure admitted") }
       catch {
@@ -251,12 +266,56 @@ import Security
       else { try await s.signIn(); precondition(f.stored != nil) }
     }
     print("PASS callback mismatch, duplicate/mixed parameters, cancel/error/expiry/replay/sign-out and retry")
-    for mode in ["nonce", "audience", "issuer", "signature", "expired", "refresh"] {
+    for mode in ["nonce", "audience", "issuer", "signature", "expired", "refresh", "header", "claims", "tokenSize", "tokenShape", "base64", "algorithm", "critical", "use", "issued", "subject", "subjectMismatch", "tokenType", "expires", "refreshSize", "keyMissing", "keyDuplicate", "keyType", "keyAlgorithm", "keyUse", "keySize"] {
       let f = try Issuer(); f.defect = mode
+      if mode.hasPrefix("key") {
+        let object = try JSONSerialization.jsonObject(with: f.jwks) as! [String: [[String: Any]]]
+        var key = object["keys"]![0]
+        if mode == "keyMissing" { key["kid"] = "other" }
+        if mode == "keyType" { key["kty"] = "EC" }
+        if mode == "keyAlgorithm" { key["alg"] = "HS256" }
+        if mode == "keyUse" { key["use"] = "enc" }
+        if mode == "keySize" { key["n"] = "YQ" }
+        f.jwksData = try JSONSerialization.data(withJSONObject: ["keys": mode == "keyDuplicate" ? [key,key] : [key]])
+      }
       if mode == "expired" { f.lifetime = -1 }; if mode == "refresh" { f.omitRefresh = true }
-      let s = f.session(); try await rejects { try await s.signIn() }; precondition(f.stored == nil)
+      let s = f.session()
+      do { try await s.signIn(); preconditionFailure("invalid token admitted") }
+      catch {
+        let expected = ["nonce": "nonceMismatch", "audience": "audienceMismatch",
+          "issuer": "issuerMismatch", "signature": "signatureInvalid",
+          "expired": "tokenExpired", "refresh": "refreshTokenMissing",
+          "header": "tokenHeader.responseShape", "claims": "tokenClaims.responseShape",
+          "tokenSize": "tokenTooLarge", "tokenShape": "tokenSegmentsInvalid", "base64": "base64Invalid",
+          "algorithm": "algorithmUnsupported", "critical": "criticalHeaderUnsupported", "use": "tokenUseMismatch",
+          "issued": "issuedAtInvalid", "subject": "subjectInvalid", "subjectMismatch": "subjectMismatch",
+          "tokenType": "tokenTypeInvalid", "expires": "expiresInInvalid", "refreshSize": "refreshTokenTooLarge",
+          "keyMissing": "signingKeyMissing", "keyDuplicate": "signingKeyAmbiguous", "keyType": "signingKeyTypeInvalid",
+          "keyAlgorithm": "signingKeyAlgorithmInvalid", "keyUse": "signingKeyUseInvalid", "keySize": "signingKeySizeInvalid"][mode]!
+        let issue = JournalAccountIssue.classify(error, stage: .identityLookup)
+        if mode == "header" || mode == "claims" { precondition(issue.diagnostic.contains("decodeTypeMismatch")) }
+        precondition(issue.diagnostic.contains(expected), "validation lost cause: \(issue.diagnostic)")
+        precondition(!issue.diagnostic.contains("https://") && !issue.diagnostic.contains("fixture-user"))
+      }
+      precondition(f.stored == nil)
     }
     print("PASS invalid signature/issuer/audience/nonce/expiry/incomplete tokens")
+    for (field, reason) in [("issuer", "issuerMismatch"), ("client", "audienceMismatch"),
+      ("user", "subjectInvalid"), ("id", "idTokenMissing"), ("access", "accessTokenMissing"), ("refresh", "refreshTokenMissing")] {
+      let f = try Issuer()
+      f.stored = JournalCognitoTokens(idToken: field == "id" ? "" : "synthetic",
+        accessToken: field == "access" ? "" : "synthetic", refreshToken: field == "refresh" ? "" : "synthetic",
+        userID: field == "user" ? "" : "synthetic", issuer: field == "issuer" ? "PRIVATE" : f.config.issuer,
+        clientID: field == "client" ? "PRIVATE" : f.config.clientID, expiresAt: f.now.addingTimeInterval(300))
+      do { _ = try await f.session().currentUserID(); preconditionFailure("invalid restored session admitted") }
+      catch {
+        let issue = JournalAccountIssue.classify(error, stage: .identityLookup)
+        precondition(issue.diagnostic.contains("sessionRestore." + reason), "restore lost reason")
+        precondition(!issue.diagnostic.contains("PRIVATE"))
+        precondition(f.requests.isEmpty, "invalid restored session reached network")
+      }
+    }
+
     let restored = issuer.session(); let restoredUser = try await restored.currentUserID(); precondition(restoredUser == user)
     issuer.now = issuer.now.addingTimeInterval(3550); issuer.holdTokens = true; issuer.omitRefresh = true
     let first = Task { try await restored.freshIDToken() }; while issuer.tokenHold == nil { await Task.yield() }

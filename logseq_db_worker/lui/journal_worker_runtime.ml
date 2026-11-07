@@ -133,11 +133,15 @@ let await_reply (reply : startup_reply) =
 ;;
 
 let set_terminal_from_loop exception_ =
-  let error =
-    match exception_ with
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let source = match exception_ with
     | Failure message | Invalid_argument message -> message
-    | _ -> Printexc.to_string exception_
-  in
+    | _ -> Printexc.to_string exception_ in
+  let detail = D.of_source ~operation:"workerOperation" ~reason:"resourceFailed" source in
+  let detail = if Option.is_some (D.decode source) || D.source_class detail <> "unknown"
+    then detail else
+    D.of_source ~operation:"workerOperation" ~reason:"resourceFailed" (Printexc.to_string exception_) in
+  let error = D.message detail in
   with_control (fun () ->
     Option.iter
       (fun client -> Journal_worker.Private.fail_unrecoverable client error)
@@ -285,15 +289,17 @@ let ensure_started () =
        Ok ()
      with
      | exception_ ->
-       let error =
-         match exception_ with
-         | Failure message | Invalid_argument message -> message
-         | _ -> Printexc.to_string exception_
-       in
+       let error = match exception_ with
+         | Unix.Unix_error ((Unix.EACCES | Unix.EPERM), _, _) -> "worker.start.permissionDenied"
+         | Unix.Unix_error (Unix.ENOSPC, _, _) -> "worker.start.noSpace"
+         | Invalid_argument _ -> "worker.start.invalidArgument"
+         | Sys_error _ | Unix.Unix_error _ -> "worker.start.systemError"
+         | Failure _ -> "worker.start.failure"
+         | _ -> "worker.start.unknown" in
        with_control (fun () ->
          control.state <- Terminal;
          Condition.broadcast control.condition);
-       Error ("Failed to spawn OCaml Worker Domain: " ^ error))
+       Error error)
 ;;
 
 let fresh_generation () =

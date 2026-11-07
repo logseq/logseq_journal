@@ -6631,3 +6631,93 @@ let resident_graph_failure_preserves_account_catalog_request () =
 ;;
 let scenarios=scenarios @ [Alcotest.test_case "resident graph failure preserves account catalog ticket" `Quick resident_graph_failure_preserves_account_catalog_request]
 ;;
+
+(* The reducer owns deletion failure projection; valid producer diagnostics must
+   survive its public completion boundary without exposing arbitrary source text. *)
+let local_deletion_preserves_cause () =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  List.iter (fun source ->
+    let original, _, _, _ = deletion_ready_graph false in
+    let ready, _, _, _ = deletion_noncurrent original in
+    let deleting = Core.step ready (Core.Local_cache_deletion_requested graph_id) in
+    let request = deletion_mirror deleting.effects in
+    let event = Core.Mirror_deleted (request, Error source) in
+    let failed = Core.step deleting.next event in
+    ignore (check_replay "deletion-cause" deleting.next event failed);
+    let diagnostics = (Core.state failed.next).diagnostics.groups in
+    let diagnostic = List.find_map (fun (group : Core.diagnostic_group) ->
+      List.assoc_opt "deleteMirror" group.entries) diagnostics in
+    let expected = D.of_source ~operation:"deleteMirror" ~reason:"deleteFailed" source in
+    Alcotest.(check (option string)) "deletion publishes the bounded concrete cause"
+      (Some (D.message expected)) diagnostic;
+    check_no_work failed.next [event])
+    [ D.create ~operation:"deleteMirror" ~reason:"persistenceFailed"
+        ~source:"Unix.Unix_error(Unix.ENOSPC,PRIVATE_PATH,PRIVATE_PATH)" () |> D.encode
+    ; D.create ~operation:"deleteMirror" ~reason:"ownershipConflict" () |> D.encode
+    ; "Bearer PRIVATE_TOKEN https://user:PRIVATE_PASSWORD@host/PRIVATE_GRAPH"
+    ]
+;;
+let scenarios = scenarios @ [Alcotest.test_case "local deletion preserves concrete safe cause"
+  `Quick local_deletion_preserves_cause]
+;;
+
+let authoritative_input_retains_validation_cause () =
+  let transaction t tx = Protocol.Server.{ t = server_cursor_of_int t; tx; outliner_op = None } in
+  List.iter (fun (txs, through, expected) ->
+    let opened, connection, _ = pull_fixture () in
+    let event = Core.Websocket_message (connection, Protocol.Server.Pull_ok
+      { t = server_cursor_of_int through; checksum = None; txs }) in
+    let failed = Core.step opened.next event in
+    ignore (check_replay "authoritative-input-cause" opened.next event failed);
+    Alcotest.(check (option string)) "typed validation cause survives to caller"
+      (Some expected) (Core.state failed.next).snapshot.last_error)
+    [ [transaction 1 ""], 1, "authoritative transaction is empty or its byte limit is invalid"
+    ; [transaction 1 (String.make (Logseq_db_types.Limits.maximum_response_bytes + 1) 'x')], 1,
+      "authoritative transaction exceeds the byte limit"
+    ; [transaction 1 "[]"; transaction 1 "[]"], 1,
+      "authoritative transaction cursors are not strictly ordered"
+    ; [transaction 2 "[]"; transaction 1 "[]"], 1,
+      "authoritative transaction cursors are not strictly ordered"
+    ; [transaction 1 "[]"], 2, "authoritative batch final cursor does not match its through cursor"
+    ; List.init 4097 (fun i -> transaction (i + 1) "[]"), 4097,
+      "authoritative batch exceeds its transaction count or byte limit"
+    ]
+;;
+let scenarios = scenarios @ [Alcotest.test_case "authoritative input retains validation cause"
+  `Quick authoritative_input_retains_validation_cause]
+;;
+
+let cache_decoder_keeps_safe_field_cause () =
+  List.iter (fun ((source : string), expected) ->
+    Alcotest.(check (option string)) "cache parser retains field cause without data"
+      (Some expected)
+      (match Core.decode_catalog_cache source with Error message -> Some message | Ok _ -> None))
+    [ {|{"cache_user_id":false,"cache_graphs":[],"cache_selected_graph":null}|},
+      "catalog cache: field cache_user_id is missing or has an invalid type"
+    ; {|{"cache_user_id":"PRIVATE_USER","cache_graphs":false,"cache_selected_graph":null}|},
+      "catalog cache: field cache_graphs is missing or has an invalid type"
+    ; {|{"cache_user_id":"PRIVATE_USER","cache_user_id":"PRIVATE_USER2","cache_graphs":[],"cache_selected_graph":null}|},
+      "catalog cache: duplicate JSON field"
+    ]
+;;
+let snapshot_metadata_keeps_safe_field_cause () =
+  List.iter (fun ((source : string), expected) ->
+    let requested, _ = begin_snapshot_bootstrap () in
+    let failed = List.find_map (function
+      | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+        Some (Core.step requested.next (Core.Runner_completed (Core.Completion (ticket, Ok source))))
+      | _ -> None) requested.effects |> Option.get in
+    Alcotest.(check (option string)) "metadata parser publishes field cause without URL"
+      (Some expected) (Core.state failed.next).snapshot.last_error)
+    [ {|{"ok":true,"t":"PRIVATE_BODY","url":"https://user:PRIVATE_PASSWORD@example.com"}|},
+      "snapshot metadata: field t is missing or has an invalid type"
+    ; {|{"ok":true,"t":1,"url":false}|},
+      "snapshot metadata: field url is missing or has an invalid type"
+    ; {|{"ok":false,"t":1,"url":"https://example.com"}|},
+      "snapshot metadata: server reported ok=false"
+    ]
+;;
+let scenarios = scenarios @ [
+  Alcotest.test_case "cache decoder keeps safe field cause" `Quick cache_decoder_keeps_safe_field_cause;
+  Alcotest.test_case "snapshot metadata keeps safe field cause" `Quick snapshot_metadata_keeps_safe_field_cause]
+;;

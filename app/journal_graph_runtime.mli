@@ -125,6 +125,7 @@ type payload =
       ; block_id : string
       ; failure : failure_source
       }
+  | Diagnostic of worker_failure
   | Rejected of failure_source
 
 type response = { payload : payload }
@@ -144,7 +145,7 @@ val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_types.Graph_types.Uuid.t
 val submit : ?capture_chain:Journal_graph_mutation_confirmation.Pure_insertion.t ->
   ?child_chain:Journal_graph_mutation_confirmation.Pure_insertion.t -> t -> Journal_graph_request.t -> output
-val fail_request : t -> Logseq_db_types.Graph_types.Uuid.t -> message:string -> output
+val fail_request : ?error:Logseq_db_worker.Error.t -> t -> Logseq_db_types.Graph_types.Uuid.t -> message:string -> output
 val abandon : t -> Logseq_db_types.Graph_types.Uuid.t -> unit
 
 val reconcile_signal
@@ -159,6 +160,7 @@ module Worker = Journal_worker_coordination.Worker_api
 type worker_read_result =
   | Query_result : 'a Worker.query * 'a -> worker_read_result
   | Read_failed of { code : Logseq_db_worker.Error.code; message : string }
+  | Read_error of Logseq_db_worker.Error.t
   | Changes_resync of string
   | Changes_retired
   | Changes_acknowledged of Worker.change_ack

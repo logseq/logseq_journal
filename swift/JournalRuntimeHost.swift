@@ -264,6 +264,9 @@ struct JournalHost: View {
   }
   private func lifecycle(backgrounded: Bool) {
     do { try platform.setBackgrounded(backgrounded) }
-    catch { Logger(subsystem: "com.logseq.journal", category: "lifecycle").error("Unable to enqueue lifecycle event") }
+    catch {
+      let diagnostic = JournalRuntime.safeDescription(error, operation: "lifecycle.enqueue")
+      Logger(subsystem: "com.logseq.journal", category: "lifecycle").error("\(diagnostic, privacy: .public)")
+    }
   }
 }

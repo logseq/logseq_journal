@@ -200,8 +200,8 @@ let dispatch t event =
          when ticket = expected_ticket && actual = expected -> finish result
        | Some (expected_ticket, _),
          Pure_reducer.Runner_completed
-           (Pure_reducer.Sync_worker_effect_completed (ticket, Error _))
-         when ticket = expected_ticket ->finish (Error "Mirror deletion failed.")
+           (Pure_reducer.Sync_worker_effect_completed (ticket, Error error))
+         when ticket = expected_ticket ->finish (Error (Logseq_db_worker_contract.Error.message error))
        | _ -> ()));
   List.iter (function
     |Pure_reducer.Run_worker(Pure_reducer.Request(ticket,Pure_reducer.Handle_sync_worker_effect(Sync.Delete_mirror _)))

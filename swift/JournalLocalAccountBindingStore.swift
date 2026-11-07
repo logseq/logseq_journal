@@ -39,7 +39,8 @@ enum JournalLocalAccountBindingStore {
     }
     let version: Int
     do { version = try JSONDecoder().decode(Format.self, from: data).version }
-    catch { throw JournalAccountIssue(kind: .corruptBinding, stage: .bindingRead) }
+    catch { throw JournalAccountIssue(kind: .corruptBinding, stage: .bindingRead,
+      nativeDetail: .init(source: .bindingLoad, reason: .invalidRecord, causes: JournalAccountDiagnostic.Cause.chain(error))) }
     guard version == 2 else {
       throw JournalAccountIssue(kind: .unsupportedFormat, stage: .bindingRead, formatVersion: version)
     }
@@ -48,7 +49,8 @@ enum JournalLocalAccountBindingStore {
       binding = try JSONDecoder().decode(Binding.self, from: data)
       _ = try encode(userID: binding.userId, managedSyncOrigin: binding.managedSyncOrigin)
     } catch {
-      throw JournalAccountIssue(kind: .corruptBinding, stage: .bindingRead, formatVersion: version)
+      throw JournalAccountIssue(kind: .corruptBinding, stage: .bindingRead, formatVersion: version,
+        nativeDetail: .init(source: .bindingLoad, reason: .invalidRecord, causes: JournalAccountDiagnostic.Cause.chain(error)))
     }
     // The key-management bridge accepts domain arguments, separate from the
     // Keychain file's generated Codable representation.

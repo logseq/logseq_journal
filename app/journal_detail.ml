@@ -1042,7 +1042,9 @@ module Pure_observation = struct
     | Not_admitted Stopping -> Some (Worker.Service_failed "Worker is stopping.")
     | Not_admitted (Unsupported_request message) -> Some (Worker.Unsupported_operation message)
     | Answered (Error error) -> Some error
-    | Interrupted _ -> Some Worker.Revoked_session
+    | Interrupted (Transport_lost error) -> Some error
+    | Interrupted Cancelled -> Some(Worker.Service_failed "Observation request was cancelled.")
+    | Interrupted Worker_stopped -> Some(Worker.Service_failed "Worker stopped during observation.")
     | Answered (Ok _) -> None
   ;;
 

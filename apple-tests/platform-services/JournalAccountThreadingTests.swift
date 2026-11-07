@@ -106,6 +106,21 @@ enum JournalLocalAccountBindingStore {
   }
 
   @MainActor static func main() async throws {
+    // Recovery bytes are decoded by the native storage owner, before reducer events.
+    for (payload, expected) in [("{", "decodeCorrupted"), ("{}", "decodeMissingKey"),
+      (#"{"version":"PRIVATE"}"#, "decodeTypeMismatch")] {
+      JournalLocalAccountBindingStore.state.withLock { $0.recovery = Data(payload.utf8) }
+      let owner = JournalNativeServices.makePlatformServices()
+      do { _ = try await owner.response(for: .localAccount); preconditionFailure("corrupt recovery admitted") }
+      catch {
+        let issue = JournalAccountIssue.classify(error, stage: .bindingWrite)
+        precondition(issue.diagnostic.contains("recovery.invalidRecord") && issue.diagnostic.contains(expected),
+          "recovery lost cause: \(issue.diagnostic)")
+        precondition(!issue.diagnostic.contains("PRIVATE"))
+      }
+    }
+    JournalLocalAccountBindingStore.state.withLock { $0.recovery = nil }
+
     // Configuration encoding is owned by the native startup producer before
     // any OCaml request. These strings do not access the filesystem/network.
     for (path,origin) in [("SECRET-relative-path","https://example.invalid"),

@@ -242,7 +242,7 @@ let () =
         |> Option.get
       in
       let allocated = Gc.allocated_bytes () -. before in
-      if outcome <> Error C.Asset_authentication || !auth_calls <> 1
+      if Result.map_error C.asset_failure_kind outcome <> Error C.Asset_authentication || !auth_calls <> 1
       then failwith "production adapter did not encode the maximum-size asset";
       Printf.printf "Production upload OCaml allocation bytes: %.0f\n%!" allocated;
       if allocated > 128. *. 1024. *. 1024.

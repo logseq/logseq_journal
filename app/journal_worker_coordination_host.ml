@@ -2,6 +2,86 @@ module Worker = Journal_worker_coordination.Worker_api
 module Core = Journal_worker_coordination.Worker_pure_coordinator
 module Runner = Journal_worker_coordination.Worker_effect_runner
 
+let error_message = function
+  | Worker.Db_error error -> Logseq_db_worker.Error.message error
+  | Invalid_input message | Service_failed message | Unsupported_operation message
+  | Protocol_mismatch message | Stale_read message | Resync_required message -> message
+  | Revoked_session -> "The graph session changed."
+  | Host_change_in_progress -> "The graph is closing. The outcome is retained."
+  | Response_budget_exceeded -> "The result exceeded its response budget."
+;;
+
+let diagnostic_error error =
+  let module E=Logseq_db_worker.Error in
+  match error with
+  | Worker.Db_error error -> error
+  | _ ->
+    let code,category=match error with
+      | Worker.Revoked_session->E.Closed_session,"revokedSession"
+      | Host_change_in_progress->E.Closed_session,"hostChangeInProgress"
+      | Response_budget_exceeded->E.Response_too_large,"responseBudgetExceeded"
+      | Invalid_input _->E.Invalid_request,"invalidInput"
+      | Protocol_mismatch _->E.Invalid_request,"protocolMismatch"
+      | Unsupported_operation _->E.Unsupported_semantics,"unsupportedOperation"
+      | Stale_read _->E.Stale_read_cursor,"staleRead"
+      | Resync_required _->E.Stale_read_cursor,"resyncRequired"
+      | Service_failed _->E.Closed_session,"serviceFailed"
+      | Db_error _->assert false in
+    let origin=E.create_cause_or_fallback ~component:E.Worker_service
+      ~operation:"coordination" ~code:(Some category) ~message:(error_message error)
+      ~fallback_message:"The Worker reported an unsafe or oversized failure description." in
+    E.create_with_origin ~code ~message:origin.message ~origin ~details:[] |> Result.get_ok
+;;
+
+let admission_error = function
+  | Worker.Full -> Worker.Service_failed "Worker request queue is full"
+  | Not_ready -> Worker.Service_failed "Worker is not ready"
+  | Stopping -> Worker.Service_failed "Worker is stopping"
+  | Unsupported_request message -> Worker.Unsupported_operation message
+;;
+
+let admission_diagnostic reason =
+  let module E=Logseq_db_worker.Error in
+  let error=diagnostic_error(admission_error reason) in
+  let code,category=match reason with
+    |Worker.Full->E.Storage_busy,"queueFull"
+    |Not_ready->E.Invalid_request,"notReady"
+    |Stopping->E.Closed_session,"stopping"
+    |Unsupported_request _->E.Unsupported_semantics,"unsupportedRequest" in
+  let origin=E.create_cause ~component:E.Worker_service ~operation:"requestAdmission"
+    ~code:(Some category) ~message:(E.message error) |> Result.get_ok in
+  E.create_with_origin ~code ~message:(E.message error) ~origin ~details:[] |> Result.get_ok
+;;
+
+let interruption_error = function
+  | Worker.Transport_lost error -> error
+  | Cancelled -> Worker.Service_failed "Worker request was cancelled."
+  | Worker_stopped -> Worker.Service_failed "Worker stopped before the request completed."
+;;
+
+let interruption_diagnostic reason =
+  let module E=Logseq_db_worker.Error in
+  let error=diagnostic_error(interruption_error reason) in
+  let category,message=match reason with
+    | Worker.Transport_lost _->"transportLost","Worker transport was lost; execution outcome may be unknown."
+    | Cancelled->"cancelled","Worker request was cancelled."
+    | Worker_stopped->"workerStopped","Worker stopped before the request completed." in
+  let context=E.create_cause ~component:E.Worker_service ~operation:"requestCompletion"
+    ~code:(Some category) ~message |> Result.get_ok in
+  E.wrap ~code:(E.code error) ~message:(E.message error) ~details:(E.details error)
+    ~context error |> Result.get_ok
+;;
+
+let reply_error = function
+  | Worker.Answered(Error error)->Some error
+  | Not_admitted reason->Some(Worker.Db_error(admission_diagnostic reason))
+  | Interrupted reason->Some(Worker.Db_error(interruption_diagnostic reason))
+  | Answered(Ok _)->None
+;;
+let reply_error_message ~fallback reply =
+  Option.fold ~none:fallback ~some:error_message (reply_error reply)
+;;
+
 type watch =
   | Watch :
       'a Core.ticket
@@ -204,5 +284,5 @@ let recover_import_sources host intents ~failed =
     |Ok ticket->watch host ticket ~f:(function
       |Worker.Answered(Ok _)->finish None
       |Answered(Error error)->finish(Some error)
-      |Not_admitted _|Interrupted _->finish(Some(Worker.Service_failed "The original attachment source could not be read.")))in
+      |(Not_admitted _|Interrupted _) as reply->finish(reply_error reply))in
   Rrbvec.iter issue reads

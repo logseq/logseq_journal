@@ -37,3 +37,8 @@ val encode : t -> string
 val decode : string -> t option
 val detail_name : string
 val signal_prefix : string
+
+(** Retain one additional independently failed finalization stage. Nested
+    secondary causes are dropped to keep the carrier bounded. *)
+val with_related : t -> t -> t
+val related : t -> t option

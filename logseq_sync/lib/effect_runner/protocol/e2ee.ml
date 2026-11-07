@@ -63,7 +63,11 @@ let graph_key_response source =
       (Logseq_db_types.Json_codec.decode
          graph_key_response_dto_of_yojson
          (Yojson.Safe.from_string source)
-       |> Result.map_error (fun _ -> "E2EE graph key response shape is invalid"))
+       |> Result.map_error (fun message ->
+         let fields = List.map (fun (field, wire) -> "E2ee.graph_key_response_dto." ^ field,
+           "field " ^ wire ^ " is missing or has an invalid type")
+           ["encrypted_aes_key", "encrypted-aes-key"; "encrypted_aes_key_base64", "encrypted-aes-key-base64"] in
+         "E2EE graph key response: " ^ Logseq_db_types.Json_codec.error_context ~fields message))
       (fun dto ->
          (* The optional compatibility field is validated by PPX but not consumed. *)
          let _ = dto.encrypted_aes_key_base64 in
@@ -78,7 +82,11 @@ let user_keys_response source =
       (Logseq_db_types.Json_codec.decode
          user_keys_response_dto_of_yojson
          (Yojson.Safe.from_string source)
-       |> Result.map_error (fun _ -> "E2EE user keys response shape is invalid"))
+       |> Result.map_error (fun message ->
+         let fields = List.map (fun (field, wire) -> "E2ee.user_keys_response_dto." ^ field,
+           "field " ^ wire ^ " is missing or has an invalid type")
+           ["public_key", "public-key"; "encrypted_private_key", "encrypted-private-key"] in
+         "E2EE user keys response: " ^ Logseq_db_types.Json_codec.error_context ~fields message))
       (fun dto ->
          bind (bounded_string "public-key" dto.public_key) (fun _ ->
            bounded_string "encrypted-private-key" dto.encrypted_private_key))

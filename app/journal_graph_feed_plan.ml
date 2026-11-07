@@ -262,8 +262,8 @@ let continue_root_batch t ~ports owner page cursor limit =
     then cursor_failure batch "The retained root page changed. Refresh Timeline."
     else (
       match ports.validate_session cursor.session with
-      | Error _ ->
-        cursor_failure batch "The retained root execution was revoked. Refresh Timeline."
+      | Error error ->
+        cursor_failure batch (Journal_worker_coordination_host.error_message error)
       | Ok () ->
         (match
            Worker.validate_request
@@ -277,8 +277,8 @@ let continue_root_batch t ~ports owner page cursor limit =
                     ; after = cursor.after
                     } ))
          with
-         | Error _ ->
-           cursor_failure batch "The retained root query no longer matches its budget."
+         | Error error ->
+           cursor_failure batch (Journal_worker_coordination_host.error_message error)
          | Ok () when not (Rrbvec.is_empty cursor.remaining) ->
            { empty with cached = Some batch }
          | Ok () when cursor.after <> None -> requests [ plan_root_batch ~ports batch ]
@@ -815,8 +815,8 @@ let resume_cached t ~ports batch =
     then superseded_root_batch t ~ports batch
     else (
       match ports.validate_session cursor.Projection.session with
-      | Error _ ->
-        cursor_failure batch "The retained root execution was revoked. Refresh Timeline."
+      | Error error ->
+        cursor_failure batch (Journal_worker_coordination_host.error_message error)
       | Ok () ->
         receive_root_tree
           t

@@ -2783,8 +2783,11 @@ let run_favorites_native_visibility
                     | Some (`String payload) ->
                       let json = Yojson.Safe.from_string payload in
                       Yojson.Safe.Util.member "completion" json = `String operation
-                      && Yojson.Safe.Util.member "error" json =
-                         `String "Import was interrupted. Select the file again."
+                      && (match Yojson.Safe.Util.member "error" json with
+                          | `String message ->
+                            String.starts_with ~prefix:"Import: Fixture interrupted import" message
+                            && String.ends_with ~suffix:"Import outcome is unknown. Select the file again." message
+                          | _ -> false)
                     | _ -> false) props false);
                 Alcotest.(check bool) "non-staged import cannot offer retained-byte retry" true
                   (Option.is_none (find "accessibility-label" "Retry imports"))));
@@ -6486,7 +6489,7 @@ let test_failed_init_disposes_context () =
       |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () -> Atomic.set release true; ignore(hooks.dispose());
     Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
-      let failed = try ignore(hooks.init 2 2 startup); false with Failure _ -> true in
+      let failed = try ignore(hooks.init 2 2 startup); false with _ -> true in
       Alcotest.(check bool) "init exception reaches native boundary" true failed;
       Alcotest.(check int) "failed startup releases its mounted context" 0 (hooks.root_node ()))
 ;;

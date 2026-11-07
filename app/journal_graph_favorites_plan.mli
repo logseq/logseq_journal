@@ -11,6 +11,7 @@ type event =
   | Favorites_loaded of Journal_graph_request.favorites_request * Journal_worker_coordination.Worker_api.favorites
   | Favorites_failed of Journal_graph_request.favorites_request * bool * string
   | Favorites_invalidated
+  | Diagnostic of { operation : string; request_id : Graph.Uuid.t; error : Error.t }
   | Rejected of rejection
 type output =
   { requests : Graph.Uuid.t Rrbvec.t

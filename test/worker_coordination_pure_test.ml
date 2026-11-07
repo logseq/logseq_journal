@@ -363,7 +363,7 @@ let test_import_source_recovery_owner_cursor_and_ack () =
   let admitted=(C.step planned.next(C.Admitted(imported,Id.Worker.Request_id.of_int64 9889L))).next in
   check(Rrbvec.is_empty(C.pending_import_source_intents(C.view admitted)))
     "source lookup raced the admitted original Import";
-  let unknown=consume planned.next imported(W.Interrupted W.Transport_lost) in
+  let unknown=consume planned.next imported(W.Interrupted (W.Transport_lost (W.Service_failed "synthetic transport interruption"))) in
   check(C.import_source_pending(C.view unknown) ~operation:source.operation)"lost import reply did not retain its source";
   let operation=W.Recover_import_inputs{after=None;maximum_items=2;maximum_bytes=65536} in
   let recovery,planned=C.request unknown session operation |> Result.get_ok in
@@ -662,7 +662,7 @@ let test_rejected_imports_release_capacity_after_fresh_readback () =
   done;
   let original=intent 261 in
   let ticket=request(W.Import original) in
-  complete ticket(W.Interrupted W.Transport_lost);apply(C.Forget ticket);
+  complete ticket(W.Interrupted (W.Transport_lost (W.Service_failed "synthetic transport interruption")));apply(C.Forget ticket);
   let read=request(W.Confirm_import_source original) in
   complete read(W.Answered(Ok None));apply(C.Forget read);
   check(C.import_source_pending(C.view !state) ~operation:(W.asset_import_intent_id original))
@@ -747,7 +747,7 @@ let test_new_host_source_proof_retires_only_identical_unknown () =
   let intent=W.asset_import_intent session source |> Result.get_ok in
   let ticket,planned=C.request(ready I.binding projection)session(W.Import intent) |> Result.get_ok in
   let old=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
-  let old=(C.step old(C.Completed(ticket,W.Interrupted W.Transport_lost))).next in
+  let old=(C.step old(C.Completed(ticket,W.Interrupted (W.Transport_lost (W.Service_failed "synthetic transport interruption"))))).next in
   let old=(C.step old(C.Forget ticket)).next in
   let old=(C.step old C.Shutdown_requested).next in
   let old=(C.step old(C.Binding_release_completed(I.binding,Ok()))).next in
@@ -816,7 +816,7 @@ let test_import_proof_consumption_properties () =
       if action mod 2=0 && not delivered.(which) then (
         delivered.(which)<-true;state:=(C.step !state(C.Import_source_reconciled proof)).next)
       else if action mod 2=1 && not terminal.(which) then (
-        terminal.(which)<-true;state:=(C.step !state(C.Completed(ticket,W.Interrupted W.Transport_lost))).next;
+        terminal.(which)<-true;state:=(C.step !state(C.Completed(ticket,W.Interrupted (W.Transport_lost (W.Service_failed "synthetic transport interruption"))))).next;
         state:=(C.step !state(C.Forget ticket)).next);
       let consumed=C.import_source_proof_consumed proof(views()) in
       check(consumed=(delivered.(0)&&delivered.(1))) "proof return skipped an old Host acknowledgement";
@@ -2173,7 +2173,7 @@ let test_durable_recovery_and_ack_purity () =
     "known rejection ACK did not carry the pure no-commit decision";
   state:=planned.next;
   state:=(C.step !state(C.Admitted(ack,Id.Worker.Request_id.of_int64 13L))).next;
-  state:=(C.step !state(C.Completed(ack,W.Interrupted W.Transport_lost))).next;
+  state:=(C.step !state(C.Completed(ack,W.Interrupted (W.Transport_lost (W.Service_failed "synthetic transport interruption"))))).next;
   check(C.intent_progress(C.view !state)intent<>None) "interrupted ACK erased durable ownership";
   state:=(C.step !state(C.Forget ack)).next;
   let ack,planned=C.request !state session(W.Acknowledge_intent intent) |> Result.get_ok in
@@ -2358,7 +2358,7 @@ let test_committed_ack_requires_current_confirmation () =
   check(C.intent_progress(C.view late)(W.Mutation_intent intent)=None) "pre-ACK mutation completion resurrected settled intent";
   check(match C.reply(C.view late)retry with Some(W.Answered(Error _))->true|_->false)
     "pre-ACK mutation completion was published as fresh ownership";
-  let late=(C.step acknowledged(C.Completed(retry,W.Interrupted W.Transport_lost))).next in
+  let late=(C.step acknowledged(C.Completed(retry,W.Interrupted (W.Transport_lost (W.Service_failed "synthetic transport interruption"))))).next in
   check(C.intent_progress(C.view late)(W.Mutation_intent intent)=None) "pre-ACK interruption resurrected Unknown intent";
   let late=(C.step acknowledged(C.Completed(again,W.Answered(Ok confirmation)))).next in
   check(C.intent_progress(C.view late)(W.Mutation_intent intent)=None) "pre-ACK confirmation resurrected settled intent";
@@ -2387,13 +2387,13 @@ let test_committed_ack_requires_current_confirmation () =
     List.iter(fun action->
       let event=match action with
         | 0->C.Completed(retry,W.Answered(Ok(W.Submission_committed receipt)))
-        | 1->C.Completed(retry,W.Interrupted W.Transport_lost)
+        | 1->C.Completed(retry,W.Interrupted (W.Transport_lost (W.Service_failed "synthetic transport interruption")))
         | 2->C.Cancel retry | 3->C.Forget retry
         | 4->C.Completed(again,W.Answered(Ok confirmation))
-        | 5->C.Completed(again,W.Interrupted W.Transport_lost)
+        | 5->C.Completed(again,W.Interrupted (W.Transport_lost (W.Service_failed "synthetic transport interruption")))
         | 6->C.Cancel again | 7->C.Forget again
         | 8->C.Completed(old_ack,W.Answered(Ok()))
-        | 9->C.Completed(old_ack,W.Interrupted W.Transport_lost)
+        | 9->C.Completed(old_ack,W.Interrupted (W.Transport_lost (W.Service_failed "synthetic transport interruption")))
         | 10->C.Cancel old_ack | 11->C.Forget old_ack
         | 12->C.Completed(independent,W.Answered(Ok(W.Submission_committed other_receipt)))
         | _->C.Drain in
@@ -2457,7 +2457,7 @@ let test_durable_recovery_ack_properties () =
           state:=next.next;acks:=ticket::List.take 7 !acks)
       | 6->ack n(fun ticket->step(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(200+n)))))
       | 7->ack n(fun ticket->step(C.Completed(ticket,W.Answered(Ok()))))
-      | 8->ack n(fun ticket->step(C.Completed(ticket,W.Interrupted W.Transport_lost)))
+      | 8->ack n(fun ticket->step(C.Completed(ticket,W.Interrupted (W.Transport_lost (W.Service_failed "synthetic transport interruption")))))
       | 9->ack n(fun ticket->step(C.Cancel ticket))
       | 10->ack n(fun ticket->step(C.Forget ticket))
       | _->step C.Drain)trace in
@@ -2822,6 +2822,30 @@ let test_observation_notice_plans_one_refresh () =
   let released = C.step newer.next (C.Release value.observation) in
   let late = C.step released.next (C.Observation_notice (notice 3L)) in
   check (count late = 0) "retired interest accepted a late invalidation"
+;;
+
+let test_observation_cleanup_admission_causes () =
+  let issuer,raw,projection,session=fixture 7259L in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
+  let operation=W.Observe(W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok,W.Graph_info) in
+  let ticket,planned=C.request(ready I.binding projection)session operation |> Result.get_ok in
+  let response=pure_observation_response issuer raw session ticket operation 0L "projection:cleanup-cause" in
+  let value=match I.reply session ~request_id:(C.ticket_id ticket)operation response |> Result.get_ok with
+    |W.Answered(Ok value)->value|_->failwith "cleanup cause fixture" in
+  let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+  let completed=(C.step admitted(C.Completed(ticket,W.Answered(Ok value)))).next in
+  let released=C.step completed(C.Observation_returned value.observation) in
+  let finalized=C.step released.next(C.Observation_release_completed(session,C.ticket_id ticket,Ok())) in
+  List.iter(fun(admission,cause)->
+    let release=C.step released.next(C.Observation_release_not_admitted(session,C.ticket_id ticket,admission)) in
+    let finalize=C.step finalized.next(C.Observation_finalize_not_admitted(session,C.ticket_id ticket,admission)) in
+    check(C.observation_error(C.view release.next)value.observation=Some(cause "Observation cleanup"))
+      "cleanup admission discarded its specific reason";
+    check(C.observation_error(C.view finalize.next)value.observation=Some(cause "Observation finalization"))
+      "finalization admission discarded its specific reason")
+    [W.Not_ready,(fun operation->W.Service_failed(operation^": worker not ready"));
+     W.Stopping,(fun operation->W.Service_failed(operation^": worker stopping"));
+     W.Unsupported_request "synthetic unsupported cleanup",(fun operation->W.Unsupported_operation(operation^": synthetic unsupported cleanup"))]
 ;;
 
 let test_observation_cleanup_failure_waits_for_explicit_retry () =
@@ -4848,6 +4872,7 @@ let test_binding_rebind_queued_read_and_failure () =
 ;;
 
 let () =
+  if Array.mem "--error-causes-only" Sys.argv then (test_observation_cleanup_admission_causes();exit 0);
   if Array.mem "--unconfirmed-demand-only" Sys.argv then (test_unconfirmed_asset_registration_cleanup();exit 0);
   if Array.mem "--live-read-rebind-only" Sys.argv then (test_live_binding_replans_ordinary_reads(); test_live_binding_read_owner_and_cancellation_fences();test_binding_rebind_queued_read_and_failure();exit 0);
   if Array.mem "--retry-release-error-only" Sys.argv then (test_retry_binding_release_error_is_observable();exit 0);
@@ -4892,6 +4917,7 @@ let () =
   test_observation_cancel_requires_ack ();
   test_observation_read_failure_and_refresh ();
   test_observation_notice_plans_one_refresh ();
+  test_observation_cleanup_admission_causes ();
   test_observation_cleanup_failure_waits_for_explicit_retry ();
   test_observation_properties ();
   test_observation_full_batch_does_not_self_wake ();

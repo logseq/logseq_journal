@@ -609,7 +609,7 @@ type control_request =
   | Latest of int
   | Crash of Worker.control_ticket
 
-let control_fixture ?(fail_init = false) () =
+let control_fixture ?(fail_init = false) ?(crash = fun () -> failwith "controlled control failure") () =
   let ticket = Atomic.make None in
   let replies = Atomic.make 0
   and latest = Atomic.make (-1) in
@@ -646,7 +646,7 @@ let control_fixture ?(fail_init = false) () =
          | Latest value ->
            Atomic.set latest value;
            Atomic.incr control_count
-         | Crash _ -> failwith "controlled control failure"
+         | Crash _ -> crash ()
          | Data _ -> invalid_arg "data is not a short control")
       ~shutdown:(fun (_, resolve) -> ignore (Eio.Promise.try_resolve resolve () : bool))
       ()
@@ -654,8 +654,8 @@ let control_fixture ?(fail_init = false) () =
   service, ticket, replies, latest, control_count
 ;;
 
-let with_control_fixture run =
-  let service, ticket, replies, latest, control_count = control_fixture () in
+let with_control_fixture ?crash run =
+  let service, ticket, replies, latest, control_count = control_fixture ?crash () in
   let client =
     Worker_runtime.start ~runtime_epoch:(ID.Runtime.Epoch.of_int64 2200L) service ()
     |> Result.get_ok
@@ -736,6 +736,34 @@ let test_control_client_epoch_and_stop () =
       "stop has priority over control traffic")
 ;;
 
+(* The mailbox owns exception-to-terminal conversion; the pure reducer cannot
+   execute a failing service callback. Use the actual codec diagnostic producer. *)
+let test_control_preserves_encoded_failure () =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let module Codec = Logseq_db_storage.Logseq_sqlite_codec in
+  List.iter (fun (codec_error, related) ->
+    let detail = Codec.diagnostic_error codec_error |> D.decode |> Option.get in
+    T.require (D.source_class detail = "unknown") "regression requires a classified reason without a source";
+    let detail = if related then D.with_related detail
+      (D.create ~operation:"closeDatabase" ~reason:"closeFailed" ~source:"database is locked" ())
+      else detail in
+    with_control_fixture ~crash:(fun () -> invalid_arg (D.encode detail))
+      (fun client ticket _ _ _ ->
+        T.require (Worker.send_control client (Crash ticket) = Worker.Control_accepted)
+          "encoded failure callback accepted";
+        let terminal = ref false in
+        control_wait "encoded failure reaches terminal" (fun () ->
+          List.iter (function
+            | Worker.Terminal {error;_} ->
+              T.require (error = D.message detail)
+                "terminal must retain codec reason and related failure despite unknown source";
+              terminal := true
+            | _ -> ()) (Worker.For_testing.drain_events client ~max_events:64);
+          !terminal)))
+    [Codec.Unsupported_tag "PRIVATE_SYNTHETIC_TAG", false;
+     Codec.Malformed_transit "PRIVATE_SYNTHETIC_PAYLOAD", true]
+;;
+
 let test_control_cancel_and_failure () =
   with_control_fixture (fun client ticket _ _ _ ->
     let cancelled = Worker.send client (Data 1) |> accepted in
@@ -772,7 +800,10 @@ let test_control_cancel_and_failure () =
     control_wait "control exception reaches terminal" (fun () ->
       List.iter
         (function
-          | Worker.Terminal _ -> terminal := true
+          | Worker.Terminal {error;_} ->
+            T.require (error = "workerOperation: Resource could not be opened. Cause: An operation raised Failure.")
+              "control exception must preserve its safe category without its raw payload";
+            terminal := true
           | _ -> ())
         (Worker.For_testing.drain_events client ~max_events:64);
       !terminal);
@@ -1883,6 +1914,7 @@ let () =
     ; T.case
         "control capabilities bind client and stop"
         test_control_client_epoch_and_stop
+    ; T.case "control encoded codec exception retains reason" test_control_preserves_encoded_failure
     ; T.case "control cancellation startup and exceptions" test_control_cancel_and_failure
     ; T.case
         "bounded control pressure and data fairness"

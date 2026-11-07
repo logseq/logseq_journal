@@ -3386,10 +3386,229 @@ let sqlite_full_int64_checkpoint () =
          "SQLite update preserves the complete cursor")
 ;;
 
+
+let storage_corruption_after_open operation () =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module D = Logseq_db_types.Failure_diagnostic in
+  T.with_temp_directory "storage-read-cause-" (fun directory ->
+    let path = Filename.concat directory "mirror.sqlite" in
+    T.copy_storage_fixture path;
+    let connection = Storage.open_database path |> Result.get_ok in
+    let callbacks = Storage.connection_callbacks connection in
+    Fun.protect ~finally:(fun () -> ignore (Storage.close callbacks)) (fun () ->
+      let sqlite = Sqlite3.db_open path in
+      Sqlite3.exec sqlite "UPDATE kvs SET content = '{invalid' WHERE addr = 0" |> Sqlite3.Rc.check;
+      T.require (Sqlite3.db_close sqlite) "close corrupting writer";
+      let result = match operation with
+        | `Startup -> Result.map (fun _ -> ()) (Storage.startup_metadata connection)
+        | `Garbage -> Result.map (fun _ -> ()) (Storage.garbage_stats callbacks) in
+      match result with
+      | Ok () -> Alcotest.fail "corruption was ignored"
+      | Error error ->
+        let diagnostic = Storage.diagnostic_error ~operation:"attachGraph" error |> D.decode |> Option.get in
+        Alcotest.(check string) "read returns concrete typed cause"
+          "codecMalformedTransit" (D.reason diagnostic)))
+;;
+
+(* Commit_batch owns the sequence of persistence stages; no reducer executes
+   its callbacks. Keep both the failing stage and the concrete SQLite cause. *)
+let storage_commit_retains_stage stage expected_reason () =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module D = Logseq_db_types.Failure_diagnostic in
+  T.with_temp_directory "storage-commit-cause-" (fun directory ->
+    let path = Filename.concat directory "mirror.sqlite" in
+    T.copy_storage_fixture path;
+    let connection = Storage.open_database path |> Result.get_ok in
+    let base = Storage.connection_callbacks connection in
+    Fun.protect ~finally:(fun () -> ignore (Storage.close base)) (fun () ->
+      let fail _ = Error "SQLITE_FULL" in
+      let callbacks = match stage with
+        | `Metadata -> { base with upsert_sync_metadata = fail }
+        | `Outbox -> { base with replace_sync_outbox = fail }
+        | `Mutation -> { base with upsert_mutation_receipts = fail }
+        | `Terminal -> { base with upsert_terminal_batch_receipts = fail } in
+      let metadata = Logseq_db_types.Sync_checkpoint.create
+          ~graph_id:T.graph_uuid ~schema:Logseq_db_types.Graph_types.{ major=1; minor=0 }
+          ~applied_server_t:(server_cursor_of_int 0) ~checksum:"0000000000000000"
+        |> Result.get_ok in
+      let batch = Storage.{ writes=[];
+        sync_metadata=(if stage=`Metadata then Some metadata else None);
+        sync_outbox=(if stage=`Outbox then Some [] else None);
+        mutation_receipts=(if stage=`Mutation then Some [] else None);
+        terminal_batch_receipts=(if stage=`Terminal then Some [] else None) } in
+      match Storage.commit_batch callbacks batch with
+      | Ok () -> Alcotest.fail "failed persistence stage was ignored"
+      | Error error ->
+        let diagnostic = Storage.diagnostic_error ~operation:"commitLocal" error
+          |> D.decode |> Option.get in
+        Alcotest.(check string) "failing commit stage" expected_reason (D.reason diagnostic);
+        Alcotest.(check string) "underlying SQLite cause" "sqlite-full" (D.source_class diagnostic)))
+;;
+
+let codec_preserves_structural_cause () =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  match Codec.decode_storage_payload "{}" with
+  | Ok _ -> Alcotest.fail "unknown storage map was accepted"
+  | Error error ->
+    let diagnostic = Codec.diagnostic_error error |> D.decode |> Option.get in
+    Alcotest.(check string) "concrete structural cause" "storage-payload-map-shape"
+      (D.source_class diagnostic)
+;;
+
+let storage_rollback_retains_primary () =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module D = Logseq_db_types.Failure_diagnostic in
+  T.with_temp_directory "storage-rollback-cause-" (fun directory ->
+    let path = Filename.concat directory "mirror.sqlite" in
+    T.copy_storage_fixture path;
+    let connection = Storage.open_database path |> Result.get_ok in
+    let base = Storage.connection_callbacks connection in
+    Fun.protect ~finally:(fun () -> ignore (Storage.close base)) (fun () ->
+      let callbacks = { base with
+        upsert = (fun _ -> Error "SQLITE_FULL");
+        rollback = (fun () -> base.rollback (); failwith "SQLITE_BUSY") } in
+      let batch = Storage.{ writes=[{address="0";payload="";addresses=[]}];
+        sync_metadata=None;sync_outbox=None;mutation_receipts=None;terminal_batch_receipts=None } in
+      match Storage.commit_batch callbacks batch with
+      | Error (Storage.Write_failed _ as error) ->
+        let diagnostic = Storage.diagnostic_error ~operation:"commitLocal" error |> D.decode |> Option.get in
+        Alcotest.(check string) "primary write cause" "sqlite-full" (D.source_class diagnostic);
+        let secondary = D.related diagnostic |> Option.get in
+        Alcotest.(check string) "rollback stage" "storageRollbackFailed" (D.reason secondary);
+        Alcotest.(check string) "rollback cause" "sqlite-locked" (D.source_class secondary)
+      | _ -> Alcotest.fail "rollback replaced the primary typed write error"))
+;;
+
+let related_diagnostic_validation () =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let primary = D.create ~operation:"closeDatabase" ~reason:"storageCheckpointFailed"
+      ~source:"SQLITE_FULL" ~cursor:Int64.max_int ~http_status:599 () in
+  let secondary = D.create ~operation:"closeDatabase" ~reason:"storageCloseFailed"
+      ~source:"SQLITE_BUSY" ~cursor:Int64.max_int ~http_status:599 () in
+  let encoded = D.with_related primary secondary |> D.encode in
+  T.require (String.length encoded <= 1024) "dual diagnostic exceeds wire budget";
+  T.require (String.length (D.message (D.with_related primary secondary)) <= 512)
+    "dual diagnostic exceeds display budget";
+  let prefix = "journal-failure:v1:" in
+  let fields = match Yojson.Safe.from_string
+      (String.sub encoded (String.length prefix) (String.length encoded - String.length prefix)) with
+    | `Assoc fields -> fields | _ -> assert false in
+  let reject fields =
+    T.require (D.decode (prefix ^ Yojson.Safe.to_string (`Assoc fields)) = None)
+      "unsafe related diagnostic was accepted" in
+  reject (("related", `String (D.encode secondary)) :: fields);
+  reject (("unexpected", `String "SECRET") :: fields);
+  reject (("related", `String "SECRET") :: List.remove_assoc "related" fields);
+  reject (("related", `String encoded) :: List.remove_assoc "related" fields)
+;;
+
+let diagnostic_unix_cause error expected () =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let source = Printexc.to_string (Unix.Unix_error (error, "SECRET-operation", "SECRET-path")) in
+  let diagnostic = D.of_source ~operation:"workerOperation" ~reason:"persistenceFailed" source in
+  Alcotest.(check string) "concrete errno" expected (D.source_class diagnostic);
+  let encoded = D.encode diagnostic in
+  Alcotest.(check bool) "no exception argument" false (String.contains encoded 'S')
+;;
+
+(* Session owns finalization of both callbacks; reducer events cannot execute
+   checkpoint and close. Inject distinct callback failures at that public owner. *)
+let storage_close_retains_both_causes ~checkpoint_raises () =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module Session = Logseq_db_storage.Storage_session in
+  let module D = Logseq_db_types.Failure_diagnostic in
+  T.with_temp_directory "storage-close-causes-" (fun directory ->
+    let path = Filename.concat directory "mirror.sqlite" in
+    T.copy_storage_fixture path;
+    let connection = Storage.open_database path |> Result.get_ok in
+    let base = Storage.connection_callbacks connection in
+    let callbacks = { base with
+      checkpoint = (fun () -> if checkpoint_raises then failwith "SQLITE_FULL" else Error "SQLITE_FULL");
+      close = (fun () -> ignore (Storage.close base); Error "SQLITE_BUSY") } in
+    let session = Session.create ~tail:[] ~callbacks in
+    match Session.close session with
+    | Error (Session.Persistence_failed encoded) ->
+      let diagnostic = match D.decode encoded with
+        | Some value -> value
+        | None -> Alcotest.fail "dual failure destroyed the structured carrier" in
+      Alcotest.(check string) "checkpoint stage" "storageCheckpointFailed" (D.reason diagnostic);
+      Alcotest.(check string) "checkpoint cause" "sqlite-full" (D.source_class diagnostic);
+      let secondary = D.related diagnostic |> Option.get in
+      Alcotest.(check string) "close stage" "storageCloseFailed" (D.reason secondary);
+      Alcotest.(check string) "close cause" "sqlite-locked" (D.source_class secondary);
+      let wrapped = D.of_source ~operation:"attachGraph" ~reason:"resourceFailed" encoded in
+      Alcotest.(check string) "upper wrapper retains secondary" "storageCloseFailed"
+        (D.reason (D.related wrapped |> Option.get));
+      let message = D.message diagnostic in
+      let contains text =
+        let rec loop n = n + String.length text <= String.length message
+          && (String.sub message n (String.length text) = text || loop (n + 1)) in
+        loop 0 in
+      T.require (contains "close" && contains "locked") "close cause was discarded"
+    | _ -> Alcotest.fail "close errors were lost")
+;;
+
+(* Corruption is produced by the SQLite/Transit adapter, not a pure reducer.
+   Exercise its public open boundary with real malformed persisted bytes. *)
+let storage_open_preserves_codec_cause content expected_reason () =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module D = Logseq_db_types.Failure_diagnostic in
+  T.with_temp_directory "storage-cause-" (fun directory ->
+    let path = Filename.concat directory "mirror.sqlite" in
+    T.copy_storage_fixture path;
+    let sqlite = Sqlite3.db_open path in
+    let statement = Sqlite3.prepare sqlite "UPDATE kvs SET content = ? WHERE addr = 0" in
+    Sqlite3.Rc.check (Sqlite3.bind_text statement 1 content);
+    Sqlite3.Rc.check (Sqlite3.step statement);
+    Sqlite3.Rc.check (Sqlite3.finalize statement);
+    T.require (Sqlite3.db_close sqlite) "close corrupted fixture";
+    match Storage.open_database path with
+    | Ok connection ->
+      ignore (Storage.close (Storage.connection_callbacks connection));
+      Alcotest.fail "corrupt root was accepted"
+    | Error error ->
+      let encoded = Storage.diagnostic_error ~operation:"attachGraph" error in
+      let diagnostic = D.decode encoded |> Option.get in
+      Alcotest.(check string) "concrete codec cause survives storage boundary"
+        expected_reason (D.reason diagnostic);
+      let rec contains_secret offset =
+        offset + 6 <= String.length encoded
+        && (String.sub encoded offset 6 = "SECRET" || contains_secret (offset + 1))
+      in
+      T.require (not (contains_secret 0))
+        "diagnostic must not include synthetic secret")
+;;
+
 let () =
   Alcotest.run
     "logseq_overlay_db storage"
-    [ ( "legacy status compatibility"
+    [ ( "storage error causes"
+      , [ Alcotest.test_case "codec structural cause" `Quick codec_preserves_structural_cause
+        ; Alcotest.test_case "rollback retains primary cause" `Quick storage_rollback_retains_primary
+        ; Alcotest.test_case "related diagnostic validates and bounds input" `Quick related_diagnostic_validation
+        ; Alcotest.test_case "startup corruption returns result" `Quick
+            (storage_corruption_after_open `Startup)
+        ; Alcotest.test_case "garbage traversal corruption returns result" `Quick
+            (storage_corruption_after_open `Garbage)
+        ; Alcotest.test_case "metadata commit stage" `Quick
+            (storage_commit_retains_stage `Metadata "storageMetadataFailed")
+        ; Alcotest.test_case "outbox commit stage" `Quick
+            (storage_commit_retains_stage `Outbox "storageOutboxFailed")
+        ; Alcotest.test_case "mutation receipt commit stage" `Quick
+            (storage_commit_retains_stage `Mutation "storageMutationReceiptFailed")
+        ; Alcotest.test_case "terminal receipt commit stage" `Quick
+            (storage_commit_retains_stage `Terminal "storageTerminalReceiptFailed")
+        ; Alcotest.test_case "Unix I/O failure" `Quick (diagnostic_unix_cause Unix.EIO "io-error")
+        ; Alcotest.test_case "Unix connection reset" `Quick (diagnostic_unix_cause Unix.ECONNRESET "network-reset")
+        ; Alcotest.test_case "close retains both failures" `Quick (storage_close_retains_both_causes ~checkpoint_raises:false)
+        ; Alcotest.test_case "throwing checkpoint still closes" `Quick
+            (storage_close_retains_both_causes ~checkpoint_raises:true)
+        ; Alcotest.test_case "malformed Transit survives open" `Quick
+            (storage_open_preserves_codec_cause "{SECRET-synthetic-invalid" "codecMalformedTransit")
+        ; Alcotest.test_case "unsupported tag survives open" `Quick
+            (storage_open_preserves_codec_cause {|["~#SECRET-synthetic-tag","SECRET"]|} "codecUnsupportedTag")
+        ] )
+    ; ( "legacy status compatibility"
       , [ Alcotest.test_case
             "format 17 status and dependency shadows"
             `Quick

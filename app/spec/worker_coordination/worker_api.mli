@@ -444,7 +444,7 @@ val maximum_mutation_recovery_bytes : int
 
 type interruption = Worker_effect_authority.interruption =
   | Cancelled
-  | Transport_lost
+  | Transport_lost of error
   | Worker_stopped
 
 type 'a reply = 'a Worker_effect_authority.reply =

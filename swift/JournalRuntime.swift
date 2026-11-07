@@ -138,18 +138,32 @@ private let platformRequest: PlatformRequestCallback = { data, length in
       "Journal could not complete a native operation (\(rawValue))."
     }
   }
+  /// Finite startup cause codes supplied by Journal_bridge. Never native text.
+  enum StartupCause: Int, Sendable {
+    case unknown = 0, startupPayloadTruncated, startupPayloadTooLarge, startupMagicInvalid
+    case startupLengthInvalid, startupLengthMismatch, startupJSONInvalid
+    case supportDirectoryInvalid, responseBudgetInvalid, pageSizeInvalid, syncOriginInvalid
+    case configurationInvalid, exceptionFailure, invalidArgument, systemError
+    case permissionDenied, missingFile, noSpace, busy, ioError, unixError
+    case outOfMemory, stackOverflow, endOfFile, matchFailure, assertionFailure, notFound
+    case mountRejected, workerStopped, workerTerminal, workerAlreadyAttached, workerDidNotStart
+    var diagnostic: String { String(describing: self) }
+  }
   struct FailureDetail: Error, LocalizedError {
     let operation: Failure
     let reason: JournalSafeDiagnostic
+    var cause: StartupCause? = nil
     var errorDescription:String? {
-      "Journal could not complete a native operation (\(operation.rawValue) · \(reason.rawValue)). \(reason.errorDescription!)"
+      "Journal could not complete a native operation (\(operation.rawValue) · \(reason.rawValue)\(cause.map { " · cause.\($0.diagnostic)" } ?? "")). \(reason.errorDescription!)"
     }
   }
   private(set) var failureReason: JournalSafeDiagnostic?
+  private(set) var failureCause: StartupCause?
   var failureDescription:String? {
-    failure.map { FailureDetail(operation:$0,reason:failureReason ?? .unknown).errorDescription! }
+    failure.map { FailureDetail(operation:$0,reason:failureReason ?? .unknown,cause:failureCause).errorDescription! }
   }
   static func safeReason(_ error:Error) -> JournalSafeDiagnostic {
+    if case JournalPlatformWire.Failure.invalidPacket = error { return .invalidPayload }
     if case let LUIBackendError.invalidBatch(source) = error { return .backendBatch(source) }
     return .classify(error)
   }
@@ -159,22 +173,30 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     return "Journal could not finish (\(operation) · \(reason.rawValue)). \(reason.errorDescription!)"
   }
   private func record(_ operation:Failure, _ reason:JournalSafeDiagnostic) {
-    failure = operation; failureReason = reason
+    failure = operation; failureReason = reason; failureCause = nil
   }
-  private func bridgeReason(_ operation:Int32) -> JournalSafeDiagnostic {
-    switch journalOCamlFailureReason(operation) {
-    case 1: .missingHandler
-    case 2: .callbackFailed
-    case 3: .allocationFailed
-    case 4: .invalidInput
-    case 5: .startupDecodeFailed
-    case 6: .startupWorkerFailed
-    case 7: .startupMountFailed
-    default: .unknown
+  private func recordBridge(_ failure: Failure, _ operation: Int32) {
+    let code = journalOCamlFailureReason(operation)
+    let reason: JournalSafeDiagnostic
+    switch code {
+    case 1: reason = .missingHandler
+    case 2: reason = .callbackFailed
+    case 3: reason = .allocationFailed
+    case 4: reason = .invalidInput
+    case 5, 500...531: reason = .startupDecodeFailed
+    case 6, 600...631: reason = .startupWorkerFailed
+    case 7: reason = .startupMountFailed
+    case 700...731: reason = .startupInitializeFailed
+    default: reason = .unknown
+    }
+    record(failure, reason)
+    if (500...531).contains(code) || (600...631).contains(code) || (700...731).contains(code) {
+      failureCause = StartupCause(rawValue: Int(code % 100))
     }
   }
+
   private var reportedFailure:FailureDetail? {
-    failure.map { FailureDetail(operation:$0,reason:failureReason ?? .unknown) }
+    failure.map { FailureDetail(operation:$0,reason:failureReason ?? .unknown,cause:failureCause) }
   }
   let backend: LUIAppleBackend
   let platform: JournalApplicationPlatform
@@ -229,7 +251,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     }
     guard generation == identity else { throw CancellationError() }
     guard accepted == 1 else {
-      record(.start,bridgeReason(1))
+      recordBridge(.start,1)
       let reported = reportedFailure!
       _ = luiOCamlStop()
       activeRuntime = nil
@@ -289,7 +311,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     started = false
     activeRuntime = nil
     stopPending = luiOCamlStop() != 1
-    if stopPending { record(.stop,bridgeReason(2)) }
+    if stopPending { recordBridge(.stop,2) }
     return !stopPending
   }
 
@@ -309,7 +331,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   func pump() {
     guard started else { return }
     let identity = generation, accepted = journalOCamlPump()
-    if generation == identity, started, accepted != 1 { record(.pump,bridgeReason(3)) }
+    if generation == identity, started, accepted != 1 { recordBridge(.pump,3) }
   }
 
   /// Marshals one LJP2 request onto the platform actor and ships its response
@@ -334,7 +356,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
       let accepted = response.withUnsafeBytes { buffer in
         journalOCamlPlatformFailure(buffer.baseAddress?.assumingMemoryBound(to:CChar.self),Int32(buffer.count))
       }
-      if generation == identity, started, accepted != 1 { record(.platformFailure,bridgeReason(6)) }
+      if generation == identity, started, accepted != 1 { recordBridge(.platformFailure,6) }
       return
     }
     let accepted = response.withUnsafeBytes { buffer in
@@ -342,7 +364,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
         buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
         Int32(buffer.count))
     }
-    if generation == identity, started, accepted != 1 { record(.platformResponse,bridgeReason(5)) }
+    if generation == identity, started, accepted != 1 { recordBridge(.platformResponse,5) }
   }
 
   /// Pushes one host-originated LJP2 event envelope to OCaml.
@@ -354,12 +376,12 @@ private let platformRequest: PlatformRequestCallback = { data, length in
         buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
         Int32(buffer.count))
     }
-    if generation == identity, started, accepted != 1 { record(.platformEvent,bridgeReason(4)) }
+    if generation == identity, started, accepted != 1 { recordBridge(.platformEvent,4) }
   }
 
   private func handle(_ event: LUIEvent) {
     guard started else { return }
     let identity = generation, accepted = JournalLUIEvents.dispatch(event)
-    if generation == identity, started, accepted != 1 { record(.event,bridgeReason(7)) }
+    if generation == identity, started, accepted != 1 { recordBridge(.event,7) }
   }
 }

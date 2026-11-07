@@ -412,7 +412,7 @@ let protected_run runner ~tasks ~posted core operation scope action =
 ;;
 
 let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
-      ?(malformed_plaintext = false) ?(decryption_failure = false) ?(cancel_online = false) () =
+      ?(malformed_plaintext = false) ?(decryption_failure = false) ?(decryption_exception = false) ?(encryption_failure = false) ?(cancel_online = false) () =
   with_support (fun support ->
     Eio_main.run (fun environment ->
       Eio.Switch.run (fun sw ->
@@ -449,7 +449,8 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
               Error "encryption was not expected")
             ~decrypt_aes_gcm:(fun ~key ~iv:_ ~ciphertext:_ ->
               if String.equal key raw_key
-              then if decryption_failure
+              then if decryption_exception then raise (Unix.Unix_error (Unix.EACCES, "PRIVATE_OPERATION", "PRIVATE_PATH"))
+                else if decryption_failure
                 then Error "SENSITIVE-synthetic-crypto-error"
                 else if malformed_plaintext
                 then Ok {|"~XSENSITIVE-synthetic-body"|}
@@ -526,8 +527,29 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
              unlocked
              "decrypt-cached"
              (Core.graph_key_handle_scope handle)
-             (Core.Decrypt_value (handle, ciphertext)) in
-        if decryption_failure then
+             (if encryption_failure then Core.Encrypt_values (handle, ["plaintext"])
+              else Core.Decrypt_value (handle, ciphertext)) in
+        if encryption_failure then
+          Alcotest.(check bool) "encryption failure returns a bounded diagnostic" true
+            (match result with
+             | Error (Core.Effect_failed source) ->
+               let module D = Logseq_db_types.Failure_diagnostic in
+               (match D.decode source with
+                | Some detail -> D.operation detail = "encryptValue"
+                  && D.reason detail = "cryptoInvalid"
+                | None -> false)
+             | _ -> false)
+        else if decryption_exception then
+          Alcotest.(check bool) "protected provider exception retains only its safe cause" true
+            (match result with
+             | Error (Core.Effect_failed source) ->
+               let module D = Logseq_db_types.Failure_diagnostic in
+               (match D.decode source with
+                | Some detail -> D.operation detail = "decryptValue"
+                  && D.reason detail = "cryptoInvalid" && D.source_class detail = "io-permission"
+                | None -> false)
+             | _ -> false)
+        else if decryption_failure then
           Alcotest.(check bool) "crypto error excludes sensitive detail" true
             (match result with
              | Error (Core.Effect_failed message) ->
@@ -1391,7 +1413,7 @@ let scenarios =
 ;;
 
 (* Migrated asset cache public runner scenarios. *)
-let with_local_asset_cache ?(budget = 8L) ?(pending_budget = 8L)
+let with_local_asset_cache ?(budget = 8L) ?(pending_budget = 8L) ?(with_causes = false)
       ?on_asset_diagnostic ?(acquire = fun _ -> Ok "token") test =
   with_support (fun support ->
     Eio_main.run (fun environment ->
@@ -1477,7 +1499,8 @@ let with_local_asset_cache ?(budget = 8L) ?(pending_budget = 8L)
                in
                state := transition.next;
                match pump (consume [] transition.effects) with
-               | [ output ] -> output.Core.result
+               | [ output ] -> if with_causes then output.Core.result
+                 else Result.map_error Core.asset_failure_kind output.Core.result
                | _ -> fail "cache operation did not resolve through reducer output"
              in
              test support request))))
@@ -2437,14 +2460,21 @@ let test_asset_authentication_cause_is_scoped () =
   let reports = ref [] in
   let on_asset_diagnostic ~scope ~operation ~request_operation detail =
     reports := (scope, operation, request_operation, detail) :: !reports in
-  with_local_asset_cache ~on_asset_diagnostic
+  with_local_asset_cache ~with_causes:true ~on_asset_diagnostic
     ~acquire:(fun _ -> Error "SENSITIVE-fixture-token-error")
     (fun _ request ->
       let version = Logseq_db_types.Asset_descriptor.version
         ~checksum:(String.make 64 'a') ~file_type:"bin" |> Result.get_ok in
+      let result = request (Core.Fetch_asset {asset=graph_id (); version; maximum_plaintext_bytes=4}) in
       Alcotest.(check bool) "original authentication category" true
-        (request (Core.Fetch_asset {asset=graph_id (); version; maximum_plaintext_bytes=4})
-          = Error Core.Asset_authentication);
+        (Result.map_error Core.asset_failure_kind result = Error Core.Asset_authentication);
+      (match result with
+       | Error failure ->
+         let cause = Core.asset_failure_cause failure in
+         Alcotest.(check (option string)) "result carries cause without side-channel dependency"
+           (Some "authenticationFailed")
+           (Option.map Logseq_db_types.Failure_diagnostic.reason cause)
+       | Ok _ -> fail "expected authentication failure");
       match !reports with
       | [(scope, operation, request_operation, detail)] ->
         let module D = Logseq_db_types.Failure_diagnostic in
@@ -2499,4 +2529,78 @@ let test_resident_websocket_owners_are_independent () =
     Runner.shutdown runner)))
 ;;
 let scenarios=scenarios @ [Alcotest.test_case "resident physical sockets admit and retire independently" `Quick test_resident_websocket_owners_are_independent]
+;;
+
+(* Provider exceptions occur in the effect runner, not the pure reducer. Reproduce
+   through its public dependencies and completion output, never a fabricated result. *)
+let test_asset_provider_exception_keeps_safe_cause () =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  List.iter (fun error ->
+    let reports = ref [] in
+    let expected = D.of_source ~operation:"assetDownload" ~reason:"invalidContent"
+      (Printexc.to_string error) in
+    with_local_asset_cache ~with_causes:true
+      ~on_asset_diagnostic:(fun ~scope:_ ~operation:_ ~request_operation:_ detail ->
+        reports := detail :: !reports)
+      ~acquire:(fun _ -> raise error)
+      (fun _ request ->
+        let version = Logseq_db_types.Asset_descriptor.version
+          ~checksum:(String.make 64 'a') ~file_type:"bin" |> Result.get_ok in
+        (match request (Core.Fetch_asset {asset=graph_id (); version; maximum_plaintext_bytes=4}) with
+         | Error failure ->
+           let source = match Core.asset_failure_kind failure with
+             | Core.Asset_invalid_content source -> source
+             | _ -> fail "expected invalid content exception category" in
+           Alcotest.(check (option string)) "exception reaches caller as safe bounded cause"
+             (Some (D.message expected)) (Option.map D.message (D.decode source))
+         | _ -> fail "expected classified provider exception");
+        Alcotest.(check (list string)) "exception also reaches scoped diagnostics"
+          [D.message expected] (List.map D.message !reports)))
+    [ Unix.Unix_error (Unix.EACCES, "PRIVATE_OPERATION", "PRIVATE_PATH")
+    ; Unix.Unix_error (Unix.ENOSPC, "PRIVATE_OPERATION", "PRIVATE_PATH")
+    ; Failure "Bearer PRIVATE_TOKEN https://user:PRIVATE_PASSWORD@host/PRIVATE_GRAPH" ]
+;;
+let scenarios = scenarios @ [Alcotest.test_case
+  "asset provider exception keeps safe cause" `Quick test_asset_provider_exception_keeps_safe_cause]
+;;
+
+let test_catalog_provider_exception_completes () =
+  with_support (fun support -> Eio_main.run (fun environment -> Eio.Switch.run (fun sw ->
+    let tasks = Queue.create () and posted = ref [] in
+    let deps = dependencies ~environment ~support
+      ~fork:(fun ~sw:_ task -> Queue.add task tasks)
+      ~id_token_dependency:(Runner.id_token_provider
+        ~acquire:(fun _ -> raise (Unix.Unix_error (Unix.EACCES, "PRIVATE_OPERATION", "PRIVATE_PATH")))
+        ~invalidate:(fun _ ~token:_ -> ())) () in
+    let runner = Runner.create ~sw deps ~post:(fun event -> posted := event :: !posted)
+      |> Result.get_ok in
+    let requested = Core.step (core ()) (Core.Account_authenticated {user_id=Some "user-1"}) in
+    let runnable = List.find_map (function
+      | Core.Run (Core.Request (_, Core.Fetch_catalog _) as runnable) -> Some runnable
+      | _ -> None) requested.effects |> Option.get in
+    Runner.submit runner runnable;
+    while not (Queue.is_empty tasks) do (Queue.take tasks) () done;
+    (match !posted with
+     | [Core.Runner_completed (Core.Completion (_, Error (Core.Effect_failed source)))] ->
+       let module D = Logseq_db_types.Failure_diagnostic in
+       let diagnostic = D.decode source |> Option.get in
+       Alcotest.(check string) "provider exception retains errno" "io-permission" (D.source_class diagnostic);
+       let failed = Core.step requested.next (List.hd !posted) in
+       Alcotest.(check bool) "pending caller completes with explicit failure" true
+         ((Core.state failed.next).snapshot.sync_phase = Core.Failed)
+     | _ -> fail "provider exception must complete the caller");
+    Runner.shutdown runner)))
+;;
+let scenarios = scenarios @ [Alcotest.test_case
+  "catalog provider exception completes" `Quick test_catalog_provider_exception_completes]
+;;
+
+let scenarios = scenarios @ [Alcotest.test_case
+  "protected provider exception keeps safe cause" `Quick
+  (test_cached_wrapped_key_is_unlocked_before_protected_value_decryption ~decryption_exception:true)]
+;;
+
+let scenarios = scenarios @ [Alcotest.test_case
+  "protected encryption failure keeps safe cause" `Quick
+  (test_cached_wrapped_key_is_unlocked_before_protected_value_decryption ~encryption_failure:true)]
 ;;

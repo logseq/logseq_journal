@@ -49,11 +49,10 @@ static lui_patch_callback patch_callback = NULL;
 static journal_wakeup_callback wakeup_callback = NULL;
 static journal_platform_request_callback platform_request_callback = NULL;
 
-static void report_ocaml_exception(const char *where, value result) {
-  (void)result;
+static void report_ocaml_exception(const char *where, int reason) {
   /* Exception text may contain credentials, paths or graph content. The return
      code reaches the native host, which can report failure without a patch. */
-  fprintf(stderr, "journal_lui_bridge: operation=%s code=ocamlCallbackFailed\n", where);
+  fprintf(stderr, "journal_lui_bridge: operation=%s code=ocamlCallbackFailed reason=%d\n", where, reason);
 }
 
 /* Only the OCaml owner's exact allowlist is queried. Never format an exception
@@ -68,7 +67,10 @@ static int classify_exception(value result) {
   int reason = 2;
   if (!Is_exception_result(classified) && Is_long(classified)) {
     int candidate = Int_val(classified);
-    if (candidate >= 5 && candidate <= 7) reason = candidate;
+    if ((candidate >= 5 && candidate <= 7) ||
+        (candidate >= 500 && candidate <= 531) ||
+        (candidate >= 600 && candidate <= 631) ||
+        (candidate >= 700 && candidate <= 731)) reason = candidate;
   }
   CAMLreturnT(int,reason);
 }
@@ -92,8 +94,8 @@ static patch_response copy_patch(const char *where, value result) {
   patch_response response = pending_response(where,0);
   response.callback = patch_callback;
   if (Is_exception_result(result)) {
-    report_ocaml_exception(where, result);
     response.reason = classify_exception(result);
+    report_ocaml_exception(where, response.reason);
     return response;
   }
   size_t length = caml_string_length(result);
@@ -388,7 +390,7 @@ LUI_EXPORT int64_t lui_ocaml_root_node(void) {
   if (root != NULL) {
     value result = caml_callback_exn(*root, Val_unit);
     if (Is_exception_result(result)) {
-      report_ocaml_exception("lui_ocaml_root_node", result);
+      report_ocaml_exception("lui_ocaml_root_node", classify_exception(result));
     } else {
       node = (int64_t)Long_val(result);
     }
@@ -446,8 +448,8 @@ static int32_t deliver_platform(const char *name, const char *data,
     value payload = copy_bytes(data, length);
     value result = caml_callback_exn(*handler, payload);
     if (Is_exception_result(result)) {
-      report_ocaml_exception(name, result);
       reason = classify_exception(result);
+      report_ocaml_exception(name, reason);
     } else {
       accepted = 1; reason = 0;
     }

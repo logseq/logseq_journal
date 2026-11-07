@@ -4,6 +4,7 @@ type t =
   ; source_name : string
   ; cursor : string option
   ; http_status : int option
+  ; related : t option
   }
 
 let operations =
@@ -28,6 +29,9 @@ let operations =
   ; "prepareCatalog", "storage"
   ; "platformCrypto", "crypto"
   ; "decryptValue", "crypto"
+  ; "encryptValue", "crypto"
+  ; "httpTransport", "network"
+  ; "websocketTransport", "network"
   ; "decodeSnapshot", "sync"
   ; "assetCache", "asset"
   ; "projectGraph", "presentation"
@@ -101,13 +105,104 @@ let reasons =
   ; "storageWriteFailed", "SQLite storage write failed"
   ; "storageCommitFailed", "SQLite transaction could not commit"
   ; "storageCheckpointFailed", "SQLite checkpoint failed"
+  ; "storageRollbackFailed", "SQLite rollback failed"
   ; "storageCloseFailed", "SQLite storage could not close"
+  ; "storageMetadataFailed", "SQLite sync metadata update failed"
+  ; "storageOutboxFailed", "SQLite outbox update failed"
+  ; "storageMutationReceiptFailed", "SQLite mutation receipt update failed"
+  ; "storageTerminalReceiptFailed", "SQLite terminal receipt update failed"
+  ; "codecUnsupportedTag", "Storage codec encountered an unsupported Transit tag"
+  ; "codecMalformedTransit", "Storage codec could not parse Transit"
+  ; "codecNumberRange", "Storage codec number is out of range"
+  ; "codecMalformedPayload", "Storage codec payload has an invalid structure"
   ]
 ;;
 
 (* These are exact producer-owned literals, never substrings of graph values. *)
 let producer_sources =
-  [ "empty-submit-group", "empty submit group"
+  [ "catalog-cache-field-cache-user-id", "catalog cache: field cache_user_id is missing or has an invalid type"
+  ; "catalog-cache-field-cache-graphs", "catalog cache: field cache_graphs is missing or has an invalid type"
+  ; "catalog-cache-field-cache-selected-graph", "catalog cache: field cache_selected_graph is missing or has an invalid type"
+  ; "catalog-cache-field-cache-resident-graphs", "catalog cache: field cache_resident_graphs is missing or has an invalid type"
+  ; "catalog-cache-field-graph-id", "catalog cache: field graph_id is missing or has an invalid type"
+  ; "catalog-cache-field-name", "catalog cache: field name is missing or has an invalid type"
+  ; "catalog-cache-field-schema", "catalog cache: field schema is missing or has an invalid type"
+  ; "catalog-cache-field-encrypted", "catalog cache: field encrypted is missing or has an invalid type"
+  ; "catalog-cache-field-major", "catalog cache: field major is missing or has an invalid type"
+  ; "catalog-cache-field-minor", "catalog cache: field minor is missing or has an invalid type"
+  ; "catalog-cache-field-exact", "catalog cache: field exact is missing or has an invalid type"
+  ; "catalog-cache-duplicate-json-field", "catalog cache: duplicate JSON field"
+  ; "catalog-cache-invalid-utf-8-field-name", "catalog cache: invalid UTF-8 field name"
+  ; "catalog-cache-invalid-utf-8-string", "catalog cache: invalid UTF-8 string"
+  ; "catalog-cache-non-finite-json-number", "catalog cache: non-finite JSON number"
+  ; "catalog-cache-nonstandard-json-value", "catalog cache: nonstandard JSON value"
+  ; "catalog-cache-json-exceeds-byte-budget", "catalog cache: JSON exceeds byte budget"
+  ; "catalog-cache-invalid-json-value", "catalog cache: invalid JSON value"
+  ; "catalog-cache-invalid-shape", "catalog cache: invalid shape"
+  ; "upload-checkpoint-field-format-version", "Asset_upload_intent.Pure_codec.checkpoint.format_version"
+  ; "upload-checkpoint-field-operation-id", "Asset_upload_intent.Pure_codec.checkpoint.operation_id"
+  ; "upload-checkpoint-field-origin", "Asset_upload_intent.Pure_codec.checkpoint.origin"
+  ; "upload-checkpoint-field-account", "Asset_upload_intent.Pure_codec.checkpoint.account"
+  ; "upload-checkpoint-field-graph", "Asset_upload_intent.Pure_codec.checkpoint.graph"
+  ; "upload-checkpoint-field-asset", "Asset_upload_intent.Pure_codec.checkpoint.asset"
+  ; "upload-checkpoint-field-version", "Asset_upload_intent.Pure_codec.checkpoint.version"
+  ; "upload-checkpoint-field-title", "Asset_upload_intent.Pure_codec.checkpoint.title"
+  ; "upload-checkpoint-field-size", "Asset_upload_intent.Pure_codec.checkpoint.size"
+  ; "upload-checkpoint-field-staged-file", "Asset_upload_intent.Pure_codec.checkpoint.staged_file"
+  ; "upload-checkpoint-field-replace-reference", "Asset_upload_intent.Pure_codec.checkpoint.replace_reference"
+  ; "upload-checkpoint-field-target", "Asset_upload_intent.Pure_codec.checkpoint.target"
+  ; "upload-checkpoint-field-local-mutation", "Asset_upload_intent.Pure_codec.checkpoint.local_mutation"
+  ; "upload-checkpoint-field-metadata-mutation", "Asset_upload_intent.Pure_codec.checkpoint.metadata_mutation"
+  ; "upload-checkpoint-field-phase", "Asset_upload_intent.Pure_codec.checkpoint.phase"
+  ; "upload-checkpoint-field-revision", "Asset_upload_intent.Pure_codec.checkpoint.revision"
+  ; "storage-payload-map-shape", "unknown storage payload map"
+  ; "storage-payload-shape", "unknown storage payload"
+  ; "storage-unresolved-reference", "storage payload cannot contain unresolved refs"
+  ; "storage-datom-attribute", "datom attr must be a Transit keyword"
+  ; "storage-datom-shape", "storage datom must be [e a v tx]"
+  ; "storage-datoms-shape", "storage datoms must be a Transit array"
+  ; "storage-children-shape", "storage node :children must be a Transit array"
+  ; "storage-tail-shape", "storage tail must be a Transit array"
+  ; "storage-transit-map-pairs", "Transit map expects an even number of entries"
+  ; "storage-transit-cmap-pairs", "Transit cmap expects an even number of entries"
+  ; "storage-transit-json-standard", "Transit JSON must be standard JSON"
+  ; "tls-alert-close-notify", "TLS alert: close notify"
+  ; "tls-alert-unexpected-message", "TLS alert: unexpected message"
+  ; "tls-alert-bad-record-mac", "TLS alert: bad record mac"
+  ; "tls-alert-record-overflow", "TLS alert: record overflow"
+  ; "tls-alert-handshake-failure", "TLS alert: handshake failure"
+  ; "tls-alert-bad-certificate", "TLS alert: bad certificate"
+  ; "tls-alert-certificate-expired", "TLS alert: certificate expired"
+  ; "tls-alert-certificate-unknown", "TLS alert: certificate unknown"
+  ; "tls-alert-decode-error", "TLS alert: decode error"
+  ; "tls-alert-protocol-version", "TLS alert: protocol version"
+  ; "tls-alert-inappropriate-fallback", "TLS alert: inappropriate fallback"
+  ; "tls-alert-user-canceled", "TLS alert: user canceled"
+  ; "tls-alert-no-renegotiation", "TLS alert: no renegotiation"
+  ; "tls-alert-missing-extension", "TLS alert: missing extension"
+  ; "tls-alert-unsupported-extension", "TLS alert: unsupported extension"
+  ; "tls-alert-unrecognized-name", "TLS alert: unrecognized name"
+  ; "tls-alert-no-application-protocol", "TLS alert: no application protocol"
+  ; "tls-alert-unknown", "TLS alert: unknown"
+  ; "tls-failure-close-notify", "TLS failure: close notify"
+  ; "tls-failure-unexpected-message", "TLS failure: unexpected message"
+  ; "tls-failure-bad-record-mac", "TLS failure: bad record mac"
+  ; "tls-failure-record-overflow", "TLS failure: record overflow"
+  ; "tls-failure-handshake-failure", "TLS failure: handshake failure"
+  ; "tls-failure-bad-certificate", "TLS failure: bad certificate"
+  ; "tls-failure-certificate-expired", "TLS failure: certificate expired"
+  ; "tls-failure-certificate-unknown", "TLS failure: certificate unknown"
+  ; "tls-failure-decode-error", "TLS failure: decode error"
+  ; "tls-failure-protocol-version", "TLS failure: protocol version"
+  ; "tls-failure-inappropriate-fallback", "TLS failure: inappropriate fallback"
+  ; "tls-failure-user-canceled", "TLS failure: user canceled"
+  ; "tls-failure-no-renegotiation", "TLS failure: no renegotiation"
+  ; "tls-failure-missing-extension", "TLS failure: missing extension"
+  ; "tls-failure-unsupported-extension", "TLS failure: unsupported extension"
+  ; "tls-failure-unrecognized-name", "TLS failure: unrecognized name"
+  ; "tls-failure-no-application-protocol", "TLS failure: no application protocol"
+  ; "tls-failure-unknown", "TLS failure: unknown"
+  ; "empty-submit-group", "empty submit group"
   ; "duplicate-submit-member", "duplicate submit member"
   ; "submit-member-missing", "submit member is missing"
   ; "submit-member-not-queued", "submit member is not queued"
@@ -426,6 +521,19 @@ let source_classes =
     ; "sqlite-aborted", "SQLite operation was aborted"
     ; "sqlite-too-large", "SQLite value exceeds its size limit"
     ; "sqlite-type-mismatch", "SQLite value type does not match"
+    ; "io-error", "Operating system I/O failed"
+    ; "io-not-directory", "Path component is not a directory"
+    ; "io-is-directory", "Expected a file but found a directory"
+    ; "io-readonly", "Filesystem is read-only"
+    ; "io-exists", "Filesystem object already exists"
+    ; "io-process-files", "Process file descriptor limit reached"
+    ; "io-system-files", "System file descriptor limit reached"
+    ; "network-refused", "Connection was refused"
+    ; "network-reset", "Connection was reset"
+    ; "network-timeout", "Connection timed out"
+    ; "network-unreachable", "Network is unreachable"
+    ; "network-host-unreachable", "Host is unreachable"
+    ; "io-broken-pipe", "Pipe or connection is closed"
     ; "io-no-space", "Storage has no free space"
     ; "io-permission", "Storage permission was denied"
     ; "io-missing", "Storage object was not found"
@@ -491,6 +599,19 @@ let source_prefixes =
   ; "CHECK constraint failed:", "sqlite-constraint"
   ; "no such table:", "sqlite-schema"
   ; "no such column:", "sqlite-schema"
+  ; "Unix.Unix_error(Unix.EIO,", "io-error"
+  ; "Unix.Unix_error(Unix.ENOTDIR,", "io-not-directory"
+  ; "Unix.Unix_error(Unix.EISDIR,", "io-is-directory"
+  ; "Unix.Unix_error(Unix.EROFS,", "io-readonly"
+  ; "Unix.Unix_error(Unix.EEXIST,", "io-exists"
+  ; "Unix.Unix_error(Unix.EMFILE,", "io-process-files"
+  ; "Unix.Unix_error(Unix.ENFILE,", "io-system-files"
+  ; "Unix.Unix_error(Unix.ECONNREFUSED,", "network-refused"
+  ; "Unix.Unix_error(Unix.ECONNRESET,", "network-reset"
+  ; "Unix.Unix_error(Unix.ETIMEDOUT,", "network-timeout"
+  ; "Unix.Unix_error(Unix.ENETUNREACH,", "network-unreachable"
+  ; "Unix.Unix_error(Unix.EHOSTUNREACH,", "network-host-unreachable"
+  ; "Unix.Unix_error(Unix.EPIPE,", "io-broken-pipe"
   ; "Unix.Unix_error(Unix.ENOSPC,", "io-no-space"
   ; "Unix.Unix_error(Unix.EACCES,", "io-permission"
   ; "Unix.Unix_error(Unix.EPERM,", "io-permission"
@@ -560,6 +681,7 @@ let create ~operation ~reason ?source ?cursor ?http_status () =
   ; cursor =
       Option.bind cursor (fun value ->
         if value < 0L then None else Some (Int64.to_string value))
+  ; related = None
   ; http_status =
       (match http_status with
        | Some status when valid_http_status status -> Some status
@@ -574,7 +696,13 @@ let reason value = value.reason_name
 let source_class value = value.source_name
 let code value = value.operation_name ^ "." ^ value.reason_name
 
-let message value =
+let with_related primary secondary =
+  { primary with related = Some { secondary with related = None } }
+;;
+
+let related value = value.related
+
+let rec message value =
   let summary = value.operation_name ^ ": " ^ List.assoc value.reason_name reasons in
   let cause =
     if value.source_name = "unknown"
@@ -582,13 +710,14 @@ let message value =
     else ". Cause: " ^ List.assoc value.source_name source_classes
   in
   let http = Option.fold ~none:"" ~some:(fun status -> Printf.sprintf " (http=%d)" status) value.http_status in
-  let text = summary ^ cause ^ http ^ "." in
+  let additional = Option.fold ~none:"" ~some:(fun other -> " Also: " ^ message other) value.related in
+  let text = summary ^ cause ^ http ^ "." ^ additional in
   if String.length text <= 512 then text else summary ^ "."
 ;;
 
 let prefix = "journal-failure:v1:"
 
-let encode value =
+let rec encode value =
   let fields =
     [ "operation", `String value.operation_name
     ; "reason", `String value.reason_name
@@ -597,11 +726,13 @@ let encode value =
     @ Option.fold ~none:[] ~some:(fun cursor -> [ "cursor", `String cursor ]) value.cursor
     @ Option.fold ~none:[] ~some:(fun status -> [ "httpStatus", `Int status ]) value.http_status
   in
+  let fields = fields @ Option.fold ~none:[]
+      ~some:(fun other -> [ "related", `String (encode other) ]) value.related in
   prefix ^ Yojson.Safe.to_string (`Assoc fields)
 ;;
 
-let decode source =
-  if String.length source > 1024 || not (String.starts_with ~prefix source)
+let rec decode_at_depth depth source =
+  if depth > 1 || String.length source > 1024 || not (String.starts_with ~prefix source)
   then None
   else (
     try
@@ -614,12 +745,13 @@ let decode source =
       match Yojson.Safe.from_string encoded with
       | `Assoc fields ->
         let keys = List.map fst fields in
-        let valid_keys = List.sort String.compare keys in
-        if
+        let valid_keys = List.sort String.compare (List.filter ((<>) "related") keys) in
+        let related_count = List.length (List.filter ((=) "related") keys) in
+        if related_count > 1 || (depth = 1 && related_count <> 0) || (
           valid_keys <> [ "operation"; "reason"; "source" ]
           && valid_keys <> [ "cursor"; "operation"; "reason"; "source" ]
           && valid_keys <> [ "httpStatus"; "operation"; "reason"; "source" ]
-          && valid_keys <> [ "cursor"; "httpStatus"; "operation"; "reason"; "source" ]
+          && valid_keys <> [ "cursor"; "httpStatus"; "operation"; "reason"; "source" ])
         then None
         else (
           match
@@ -648,15 +780,21 @@ let decode source =
               | None -> Some None
               | Some (`Int value) when valid_http_status value -> Some (Some value)
               | _ -> None in
-            (match cursor, http_status with
-             | Some cursor, Some http_status ->
-               Some { operation_name; reason_name; source_name; cursor; http_status }
+            let related = match List.assoc_opt "related" fields with
+              | None -> Some None
+              | Some (`String source) -> Option.map Option.some (decode_at_depth (depth + 1) source)
+              | _ -> None in
+            (match cursor, http_status, related with
+             | Some cursor, Some http_status, Some related ->
+               Some { operation_name; reason_name; source_name; cursor; http_status; related }
              | _ -> None)
           | _ -> None)
       | _ -> None
     with
     | Yojson.Json_error _ -> None)
 ;;
+
+let decode = decode_at_depth 0
 
 let detail_name = "failureDiagnostic"
 let signal_prefix = "worker.failure:"

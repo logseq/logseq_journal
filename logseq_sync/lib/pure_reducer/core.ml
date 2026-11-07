@@ -340,7 +340,14 @@ let decode_catalog_cache source =
         catalog_cache_of_yojson
         (Yojson.Safe.from_string source)
     with
-    | Error _ -> Error "unsupported or invalid catalog cache format"
+    | Error message ->
+      let fields = List.concat_map (fun (prefix, names) ->
+        List.map (fun name -> prefix ^ name,
+          "field " ^ name ^ " is missing or has an invalid type") names)
+        [ "Core.catalog_cache.", ["cache_user_id"; "cache_graphs"; "cache_selected_graph"; "cache_resident_graphs"]
+        ; "Core.graph.", ["graph_id"; "name"; "schema"; "encrypted"]
+        ; "Core.cache_schema.", ["major"; "minor"; "exact"] ] in
+      Error ("catalog cache: " ^ Logseq_db_types.Json_codec.error_context ~fields message)
     | Ok cache ->
       if
         (not (bounded_text cache.cache_user_id))
@@ -361,8 +368,8 @@ let decode_catalog_cache source =
       then Error "catalog cache contains invalid domain values"
       else Ok cache
   with
-  | Yojson.Json_error _ | Failure _ | Invalid_argument _ ->
-    Error "unsupported or invalid catalog cache format"
+  | Yojson.Json_error _ -> Error "catalog cache: invalid JSON syntax"
+  | Failure _ | Invalid_argument _ -> Error "catalog cache: invalid shape"
 ;;
 
 type encryption_batch =
@@ -460,6 +467,21 @@ type asset_failure =
   | Asset_revoked_access
   | Asset_cancelled
   | Asset_invalid_content of string
+  | Asset_with_cause of asset_failure * Logseq_db_types.Failure_diagnostic.t
+
+let rec asset_failure_kind = function
+  | Asset_with_cause (failure, _) -> asset_failure_kind failure
+  | failure -> failure
+;;
+
+let asset_failure_cause = function
+  | Asset_with_cause (_, cause) -> Some cause
+  | _ -> None
+;;
+
+let asset_failure_with_cause failure cause =
+  Asset_with_cause (asset_failure_kind failure, cause)
+;;
 
 type asset_value =
   | Asset_unit
@@ -1323,6 +1345,16 @@ let start_websocket core graph =
   { next; effects = [ publish next; Run (Start_websocket { scope; uri }) ] }
 ;;
 
+let authoritative_input_error_message = function
+  | Overlay.Invalid_server_cursor -> "authoritative server cursor is invalid"
+  | Invalid_encoded_transaction -> "authoritative transaction is empty or its byte limit is invalid"
+  | Authoritative_transaction_too_large -> "authoritative transaction exceeds the byte limit"
+  | Authoritative_batch_empty -> "authoritative batch contains no transactions"
+  | Authoritative_batch_too_large -> "authoritative batch exceeds its transaction count or byte limit"
+  | Authoritative_cursor_not_strictly_ordered -> "authoritative transaction cursors are not strictly ordered"
+  | Authoritative_through_mismatch -> "authoritative batch final cursor does not match its through cursor"
+;;
+
 let checksum value = Overlay.Checksum.of_string ("checksum:v1:" ^ value)
 
 let decode_snapshot_baseline source =
@@ -1353,7 +1385,11 @@ let decode_snapshot_uri source =
           | Some "https", Some host, None, None when String.length host > 0 ->
             Ok (uri, server_t)
           | _ -> Error "snapshot download URL is invalid"))
-    | Ok _ | Error _ -> Error "snapshot metadata is invalid"
+    | Ok _ -> Error "snapshot metadata: server reported ok=false"
+    | Error message ->
+      let fields = List.map (fun name -> "Core.snapshot_uri_response." ^ name,
+        "field " ^ name ^ " is missing or has an invalid type") ["ok"; "url"; "t"] in
+      Error ("snapshot metadata: " ^ Logseq_db_types.Json_codec.error_context ~fields message)
   with
   | Yojson.Json_error _ -> Error "snapshot metadata is not valid JSON"
 ;;
@@ -2191,7 +2227,7 @@ let authoritative_input core t checksum_value txs =
              ~maximum_bytes:core.config.limits.maximum_response_bytes
              tx.Sync_protocol.Server.tx
          with
-         | Error _ -> Error "invalid encoded transaction"
+         | Error failure -> Error (authoritative_input_error_message failure)
          | Ok transaction ->
            encode
              (Overlay.authoritative_transaction ~cursor:tx.t ~transaction :: acc)
@@ -2211,7 +2247,7 @@ let authoritative_input core t checksum_value txs =
           ~through:t
           ~checksum
         |> Result.map Option.some
-        |> Result.map_error (fun _ -> "invalid authoritative batch"))))
+        |> Result.map_error authoritative_input_error_message)))
 ;;
 
 let enqueue_authoritative core batch =
@@ -2751,7 +2787,25 @@ let complete_catalog_load core cache =
   else restored
 ;;
 
-let deletion_failed core stage =
+let deletion_failed ?source core stage =
+  let core = match source with
+    | None -> core
+    | Some source ->
+      let operation, reason = match stage with
+        | Closing_graph -> "closeDatabase", "closeFailed"
+        | Deleting_mirror -> "deleteMirror", "deleteFailed"
+        | Clearing_selection -> "saveCatalog", "persistenceFailed" in
+      let diagnostic = Logseq_db_types.Failure_diagnostic.of_source
+        ~operation ~reason source in
+      let groups = core.public_state.diagnostics.groups in
+      let entries = List.concat_map (fun group ->
+        if group.title = "Sync errors" then group.entries else []) groups in
+      let group = { title = "Sync errors"; entries =
+        (operation, Logseq_db_types.Failure_diagnostic.message diagnostic)
+        :: List.remove_assoc operation entries } in
+      { core with public_state = { core.public_state with diagnostics =
+        { groups = group :: List.filter (fun group -> group.title <> "Sync errors") groups } } }
+  in
   let message =
     match stage with
     | Closing_graph -> "Local graph close failed."
@@ -3071,7 +3125,7 @@ let graph_detached core scope result =
   match core.deletion_scope, core.public_state.snapshot.local_deletion with
   | Some captured, Some (Deletion_in_progress Closing_graph) when captured = scope ->
     (match result with
-     | Error _ -> deletion_failed core Closing_graph
+     | Error source -> deletion_failed ~source core Closing_graph
      | Ok () ->
        let next =
          set_snapshot
@@ -3101,7 +3155,7 @@ let mirror_deleted core (request : mirror_deletion) result =
       && request.scope = effect_scope_of_graph scope ->
     (match result with
      | Error message ->
-       let failed = deletion_failed core Deleting_mirror in
+       let failed = deletion_failed ~source:message core Deleting_mirror in
        if List.mem message
          [ "Switch to another graph before deleting."
          ; "The local copy is still in use. Close attachment previews and try again." ]

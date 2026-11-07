@@ -2557,6 +2557,13 @@ let plan_host_action_attempt (state:t) receipt =
     host_consume_early=None;host_consume_waiting=false},Consume_handoff(receipt,attempt))
 ;;
 
+let cleanup_admission_error operation = function
+  | Worker.Full -> None
+  | Not_ready -> Some (Worker.Service_failed (operation ^ ": worker not ready"))
+  | Stopping -> Some (Worker.Service_failed (operation ^ ": worker stopping"))
+  | Unsupported_request reason -> Some (Worker.Unsupported_operation (operation ^ ": " ^ reason))
+;;
+
 let step_base state event =
   match event with
   | Import_source_proof_returned proof ->
@@ -3002,11 +3009,7 @@ let step_base state event =
      | Some (Observing value)
        when Worker.equal_session session value.obs_session && value.obs_release_inflight && not value.obs_release_done
        ->
-       let error =
-         match admission with
-         | Worker.Full -> None
-         | _ -> Some (Worker.Service_failed "Observation cleanup not admitted")
-       in
+       let error = cleanup_admission_error "Observation cleanup" admission in
        changed
          { state with
            facts =
@@ -3058,7 +3061,7 @@ let step_base state event =
     (match Observation_ids.find_opt id state.facts.observations with
      |Some(Observing value) when value.obs_release_done && value.obs_release_inflight
        && Worker.equal_session session value.obs_session->
-       let error=if admission=Worker.Full then None else Some(Worker.Service_failed "Observation finalization not admitted") in
+       let error=cleanup_admission_error "Observation finalization" admission in
        let observations=Observation_ids.add id (Observing{value with obs_release_inflight=false;
          obs_cleanup_waiting=admission=Worker.Full;obs_cleanup_error=error})state.facts.observations in
        changed {state with facts={state.facts with observations}} []

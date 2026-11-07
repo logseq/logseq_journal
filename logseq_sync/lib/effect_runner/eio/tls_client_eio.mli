@@ -46,3 +46,6 @@ val connect_diagnosed_with_attention
   -> host:string
   -> port:int
   -> (Tls_eio.t, error) result
+
+(** Bounded safe carrier retaining errno or finite TLS alert category. *)
+val transport_failure : operation:string -> exn -> string

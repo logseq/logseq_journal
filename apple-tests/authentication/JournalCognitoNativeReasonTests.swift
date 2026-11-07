@@ -96,7 +96,21 @@ private enum FixtureSecurity {
     FixtureSecurity.state.withLock { $0.data = Data(repeating: 65, count: 131073) }
     try await rejected(["keychainLoad.responseTooLarge"]) { _ = try await storage.load() }
     FixtureSecurity.state.withLock { $0.data = Data("private-token-sentinel".utf8) }
-    try await rejected(["keychainLoad.invalidRecord"]) { _ = try await storage.load() }
+    try await rejected(["keychainLoad.invalidRecord", "decodeCorrupted"]) { _ = try await storage.load() }
+    FixtureSecurity.state.withLock { $0.data = Data("{}".utf8) }
+    try await rejected(["keychainLoad.invalidRecord", "decodeMissingKey"]) { _ = try await storage.load() }
+    FixtureSecurity.state.withLock { $0.data = Data(#"{"idToken":42}"#.utf8) }
+    try await rejected(["keychainLoad.invalidRecord", "decodeTypeMismatch"]) { _ = try await storage.load() }
+    for (payload, expected) in [("{}", "decodeMissingKey"), ("{", "decodeCorrupted"),
+      (#"{"version":"private-token-sentinel"}"#, "decodeTypeMismatch"),
+      (#"{"version":2}"#, "decodeMissingKey")] {
+      do { _ = try JournalLocalAccountBindingStore.decode(Data(payload.utf8)); preconditionFailure("accepted corrupt binding") }
+      catch {
+        let issue = JournalAccountIssue.classify(error, stage: .bindingRead)
+        precondition(issue.rejectsBinding && issue.diagnostic.contains(expected), "binding lost decode cause")
+        precondition(!issue.diagnostic.contains("private-"))
+      }
+    }
     FixtureSecurity.state.withLock { $0.updateStatus = -25308 }
     try await rejected(["keychainSave.status", "osstatus -25308"]) { try await storage.save(tokens) }
     FixtureSecurity.state.withLock { $0.updateStatus = errSecItemNotFound; $0.status = -25299 }
@@ -123,6 +137,17 @@ private enum FixtureSecurity {
     FixtureBrowserState.error = NSError(domain: "private-token-sentinel", code: 77,
       userInfo: [NSLocalizedDescriptionKey: "private-token-sentinel"])
     try await rejected(["browser.browserFailed"]) { _ = try await browser.authenticate(url, scheme: "synthetic") }
+    FixtureBrowserState.error = ASWebAuthenticationSessionError(.presentationContextInvalid)
+    try await rejected(["browser.browserFailed", "webAuthentication", "code 3"]) {
+      _ = try await browser.authenticate(url, scheme: "synthetic")
+    }
+    let wrapped = NSError(domain: NSCocoaErrorDomain, code: 256,
+      userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: 13),
+        NSLocalizedDescriptionKey: "private-token-sentinel", NSFilePathErrorKey: "/private-token-sentinel"])
+    FixtureBrowserState.error = wrapped
+    try await rejected(["browser.browserFailed", "cocoa", "code 256", "posix", "code 13"]) {
+      _ = try await browser.authenticate(url, scheme: "synthetic")
+    }
     FixtureBrowserState.error = ASWebAuthenticationSessionError(.canceledLogin)
     do { _ = try await browser.authenticate(url, scheme: "synthetic"); preconditionFailure("cancel returned success") }
     catch is CancellationError {}

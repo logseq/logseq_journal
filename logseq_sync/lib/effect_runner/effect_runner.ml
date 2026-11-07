@@ -631,7 +631,8 @@ let encrypt_protected_values t handle plaintexts =
       | plaintext :: rest ->
         (match t.dependencies.crypto.encrypt_aes_gcm ~key:graph_key ~plaintext with
          | Ok value -> encrypt (value :: encrypted) rest
-         | Error message -> Error message)
+         | Error source -> Error Failure_diagnostic.(
+             of_source ~operation:"encryptValue" ~reason:"cryptoInvalid" source |> encode))
     in
     encrypt [] plaintexts
 ;;
@@ -1055,6 +1056,17 @@ let network_request : type a. a Core.runner_request -> bool = function
   | Encrypt_protected_values _ | Decrypt_protected_values _ -> false
 ;;
 
+let request_diagnostic_operation : type a. a Core.runner_request -> string = function
+  | Core.Fetch_catalog _ | Load_catalog _ -> "loadCatalog"
+  | Save_catalog _ -> "saveCatalog"
+  | Fetch_snapshot_baseline _ | Fetch_snapshot_metadata _ | Download_snapshot _ -> "decodeSnapshot"
+  | Delete_account_secrets _ -> "resetAccount"
+  | Encrypt_protected_values _ -> "encryptValue"
+  | Decrypt_protected_values _ -> "decryptValue"
+  | Fetch_e2ee_graph_key _ | Fetch_e2ee_user_keys _ | Load_and_unlock_graph_key _
+  | Fetch_and_unlock_graph_key _ | Unlock_private_key _ -> "platformCrypto"
+;;
+
 let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request -> unit =
   fun t ticket request ->
   let id = Core.effect_ticket_id ticket |> Core.effect_id_to_string in
@@ -1092,6 +1104,10 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
                 raise Runner_cancelled))
       with
       | Runner_cancelled -> None
+      | Eio.Cancel.Cancelled _ as error -> raise error
+      | error -> Some (Error (Core.Effect_failed Failure_diagnostic.(
+          of_source ~operation:(request_diagnostic_operation request) ~reason:"unavailable"
+            (Printexc.to_string error) |> encode)))
     in
     Hashtbl.remove t.operations id;
     Option.iter (fun kind ->
@@ -1368,15 +1384,24 @@ let asset_diagnostic_operation = function
   | _ -> "assetPreview"
 ;;
 
+let asset_exception (request : Core.asset_io_request) error =
+  Core.Asset_invalid_content Failure_diagnostic.(
+    of_source ~operation:(asset_diagnostic_operation request.action) ~reason:"invalidContent"
+      (Printexc.to_string error) |> encode)
+;;
+
 let with_asset_diagnostics t (request : Core.asset_io_request) ~current work =
   let operation = asset_diagnostic_operation request.action in
   let captured = ref None in
   let report ~reason:reason_name source =
     captured := Some (Failure_diagnostic.of_source ~operation ~reason:reason_name source) in
-  let result = Eio.Fiber.with_binding asset_diagnostic_capture report work in
-  (match result with
-   | Error Core.Asset_cancelled | Ok _ -> ()
-   | Error failure when not t.closed && current () ->
+  let result = Eio.Fiber.with_binding asset_diagnostic_capture report (fun () ->
+    try work () with
+    | (Runner_cancelled | Eio.Cancel.Cancelled _) as error -> raise error
+    | error -> Error (asset_exception request error)) in
+  match result with
+   | Error Core.Asset_cancelled | Ok _ -> result
+   | Error failure ->
      let fallback = match failure with
        | Core.Asset_network -> "networkFailed", ""
        | Asset_not_found -> "notFound", ""
@@ -1388,15 +1413,16 @@ let with_asset_diagnostics t (request : Core.asset_io_request) ~current work =
        | Asset_size_rejected -> "sizeRejected", ""
        | Asset_revoked_access -> "revokedAccess", ""
        | Asset_invalid_content source -> "invalidContent", source
-       | Asset_cancelled -> "cancelled", "" in
+       | Asset_cancelled -> "cancelled", ""
+       | Asset_with_cause (_, cause) -> Failure_diagnostic.reason cause, Failure_diagnostic.encode cause in
      let reason_name, source = fallback in
      let detail = Option.value !captured ~default:(
        Failure_diagnostic.of_source ~operation ~reason:reason_name source) in
      (* Diagnostics must never change an operation's completion or cleanup. *)
-     (try t.on_asset_diagnostic ~scope:request.context.scope ~operation
-       ~request_operation:request.operation detail with _ -> ())
-   | Error _ -> ());
-  result
+     if not t.closed && current () then
+       (try t.on_asset_diagnostic ~scope:request.context.scope ~operation
+         ~request_operation:request.operation detail with _ -> ());
+     Error (Core.asset_failure_with_cause failure detail)
 ;;
 
 type asset_encryption =
@@ -2215,7 +2241,8 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
                     raise Runner_cancelled)
              with
              | Runner_cancelled -> Error Core.Asset_cancelled
-             | error -> Error (Core.Asset_invalid_content (Printexc.to_string error)))
+             | Eio.Cancel.Cancelled _ as error -> raise error
+          | error -> Error (asset_exception request error))
       in
       (* A completed resource must reach the reducer even after cancellation.
          The reducer owns acceptance and issues cleanup for stale resources. *)
@@ -2273,7 +2300,11 @@ let submit_protected t instruction ticket (request : Core.protected_request) =
              with
              | Runner_cancelled ->
                Error (Core.Effect_failed "Protected request cancelled")
-             | error -> Error (Core.Effect_failed (Printexc.to_string error)))
+             | Eio.Cancel.Cancelled _ as error -> raise error
+             | error -> Error (Core.Effect_failed Failure_diagnostic.(
+                 of_source ~operation:(match request.protected_action with
+                   | Core.Encrypt_values _ -> "encryptValue" | Decrypt_value _ -> "decryptValue")
+                   ~reason:"cryptoInvalid" (Printexc.to_string error) |> encode)))
       in
       t.post (Core.Runner_completed (Core.Protected_completion (ticket, result)))))
 ;;
@@ -2338,7 +2369,8 @@ let submit t instruction =
                 ~current:(fun () -> not t.closed)
                 (fun () -> execute_asset t request ~current:(fun () -> false)))
           with
-          | error -> Error (Core.Asset_invalid_content (Printexc.to_string error))
+          | Eio.Cancel.Cancelled _ as error -> raise error
+          | error -> Error (asset_exception request error)
         in
         t.post (Core.Runner_completed (Core.Asset_completion (ticket, result)))))
     else if t.closed

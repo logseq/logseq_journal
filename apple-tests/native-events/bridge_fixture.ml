@@ -64,6 +64,18 @@ let dispatch = function
   | Press node -> patch node "press"
   | LongPress node -> patch node "longPress"
   | TextChanged (_, "raise") -> failwith "native event fixture rejection"
+  | TextChanged (_, "raise-truncated") ->
+    raise (Journal_bridge.initialization_failure Decode_startup "startup payload is truncated")
+  | TextChanged (_, "raise-magic") ->
+    raise (Journal_bridge.initialization_failure Decode_startup "invalid startup magic")
+  | TextChanged (_, "raise-permission") ->
+    raise (Journal_bridge.initialization_failure Start_worker "worker.start.permissionDenied")
+  | TextChanged (_, "raise-space") ->
+    raise (Journal_bridge.initialization_failure Start_worker "worker.start.noSpace")
+  | TextChanged (_, "raise-private") ->
+    raise (Journal_bridge.initialization_failure Decode_startup "SENSITIVE https://private.invalid/?token=SECRET")
+  | TextChanged (_, "raise-unix") ->
+    raise (Journal_bridge.initialization_exception (Unix.Unix_error (Unix.ENOSPC, "SENSITIVE", "SENSITIVE")))
   | TextChanged (_, "raise-startup") -> failwith "application.decodeStartup.failed"
   | TextChanged (_, "raise-worker") -> failwith "application.startWorker.failed"
   | TextChanged (_, "raise-mount") -> failwith "application.mount.failed"

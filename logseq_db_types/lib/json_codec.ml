@@ -39,3 +39,17 @@ let decode ?maximum_bytes parser json =
   | Failure _ | Invalid_argument _ | Yojson.Json_error _ | Stack_overflow ->
     Error "invalid JSON value"
 ;;
+
+(* Only exact producer-owned decoder identities are projected. Parser messages
+   may contain input values, so an unknown message is never copied to callers. *)
+let error_context ~fields message =
+  match List.assoc_opt message fields with
+  | Some context -> context
+  | None ->
+    if List.mem message
+      [ "invalid UTF-8 field name"; "duplicate JSON field"; "invalid UTF-8 string"
+      ; "non-finite JSON number"; "nonstandard JSON value"; "JSON exceeds byte budget"
+      ; "invalid JSON value" ]
+    then message
+    else "invalid shape"
+;;

@@ -4183,7 +4183,12 @@ let test_staged_file_adapter_guard_and_failures () =
       Unix.mkdir blocked 0o700;
       Journal_asset_import.discard_staged_file (descriptor 0 kept);
       require (Sys.file_exists kept) "non-import file removed";
-      Journal_asset_import.discard_staged_file (descriptor 1 blocked);
+      let failures=ref [] in
+      Journal_asset_import.discard_staged_file ~on_failure:(fun message->failures:=message::!failures) (descriptor 1 blocked);
+      require(List.length !failures=1) "blocked staging cleanup lost its cause";
+      let diagnostic=Logseq_db_types.Failure_diagnostic.decode(List.hd !failures) |> Option.get in
+      require(Logseq_db_types.Failure_diagnostic.reason diagnostic="cleanupFailed") "cleanup reason lost";
+      require(not(String.contains (List.hd !failures) '/')) "cleanup diagnostic exposed a path";
       Journal_asset_import.discard_staged_file (descriptor 2 owned);
       require (not (Sys.file_exists owned)) "matched file not removed after previous failure";
       Journal_asset_import.discard_staged_file (descriptor 2 owned);
@@ -4654,6 +4659,51 @@ module Child_chain_fixture = struct
     | Wait message ->fail "prefix settlement failed: %s" message
     | Ignore ->fail "prefix settlement ignored its current operation"
 end
+
+(* Transport owns admission of Runtime's canonical follow-up; the pure insertion
+   reducer cannot turn an auxiliary diagnostic into a fatal transport outcome. *)
+let test_child_canonical_admission_keeps_recovery () =
+  let module F=Child_chain_fixture in
+  let module R=Journal_graph_runtime in
+  let module T=Journal_graph_transport in
+  let module E=Logseq_db_worker.Error in
+  let fixture=F.make () in
+  let runtime=R.create ~localtime:Unix.gmtime () in
+  let calendar=Journal_calendar.Sampler.create
+    ~clock:(fun()->Int64.to_float(Journal_time.instant_unix_ms fixture.command.creation_time)/.1000.)
+    ~localtime:Unix.gmtime () |> Journal_calendar.Sampler.sample |> Result.get_ok in
+  R.set_calendar runtime calendar;
+  let only output=match output.R.requests with [request]->request
+    |_->fail "expected one canonical child lifecycle request" in
+  let initial=R.submit ~child_chain:fixture.initial runtime
+    (Journal_graph_request.Create_child fixture.command) |> only in
+  let intent=R.worker_intent runtime initial fixture.session |> Result.get_ok in
+  require(R.bind_mutation runtime initial ~presentation:fixture.presentation ~intent)
+    "original child mutation did not bind";
+  let canonical=R.receive_mutation runtime initial (fixture.confirm 0 intent fixture.presentation) in
+  let canonical_id=only canonical in
+  require(R.worker_read runtime canonical_id<>None) "committed child did not reach its canonical read";
+  let sent=ref [] in
+  let delivered=T.deliver ~runtime ~send:(fun id->sent:=id::!sent;T.Full) canonical in
+  require(!sent=[canonical_id]) "transport did not refuse exactly the canonical read";
+  require(delivered.error=None) "canonical read backpressure became a fatal transport error";
+  require(List.exists(fun response->match response.R.payload with
+    | Child_waiting _ -> true | _->false) delivered.responses)
+    "committed child lost its waiting/recovery response";
+  require(not(List.exists(fun response->match response.R.payload with
+    | Child_failed _ | Mutation_failed _ -> true | _->false) delivered.responses))
+    "auxiliary canonical-read diagnostic became a business rejection";
+  let failure=List.find_map(fun response->match response.R.payload with
+    | Diagnostic failure when failure.request_id=canonical_id -> Some failure
+    | _->None) delivered.responses |> Option.get in
+  require(failure.operation="readCanonicalChildParent")
+    "canonical read failure lost its owning operation";
+  let error=failure.error in
+  let origin=(E.trace error).origin in
+  require(E.code error=E.Storage_busy && origin.operation="requestAdmission" && origin.code=Some "queueFull")
+    "canonical read backpressure lost its concrete admission cause"
+;;
+let () = test_child_canonical_admission_keeps_recovery ()
 
 let test_capture_oversize_is_editable_before_admission () =
   let source=String.make (Worker_pure_data.maximum_title_bytes+1) 'x' in

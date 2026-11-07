@@ -61,3 +61,12 @@ val platform_failure_message : string -> string
 (** Recognized native diagnostic family and finite subcause. Unrecognized
     suffixes use a fixed unknown reason; arbitrary payloads are never echoed. *)
 val native_diagnostic : string -> (string * string) option
+
+
+(** Startup failures retain a finite operation and cause without exception
+    arguments, paths, configuration values or credentials. *)
+type initialization_stage = Decode_startup | Start_worker | Initialize
+val initialization_failure : initialization_stage -> string -> exn
+(** Preserve an existing typed startup failure, or classify an exception by its
+    constructor and a bounded Unix error category. *)
+val initialization_exception : exn -> exn

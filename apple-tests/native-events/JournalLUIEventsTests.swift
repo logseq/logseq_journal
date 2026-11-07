@@ -155,7 +155,9 @@ private let receivePatch: PatchCallback = { source in
       "OCaml exception reported success")
     try check(patches.isEmpty, "OCaml exception emitted a patch")
     try check(failureReason(7) == 2 && failureReason(3) == 0, "reason must belong to the exact operation")
-    for (text, reason) in [("raise-startup",Int32(5)),("raise-worker",6),("raise-mount",7)] {
+    for (text, reason) in [("raise-startup",Int32(5)),("raise-worker",6),("raise-mount",7),
+      ("raise-truncated",501),("raise-magic",503),("raise-permission",615),("raise-space",617),
+      ("raise-private",500),("raise-unix",717)] {
       try check(JournalLUIEvents.dispatch(.textChanged(node:node,text:text)) == 0,
         "typed startup exception was accepted")
       try check(failureReason(7) == reason, "fixed startup exception reason was lost")

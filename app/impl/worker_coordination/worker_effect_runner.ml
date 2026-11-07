@@ -212,6 +212,15 @@ let submit t = function
   | Schedule_drain -> t.post Core.Drain
 ;;
 
+let retirement_result operation decode = function
+  | Mailbox.Completed response -> decode response
+  | Failed message -> Error (Worker.Service_failed (operation ^ ": " ^ message))
+  | Cancelled ->
+    Error (Worker.Service_failed (operation ^ ": cancelled before retirement acknowledgement"))
+  | Shutdown ->
+    Error (Worker.Service_failed (operation ^ ": worker stopped before retirement acknowledgement"))
+;;
+
 let on_event t event =
   let runtime, worker =
     match event with
@@ -288,7 +297,10 @@ let on_event t event =
                      Worker.Answered (Error e))
                 | Failed message ->
                   (match request with
-                   | Worker.Import _ -> Worker.Interrupted Worker.Transport_lost
+                   | Worker.Import _ ->
+                     let cause = Worker.Service_failed ("Import: " ^ message) in
+                     error := Some cause;
+                     Worker.Interrupted (Worker.Transport_lost cause)
                    | _ -> Worker.Answered (Error (Worker.Service_failed message)))
                 | Cancelled -> Worker.Interrupted Worker.Cancelled
                 | Shutdown -> Worker.Interrupted Worker.Worker_stopped
@@ -301,19 +313,14 @@ let on_event t event =
             | Unobserve (issuer, session, id) ->
               let module I = (val issuer : Worker_effect_authority.ISSUER) in
               let result =
-                match outcome with
-                | Completed response ->
-                  I.observation_registration_released session ~observation_id:id response
-                | _ ->
-                  Error
-                    (Worker.Service_failed
-                       "Observation release did not acknowledge physical retirement")
+                retirement_result "Observation release"
+                  (I.observation_registration_released session ~observation_id:id) outcome
               in
               t.post (Core.Observation_release_completed (session, id, result))
             |Finalize_observation(issuer,session,id)->
               let module I=(val issuer:Worker_effect_authority.ISSUER) in
-              let result=match outcome with Completed response->I.observation_registration_finalized session ~observation_id:id response
-                |_->Error(Worker.Service_failed "Observation finalization was not acknowledged") in
+              let result=retirement_result "Observation finalization"
+                (I.observation_registration_finalized session ~observation_id:id) outcome in
               t.post(Core.Observation_finalize_completed(session,id,result))
             |Release_demand(issuer,ticket,registration)->
               let module I=(val issuer:Worker_effect_authority.ISSUER) in
@@ -357,14 +364,7 @@ let on_event t event =
                 |Ok receipt->Worker.Safe_to_proceed receipt|Error error->Worker.Handoff_failed(change,error)))
             | Unregister issuer ->
               let module I = (val issuer : Worker_effect_authority.ISSUER) in
-              let result =
-                match outcome with
-                | Completed response -> I.binding_released response
-                | _ ->
-                  Error
-                    (Worker.Service_failed
-                       "Unregister did not acknowledge resource retirement")
-              in
+              let result = retirement_result "Binding unregister" I.binding_released outcome in
               t.post (Core.Binding_release_completed (I.binding, result)));
            Consumed)
       | Push { payload = Service.Graph_pushes _ as payload; push_sequence; _ } ->
@@ -410,7 +410,7 @@ let on_event t event =
             | None->()
             | Some resident->(match I.asset_notice resident.session data with
               | Ok notice->t.post(Core.Asset_received(notice,push_sequence))
-              | Error _->()))(Service.asset_notices payload))
+              | Error cause->error := Some cause))(Service.asset_notices payload))
           (Core.projection view))t.latest;
         Broadcast
       | Push _ -> Broadcast
