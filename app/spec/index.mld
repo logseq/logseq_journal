@@ -1,0 +1,10 @@
+{0 Logseq Journal}
+
+{1 Execution guide}
+
+{{!page-journal_execution_flow}Journal execution flow}: follow startup, reads,
+durable writes, synchronization and resource retirement through the existing specs.
+
+{1 Library logseq_journal.worker_coordination}
+
+The App/Worker coordination API is {!module-Journal_worker_coordination}.
