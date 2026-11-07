@@ -1,5 +1,9 @@
 # App specification container
 
+- [Journal execution flow](journal_execution_flow.mli): documentation-only
+  walkthrough of the important App, Worker and Sync paths using existing spec
+  types and pseudocode. It exports no interface and adds no virtual library.
+
 Each area under this directory is an independent wrapped Dune virtual library.
 Do not use recursive `include_subdirs` to merge future specifications into one
 library. Add another area only when it has actual contracts and consumers.
