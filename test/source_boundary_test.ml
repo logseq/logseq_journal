@@ -88,6 +88,40 @@ let rec files_with_suffixes root relative suffixes =
 
 let ocaml_product_files root = files_with_suffixes root "app" [ ".ml"; ".mli" ]
 
+(* Only the named execution guide may explain cross-layer modules. Require one
+   complete odoc comment: no source declaration can hide before or after it.
+   This deliberately rejects nested/multiple comments rather than implementing
+   a permissive OCaml lexer for an otherwise documentation-only exception. *)
+let is_single_documentation_comment contents =
+  let contents = String.trim contents in
+  String.starts_with ~prefix:"(**" contents
+  && String.ends_with ~suffix:"*)" contents
+  && count_occurrences contents "(*" = 1
+  && count_occurrences contents "*)" = 1
+;;
+
+let require_documentation_only_guide root relative =
+  List.iter
+    (fun (contents, expected) ->
+       if is_single_documentation_comment contents <> expected
+       then fail "documentation-only guard misclassified %S" contents)
+    [ "(** Cross-layer Logseq_sync example. *)", true
+    ; " \n(** {[ val sample : Logseq_overlay_db.Types.sync_view ]} *)\n ", true
+    ; "", false
+    ; "(* Not an odoc comment. *)", false
+    ; "(** Unclosed", false
+    ; "(** Closed *) val exposed : Logseq_sync_pure_reducer.Core.t", false
+    ; "module S = Logseq_sync_pure_reducer.Core\n(** Guide *)", false
+    ; "(** First *) (** Second *)", false
+    ; "(** Outer (* nested *) tail *)", false
+    ];
+  require_file root relative;
+  let candidate = path root relative in
+  if Sys.file_exists candidate && not (Sys.is_directory candidate)
+     && not (is_single_documentation_comment (read_file candidate))
+  then fail "execution guide must contain only one odoc comment: %s" relative
+;;
+
 let forbid_text root relative needles =
   let candidate = path root relative in
   if Sys.file_exists candidate && not (Sys.is_directory candidate)
@@ -871,9 +905,11 @@ let test_final_overlay_data_plane_boundary root =
      @ files_with_suffixes root "logseq_db_worker/spec" [ ".ml"; ".mli"; "dune" ]
      @ files_with_suffixes root "logseq_db_worker/lib" [ ".ml"; ".mli"; "dune" ]
      @ files_with_suffixes root "logseq_db_worker/lui" [ ".ml"; ".mli"; "dune" ]);
+  let guide = "app/spec/journal_execution_flow.mli" in
+  require_documentation_only_guide root guide;
   List.iter
     (fun relative -> forbid_text root relative [ "Logseq_overlay_db"; "Logseq_sync" ])
-    (ocaml_product_files root);
+    (List.filter (fun relative -> relative <> guide) (ocaml_product_files root));
   forbid_text root "app/dune" [ "logseq_sync"; "logseq_overlay_db" ];
   List.iter
     (fun relative ->
