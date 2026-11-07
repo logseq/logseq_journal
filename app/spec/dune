@@ -1,0 +1,15 @@
+; Keep the documentation-only .mli as the sole body source. Its single comment
+; is checked by source_boundary_test; no OCaml module or library is added here.
+
+(rule
+ (target journal_execution_flow.mld)
+ (action
+  (with-stdout-to
+   %{target}
+   (progn
+    (echo "{0 Journal execution flow}\n\n")
+    (run sed -e "1s/^(\\*\\* *//" -e "$d" %{dep:journal_execution_flow.mli})))))
+
+(documentation
+ (package logseq_journal)
+ (mld_files index journal_execution_flow))

@@ -4,6 +4,13 @@
   walkthrough of the important App, Worker and Sync paths using existing spec
   types and pseudocode. It exports no interface and adds no virtual library.
 
+Run `dune build @doc` and open `_build/default/_doc/_html/logseq_journal/index.html`.
+The package homepage links to the execution guide and the coordination API.
+The guide's `.mld` page is generated from its single `.mli` documentation comment;
+edit only the `.mli` body. After building, run
+`python3 -B test/journal_documentation_test.py` from the repository root to check
+the generated page, all examples and local navigation links.
+
 Each area under this directory is an independent wrapped Dune virtual library.
 Do not use recursive `include_subdirs` to merge future specifications into one
 library. Add another area only when it has actual contracts and consumers.
