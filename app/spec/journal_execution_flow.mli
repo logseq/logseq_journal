@@ -16,6 +16,17 @@
       module SR = Logseq_sync_effect_runner.Effect_runner
     ]}
 
+    Open the corresponding module contracts here; the aliases inside code and
+    trace blocks remain literal OCaml names:
+    {ul
+    {- [A]: {!Journal_worker_coordination.Worker_api}.}
+    {- [AC]: {!Journal_worker_coordination.Worker_pure_coordinator}.}
+    {- [AR]: {!Journal_worker_coordination.Worker_effect_runner}.}
+    {- [W]: {!Logseq_db_worker_pure_reducer.Core}.}
+    {- [WR]: {!Logseq_db_worker_effect_runner.Effect_runner}.}
+    {- [S]: {!Logseq_sync_pure_reducer.Core}.}
+    {- [SR]: {!Logseq_sync_effect_runner.Effect_runner}.}}
+
     There are three policy boundaries, not three independent App event loops:
     {ul
     {- App coordination owns typed tickets, sessions, presentation checks and
@@ -152,9 +163,11 @@
     validate input; DTOs, UUIDs and successful shape checks alone grant no authority.
 
     Some spec signatures deliberately refer to contracts outside [spec/], notably
-    [AR.client], [Worker_pure_read.packed_query]/[answer],
-    [Logseq_db_worker_contract.Config.t] and
-    [Logseq_db_worker_contract.Worker_pure_mutation.durable_intent]/[outcome].
+    [AR.client] in {!Journal_worker_coordination.Worker_effect_runner},
+    [packed_query]/[answer] in {!Worker_pure_read},
+    [t] in {!Logseq_db_worker_contract.Config} and
+    [durable_intent]/[outcome] in
+    {!Logseq_db_worker_contract.Worker_pure_mutation}.
     Those are existing boundary inputs, not types defined here. The examples keep
     them opaque and never invent their representation or a packing function.
 
@@ -450,8 +463,8 @@
     does not itself mean the authoritative batch is applied locally. Disconnects
     and rejection can require Retry_group/Reject_group or a blocked/deferred state;
     the arrows above are not unconditional retry policy. The opaque
-    [Logseq_overlay_db.Types.sync_view] is inspected through its accessors, such as
-    [sync_view_token], never through invented pending/token fields.
+    [sync_view] in {!Logseq_overlay_db.Types} is inspected through its accessors,
+    such as [sync_view_token], never through invented pending/token fields.
 
     [Websocket_opened], Server.Hello and Server.Changed can initiate Client.Pull.
     The current path does not require an invented initial Client.Hello send.
@@ -588,19 +601,24 @@
 
     Public contracts used above:
     {ul
-    {- [app/spec/worker_coordination/worker_api.mli]: typed requests, authority,
-       durable intent, canonical readback, observations/resources and handoff.}
-    {- [app/spec/worker_coordination/worker_pure_coordinator.mli]: events,
-       private transitions, request planning, reconciliation and ownership.}
-    {- [app/spec/worker_coordination/worker_effect_runner.mli]: borrowed client,
-       actual response routing, interpretation and nonblocking retirement.}
-    {- [logseq_db_worker/spec/pure_reducer/core.mli] and
-       [logseq_db_worker/spec/effect_runner/effect_runner.mli]: Worker events,
-       execution, scoped reads/durable writes and Sync delegation.}
-    {- [logseq_sync/spec/pure_reducer/core.mli], [sync_protocol.mli] in the same
-       directory, and [logseq_sync/spec/effect_runner/effect_runner.mli]: Sync
-       policy, network protocol and I/O ownership.}
-    {- [logseq_overlay_db/spec/types.mli] and [database.mli] in the same directory:
+    {- {{!Journal_worker_coordination.Worker_api}[app/spec/worker_coordination/worker_api.mli]}:
+       typed requests, authority, durable intent, canonical readback,
+       observations/resources and handoff.}
+    {- {{!Journal_worker_coordination.Worker_pure_coordinator}[app/spec/worker_coordination/worker_pure_coordinator.mli]}:
+       events, private transitions, request planning, reconciliation and ownership.}
+    {- {{!Journal_worker_coordination.Worker_effect_runner}[app/spec/worker_coordination/worker_effect_runner.mli]}:
+       borrowed client, actual response routing, interpretation and nonblocking
+       retirement.}
+    {- {{!Logseq_db_worker_pure_reducer.Core}[logseq_db_worker/spec/pure_reducer/core.mli]} and
+       {{!Logseq_db_worker_effect_runner.Effect_runner}[logseq_db_worker/spec/effect_runner/effect_runner.mli]}:
+       Worker events, execution, scoped reads/durable writes and Sync delegation.}
+    {- {{!Logseq_sync_pure_reducer.Core}[logseq_sync/spec/pure_reducer/core.mli]},
+       {{!Logseq_sync_pure_reducer.Sync_protocol}[sync_protocol.mli]} in the same
+       directory, and
+       {{!Logseq_sync_effect_runner.Effect_runner}[logseq_sync/spec/effect_runner/effect_runner.mli]}:
+       Sync policy, network protocol and I/O ownership.}
+    {- {{!Logseq_overlay_db.Types}[logseq_overlay_db/spec/types.mli]} and
+       {{!Logseq_overlay_db.Database}[database.mli]} in the same directory:
        immutable local intent, outbox transitions and authoritative application.}}
 
     Current implementation seams, intentionally not presented as spec APIs:
