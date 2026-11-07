@@ -437,6 +437,8 @@ type submission_descriptor =
   { mutation_id : Graph.Uuid.t
   ; fingerprint : mutation_fingerprint
   ; state : transport_state
+  ; operation : outliner_operation
+    (** Durable mutation operation; deletion submissions must be singletons. *)
   ; dependency_eligible : bool
   ; attempt_count : int
   ; plaintext_bytes : int

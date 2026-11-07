@@ -860,6 +860,11 @@ type event =
   | Graph_attachment_failed of scoped_error
   | Sync_inspected of sync_inspection
   | Outbox_transition_applied of outbox_transition_result
+  (** An uncommitted preparation lost its token to a newer durable revision.
+      The exact pending request and a changed token fence recovery; this is not
+      evidence of a commit or permission to repeat an unchanged failed request. *)
+  | Outbox_transition_superseded of
+      { request : outbox_transition_request; sync : Logseq_overlay_db.Types.sync_view }
   | Outbox_transition_failed of outbox_transition_failure
   | Authoritative_batch_applied of authoritative_commit_result
   | Authoritative_batch_deferred of authoritative_deferred_result
@@ -1920,13 +1925,15 @@ let plan_submission core =
            let rec take n acc = function
              | [] -> List.rev acc
              | _ when n = 0 -> List.rev acc
-             | x :: xs -> take (n - 1) (x :: acc) xs
+             | (item : Overlay.submission_descriptor) :: rest ->
+               if item.operation = Overlay.Delete_blocks_operation
+               then if acc = [] then [ item.mutation_id ] else List.rev acc
+               else take (n - 1) (item.mutation_id :: acc) rest
            in
            let ids =
              descriptors
              |> List.filter (fun (item : Overlay.submission_descriptor) ->
                item.state = Overlay.Queued && item.dependency_eligible)
-             |> List.map (fun (item : Overlay.submission_descriptor) -> item.mutation_id)
              |> take core.config.limits.submission_batch_size []
            in
            if ids = []
@@ -3424,6 +3431,28 @@ let step core event =
              ; private_key_package = challenge.private_key_package }) in
          { next; effects = [ publish next; Run request ] }
        | _ -> unchanged core)
+    | Outbox_transition_superseded {request;sync} ->
+      (match core.pending_outbox_transition with
+       | Some pending when graph_scope_is_current core request.scope
+           && pending.scope=request.scope && pending.transition=request.transition
+           && Overlay.sync_token_equal pending.expected request.expected
+           && not(Overlay.sync_token_equal request.expected(Overlay.sync_view_token sync))->
+         (* An independently completed inspection may already have replaced the
+            preparation's view. Tokens are opaque: retain that observation
+            rather than guessing that the superseded result is newer. *)
+         let sync=match core.sync_view with
+           | Some observed when not(Overlay.sync_token_equal request.expected(Overlay.sync_view_token observed))->observed
+           | Some _ | None -> sync in
+         let core={core with sync_view=Some sync;pending_outbox_transition=None} in
+         (match request.transition with
+          | Overlay.Submit_group _ | Retry_group _ -> plan_submission core
+          | Accept_group _ | Reject_group _ ->
+            (* Keep the exact server outcome. Replanning submission here could
+               discard an accepted prefix or repeat already executed work. *)
+            let request={request with expected=Overlay.sync_view_token sync} in
+            {next={core with pending_outbox_transition=Some request};
+             effects=[Delegate(Apply_outbox_transition request)]})
+       | Some _ | None -> unchanged core)
     | Outbox_transition_failed { request; message } ->
       (match core.pending_outbox_transition with
        | Some pending
@@ -4369,6 +4398,7 @@ let event_graph_scope core = function
   | Mirror_inspected (Mirror_available {scope;_}) | Graph_attached {scope;_}
   | Sync_inspected {scope;_} | Outbox_transition_applied {scope;_}
   | Authoritative_batch_applied {scope;_} | Authoritative_batch_deferred {scope;_}
+  | Outbox_transition_superseded {request={scope;_};_}
   | Outbox_transition_failed {request={scope;_};_} -> Some scope
   | Snapshot_activated activation -> Some activation.scope
   | Snapshot_activation_failed error -> Some error.activation.scope
@@ -4550,6 +4580,10 @@ let step core event =
   | Visible_graph_changed _ -> unchanged core
   | Local_cache_deletion_requested id when List.mem id (resident_graphs core) -> unchanged core
   | _ when not core.resident_enabled ->
+    let event = match event with
+      | Local_graph_outbox_changed scope when graph_scope_is_current core scope ->
+        Local_outbox_changed
+      | event -> event in
     let transition=step_graph_policy core event in
     let next={transition.next with resident_next_generation=max core.resident_next_generation transition.next.public_state.snapshot.startup.graph_generation} in
     (match next.restored_residents with

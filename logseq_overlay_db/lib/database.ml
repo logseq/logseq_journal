@@ -6761,6 +6761,7 @@ let descriptor (record : outbox_record) =
   { Types.mutation_id = record.mutation_id
   ; fingerprint = mutation_fingerprint record.fingerprint
   ; state = record.transport_state
+  ; operation = operation_of_mutation record.mutation
   ; dependency_eligible = record.transport_state <> Types.Blocked
   ; attempt_count = record.attempt_count
   ; plaintext_bytes = String.length record.normalized_transaction
@@ -10105,6 +10106,46 @@ let commit_authoritative_candidate database prepared =
             in
             let authoritative_after = prepared.authoritative_db_after in
             let authoritative_before = authoritative_database database in
+            (* Origin validation compares complete transaction data at its expected
+               cursor. Earlier local effects were already visible when a queued
+               delete was authored; their echoes are not competing remote edits. *)
+            let local_sequences = Hashtbl.create (List.length database.outbox) in
+            List.iter (fun (record : outbox_record) ->
+              Hashtbl.replace local_sequences (Graph.Uuid.to_string record.mutation_id)
+                record.sequence) database.outbox;
+            let origin_sequences = Hashtbl.create (List.length prepared.validated_origins) in
+            List.iter (fun (id, cursor) ->
+              Option.iter (fun sequence ->
+                Hashtbl.replace origin_sequences (Types.Server_cursor.to_int64 cursor) sequence)
+                (Hashtbl.find_opt local_sequences (Graph.Uuid.to_string id)))
+              prepared.validated_origins;
+            let _, conflict_contexts = List.fold_left2
+              (fun (before, contexts) transaction after ->
+                let origin = Hashtbl.find_opt origin_sequences
+                  (Types.Server_cursor.to_int64
+                    (Types.authoritative_transaction_cursor transaction)) in
+                after, Rrbvec.push_back contexts (before, after, origin))
+              (authoritative_before, Rrbvec.empty)
+              (Types.authoritative_batch_transactions preparation.authoritative_batch)
+              prepared.authoritative_roots_after in
+            let module Conflict_set = Set.Make (struct
+              type t = Types.delete_conflict_kind
+              let compare = Stdlib.compare
+            end) in
+            let queued_delete_conflicts (record : outbox_record) =
+              let earlier = function Some sequence -> sequence < record.sequence | None -> false in
+              if not (Rrbvec.exists (fun (_, _, origin) -> earlier origin) conflict_contexts)
+              then delete_conflict_kinds_between authoritative_before authoritative_after record
+              else
+                Rrbvec.fold_left
+                  (fun conflicts (before, after, origin) ->
+                    if earlier origin then conflicts
+                    else List.fold_left
+                      (fun conflicts kind -> Conflict_set.add kind conflicts)
+                      conflicts (delete_conflict_kinds_between before after record))
+                  Conflict_set.empty conflict_contexts
+                |> Conflict_set.elements
+            in
             let remote_won_queued =
               List.filter_map
                 (fun (record : outbox_record) ->
@@ -10112,10 +10153,7 @@ let commit_authoritative_candidate database prepared =
                    | Queued, Types.Delete_blocks { root; _ } ->
                      let after = block_of_database authoritative_after root in
                      let conflicts =
-                       delete_conflict_kinds_between
-                         authoritative_before
-                         authoritative_after
-                         record
+                       queued_delete_conflicts record
                      in
                      if conflicts <> [] && Option.is_some after
                      then Some (record, conflicts)

@@ -184,6 +184,7 @@ let queued_sync sync_token checkpoint mutation_id =
     { mutation_id
     ; fingerprint
     ; state = Overlay.Queued
+    ; operation = Overlay.Save_block_operation
     ; dependency_eligible = true
     ; attempt_count = 0
     ; plaintext_bytes = 16
