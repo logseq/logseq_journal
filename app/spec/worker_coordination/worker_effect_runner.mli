@@ -1,9 +1,40 @@
-(** Direct interpreter against the existing dbworker Service/client. No adapter,
-    second Worker client is introduced; the host selects its implementation explicitly. *)
+(** {1 TLDR}
+
+    Interpret the coordinator's private instructions through the existing Worker
+    client and its single host pump. {!create} borrows that client/account and
+    queues binding/bootstrap events; success does not imply Ready. {!submit}
+    performs scoped I/O, while {!on_event} routes actual mailbox completions.
+    The host owns serialization, UI/business state and shared client lifetime.
+    {!shutdown} returns [Draining], [Stopped] or [Shutdown_failed]; only [Stopped]
+    proves this runner's cleanup has reached its terminal fence. *)
+
 module Worker = Worker_api
 
 type client = (Logseq_db_worker_lui.Logseq_db_worker_lui_service.request, Logseq_db_worker_lui.Logseq_db_worker_lui_service.response, Logseq_db_worker_lui.Logseq_db_worker_lui_service.push) Logseq_db_worker_lui.Journal_worker.client
 type t
+type disposition = Consumed | Unowned_response | Broadcast | Dropped_envelope
+type delivery = private { disposition : disposition; error : Worker.error option }
+
+type shutdown_state = Draining | Stopped | Shutdown_failed of Worker.error
+
+(** {1 Minimal usage example}
+
+    The caller supplies the existing [client], verified [managed_origin]/[user_id],
+    [post] that queues serialized coordinator events, and the host's [publish]:
+    {[
+      match create ~client ~managed_origin ~user_id ~post ~publish with
+      | Error error -> Error error
+      | Ok runner -> Ok runner
+    ]}
+    Keep the returned runner in the host. For each coordinator transition install
+    [next] first, then [List.iter (submit runner) transition.instructions]. Route
+    the existing pump through [on_event] before legacy dispatch and honor its
+    [disposition]. During retirement keep delivering real cleanup events and call
+    [shutdown runner] after progress until [Stopped]; retain failures for retry.
+    Closing the shared client also waits for every other owner. *)
+
+(** {1 Construction and validation} *)
+
 val create
   : client:client -> managed_origin:string -> user_id:string
   -> post:(Worker_pure_coordinator.event -> unit)
@@ -23,8 +54,8 @@ val create
     turns; publish does not own UI/business state. Ready comes only from the
     correlated registered Service baseline, never from independent legacy pushes. *)
 
-type disposition = Consumed | Unowned_response | Broadcast | Dropped_envelope
-type delivery = private { disposition : disposition; error : Worker.error option }
+(** {1 Capability details} *)
+
 val on_event : t -> (Logseq_db_worker_lui.Logseq_db_worker_lui_service.response, Logseq_db_worker_lui.Logseq_db_worker_lui_service.push) Logseq_db_worker_lui.Journal_worker.event -> delivery
 
 (** One shared host router calls this BEFORE legacy response dispatch. Ownership
@@ -82,7 +113,8 @@ val submit : t -> Worker_pure_coordinator.instruction -> unit
     UI/auth/client continuation. Unknown outcomes retain their original permission
     and cleanup owner; they are never replayed with a fresh receipt. *)
 
-type shutdown_state = Draining | Stopped | Shutdown_failed of Worker.error
+(** {1 Lifecycle and recovery} *)
+
 val shutdown : t -> shutdown_state
 
 (** Nonblocking and idempotent. Revoke ordinary admission, cancel/reconcile owned

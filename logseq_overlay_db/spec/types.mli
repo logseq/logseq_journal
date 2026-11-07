@@ -1,4 +1,12 @@
-(** Stable UUID-addressed values for the logical Logseq overlay database. *)
+(** {1 TLDR}
+
+    Describe UUID-addressed logical overlay data, revision tokens and typed
+    operation outcomes without I/O or persistence. {!graph_info} identifies one
+    coherent projection; {!snapshot_version} binds its generation and revision.
+    Local intent, outbox transport and authoritative commits have separate result
+    types: local admission or commitment is not remote acceptance.
+    [Database] owns execution and durable resource lifecycles; tokens and records
+    here do not acquire a database, lease or current authority. *)
 
 module Graph = Logseq_db_types.Graph_types
 
@@ -65,6 +73,21 @@ type graph_info =
   ; limits : capability_limits
   ; version : snapshot_version
   }
+
+(** {1 Minimal usage example}
+
+    The caller supplies an acquired [snapshot] and releases it through [Database]
+    after use. This function consumes a {!graph_info} returned by the actual owner:
+    {[
+      let read_identity snapshot =
+        match Database.graph_info snapshot with
+        | Error error -> Error error
+        | Ok info -> Ok (info.graph_uuid, info.version)
+    ]}
+    The returned version describes that captured projection; it does not refresh
+    later reads or authorize a write without the owner's preconditions. *)
+
+(** {1 Capability details} *)
 
 type admission_inspection =
   { active_records : int
@@ -234,6 +257,8 @@ type logical_change_summary =
       }
   | Logical_resync_required of resync_reason
 
+(** {2 Local mutation intent and outcomes} *)
+
 type block_tree =
   { uuid : Graph.block_uuid
   ; title : string
@@ -339,6 +364,13 @@ val delete_conflict_kind_set
 
 val delete_conflict_kinds : delete_conflict_kind_set -> delete_conflict_kind list
 
+(** {1 Lifecycle and recovery}
+
+    Mutation fingerprints and receipts retain durable identity; transport attempts
+    and acceptance barriers describe different evidence. A stale/unknown attempt
+    cannot be treated as a proven rollback. The database validates owner, token
+    and generation at execution; deserializing an opaque token grants no authority. *)
+
 type remote_won_reason =
   | Before_submission
   | Proven_unexecuted
@@ -432,6 +464,8 @@ val remote_won_proof_rejection_through : remote_won_proof -> server_cursor optio
 val remote_won_proof_earliest_conflict_cursor : remote_won_proof -> server_cursor option
 val remote_won_proof_operation : remote_won_proof -> outliner_operation
 val remote_won_proof_digest : remote_won_proof -> mutation_fingerprint
+
+(** {2 Submission batches} *)
 
 type submission_descriptor =
   { mutation_id : Graph.Uuid.t
@@ -569,6 +603,8 @@ type terminal_receipt =
   ; transport_disposition : terminal_transport_disposition
   }
 
+(** {2 Authoritative history} *)
+
 type authoritative_input_error =
   | Invalid_server_cursor
   | Invalid_encoded_transaction
@@ -628,6 +664,12 @@ type authoritative_commit =
   ; blocked_ids : Graph.Uuid.t list
   ; logical_change_summary : logical_change_summary
   }
+
+(** {1 Observation and helpers}
+
+    Mirror observations and operation-specific errors are facts returned by their
+    execution owner. A recorded generation detects replacement; it does not keep
+    a resource live or turn a failed physical cleanup into an acknowledgement. *)
 
 type mirror_presence =
   | Absent of { generation : mirror_generation }

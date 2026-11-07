@@ -1,37 +1,80 @@
-(** The lifecycle and transaction boundary of the logical Logseq database.
+(** {1 TLDR}
 
-    A value of this module presents one coherent graph assembled from two durable
-    sources: the authoritative mirror and the ordered local outbox. Callers do not
-    choose between those sources. They inspect a mirror, open the logical database,
-    capture an immutable snapshot, and read the projection represented by that
-    snapshot.
+    Own the lifecycle and transaction boundary of one logical Logseq graph:
+    a coherent projection of the durable authoritative mirror and local outbox.
+    Inspect an available mirror, {!open_} it, acquire a {!snapshot}, read it,
+    {!release_snapshot}, then {!close} the database and check its result.
+    Writes are serialized durable operations; cryptography remains with the caller.
+    Snapshot activation owns cancelable staging resources. No raw database,
+    filesystem handle or outbox record crosses this boundary. *)
 
-    Writes commit in one serialized operation. Synchronization uses a preparation
-    only when external cryptography must occur between observation and durable
-    application. Snapshot activation remains explicitly cancelable because it owns
-    staged filesystem resources.
+module Graph = Logseq_db_types.Graph_types
 
-    No Datascript database, entity id, filesystem handle, or outbox record crosses
-    this interface.
+type dependencies
+type mirror_inspection
 
-    Examples use [require_ok] to keep attention on resource ownership and protocol
-    order. Production callers should preserve and handle the typed errors instead.
+type t
+type snapshot
 
+(** [open_ ~sw dependencies inspection ~graph_name] validates the display name,
+    acquires exclusive ownership, and restores an available inspected mirror.
+    Resources are tied to [sw], but callers should still use [close] to observe
+    shutdown errors. *)
+val open_
+  :  sw:Eio.Switch.t
+  -> dependencies
+  -> mirror_inspection
+  -> graph_name:string
+  -> (t, Types.open_error) result
+
+(** Closes storage and invalidates the database's outstanding snapshots and
+    subscriptions. *)
+val close : t -> (unit, Types.close_error) result
+
+(** Captures the current coherent logical projection as a read lease. *)
+val current_snapshot : t -> (snapshot, Types.read_error) result
+
+(** Returns the generation and projection revision captured by the snapshot. *)
+val snapshot_version : snapshot -> Types.snapshot_version
+
+(** Prevents new reads from starting through [snapshot] and releases its pinned
+    roots after already-started reads finish. *)
+val release_snapshot : snapshot -> unit
+
+(** Reads graph identity, schema, admission facts, limits, and version from the
+    snapshot. *)
+val graph_info : snapshot -> (Types.graph_info, Types.read_error) result
+
+(** {1 Minimal usage example}
+
+    The caller supplies an Eio [sw], validated [dependencies], the support
+    directory, [graph_id] and [graph_name]. [require_ok] raises on a typed error
+    for this example; production callers should retain and handle those errors.
     {[
       let require_ok = function
         | Ok value -> value
         | Error _ -> failwith "database operation failed"
-    ]} *)
+      in
+      let inspection =
+        inspect_mirror ~application_support_directory ~graph_id |> require_ok
+      in
+      let database = open_ ~sw dependencies inspection ~graph_name |> require_ok in
+      Fun.protect
+        ~finally:(fun () -> close database |> require_ok)
+        (fun () ->
+          let snapshot = current_snapshot database |> require_ok in
+          Fun.protect
+            ~finally:(fun () -> release_snapshot snapshot)
+            (fun () -> graph_info snapshot |> require_ok))
+    ]}
+    An absent mirror requires snapshot activation before opening. Detailed examples
+    below use the same caller-defined [require_ok] convention. *)
 
-module Graph = Logseq_db_types.Graph_types
-
-(** {1 Establishing the operating envelope}
+(** {1 Construction and validation}
 
     Limits and dependencies are validated before any path is inspected or any
     resource is acquired. Keeping them immutable makes every later admission,
     batching, cursor, and clock decision part of the database's construction. *)
-
-type dependencies
 
 (** [dependencies] validates and fixes the clocks and public capability limits used
     by one database. Every bound must be positive, and a wire batch must fit within
@@ -45,14 +88,14 @@ val dependencies
 (** Immutable limits fixed by [dependencies], before any graph is opened. *)
 val dependency_limits : dependencies -> Types.capability_limits
 
-(** {1 Discovering a durable mirror}
+(** {1 Capability details}
+
+    {2 Discovering a durable mirror}
 
     Opening begins with observation rather than mutation. An inspection records
     what was found at the graph's canonical database path. The recorded mirror
     generation prevents a stale observation from opening, deleting, or collecting
     a different mirror. *)
-
-type mirror_inspection
 
 (** [inspect_mirror ~application_support_directory ~graph_id] derives the canonical
     path and records whether the mirror is absent or available. An available
@@ -210,44 +253,12 @@ val collect_garbage
   :  mirror_inspection
   -> (Types.garbage_collection, Types.garbage_collection_error) result
 
-(** {1 Opening the logical database}
+(** {2 Opening the logical database}
 
     An open database owns the mirror, the authoritative Datascript lineage, the
     queryable outbox, and the ordered change dispatcher. A snapshot is a leased,
     immutable pair of authoritative and outbox roots; every read through it sees
     that same pair even while later commits advance the open database. *)
-
-type t
-type snapshot
-
-(** [open_ ~sw dependencies inspection ~graph_name] validates the display name,
-    acquires exclusive ownership, and restores an available inspected mirror.
-    Resources are tied to [sw], but callers should still use [close] to observe
-    shutdown errors. *)
-val open_
-  :  sw:Eio.Switch.t
-  -> dependencies
-  -> mirror_inspection
-  -> graph_name:string
-  -> (t, Types.open_error) result
-
-(** Closes storage and invalidates the database's outstanding snapshots and
-    subscriptions. *)
-val close : t -> (unit, Types.close_error) result
-
-(** Captures the current coherent logical projection as a read lease. *)
-val current_snapshot : t -> (snapshot, Types.read_error) result
-
-(** Returns the generation and projection revision captured by the snapshot. *)
-val snapshot_version : snapshot -> Types.snapshot_version
-
-(** Prevents new reads from starting through [snapshot] and releases its pinned
-    roots after already-started reads finish. *)
-val release_snapshot : snapshot -> unit
-
-(** Reads graph identity, schema, admission facts, limits, and version from the
-    snapshot. *)
-val graph_info : snapshot -> (Types.graph_info, Types.read_error) result
 
 (** Reports current outbox occupancy and the limits against which future local
     commits and submissions will be admitted. *)
@@ -346,7 +357,9 @@ val get_structure
             (fun () -> get_outline_blocks snapshot uuids)
     ]} *)
 
-(** {1 Crossing from a snapshot to live changes}
+(** {1 Lifecycle and recovery}
+
+    {2 Crossing from a snapshot to live changes}
 
     Subscription registration and predecessor capture are one atomic operation.
     The returned subscription starts paused, so a consumer can hydrate from the
@@ -395,7 +408,7 @@ val unlisten : subscription -> unit
              raise exn)
     ]} *)
 
-(** {1 Committing optimistic local intent}
+(** {2 Committing optimistic local intent}
 
     A local mutation is checked against equality tokens obtained from earlier
     logical reads. One serialized operation validates identity and preconditions,
@@ -537,7 +550,7 @@ val discard_blocked
         |> require_ok
     ]} *)
 
-(** {1 Handing cryptography to the caller}
+(** {2 Handing cryptography to the caller}
 
     The database owns durable records and crypto item identities, while the sync
     layer owns encryption and decryption. Requests expose only bounded strings.
@@ -554,7 +567,7 @@ val unprotection_ciphertexts
   :  unprotection_request
   -> (Types.crypto_item_id * string) list
 
-(** {1 Advancing synchronization}
+(** {2 Advancing synchronization}
 
     Sync reads one opaque token and uses it as the compare-and-set boundary for
     either direction. Outbox transitions prepare client submissions and terminal
@@ -673,6 +686,8 @@ val apply_authoritative
         in
         apply_authoritative database preparation ~decrypted |> require_ok
     ]} *)
+
+(** {1 Observation and helpers} *)
 
 (** Reads validated metadata for explicit asset identities. Missing/non-asset
     identities are omitted; no binary IO occurs. At most 200 identities per call. *)

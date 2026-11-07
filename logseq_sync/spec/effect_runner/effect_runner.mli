@@ -1,8 +1,50 @@
-(** Eio-native interpreter for [Logseq_sync_pure_reducer.Core.runner_effect]. *)
+(** {1 TLDR}
+
+    Interpret [Logseq_sync_pure_reducer.Core.runner_effect] with Eio and
+    caller-supplied validated dependencies. {!create} binds a runner to an Eio
+    switch; {!submit} performs I/O and queues exact Core completion events through
+    [post]. The serial reducer remains the state owner. Asset and protected-value
+    tickets execute at most once during this runner's lifetime; that process-local
+    rule is not durable replay evidence. The lifecycle owner calls {!shutdown}.
+
+    Construction depends on the capability types below. Primary excerpts:
+    {[
+      val create :
+        ?on_asset_diagnostic:(scope:Logseq_sync_pure_reducer.Core.graph_scope
+          -> operation:string -> request_operation:string
+          -> Logseq_db_types.Failure_diagnostic.t -> unit)
+        -> sw:Eio.Switch.t -> dependencies
+        -> post:(Logseq_sync_pure_reducer.Core.event -> unit)
+        -> (t, create_error) result
+      val submit : t -> Logseq_sync_pure_reducer.Core.runner_effect -> unit
+      val shutdown : t -> unit
+    ]} *)
 
 type t
 type dependency_error = Invalid_dependency of string
 type create_error = Invalid_create of string
+
+(** {1 Minimal usage example}
+
+    The caller supplies [sw], validated [dependencies], a Core-produced [runner_effect],
+    and [post] that queues later serialized reducer turns:
+    {[
+      match create ~sw dependencies ~post with
+      | Error error -> Error error
+      | Ok runner ->
+        Fun.protect
+          ~finally:(fun () -> shutdown runner)
+          (fun () ->
+            submit runner runner_effect;
+            run_until_retired runner;
+            Ok ())
+    ]}
+    [run_until_retired] is the caller's event loop, not a runner API. It keeps the
+    switch, pump and callback delivery alive through the owner's retirement
+    protocol. [submit] returning is not the effect's completion acknowledgement. *)
+
+(** {1 Construction and validation} *)
+
 type runtime
 
 val runtime
@@ -40,6 +82,8 @@ val transport
   -> clock:_ Eio.Time.clock
   -> websocket_liveness:websocket_liveness
   -> (transport, dependency_error) result
+
+(** {2 Storage, secrets and crypto} *)
 
 type local_store
 
@@ -122,13 +166,20 @@ val create
   -> post:(Logseq_sync_pure_reducer.Core.event -> unit)
   -> (t, create_error) result
 
+(** {1 Capability details} *)
+
 (** Asset and protected-value tickets execute at most once for the runner's lifetime.
     Replaying an already submitted ticket does not execute I/O or post a second completion. *)
 val submit : t -> Logseq_sync_pure_reducer.Core.runner_effect -> unit
+
+(** {1 Lifecycle and recovery} *)
 
 (** Checked physical cleanup for the original retired logical account. The
     caller must hold its lifecycle fence and join admitted IO first. Retained
     native leases preserve their cache and return Error; this issues no authority. *)
 val retire_account:t -> account:Logseq_sync_pure_reducer.Core.account_scope -> (unit,string)result
 
+(** Stop this runner's admission and cancel owned work. The enclosing switch and
+    lifecycle owner still own actual I/O/callback joining; this unit return is not
+    a checked per-account cleanup receipt. *)
 val shutdown : t -> unit

@@ -1,7 +1,20 @@
-(** App/Worker coordination boundary. Pure data belongs to [Worker_pure_data];
-    sealed authority is issued by the trusted
-    Worker runner. Abstraction is not authentication: every message, continuation,
-    receipt and resource is validated against its actual channel and owner. *)
+(** {1 TLDR}
+
+    Define the typed App/Worker boundary: read DTOs, durable intent, observations,
+    resource leases and host handoff capabilities. The trusted runner issues
+    sealed authority; [Worker_pure_coordinator.request] plans execution and
+    [Worker_effect_runner.submit] interprets it. This module itself performs no
+    transport I/O. Abstraction is not authentication: runtime checks still bind
+    every message, continuation, receipt and lease to its real channel and owner.
+    Queue admission, durable commitment and presentation confirmation are separate.
+
+    The query/request GADTs depend on the capability families below. Their actual
+    public shapes include [Query (budget, query)], [Observe (budget, query)],
+    [Mutate intent], [Confirm (presentation, receipt)] and [Release observation].
+    Replies distinguish [Not_admitted], [Answered] and [Interrupted]; interruption
+    after admission does not prove rollback. Sessions survive resident focus
+    changes but close/reopen, rebinding and account changes revoke execution. *)
+
 module Graph = Logseq_db_types.Graph_types
 
 module Uuid = Graph.Uuid
@@ -19,6 +32,44 @@ val equal_binding : binding -> binding -> bool
 type session = Worker_effect_authority.session
 type presentation = Worker_effect_authority.presentation
 
+(** Sessions survive focus changes while resident. Close/reopen, account changes,
+    removal and rebinding revoke execution authority. Presentation has a separate
+    lifetime. Admission and completion recheck all identities, not just UUID. *)
+type error = Worker_effect_authority.error =
+  | Revoked_session
+  | Invalid_input of string
+  | Response_budget_exceeded
+  | Stale_read of string
+  | Resync_required of string
+  | Host_change_in_progress
+  | Protocol_mismatch of string
+  | Db_error of Logseq_db_worker.Error.t
+  | Service_failed of string
+  | Unsupported_operation of string
+
+(** {1 Minimal usage example}
+
+    The caller supplies a coordinator [state], a [session] obtained from a Ready
+    projection's Open resident, a typed [query], and the runner's [interpret].
+    This example returns its ticket so the caller can later consume the reply:
+    {[
+      match read_budget session ~maximum_items:1 ~maximum_bytes:4096 with
+      | Error error -> Error error
+      | Ok budget ->
+        match Worker_pure_coordinator.request !state session (Query (budget, query)) with
+        | Error error -> Error error
+        | Ok (ticket, transition) ->
+          state := transition.next;
+          List.iter interpret transition.instructions;
+          Ok ticket
+    ]}
+    [interpret] queues completion events for later serialized turns. Inspect
+    [Worker_pure_coordinator.reply] for admission, operation and interruption
+    outcomes, then feed [Forget ticket] through that coordinator. An observation
+    or file lease additionally requires its actual release acknowledgement. *)
+
+(** {1 Construction and validation} *)
+
 val account_generation : session -> account_generation
 val graph_generation : session -> graph_generation
 val presentation_generation : presentation -> presentation_generation
@@ -35,21 +86,6 @@ val worker_incarnation
   :  runtime_epoch:Journal_worker_ids.Runtime.epoch
   -> worker_generation:Journal_worker_ids.Worker.generation
   -> worker_incarnation
-
-(** Sessions survive focus changes while resident. Close/reopen, account changes,
-    removal and rebinding revoke execution authority. Presentation has a separate
-    lifetime. Admission and completion recheck all identities, not just UUID. *)
-type error = Worker_effect_authority.error =
-  | Revoked_session
-  | Invalid_input of string
-  | Response_budget_exceeded
-  | Stale_read of string
-  | Resync_required of string
-  | Host_change_in_progress
-  | Protocol_mismatch of string
-  | Db_error of Logseq_db_worker.Error.t
-  | Service_failed of string
-  | Unsupported_operation of string
 
 type request_id = Worker_effect_authority.request_id
 
@@ -82,6 +118,8 @@ val read_budget
 type journal_day = Worker_effect_authority.journal_day
 
 val journal_day : int -> (journal_day, error) result
+
+(** {1 Capability details} *)
 
 type page = Worker_effect_authority.page
 type block = Worker_effect_authority.block
@@ -282,6 +320,8 @@ val change_ack_session : change_ack -> session
 val change_ack_generation : change_ack -> string
 val change_ack_through : change_ack -> string
 
+(** {2 Durable mutations} *)
+
 type append_intent = Worker_effect_authority.append_intent
 
 (** Persist the complete bounded root/child/status payload and normalized stable
@@ -356,7 +396,6 @@ type durable_intent = Worker_effect_authority.durable_intent =
 val durable_intent_id : durable_intent -> Uuid.t
 val encode_durable_intent : durable_intent -> bytes
 val restore_durable_intent : session -> bytes -> (durable_intent, error) result
-
 
 (** General mutations preserve today's exact preconditions and mutation IDs.
     Restores validate logical origin/account/graph and all bytes, allowing fresh
@@ -458,6 +497,8 @@ type 'a reply = 'a Worker_effect_authority.reply =
     non-commit evidence cannot become Rejected. Replay must be durable/idempotent
     across restart, not merely a process-local duplicate cache. *)
 
+(** {2 Observations and change windows} *)
+
 type changefeed_notice = Worker_effect_authority.changefeed_notice = private
   { notice_session : session
   ; notice : Worker_pure_data.changefeed_signal
@@ -508,6 +549,8 @@ type observation_notice = Worker_effect_authority.observation_notice = private
       ; epoch : observation_epoch
       }
   | Observations_resync of binding
+
+(** {2 Assets and import sources} *)
 
 type asset_consumer = Worker_effect_authority.asset_consumer
 type asset_demand = Worker_effect_authority.asset_demand
@@ -619,6 +662,8 @@ val upload_operation : asset_notice -> upload_operation option
     replaces an underlying successful resource result and App never receives the
     handle. App-only late-reply cleanup cannot prove this; backend acquisition/
     import ledger or atomic rollback must settle every Accepted operation. *)
+(** {2 Typed execution requests} *)
+
 type 'a request = 'a Worker_effect_authority.request =
   | Query : read_budget * 'a query -> 'a request
   | Observe : read_budget * 'a query -> 'a observed request
@@ -657,6 +702,8 @@ type 'a request = 'a Worker_effect_authority.request =
     Today's separate operations do not implement it. Unsupported capabilities
     fail before enqueue, without a fabricated receipt/registration/lease ACK. *)
 val validate_request : session -> 'a request -> (unit, error) result
+
+(** {1 Lifecycle and recovery} *)
 
 type observation_update = Worker_effect_authority.observation_update = Update : 'a observed -> observation_update
 type projection_version = Worker_effect_authority.projection_version
@@ -748,6 +795,8 @@ type bootstrap_state = Worker_effect_authority.bootstrap_state =
     state. The host must perform a handoff before retiring a graph/account/client;
     focus alone revokes presentation, not resident execution. The authoritative
     projection, not optimistic UI flags, admits the next session. *)
+(** {2 Host handoff} *)
+
 type host_change = Worker_effect_authority.host_change =
   | Account_will_change
   | Graph_will_close of Uuid.t
@@ -816,6 +865,5 @@ type handoff_state = Worker_effect_authority.handoff_state =
     and removal uses the bound existing deletion owner. Do not dispatch a second
     legacy Close/Delete after that ACK. Auth/UI/client lifecycle stay with host. *)
 
-(** Connection-bound validation used inside the direct effect runner. Methods below
-    map concrete Service messages, not fictional bytes or a separate adapter. The
-    factory is trusted integration, not proof of an honest backend. *)
+(** Connection-bound validation remains the direct effect runner's responsibility.
+    The trusted integration is not itself proof of an honest backend. *)
