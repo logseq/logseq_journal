@@ -4871,7 +4871,71 @@ let test_binding_rebind_queued_read_and_failure () =
     "fresh baseline did not resume queued dependency read"
 ;;
 
+type continuation_case = Continuation_case : string * ('item W.continuation option -> 'a W.query) -> continuation_case
+
+let continuation_cases () =
+  let from_day=W.journal_day 10101 |> Result.get_ok in
+  let through_day=W.journal_day 99991231 |> Result.get_ok in
+  [ Continuation_case ("journals",fun after->W.Journals{from_day;through_day;revision=None;after})
+  ; Continuation_case ("summary",fun after->W.Block_summary{block=graph;after})
+  ; Continuation_case ("children",fun after->W.Children{parent=graph;after})
+  ; Continuation_case ("child members",fun after->W.Child_members{parent=graph;revision=None;after})
+  ; Continuation_case ("tree",fun after->W.Tree{page=graph;maximum_depth=1;revision=None;after})
+  ; Continuation_case ("favorites",fun after->W.Favorites after)
+  ; Continuation_case ("task statuses",fun after->W.Task_statuses after)
+  ; Continuation_case ("assets",fun after->W.Assets{recursive=true;roots=[];after}) ]
+;;
+
+let test_binding_handover_retires_embedded_continuations () =
+  List.iteri(fun index (Continuation_case(name,query))->
+    List.iter(fun queued->
+      let old_issuer,raw,projection,session=fixture(Int64.of_int(10000+index*10)) in
+      let next_issuer,_,next_projection,_=fixture(Int64.of_int(10001+index*10)) in
+      let module Old=(val old_issuer:Worker_effect_authority.ISSUER) in
+      let module Next=(val next_issuer:Worker_effect_authority.ISSUER) in
+      let owner=Option.get raw.S.baseline.state.sync.selected in
+      let budget=W.read_budget session ~maximum_items:7 ~maximum_bytes:65536 |> Result.get_ok in
+      let cursor=Logseq_db_types.Graph_types.Cursor.of_string "valid-first-page" |> Result.get_ok in
+      let after=Read.For_worker.continuation ~owner:session ~budget ~key:(Read.query_key budget(query None)) ~cursor in
+      let read=query(Some after) in
+      check(W.validate_request session(W.Query(budget,read))=Ok())(name^": original continuation invalid");
+      let ticket,planned=C.plan_query_when_available(ready Old.binding projection) ~owner
+        ~maximum_items:7 ~maximum_bytes:65536 read |> Result.get_ok in
+      let admitted=if queued then (C.step planned.next(C.Admission_refused(ticket,W.Full))).next
+        else (C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+      let invalidated=C.step admitted(C.Binding_invalidated Old.binding) in
+      let settled=if queued then invalidated else C.step invalidated.next(C.Completed(ticket,W.Interrupted W.Cancelled)) in
+      let released=C.step settled.next(C.Binding_release_completed(Old.binding,Ok())) in
+      let bound=C.step released.next(C.Worker_bound Next.binding) in
+      let resumed=C.step bound.next(C.Bootstrap_received(Next.binding,W.Ready next_projection)) in
+      check(match C.reply(C.view resumed.next)ticket with Some(W.Answered(Error(W.Stale_read _)))->true|_->false)
+        (name^": expired continuation must request a fresh business read, not report invalid input");
+      check(not(List.exists(function C.Send(_,_,W.Query _)->true|_->false)resumed.instructions))
+        (name^": expired continuation reached the replacement worker");
+      let late,late_plan=C.plan_query resumed.next ~owner ~maximum_items:7 ~maximum_bytes:65536 read |> Result.get_ok in
+      check(match C.reply(C.view late_plan.next)late with Some(W.Answered(Error(W.Stale_read _)))->true|_->false)
+        (name^": continuation submitted after handover lost stale classification");
+      let fresh,fresh_plan=C.plan_query late_plan.next ~owner ~maximum_items:7 ~maximum_bytes:65536 (query None) |> Result.get_ok in
+      check(C.reply(C.view fresh_plan.next)fresh=None && List.exists(function C.Send _->true|_->false)fresh_plan.instructions)
+        (name^": fresh unpaged restart was blocked")) [false;true]) (continuation_cases())
+;;
+
+let test_continuation_mismatch_preserves_invalid_input () =
+  let issuer,raw,projection,session=fixture 10200L in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
+  let owner=Option.get raw.S.baseline.state.sync.selected in
+  List.iter(fun (Continuation_case(name,query))->
+    let budget=W.read_budget session ~maximum_items:7 ~maximum_bytes:65536 |> Result.get_ok in
+    let cursor=Logseq_db_types.Graph_types.Cursor.of_string "valid-first-page" |> Result.get_ok in
+    let after=Read.For_worker.continuation ~owner:session ~budget ~key:(Read.query_key budget(query None)) ~cursor in
+    List.iter(fun (maximum_items,maximum_bytes)->
+      let ticket,planned=C.plan_query(ready I.binding projection) ~owner ~maximum_items ~maximum_bytes (query(Some after)) |> Result.get_ok in
+      check(match C.reply(C.view planned.next)ticket with Some(W.Answered(Error(W.Invalid_input _)))->true|_->false)
+        (name^": same-session programming mismatch must remain invalid input")) [6,65536;7,32768]) (continuation_cases())
+;;
+
 let () =
+  if Array.mem "--sealed-rebind-only" Sys.argv then (test_binding_handover_retires_embedded_continuations();test_continuation_mismatch_preserves_invalid_input();exit 0);
   if Array.mem "--error-causes-only" Sys.argv then (test_observation_cleanup_admission_causes();exit 0);
   if Array.mem "--unconfirmed-demand-only" Sys.argv then (test_unconfirmed_asset_registration_cleanup();exit 0);
   if Array.mem "--live-read-rebind-only" Sys.argv then (test_live_binding_replans_ordinary_reads(); test_live_binding_read_owner_and_cancellation_fences();test_binding_rebind_queued_read_and_failure();exit 0);
@@ -4902,6 +4966,8 @@ let () =
   test_durable_recovery_ack_properties ();
   test_dependency_read_waits_for_capacity ();
   test_live_binding_invalidation_is_pure ();
+  test_binding_handover_retires_embedded_continuations ();
+  test_continuation_mismatch_preserves_invalid_input ();
   test_binding_rebind_queued_read_and_failure ();
   test_live_binding_replans_ordinary_reads ();
   test_live_binding_read_owner_and_cancellation_fences ();

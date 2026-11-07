@@ -891,6 +891,29 @@ let cancel_entries ?(waiting = true) predicate facts =
   { facts with entries }, List.rev !instructions
 ;;
 
+(* Expected-owner reads may follow a replacement binding, but embedded
+   continuations still belong to the execution that issued their budget.
+   Let the business owner restart its traversal rather than reusing that seal. *)
+let validate_continuation_session : type a. Worker.session -> a Worker.query -> (unit,Worker.error) result =
+  fun session query ->
+  let original = match query with
+    | Worker.Journals {after;_} -> Option.map Worker.continuation_budget after
+    | Worker.Block_summary {after;_} -> Option.map Worker.continuation_budget after
+    | Worker.Children {after;_} -> Option.map Worker.continuation_budget after
+    | Worker.Child_members {after;_} -> Option.map Worker.continuation_budget after
+    | Worker.Tree {after;_} -> Option.map Worker.continuation_budget after
+    | Worker.Favorites after -> Option.map Worker.continuation_budget after
+    | Worker.Task_statuses after -> Option.map Worker.continuation_budget after
+    | Worker.Assets {after;_} -> Option.map Worker.continuation_budget after
+    | Worker.Graph_info | Worker.Admission | Worker.Journal _ | Worker.Page _
+    | Worker.Outline_block _ | Worker.Task_status_definitions _
+    | Worker.Asset_descriptors _ | Worker.Changes _ -> None in
+  match original with
+  | Some budget when Worker.validate_request session (Worker.Query(budget,query))=Error Worker.Revoked_session ->
+    Error (Worker.Stale_read "The continuation execution changed. Restart the read from its retained boundary.")
+  | _ -> Ok ()
+;;
+
 let validate_change_query
   : type a.
     view
@@ -1120,7 +1143,8 @@ let dispatch_waiting ?(publish = false) ?(retry_full = false) state instructions
                             match slot.ticket.query with
                             | Read query ->
                               Result.bind
-                                (validate_change_query state.facts session budget query)
+                                (Result.bind (validate_continuation_session session query)
+                                   (fun () -> validate_change_query state.facts session budget query))
                                 (fun () ->
                                    Result.map
                                      (fun () -> Worker.Query (budget, query))
