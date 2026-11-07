@@ -7,9 +7,7 @@
 Run `dune build @doc` and open `_build/default/_doc/_html/logseq_journal/index.html`.
 The package homepage links to the execution guide and the coordination API.
 The guide's `.mld` page is generated from its single `.mli` documentation comment;
-edit only the `.mli` body. After building, run
-`python3 -B test/journal_documentation_test.py` from the repository root to check
-the generated page, all examples and local navigation links.
+edit only the `.mli` body.
 
 Each area under this directory is an independent wrapped Dune virtual library.
 Do not use recursive `include_subdirs` to merge future specifications into one
