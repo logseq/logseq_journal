@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import LUIAppleBackend
 import Observation
@@ -8,6 +9,14 @@ import Observation
   static func mark(_ stage: StaticString) {
     guard enabled else { return }
     write("stage=\(stage) phase=mark uptime_s=\(ProcessInfo.processInfo.systemUptime)")
+  }
+
+  static func recordEntry(_ ticks: UInt64) {
+    guard enabled else { return }
+    var timebase = mach_timebase_info_data_t()
+    guard mach_timebase_info(&timebase) == KERN_SUCCESS else { return }
+    let uptime = Double(ticks) * Double(timebase.numer) / Double(timebase.denom) / 1_000_000_000
+    write("stage=main_raw phase=mark uptime_s=\(uptime) mach_ticks=\(ticks)")
   }
 
   @discardableResult static func begin(_ stage: StaticString) -> TimeInterval? {

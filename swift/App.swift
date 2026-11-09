@@ -1,3 +1,4 @@
+import Darwin
 import LUIAppleBackend
 import SwiftUI
 import OSLog
@@ -7,7 +8,9 @@ import AppKit
 
 @main enum JournalApplicationEntry {
   @MainActor static func main() {
+    let entryTicks = mach_absolute_time()
     JournalStartupDiagnostics.mark("main_enter")
+    JournalStartupDiagnostics.recordEntry(entryTicks)
     JournalApplication.main()
   }
 }
