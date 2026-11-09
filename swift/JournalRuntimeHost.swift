@@ -191,6 +191,7 @@ struct JournalHost: View {
   @State private var clock = JournalStartupClock()
 
   var body: some View {
+    let _ = JournalStartupDiagnostics.mark("host_body")
     Group {
       switch setup {
       case .none:
@@ -216,6 +217,7 @@ struct JournalHost: View {
     }
     .environment(\.journalStartupClock, clock)
     .task {
+      JournalStartupDiagnostics.mark("host_task_entered")
       guard setup == nil else { return }
       let began = JournalStartupDiagnostics.begin("host_prepare")
       defer { JournalStartupDiagnostics.end("host_prepare", since: began) }

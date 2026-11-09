@@ -5,13 +5,29 @@ import OSLog
 import AppKit
 #endif
 
-@main struct JournalApplication: App {
-  @State private var platform = JournalApplicationPlatform(services: JournalNativeServices.makePlatformServices())
+@main enum JournalApplicationEntry {
+  @MainActor static func main() {
+    JournalStartupDiagnostics.mark("main_enter")
+    JournalApplication.main()
+  }
+}
+
+struct JournalApplication: App {
+  @State private var platform: JournalApplicationPlatform
   #if os(macOS)
   @NSApplicationDelegateAdaptor(JournalApplicationDelegate.self) private var delegate
   #endif
 
+  init() {
+    let began = JournalStartupDiagnostics.begin("app_init")
+    defer { JournalStartupDiagnostics.end("app_init", since: began) }
+    _platform = State(initialValue: JournalStartupDiagnostics.measure("native_services") {
+      JournalApplicationPlatform(services: JournalNativeServices.makePlatformServices())
+    })
+  }
+
   var body: some Scene {
+    let _ = JournalStartupDiagnostics.mark("app_body")
     #if os(macOS)
     Window("Logseq Journal", id: "journal") {
       JournalHost(platform: platform, prepare: {

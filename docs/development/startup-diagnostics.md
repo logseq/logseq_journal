@@ -50,6 +50,14 @@ can contain private metadata; review and redact raw logs before sharing them.
 
 ## Interpretation
 
+- `main_enter` is the first application logging call before SwiftUI `App.main`,
+  after the loader has entered the executable. It includes diagnostic flag/clock
+  initialization overhead, and does not isolate dyld or framework initializers.
+  `app_init` encloses the App initializer body; its nested `native_services` span
+  includes platform construction. `app_body` and `host_body` mark body evaluation,
+  which may repeat. Select their first occurrence for launch attribution.
+  `host_task_entered` precedes the setup guard and existing `host_prepare` span.
+  These markers do not change the order of service construction or startup work.
 - Spans can nest or overlap; do not add their durations as serial launch time.
   In particular, `local_attach` includes its subspans.
 - A span ending means its call returned or unwound, not that the operation
