@@ -1769,41 +1769,6 @@ let page_of_database ?cache database uuid =
   Option.bind (entity_of_uuid database uuid) (page_record_of_entity ?cache database)
 ;;
 
-let entity_datoms_for_ids database entities =
-  let entities = List.sort_uniq Int.compare entities in
-  let result = Hashtbl.create (List.length entities) in
-  let add datom =
-    let preceding =
-      Hashtbl.find_opt result datom.Datascript.e |> Option.value ~default:[]
-    in
-    Hashtbl.replace result datom.e (datom :: preceding)
-  in
-  (match entities with
-   | [] -> ()
-   | first :: _ ->
-     let last = List.hd (List.rev entities) in
-     if last - first <= List.length entities * 32
-     then (
-       let wanted = Hashtbl.create (List.length entities) in
-       List.iter (fun entity -> Hashtbl.add wanted entity ()) entities;
-       let rec consume sequence =
-         match sequence () with
-         | Seq.Nil -> ()
-         | Seq.Cons (datom, rest) ->
-           if datom.Datascript.e > last
-           then ()
-           else (
-             if Hashtbl.mem wanted datom.e then add datom;
-             consume rest)
-       in
-       consume (Datascript.seek_datoms database Datascript.Eavt ~e:first ()))
-     else List.iter (fun entity -> List.iter add (entity_datoms database entity)) entities);
-  Hashtbl.iter
-    (fun entity datoms -> Hashtbl.replace result entity (List.rev datoms))
-    result;
-  result
-;;
-
 let status_entity database = function
   | Types.Status_uuid uuid -> entity_of_uuid database uuid
   | Legacy_status_ident ident -> entity_of_ident database ident
@@ -3308,7 +3273,7 @@ let structural_fields_reader database =
       fields
 ;;
 
-let authoritative_child_entity_facts ?datoms_by_uuid (snapshot : snapshot) parent =
+let authoritative_child_entity_facts (snapshot : snapshot) parent =
   let database = Option.get snapshot.authoritative_database in
   match entity_of_uuid database parent with
   | None -> Seq.empty
@@ -3322,39 +3287,12 @@ let authoritative_child_entity_facts ?datoms_by_uuid (snapshot : snapshot) paren
         ()
       |> Seq.map (fun (datom : Datascript.datom) -> datom.e)
     in
-    let fields =
-      match datoms_by_uuid with
-      | None ->
-        (* Structural eligibility requires UUID and order only. Full payloads
-           are needed only by callers explicitly requesting hydration inputs. *)
-        let read = structural_fields_reader database in
-        Seq.map
-          (fun entity ->
-             let uuid, order = read entity in
-             entity, None, uuid, order)
-          entities
-      | Some _ ->
-        let entities = List.of_seq entities in
-        let datoms_by_entity = entity_datoms_for_ids database entities in
-        entities
-        |> List.to_seq
-        |> Seq.map (fun entity ->
-          let datoms =
-            Hashtbl.find_opt datoms_by_entity entity |> Option.value ~default:[]
-          in
-          ( entity
-          , Some datoms
-          , one_in_datoms datoms "block/uuid"
-          , one_in_datoms datoms "block/order" ))
-    in
-    fields
-    |> Seq.filter_map (fun (entity, datoms, uuid, order) ->
+    let read = structural_fields_reader database in
+    entities
+    |> Seq.filter_map (fun entity ->
+      let uuid, order = read entity in
       match Option.bind uuid uuid_of_value, Option.bind order string_of_value with
       | Some uuid, Some order when not (block_is_tombstoned snapshot uuid) ->
-        Option.iter
-          (fun table ->
-             Hashtbl.replace table (Graph.Uuid.to_string uuid) (Option.get datoms))
-          datoms_by_uuid;
         Some (order, uuid, entity)
       | _ -> None)
 ;;
@@ -4377,14 +4315,7 @@ let paginate_children snapshot ~parent ~limit ~offset =
       xor_digest membership_accumulator (Graph.Uuid.to_string uuid ^ "\000" ^ order);
       fact
     in
-    let authoritative_datoms = Hashtbl.create requested in
-    let authoritative_facts =
-      authoritative_child_entity_facts
-        ~datoms_by_uuid:authoritative_datoms
-        snapshot
-        parent
-      |> Seq.map (fun (order, uuid, _) -> order, uuid)
-    in
+    let authoritative_facts = authoritative_child_facts snapshot parent in
     let facts, total =
       Overlay_read.bounded_members
         ~maximum:requested
@@ -4396,20 +4327,15 @@ let paginate_children snapshot ~parent ~limit ~offset =
       | 0, _ | _, [] -> values
       | count, _ :: rest -> drop (count - 1) rest
     in
-    let cache = hydration_cache (Option.get snapshot.authoritative_database) in
+    let cache =
+      lazy (hydration_cache ~index_idents:false (Option.get snapshot.authoritative_database))
+    in
     let rec take count reversed = function
       | [] -> List.rev reversed
       | _ when count = 0 -> List.rev reversed
       | (_, uuid) :: rest ->
         let reversed =
-          let initial =
-            Option.bind
-              (Hashtbl.find_opt authoritative_datoms (Graph.Uuid.to_string uuid))
-              (block_record_of_datoms_with_cache
-                 (Option.get snapshot.authoritative_database)
-                 cache)
-          in
-          match logical_block_at ~cache ~initial snapshot uuid with
+          match logical_block_at ~cache:(Lazy.force cache) snapshot uuid with
           | Some block ->
             Types.{ block; revision = logical_block_revision uuid (Some block) }
             :: reversed
