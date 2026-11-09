@@ -4,6 +4,16 @@ let report_warning message =
   try output_string stderr message; flush stderr with _ -> ()
 ;;
 
+let startup_timed stage action =
+  if Sys.getenv_opt "JOURNAL_STARTUP_DIAGNOSTICS" <> Some "1" then action ()
+  else
+    let began = Unix.gettimeofday () in
+    Fun.protect action ~finally:(fun () ->
+      report_warning (Printf.sprintf
+        "journal-startup: source=worker stage=%s phase=end clock=wall elapsed_ms=%.3f\n"
+        stage ((Unix.gettimeofday () -. began) *. 1000.)))
+;;
+
 module Upload = Logseq_db_worker_pure_reducer.Asset_upload
 module Core = Logseq_db_worker_pure_reducer.Core
 module Database = Logseq_overlay_db.Database
@@ -165,12 +175,17 @@ let clear_id_token_cache cache message =
   cancel_token_flight cache message
 ;;
 
+let revoke_id_token_cache cache =
+  clear_id_token_cache cache Logseq_db_types.Failure_diagnostic.(
+    create ~operation:"httpTransport" ~reason:"cancelled" () |> encode)
+;;
+
 let reconcile_authenticated_user cache ~user_id =
   Eio.Mutex.use_rw ~protect:true cache.lock (fun () ->
     if cache.authenticated_user <> user_id
     then (
       cache.authenticated_user <- user_id;
-      clear_id_token_cache cache "ID token request is no longer current."))
+      revoke_id_token_cache cache))
 ;;
 
 let reusable_token cache owner =
@@ -214,7 +229,7 @@ let acquire_id_token cache ~(account : Sync.account_scope) =
       else (
         (match cache.authenticated_user with
          | Some user_id when not (String.equal user_id owner.user_id) ->
-           clear_id_token_cache cache "ID token request is no longer current."
+           revoke_id_token_cache cache
          | None | Some _ -> ());
         cache.authenticated_user <- Some owner.user_id;
         match reusable_token cache owner with
@@ -223,7 +238,7 @@ let acquire_id_token cache ~(account : Sync.account_scope) =
           (match cache.flight with
            | Some flight when flight.request.owner = owner -> Await_token flight.outcome
            | Some _ ->
-             clear_id_token_cache cache "ID token request is no longer current.";
+             revoke_id_token_cache cache;
              start_token_request cache owner
            | None -> start_token_request cache owner)))
   in
@@ -2495,6 +2510,7 @@ let release_host_copy t ~registration =match t.host_copy with
 
 let handle_sync_worker_effect t = function
   | Sync.Inspect_mirror request ->
+    startup_timed "mirror_inspection" (fun () ->
     let recovery = with_staging_lock t (fun () -> recover_local_retirements t request.scope) in
     (match recovery with
      | Error message -> Error (effect_error message)
@@ -2515,7 +2531,7 @@ let handle_sync_worker_effect t = function
         | Overlay.Absent _ ->
           Ok (sync_result ~event:(Sync.Mirror_inspected (Mirror_absent request.scope)) ())
         | Available _ ->
-             Ok (sync_result ~event:(Sync.Mirror_inspected (Mirror_available request)) ()))))
+             Ok (sync_result ~event:(Sync.Mirror_inspected (Mirror_available request)) ())))))
   | Activate_snapshot request ->
     let key = Graph.Uuid.to_string (Sync.snapshot_activation_scope request).graph_id in
     (match Hashtbl.find_opt t.inspections key with

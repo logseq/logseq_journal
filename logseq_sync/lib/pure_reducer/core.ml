@@ -1502,8 +1502,16 @@ let request_catalog_reconciliation core =
   match core.user_id with
   | None -> unchanged core
   | Some user_id ->
-    let next, request = issue_request core (Fetch_catalog (account_scope core user_id)) in
-    { next; effects = [ publish next; Run request ] }
+    let account = account_scope core user_id in
+    let pending = List.exists (fun (Pending_effect ticket) ->
+      match ticket.kind with
+      | Fetch_catalog_kind -> ticket.scope = effect_scope_of_account account
+      | _ -> false) core.pending_effects in
+    if pending then
+      { next = { core with deferred_catalog_reconciliation = true }; effects = [ publish core ] }
+    else
+      let next, request = issue_request core (Fetch_catalog account) in
+      { next; effects = [ publish next; Run request ] }
 ;;
 
 let authenticate core user_id =
@@ -2852,7 +2860,8 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
   match ticket.kind with
   | Load_catalog_kind -> complete_catalog_load core value
   | Save_catalog_kind -> deletion_selection_saved core
-  | Fetch_catalog_kind -> apply_fetched_catalog core value
+  | Fetch_catalog_kind ->
+    apply_fetched_catalog { core with deferred_catalog_reconciliation = false } value
   | Fetch_snapshot_baseline_kind ->
     (match decode_snapshot_baseline value, bootstrap_scope core.bootstrap with
      | Ok _, Some scope when graph_scope_is_current core scope ->
@@ -2950,10 +2959,18 @@ let consume_completion core = function
         | Ok value -> complete_runner core ticket value
         | Error (Effect_failed message | Crypto_failed (_, message)) ->
           let source = message in
-          let message = match Logseq_db_types.Failure_diagnostic.decode source with
+          let diagnostic = Logseq_db_types.Failure_diagnostic.decode source in
+          let message = match diagnostic with
             | Some diagnostic -> Logseq_db_types.Failure_diagnostic.message diagnostic
             | None -> message in
           (match ticket.kind with
+           | Fetch_catalog_kind when core.deferred_catalog_reconciliation
+               && Option.exists (fun diagnostic -> Logseq_db_types.Failure_diagnostic.(
+                 operation diagnostic = "httpTransport" && reason diagnostic = "cancelled")) diagnostic ->
+             (* Newer authentication can outlive a revoked shared token flight. *)
+             request_catalog_reconciliation core
+           | Fetch_catalog_kind ->
+             fail { core with deferred_catalog_reconciliation = false } During_catalog message
            | Save_catalog_kind ->
              (* Keep the existing advisory/deletion outcome. Only the safe
                 diagnostics projection retains the producer's specific cause. *)

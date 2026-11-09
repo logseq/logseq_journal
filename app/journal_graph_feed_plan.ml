@@ -11,6 +11,7 @@ type day_feed =
 
 type feed_scan =
   { root_session : int64
+  ; root_started : Mtime_clock.counter option
   ; root_generation : int64
   ; root_start_day : int option
   ; root_before_day : int option
@@ -387,6 +388,12 @@ let root_feed_response ~ports scan complete =
     ; continuation = root_date_continuation scan
     ; prioritized_day = scan.root_skipped_day
     } in
+  Option.iter (fun began ->
+    ports.report "startup-feed"
+      [ "requestGeneration", `String (Int64.to_string scan.root_generation)
+      ; "complete", `Bool complete
+      ; "elapsedMs", `Float (Mtime.Span.to_float_ns (Mtime_clock.count began) /. 1_000_000.)
+      ]) scan.root_started;
   ports.report "runtime-feed-result"
     [ "requestGeneration", `String (Int64.to_string scan.root_generation)
     ; "complete", `Bool complete
@@ -652,6 +659,8 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
     then t.initial_feed_spec <- Some (root_limit, day_limit);
     let scan =
       { root_session = t.feed_session
+      ; root_started = (if Sys.getenv_opt "JOURNAL_STARTUP_DIAGNOSTICS" = Some "1"
+          then Some (Mtime_clock.counter ()) else None)
       ; root_generation = request_generation
       ; root_start_day = start_day
       ; root_before_day = before_day

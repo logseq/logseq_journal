@@ -144,6 +144,7 @@ import AppKit
     }
     let requestScope = startupScope
     failureScope = requestScope
+    if request == .timelinePresented { JournalStartupDiagnostics.mark("timeline_acknowledged") }
     requestObserver?(request)
     if request == .signOut {
       refresh?.cancel()

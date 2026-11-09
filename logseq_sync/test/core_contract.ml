@@ -2278,6 +2278,55 @@ let authenticated_fetch user_id
   | _ -> Alcotest.fail "authentication did not issue one catalog request"
 ;;
 
+let authentication_coalesces_pending_catalog () =
+  let authenticate core user =
+    Core.step core (Core.Account_authenticated { user_id = Some user })
+  in
+  let catalog_requests effects =
+    List.filter
+      (function
+        | Core.Run (Core.Request (_, Core.Fetch_catalog _)) -> true
+        | _ -> false)
+      effects
+    |> List.length
+  in
+  let pending, ticket, _ = authenticated_fetch "user" in
+  let duplicate = authenticate pending.next "user" in
+  Alcotest.(check int) "same-scope authentication shares pending refresh" 0
+    (catalog_requests duplicate.effects);
+  let cancelled = Logseq_db_types.Failure_diagnostic.(
+    create ~operation:"httpTransport" ~reason:"cancelled" () |> encode) in
+  let failed = Core.step duplicate.next
+      (Core.Runner_completed (Core.Completion (ticket, Error (Core.Effect_failed cancelled)))) in
+  Alcotest.(check int) "newer authentication survives a failed shared request" 1
+    (catalog_requests failed.effects);
+  let retry_failure = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
+      Some (Core.Completion (ticket, Error (Core.Effect_failed "unavailable")))
+    | _ -> None) failed.effects |> Option.get in
+  let exhausted = Core.step failed.next (Core.Runner_completed retry_failure) in
+  Alcotest.(check int) "shared authentication cannot retry indefinitely" 0
+    (catalog_requests exhausted.effects);
+  Alcotest.(check bool) "retry failure remains visible" true
+    ((Core.state exhausted.next).snapshot.startup.failure = Some Core.During_catalog);
+  let rejected = Core.step duplicate.next
+      (Core.Runner_completed (Core.Completion (ticket, Error (Core.Effect_failed "invalid token")))) in
+  Alcotest.(check int) "ordinary authentication failures are not retried" 0
+    (catalog_requests rejected.effects);
+  let completed = Core.step duplicate.next
+      (Core.Runner_completed (Core.Completion (ticket, Ok [graph]))) in
+  Alcotest.(check bool) "shared completion updates the catalog" true
+    ((Core.state completed.next).snapshot.catalog = [graph]);
+  Alcotest.(check int) "authentication can refresh after completion" 1
+    (catalog_requests (authenticate completed.next "user").effects);
+  let resumed = Core.step pending.next
+      (Core.Foreground_changed { foreground = true; lifecycle_generation = 1L }) in
+  Alcotest.(check int) "old lifecycle cannot suppress current refresh" 1
+    (catalog_requests (authenticate resumed.next "user").effects);
+  Alcotest.(check int) "another account owns a separate refresh" 1
+    (catalog_requests (authenticate pending.next "other-user").effects)
+;;
+
 let account_deletion_completion signed_out (result : (unit, Core.effect_error) result) =
   List.find_map
     (function
@@ -4260,6 +4309,10 @@ let scenarios =
       "authentication delegates catalog transport"
       `Quick
       authentication_delegates_catalog_transport
+  ; Alcotest.test_case
+      "authentication shares pending catalog refresh within its scope"
+      `Quick
+      authentication_coalesces_pending_catalog
   ; Alcotest.test_case
       "websocket connect uses the deployed graph path"
       `Quick

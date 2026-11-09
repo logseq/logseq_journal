@@ -41,6 +41,7 @@ struct JournalRuntimeHost: View {
         }
       } else if let runtime, let rootID = runtime.rootID {
         LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
+          .onAppear { JournalStartupDiagnostics.mark("root_appeared") }
       } else {
         JournalStartupLoadingSurface(loading: false, initial: true, active: true)
       }
@@ -74,7 +75,11 @@ struct JournalRuntimeHost: View {
           startingRuntime = next
           do {
             try next.start()
-            try await next.waitForInitialPlatformRequests()
+            do {
+              let began = JournalStartupDiagnostics.begin("initial_platform_requests")
+              defer { JournalStartupDiagnostics.end("initial_platform_requests", since: began) }
+              try await next.waitForInitialPlatformRequests()
+            }
             try Task.checkCancellation()
             guard startingRuntime === next else { throw CancellationError() }
             runtime = next
@@ -212,6 +217,8 @@ struct JournalHost: View {
     .environment(\.journalStartupClock, clock)
     .task {
       guard setup == nil else { return }
+      let began = JournalStartupDiagnostics.begin("host_prepare")
+      defer { JournalStartupDiagnostics.end("host_prepare", since: began) }
       do { setup = .success(try await prepare()) }
       catch { if !Task.isCancelled { setup = .failure(error) } }
     }

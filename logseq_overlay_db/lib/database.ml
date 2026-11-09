@@ -18,6 +18,18 @@ type dependencies =
   ; limits : Types.capability_limits
   }
 
+let startup_timed dependencies stage action =
+  if Sys.getenv_opt "JOURNAL_STARTUP_DIAGNOSTICS" <> Some "1" then action ()
+  else
+    let began = dependencies.monotonic_ns () in
+    let cpu = Sys.time () in
+    Fun.protect action ~finally:(fun () ->
+      let elapsed_ms = Int64.sub (dependencies.monotonic_ns ()) began |> Int64.to_float in
+      report_warning (Printf.sprintf
+        "journal-startup: source=overlay stage=%s phase=end elapsed_ms=%.3f process_cpu_ms=%.3f\n"
+        stage (elapsed_ms /. 1_000_000.) ((Sys.time () -. cpu) *. 1000.)))
+;;
+
 type durable_mirror_location =
   { database_path : string
   ; graph_id : Graph.Uuid.t
@@ -5941,7 +5953,8 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
   if not (Sys.file_exists path)
   then Error Types.Attachment_stale
   else (
-    match read_outbox path, validate_durable_receipts path with
+    match startup_timed dependencies "outbox_read" (fun () -> read_outbox path),
+          startup_timed dependencies "receipt_validation" (fun () -> validate_durable_receipts path) with
     | Error message, _ -> Error (Types.Corrupt_outbox message)
     | _, Error message -> Error (Types.Corrupt_mutation_receipt message)
     | Ok (encoded, durable_revision), Ok () ->
@@ -5953,10 +5966,11 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
        | Ok (outbox, legacy_revision) ->
          let sync_revision = Option.value durable_revision ~default:legacy_revision in
          let durable_outbox = durable_outbox_rows outbox in
-         (match migrate_outbox path ~revision:sync_revision ~expected_records:encoded durable_outbox with
+         (match startup_timed dependencies "outbox_migration" (fun () ->
+            migrate_outbox path ~revision:sync_revision ~expected_records:encoded durable_outbox) with
           | Error message -> Error (Types.Corrupt_outbox message)
           | Ok () ->
-         (match Storage.open_database path with
+         (match startup_timed dependencies "storage_open" (fun () -> Storage.open_database path) with
           | Error error -> Error (Types.Restore_failed (Storage.diagnostic_error ~operation:"attachGraph" error))
           | Ok connection ->
             let callbacks = Storage.connection_callbacks connection in
@@ -5972,7 +5986,7 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                     !installed_listener;
                   ignore (Storage.close callbacks)))
               (fun () ->
-                 match Storage.restore_database connection with
+                 match startup_timed dependencies "datascript_restore" (fun () -> Storage.restore_database connection) with
                  | Error error ->
                    Error (Types.Restore_failed (Storage.diagnostic_error ~operation:"attachGraph" error))
                  | Ok authoritative_database ->
@@ -6140,7 +6154,8 @@ let open_ ~sw dependencies inspection ~graph_name =
          in
          (match
             if generation_matches
-            then open_owned ~sw dependencies inspection ~graph_name ownership
+            then startup_timed dependencies "local_attach" (fun () ->
+              open_owned ~sw dependencies inspection ~graph_name ownership)
             else Error Types.Attachment_stale
           with
           | Ok _ as opened -> opened

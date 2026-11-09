@@ -2,6 +2,38 @@ import Foundation
 import LUIAppleBackend
 import Observation
 
+@MainActor enum JournalStartupDiagnostics {
+  private static let enabled = ProcessInfo.processInfo.environment["JOURNAL_STARTUP_DIAGNOSTICS"] == "1"
+
+  static func mark(_ stage: StaticString) {
+    guard enabled else { return }
+    write("stage=\(stage) phase=mark uptime_s=\(ProcessInfo.processInfo.systemUptime)")
+  }
+
+  @discardableResult static func begin(_ stage: StaticString) -> TimeInterval? {
+    guard enabled else { return nil }
+    let now = ProcessInfo.processInfo.systemUptime
+    write("stage=\(stage) phase=begin uptime_s=\(now)")
+    return now
+  }
+
+  static func end(_ stage: StaticString, since began: TimeInterval?) {
+    guard let began else { return }
+    let now = ProcessInfo.processInfo.systemUptime
+    write("stage=\(stage) phase=end uptime_s=\(now) elapsed_ms=\((now - began) * 1000)")
+  }
+
+  static func measure<Value>(_ stage: StaticString, _ action: () throws -> Value) rethrows -> Value {
+    let began = begin(stage)
+    defer { end(stage, since: began) }
+    return try action()
+  }
+
+  private static func write(_ fields: String) {
+    FileHandle.standardError.write(Data("journal-startup: source=swift \(fields)\n".utf8))
+  }
+}
+
 /// C bridge entries exported by app/journal_lui_bridge.c (see also
 /// platform/native/lui_ocaml_bridge.c in the lui repository). Every entry that
 /// produces a patch copies it into owned bytes and releases the OCaml runtime
@@ -218,7 +250,9 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     self.platform = platform
     self.startupPayload = startupPayload
     do {
-      backend = try LUIAppleBackend(appIcons: journalAppIcons, extensionRegistry: extensionRegistry)
+      backend = try JournalStartupDiagnostics.measure("backend_init") {
+        try LUIAppleBackend(appIcons: journalAppIcons, extensionRegistry: extensionRegistry)
+      }
     } catch { throw FailureDetail(operation:.start,reason:Self.safeReason(error)) }
     backend.onEvent = { [weak self] event in self?.handle(event) }
   }
@@ -241,13 +275,15 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     #else
     let operatingSystem: Int32 = 2
     #endif
-    let accepted = startupPayload.withUnsafeBytes { bytes in
-      luiOCamlStart(
-        receivePatch,
-        operatingSystem,
-        2,
-        bytes.baseAddress?.assumingMemoryBound(to: CChar.self),
-        Int32(bytes.count))
+    let accepted = JournalStartupDiagnostics.measure("ocaml_start") {
+      startupPayload.withUnsafeBytes { bytes in
+        luiOCamlStart(
+          receivePatch,
+          operatingSystem,
+          2,
+          bytes.baseAddress?.assumingMemoryBound(to: CChar.self),
+          Int32(bytes.count))
+      }
     }
     guard generation == identity else { throw CancellationError() }
     guard accepted == 1 else {
