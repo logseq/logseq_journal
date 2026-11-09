@@ -766,14 +766,20 @@ let receive_root_tree t ~ports ~origin ~cached batch items next_cursor =
        with
        | Error message -> root_failure batch message
        | Ok projected ->
-         let selected = List.take batch.root_limit projected.entries in
+         let limit =
+           match batch.root_owner with
+           | Feed_roots scan when scan.root_publish_partial && Rrbvec.is_empty scan.root_days ->
+             min 4 batch.root_limit
+           | Feed_roots _ | Changed_roots _ -> batch.root_limit
+         in
+         let selected = List.take limit projected.entries in
          let ids =
            List.map
              (fun (entry : Projection.timeline_entry) -> Journal_model.id entry.block)
              selected
          in
          let cut =
-           if List.length projected.entries <= batch.root_limit
+           if List.length projected.entries <= limit
            then Rrbvec.length items
            else (
              let last = List.hd (List.rev ids) in

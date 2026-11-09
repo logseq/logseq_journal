@@ -1,8 +1,9 @@
 # Cached graph startup diagnostics
 
 Set `JOURNAL_STARTUP_DIAGNOSTICS=1` for a launched process to enable stage timing.
-It is off by default; it does not enable networking, change startup ordering, or
-write graph data. With an already installed app on an explicitly selected iOS
+Logging is off by default; the entry point always captures one raw Mach timestamp
+before checking the diagnostic flag. It does not enable networking, change service
+startup ordering, or write graph data. With an already installed app on an explicitly selected iOS
 Simulator:
 
 ```sh
@@ -50,6 +51,11 @@ can contain private metadata; review and redact raw logs before sharing them.
 
 ## Interpretation
 
+- `main_raw` records Mach ticks captured at the first source statement in the
+  entry point, before diagnostic flag, Foundation or string initialization. It is
+  emitted after `main_enter` and converted using `mach_timebase_info`; compare
+  timestamps, not log order. Verify the compiled entry when attributing startup.
+  It is not the first machine instruction or the exec boundary.
 - `main_enter` is the first application logging call before SwiftUI `App.main`,
   after the loader has entered the executable. It includes diagnostic flag/clock
   initialization overhead, and does not isolate dyld or framework initializers.
