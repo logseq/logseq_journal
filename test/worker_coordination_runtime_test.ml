@@ -583,7 +583,7 @@ let test_application_current_close ~replacement () =
       press "accessibility-label" "Favorites";
       press "text" "Switch graph";
       wait "native identity reaches the deliberately blocked token request" (fun()-> !token_requested);
-      wait "same-user authentication rebind completes before the close action" (fun()-> !registrations>=2);
+      require (!registrations=1) "same-user authentication preserves the original app registration";
       if Option.is_none(find "accessibility-identifier" "graph-picker-list")then press "text" "Switch graph";
       List.iter(fun graph_id->
         press "accessibility-identifier" ("graph-picker:" ^ W.Uuid.to_string graph_id);
@@ -1951,7 +1951,7 @@ let test_client_to_typed_read () =
       "late cancelled read revived a forgotten consumer")
 ;;
 
-let test_read_completion_rechecks_graph_owner () =
+let test_read_completion_rechecks_graph_owner ?(change=`Graph) () =
   let armed = Atomic.make false
   and entered = Atomic.make false
   and release = Atomic.make false in
@@ -1969,7 +1969,7 @@ let test_read_completion_rechecks_graph_owner () =
       ~finally:(fun () -> Atomic.set release true)
       (fun () ->
          let responses = Hashtbl.create 16
-         and baseline = ref None in
+         and baseline = ref None and authority_revoked = ref false in
          Mailbox.on_event client (function
            | Mailbox.Response { request_id; outcome; _ } ->
              Hashtbl.replace responses request_id outcome
@@ -1977,7 +1977,7 @@ let test_read_completion_rechecks_graph_owner () =
              List.iter
                (function
                  | Service.Coordination_snapshot value -> remember_baseline baseline value
-                 | _ -> ())
+                 | Coordination_revoked _ -> authority_revoked := true)
                updates
            | _ -> ());
          let wait stage predicate =
@@ -2052,24 +2052,34 @@ let test_read_completion_rechecks_graph_owner () =
          require
            (not (Hashtbl.mem responses read))
            "read did not wait behind actual writer";
-         ignore (send (Service.Client_command Return_to_graph_picker));
-         wait "graph picker published" (fun () ->
-           match !baseline with
-           | Some value -> value.baseline.state.sync.selected = None
-           | _ -> false);
+         (match change with
+          | `Graph ->
+            ignore (send (Service.Client_command Return_to_graph_picker));
+            wait "graph picker published" (fun () ->
+              match !baseline with
+              | Some value -> value.baseline.state.sync.selected = None
+              | _ -> false)
+          | `Same | `Changed | `Signout ->
+            let user_id=match change with `Same->Some "user-1"|`Changed->Some "other-user"|_->None in
+            let auth=send(Service.Client_command(Reconcile_authenticated_user{user_id})) in
+            if change=`Same then wait "same identity confirmed" (fun()->Hashtbl.mem responses auth)
+            else wait "different authority revoked" (fun()-> !authority_revoked));
          Atomic.set release true;
          wait "retired read completion" (fun () -> Hashtbl.mem responses read);
          require
            (match Hashtbl.find responses read with
-            | Failed _ -> true
+            | Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Graph_info,Ok info);_})
+              when change=`Same -> info.graph_uuid=Test_support.graph_uuid
+            | Completed(Service.Coordination_query_revoked _) | Failed _ when change<>`Same -> true
             | _ -> false)
-           "retired graph read completion still crossed Service's authority gate";
+           "in-flight read did not respect the actual identity/graph transition";
          (
            wait "cancelled writer completion" (fun () -> Hashtbl.mem responses writer);
            require
              (Hashtbl.find responses writer = Mailbox.Cancelled)
              "cancelled durable attempt was reported as known rollback";
            Atomic.set armed false;
+           if change=`Graph then (
            ignore (send (Service.Client_command (Select_graph Test_support.graph_uuid)));
            wait "replacement graph open" (fun () ->
              match !baseline with
@@ -2109,7 +2119,7 @@ let test_read_completion_rechecks_graph_owner () =
                (committed.before
                 <> committed.after)
                "unknown accepted write lost original commit evidence"
-           | _ -> failwith "durable unknown did not reconcile across close/reopen")))
+           | _ -> failwith "durable unknown did not reconcile across close/reopen"))))
 ;;
 
 let test_host_durable_recovery_confirmation_ack () =
@@ -2642,88 +2652,140 @@ let test_dependency_point_reads_use_typed_owner () =
     wait (fun () -> C.shutdown_state (Host.view host) = C.Stopped))
 ;;
 
-(* A real Service authority control can retire an offline binding without
-   changing its user or physical graph. The old pure event only represented
-   terminal bootstrap revocation, so it could not express this live handover. *)
-let test_live_authority_invalidation_rebinds () =
-  let module Host = Journal_worker_coordination_host in
-  with_client (fun client ->
-    let jobs = Queue.create () in
-    let host =
-      Host.create
-        ~client
-        ~client_id
-        ~managed_origin:"https://api.logseq.io"
-        ~user_id:"user-1"
-        ~enqueue:(fun f -> Queue.add f jobs)
-        ~changed:(fun _ -> ())
-      |> Result.get_ok
-    in
-    Mailbox.on_event client (fun event -> ignore (Host.on_event host event));
-    let pump () =
-      Mailbox.Private.deliver client ~max_events:64;
-      let count = Queue.length jobs in
-      for _ = 1 to count do
-        (Queue.take jobs) ()
-      done
-    in
-    let wait predicate =
-      let deadline = Unix.gettimeofday () +. 6. in
-      while (not (predicate ())) && Unix.gettimeofday () < deadline do
-        pump ();
-        Thread.delay 0.001
-      done;
-      require (predicate ()) "authority handover did not settle"
-    in
-    let current () =
-      Option.bind
-        (C.projection (Host.view host))
-        (fun p ->
-           List.find_map
-             (fun r -> if r.W.phase = W.Open then Some r.session else None)
-             (W.residents p))
-    in
-    ignore
-      (Mailbox.send
-         client
-         (Service.Client_command (Restore_local_account { user_id = "user-1" })));
-    wait (fun () -> current () <> None);
-    let old = Option.get (current ()) in
-    ignore
-      (Mailbox.send
-         client
-         (Service.Client_command
-            (Reconcile_authenticated_user { user_id = Some "user-1" })));
-    wait (fun () ->
-      match C.bootstrap (Host.view host), current () with
-      | W.Binding_revoked _, _ -> true
-      | _, Some session -> not (W.equal_session old session)
-      | _ -> false);
-    let session =
-      match current () with
-      | Some value -> value
-      | None ->
-        failwith "same-user live authority left the offline binding permanently revoked"
-    in
-    require
-      (not (W.equal_session old session))
-      "authority handover reused its revoked registration";
-    let budget =
-      W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
-    in
-    let ticket =
-      Host.request host session (W.Query (budget, W.Graph_info)) |> Result.get_ok
-    in
-    let completed = ref false in
-    Host.watch host ticket ~f:(function
-      | W.Answered (Ok _) -> completed := true
-      | _ -> failwith "replacement binding cannot execute a real read");
-    wait (fun () -> !completed);
-    require
-      (Host.validate_session host old = Error W.Revoked_session)
-      "old authority session recovered data admission";
-    ignore (Host.shutdown host);
-    wait (fun () -> C.shutdown_state (Host.view host) = C.Stopped))
+(* The pure Sync reducer already retains same-user generations. Registration
+   invalidation and coalesced SDK controls belong to the real Service boundary. *)
+let test_restored_authentication_session mode () =
+  with_service_fixture (fun dependencies config ->
+    let client, startup = Mailbox.Private.prepare
+      ~runtime_epoch:(Id.Runtime.Epoch.of_int64 9200L)
+      ~worker_generation:(Id.Worker.Generation.of_int64 1L)
+      (Service.create ~dependencies) config in
+    let ready = Atomic.make false and pause = Atomic.make false
+    and paused = Atomic.make false in
+    let worker = Domain.spawn (fun () ->
+      Logseq_db_worker_lui.Journal_worker_eio_backend.run (fun environment ->
+        Eio.Switch.run (fun session_switch ->
+          Mailbox.Private.run_session startup ~environment ~session_switch
+            ~on_startup:(fun result -> require (Result.is_ok result) "auth Service startup"; Atomic.set ready true)
+            ~on_idle_wait:(fun () -> if Atomic.get pause then (
+              Atomic.set paused true;
+              while Atomic.get pause do Thread.delay 0.001 done;
+              Atomic.set paused false))
+            ~on_yield:(fun () -> ())))) in
+    Fun.protect
+      ~finally:(fun () -> Atomic.set pause false; Mailbox.Private.request_stop client; ignore(Domain.join worker))
+      (fun () ->
+        let responses = Hashtbl.create 32 and baseline = ref None and revoked = ref [] in
+        let pump () = Mailbox.For_testing.drain_events client ~max_events:128 |> List.iter (function
+          | Mailbox.Response {request_id;outcome;_} ->
+            require (not(Hashtbl.mem responses request_id)) "auth request completed twice";
+            Hashtbl.add responses request_id outcome
+          | Push {payload=Service.Coordination_updates updates;_} ->
+            List.iter (function
+              | Service.Coordination_snapshot value -> remember_baseline baseline value
+              | Coordination_revoked(id,_) -> revoked := id :: !revoked) updates
+          | _ -> ()) in
+        let wait stage predicate =
+          let deadline = Unix.gettimeofday () +. 6. in
+          while not(predicate()) && Unix.gettimeofday()<deadline do pump(); Thread.delay 0.001 done;
+          require (predicate()) ("auth session " ^ mode ^ ": " ^ stage) in
+        let send request = match Mailbox.send client request with
+          | Accepted id -> id | _ -> failwith "auth request admission" in
+        let result id = wait "request completion" (fun () -> Hashtbl.mem responses id); Hashtbl.find responses id in
+        let call request = result(send request) in
+        let auth user_id = Service.Client_command(Reconcile_authenticated_user{user_id}) in
+        wait "ready" (fun () -> Atomic.get ready);
+        (* Register before restoration to require tracking the live baseline,
+           rather than only its original empty registration snapshot. *)
+        let registration = 9200L in
+        (match call(Service.Register_coordination registration) with
+         | Completed(Service.Coordination_registered value) -> remember_baseline baseline value
+         | _ -> failwith "auth registration");
+        ignore(call(Service.Client_command(Restore_local_account{user_id="user-1"})));
+        wait "restored graph" (fun () -> Option.exists (fun value ->
+          List.exists(fun(_,state)->state.Logseq_db_worker.phase=Graph_open)
+            value.Service.baseline.state.residents) !baseline);
+        let old = Option.get !baseline in
+        let owner = Option.get old.baseline.state.sync.selected in
+        let source = observation_read client !baseline owner registration Read.Graph_info in
+        let id n=uuid(Printf.sprintf "9c000000-0000-4000-8000-%012d" (9200+n)) in
+        let query n=Service.Coordination_query{registration;owner;request_id=id n;read=source} in
+        let observe=Service.Coordination_observe{registration;owner;observation_id=id 10;request_id=id 11;read=source} in
+        let successful = function
+          | Mailbox.Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Graph_info,Ok info);_}) ->
+            info.graph_uuid=Test_support.graph_uuid
+          | _ -> false in
+        require(successful(call(query 1))) "restored session cannot read";
+        require(match call observe with Completed(Service.Coordination_observed{epoch=0L;_})->true|_->false)
+          "restored observation not established";
+        if mode="same-online" then
+          ignore(call(Service.Client_command(Request_sign_in owner.startup)));
+        if mode="verified-aba" then ignore(call(auth(Some "user-1")));
+        Atomic.set pause true;
+        ignore(send Service.Get_graph_state);
+        wait "scheduler paused" (fun () -> Atomic.get paused);
+        let pending=send(query 2) in
+        let keys=match mode with
+          | "same" | "same-online" | "full-same" -> [Some "user-1"]
+          | "duplicate" -> [Some "user-1";Some "user-1"]
+          | "changed" -> [Some "other-user"]
+          | "signout" | "full-signout" | "cancelled-signout" -> [None]
+          | "first-aba" | "verified-aba" -> [Some "other-user";Some "user-1"]
+          | "first-signout-a" -> [None;Some "user-1"]
+          | _ -> failwith "unknown auth session case" in
+        if String.starts_with ~prefix:"full-" mode then (
+          let full=ref false in
+          for _=1 to 128 do if not !full then
+            match Mailbox.send client Service.Get_graph_state with
+            | Full -> full:=true | Accepted _ -> () | _ -> failwith "queue stopped" done;
+          require !full "auth fixture did not fill response reservations");
+        let confirmations=List.filter_map(fun user -> match Mailbox.send client(auth user) with
+          | Accepted id ->
+            if mode="cancelled-signout" then Mailbox.cancel client ~request_id:id;
+            Some id
+          | Full when String.starts_with ~prefix:"full-" mode -> None
+          | _ -> failwith "auth control admission") keys in
+        Atomic.set pause false;
+        let outcome=result pending in
+        List.iter(fun id -> ignore(result id)) confirmations;
+        (* Data completion is after the pending Latest control even on Full. *)
+        let preserves=List.mem mode ["same";"same-online";"duplicate";"full-same"] in
+        if preserves then (
+          require(successful outcome) "same-user confirmation revoked an outstanding read";
+          require(not(List.mem registration !revoked)) "same-user confirmation published revocation";
+          (match call(Service.Register_coordination registration) with
+           | Completed(Service.Coordination_registered current) ->
+             require(current.baseline.state.sync.account=old.baseline.state.sync.account)
+               "same-user confirmation replaced account generations";
+             require(current.baseline.state.sync.selected=old.baseline.state.sync.selected)
+               "same-user confirmation replaced graph/presentation ownership"
+           | _ -> failwith "same-user confirmation retired the original registration");
+          require(successful(call(query 3))) "original session cannot read after confirmation";
+          require(match call observe with Completed(Service.Coordination_observed{epoch=0L;_})->true|_->false)
+            "same-user confirmation retired the original observation";
+          (* A genuine new graph lifetime still rejects the old capability. *)
+          ignore(call(Service.Client_command Return_to_graph_picker));
+          wait "graph closed" (fun () -> Option.exists(fun value->value.Service.baseline.state.sync.selected=None)!baseline);
+          require(not(successful(call(query 4)))) "same-user exemption revived a closed graph";
+          ignore(call(Service.Client_command(Select_graph Test_support.graph_uuid)));
+          wait "graph reopened" (fun () -> Option.exists(fun value ->
+            List.exists(fun((scope:Sync.graph_scope),state)->scope.graph_generation<>owner.graph_generation
+              && state.Logseq_db_worker.phase=Graph_open)value.Service.baseline.state.residents)!baseline);
+          require(not(successful(call(query 5)))) "same-user exemption crossed a new graph lifetime")
+        else (
+          require(not(successful outcome)) "changed authority completed an old outstanding read";
+          wait "binding revoked" (fun () -> List.mem registration !revoked);
+          require(not(successful(call(query 3)))) "changed authority revived old query admission";
+          require(match call(Service.Register_coordination registration) with Failed _->true|_->false)
+            "retired registration became live again")))
+;;
+
+let test_restored_authentication_sessions () =
+  List.iter (fun mode -> test_restored_authentication_session mode ())
+    ["same";"same-online";"duplicate";"changed";"signout";"first-aba";"first-signout-a";
+     "verified-aba";"full-same";"full-signout";"cancelled-signout"];
+  List.iter (fun change -> test_read_completion_rechecks_graph_owner ~change ())
+    [`Same;`Changed;`Signout]
 ;;
 
 let test_changefeed_business_waits_for_ui_application () =
@@ -4510,7 +4572,7 @@ let test_retired_query_has_correlated_response () =
     let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
     let id=W.request_id(uuid "9c000000-0000-4000-8000-000000009901") in
     let request=I.request session ~request_id:id(W.Query(budget,W.Graph_info)) |> Result.get_ok in
-    ignore(send(Service.Client_command(Reconcile_authenticated_user{user_id=Some "user-1"})));
+    ignore(send(Service.Client_command(Reconcile_authenticated_user{user_id=None})));
     let response=match send request with
       |Mailbox.Completed response->response
       |_->failwith "retired query used an uncorrelated transport failure instead of an owned authority result" in
@@ -4527,6 +4589,10 @@ let test_retired_query_has_correlated_response () =
 let () =
   test_cleanup_transport_causes();
   if Array.mem "--cleanup-causes-only" Sys.argv then exit 0;
+  if Array.mem "--auth-session-only" Sys.argv then (
+    test_restored_authentication_sessions();
+    test_retired_query_has_correlated_response();
+    print_endline "Restored same-user sessions and real authority retirement passed";exit 0);
   if Array.mem "--read-revocation-only" Sys.argv then (test_retired_query_has_correlated_response();exit 0);
   if Array.mem "--application-close-only" Sys.argv then (test_application_current_close ~replacement:false();test_application_current_close ~replacement:true();exit 0);
   test_application_current_close ~replacement:false();
@@ -4568,7 +4634,7 @@ let () =
   test_visible_media_listing_uses_typed_reads ();
   test_offline_asset_scans_use_typed_reads ();
   test_dependency_point_reads_use_typed_owner ();
-  test_live_authority_invalidation_rebinds ();
+  test_restored_authentication_sessions ();
   test_retired_query_has_correlated_response ();
   test_service_changefeed_has_one_owner ();
   test_service_unallocated_observation_cleanup_after_close ();

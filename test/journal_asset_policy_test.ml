@@ -416,6 +416,83 @@ let runtime_same_configuration () =
 
 ;;
 
+let runtime_binding_retains_reads () =
+  let sent = Queue.create () in
+  let retired = ref [] in
+  let r = Runtime.create
+    ~read:(fun request -> Queue.add (Read request) sent; true)
+    ~read_retired:(fun id -> retired := id :: !retired)
+    ~demand:(demand_port sent) ~release_consumer:(release_port sent)
+    ~changed:(fun _ _ _ -> ()) () in
+  let module I = (val resources.Resources.issuer : Worker_effect_authority.ISSUER) in
+  Runtime.bind_coordinated_resources r I.binding;
+  Runtime.refresh r ~graph_generation:1 ~today:20260301 ~settings:P.default_settings;
+  let requests = Queue.to_seq sent |> Seq.filter_map(function Read request->Some request|_->None) |> List.of_seq in
+  Queue.clear sent;
+  Runtime.retire_coordinated_resources r;
+  List.iter(fun request -> check (Runtime.owns_read r (request_id request))
+    "resource handover lost an offline scan read") requests;
+  Runtime.bind_coordinated_resources r I.binding;
+  check (Queue.is_empty sent) "binding handover duplicated pending offline scans";
+  check (!retired = []) "binding handover retired shared scan consumers";
+  Runtime.shutdown r;
+  List.iter(fun request -> check (not(Runtime.owns_read r (request_id request)))
+    "account revocation kept offline scan ownership") requests
+;;
+
+let runtime_binding_restarts_waiting_demand accepted () =
+  let sent=Queue.create() and released=ref 0 in
+  let allow_reads=ref true in
+  let r=Runtime.create
+    ~read:(fun request->if !allow_reads then (Queue.add(Read request)sent;true)else false)
+    ~demand:(fun ~graph_generation ~name priority assets->
+      if accepted then demand_port sent ~graph_generation ~name priority assets else None)
+    ~release_consumer:(fun registration->incr released;release_port sent registration)
+    ~changed:(fun _ _ _->()) () in
+  let module I=(val resources.Resources.issuer:Worker_effect_authority.ISSUER) in
+  Runtime.bind_coordinated_resources r I.binding;
+  let settings=P.settings ~recent_days:0 |> Result.get_ok in
+  Runtime.refresh r ~graph_generation:1 ~today:20260301 ~settings;
+  let take()=match Queue.take sent with Read request->request|_->failwith "expected read" in
+  respond r (take()) (fun(Read.Read_query(budget,query))->
+    let module F=Read.For_worker in
+    match query with
+    |Read.Favorites _->F.answer budget query(Ok(F.favorites ~favorites_page:None
+      ~generation:"g" ~projection_revision:"r" ~next:None
+      ~items:[{membership_uuid=uuid 10;membership_order="a";membership_revision="r";
+        target=Worker_pure_data.V2_favorite_page{uuid=uuid 1;title="Page";revision="r"}}]))
+    |_->failwith "expected favorites");
+  while not(Queue.is_empty sent) do
+    match Queue.take sent with
+    |Command _->()
+    |Read request->respond r request (fun(Read.Read_query(budget,query))->
+      let module F=Read.For_worker in match query with
+      |Read.Assets _->F.answer budget query(Ok(F.asset_listing ~generation:"g"
+        ~projection_revision:"r" ~items:[asset 50] ~next:None))
+      |Read.Page{uuid;_}->F.answer budget query(Ok(Worker_pure_data.V2_present_page
+        {page={G.uuid;name="page";title="Page";kind=Ordinary_page;created_at_ms=0L;
+          updated_at_ms=0L;tags=[];properties=[];recycled=false};revision="r"}))
+      |_->failwith "expected assets or their page dependency")
+  done;
+  Queue.clear sent;
+  allow_reads:=false;
+  Runtime.retire_coordinated_resources r;
+  if accepted then check(!released=1) "retired demand cleanup waited behind a read";
+  (* Ordinary repeated model synchronization must not erase a pending rebind. *)
+  Runtime.refresh r ~graph_generation:1 ~today:20260301 ~settings;
+  allow_reads:=true;
+  Runtime.bind_coordinated_resources r I.binding;
+  check(Queue.to_seq sent |> Seq.exists(function
+    |Read(Runtime.Read{query=W.Favorites None;_})->true|_->false))
+    "retiring an unacknowledged demand stranded its offline scan"
+;;
+
+let () =
+  runtime_binding_retains_reads ();
+  runtime_binding_restarts_waiting_demand false ();
+  runtime_binding_restarts_waiting_demand true ()
+
+
 let completed_favorites () =
   let s, ins = refresh P.empty in
   let s, ins = P.step s (Roots_loaded (read Favorites ins, [ uuid 1 ], None)) in

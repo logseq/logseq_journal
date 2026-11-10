@@ -513,9 +513,104 @@ let run_cases cases =
   check (!failed = 0) (Printf.sprintf "%d media dependency cases failed" !failed)
 ;;
 
+(* Resource retirement is owned by this adapter, outside the coordinator reducer.
+   Its expected-owner read tickets already survive a binding handover. *)
+let test_binding_retains_media_reads () =
+  List.iter (fun accepted ->
+    let r,q,views,admitted = fixture () in
+    let module I = (val resource_source.Resources.issuer : Worker_effect_authority.ISSUER) in
+    R.bind_coordinated_resources r I.binding;
+    admitted := accepted;
+    let root = G.Uuid.to_string (uuid 1) in
+    R.root_visible ~owner:"timeline" r ~root true;
+    R.root_visible ~owner:"detail" r ~root true;
+    let original = if accepted then Some(take_read q) else None in
+    admitted := false;
+    R.retire_coordinated_resources r;
+    Option.iter (fun request -> check (R.owns_read r (R.read_request_id request))
+      "resource handover retired a live media read") original;
+    R.root_visible ~owner:"timeline" r ~root false;
+    admitted := true;
+    R.bind_coordinated_resources r I.binding;
+    let request = match original with Some request -> request | None -> take_read q in
+    check (Queue.is_empty q) "shared visible owners duplicated a retained media read";
+    reply r request [];
+    check (Queue.is_empty q) "retained media completion unnecessarily restarted its listing";
+    check ((Hashtbl.find views root).error = None) "binding handover published a media error";
+    R.reset r ~graph_generation:(Some 2);
+    check (not(R.owns_read r (R.read_request_id request))) "graph replacement kept old media ownership"
+  ) [false;true]
+;;
+
+let test_binding_cleanup_precedes_waiting_reads () =
+  let sent=Queue.create() and allow_reads=ref true and released=ref 0 and views=Hashtbl.create 2 in
+  let ports=resource_ports sent (fun()->true) in
+  let r=R.create
+    ~read:(fun request->if !allow_reads then(Queue.add(Read request)sent;true)else false)
+    ~demand:ports.demand ~acquire:ports.acquire ~release_file:ports.release_file
+    ~release_consumer:(fun registration->incr released;ports.release_consumer registration)
+    ~retry_asset:ports.retry_asset ~changed:(fun root view->Hashtbl.replace views root view) () in
+  R.reset r ~graph_generation:(Some 1);
+  let module I=(val resource_source.Resources.issuer:Worker_effect_authority.ISSUER) in
+  R.bind_coordinated_resources r I.binding;
+  let root=G.Uuid.to_string(uuid 1) in
+  let asset=A.create ~uuid:(uuid 2)
+    ~source:(Managed(Some(A.version ~checksum:(String.make 64 'a') ~file_type:"png" |> Result.get_ok)))
+    ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+  loaded r sent root [asset];
+  let token=(List.hd(Hashtbl.find views root).items).token in
+  R.asset_visible r ~root ~asset:token true;
+  Queue.clear sent;
+  R.notice r (Resources.notice resource_source(S.Asset_availability
+    {consumer=token;asset=asset.uuid;descriptor=asset;availability=Ready "cached"}));
+  let acquisition=take_acquire sent in
+  file_reply r acquisition "rebind-held" "/cache/rebind-held";
+  Queue.clear sent;
+  allow_reads:=false;
+  R.root_visible r ~root:(G.Uuid.to_string(uuid 3)) true;
+  R.retire_coordinated_resources r;
+  check(!released>0) "waiting read blocked retired demand cleanup";
+  check(commands sent |> Seq.exists(fun command->released_handle command=Some "rebind-held"))
+    "waiting read blocked retired file cleanup";
+  check(list_reads sent=0) "waiting read was admitted while rebinding"
+;;
+
+let test_binding_retains_shared_facts () =
+  let r,q,views,admitted = fixture () in
+  let module I = (val resource_source.Resources.issuer : Worker_effect_authority.ISSUER) in
+  R.bind_coordinated_resources r I.binding;
+  observe r (raw_block 1 60);
+  observe r (raw_block 2 60);
+  loaded r q (G.Uuid.to_string(uuid 1)) [];
+  loaded r q (G.Uuid.to_string(uuid 2)) [];
+  change r [80];
+  let original = take_read q in
+  check (Queue.is_empty q) "two roots did not share the missing ancestor read";
+  admitted := false;
+  R.retire_coordinated_resources r;
+  check (R.owns_read r (R.read_request_id original)) "binding handover stranded shared ancestor consumers";
+  R.root_visible r ~root:(G.Uuid.to_string(uuid 1)) false;
+  check (R.owns_read r (R.read_request_id original)) "one hidden root canceled another root's shared read";
+  Queue.add(Read original)q;
+  admitted:=true;
+  R.bind_coordinated_resources r I.binding;
+  reply_block r q (raw_block 60 900);
+  check(not(R.owns_read r (R.read_request_id original))) "retained ancestor completion was not consumed";
+  check((Hashtbl.find views (G.Uuid.to_string(uuid 2))).error=None)
+    "remaining shared consumer failed after a binding handover";
+  let pending=take_metadata q in
+  R.reset r ~graph_generation:None;
+  check (not(R.owns_read r (R.read_request_id pending))) "account revocation retained media read";
+  reply r pending [];
+  check(Queue.is_empty q) "late read after account revocation restarted media work"
+;;
+
 let () =
   run_cases
-    [ ("queued coordinated read retires on Hide",coordinated_read_retirement false)
+    [ ("binding retains media reads",test_binding_retains_media_reads)
+    ; ("binding cleanup precedes waiting reads",test_binding_cleanup_precedes_waiting_reads)
+    ; ("binding retains shared facts",test_binding_retains_shared_facts)
+    ; ("queued coordinated read retires on Hide",coordinated_read_retirement false)
     ; ("accepted coordinated read retires on reset",coordinated_read_retirement true)
     ; ( "stale initial holder facts refill without poisoning the root"
       , fun () ->

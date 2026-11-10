@@ -1,4 +1,23 @@
-(** Typed domain-0 client and Worker Domain service contract. *)
+(** {1 TLDR}
+
+    Typed domain-0 client and Worker Domain service contract. Services own their
+    session state; clients enqueue requests and receive correlated outcomes.
+    [send] reports admission, not completion. Latest controls can supersede
+    queued state independently of ordinary request admission.
+
+    {1 Minimal usage example}
+
+    Given a ready [client] and service [request], retain the admitted ID and
+    match it against later {!event} responses:
+    {[
+      match send client request with
+      | Accepted request_id -> track request_id
+      | Full | Not_ready | Stopping -> defer_request request
+    ]}
+    [track] and [defer_request] are caller-supplied callbacks. Cancellation does
+    not imply rollback of an already accepted durable operation.
+
+    {1 Construction and validation} *)
 
 type mono_clock = Eio.Time.Mono.ty Eio.Resource.t
 type net = [ `Generic ] Eio.Net.ty Eio.Resource.t
@@ -41,6 +60,14 @@ module Session_context : sig
       the previous obligation before issuing a replacement. Returns [None]
       during stop or while an invalidating latest update is pending. *)
   val issue_control : 'push t -> topic:int -> control_ticket option
+
+  (** Number of distinct latest-state keys admitted on this session's topic,
+      including superseded/coalesced updates and updates whose ordinary request
+      was full or cancelled. Identical consecutive keys do not advance it.
+      [None] means no latest-state admission; reply topics also return [None].
+      Read atomically under the control mutex; this is not a handler count and
+      may already include an update newer than the executing handler. *)
+  val latest_control_version : 'push t -> topic:int -> int option
 end
 
 module Request_context : sig

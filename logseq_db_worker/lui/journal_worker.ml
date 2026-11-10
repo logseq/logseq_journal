@@ -92,6 +92,7 @@ module Session_context = struct
     ; emit : topic:ID.Worker.push_topic -> 'push -> unit
     ; fork_daemon : name:string -> (unit -> unit) -> unit
     ; issue_control : topic:int -> control_ticket option
+    ; latest_control_version : topic:int -> int option
     }
 
   let switch t = t.switch
@@ -102,6 +103,7 @@ module Session_context = struct
   let emit t = t.emit
   let fork_daemon t = t.fork_daemon
   let issue_control t = t.issue_control
+  let latest_control_version t = t.latest_control_version
 end
 
 module Request_context = struct
@@ -1075,6 +1077,9 @@ let run_direct_session
         ; emit = emit_push
         ; fork_daemon = start_daemon
         ; issue_control = issue_control_ticket client
+        ; latest_control_version = (fun ~topic -> with_control_lock client (fun () ->
+            let slot = control_slot client topic in
+            Option.map (fun _ -> slot.version) slot.invalidation_target))
         }
     in
     let init_result, resolve_init = Eio.Promise.create () in

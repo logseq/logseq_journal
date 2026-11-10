@@ -404,10 +404,10 @@ let dispatch t event =
 ;;
 
 let refresh t ~graph_generation ~today ~settings =
-  t.resume_configuration<-None;
   let configuration = graph_generation, today, settings in
   if t.configuration <> Some configuration
   then (
+    t.resume_configuration<-None;
     retire_policy_reads t;
     Hashtbl.clear t.pending;
     if t.generation <> Some graph_generation
@@ -936,9 +936,22 @@ let shutdown t =
 
 let retire_coordinated_resources t =
   if t.resource_binding<>None then (
-    let configuration=t.configuration in
-    shutdown t;
-    t.resume_configuration<-configuration)
+    t.resource_binding<-None;
+    t.resume_configuration<-t.configuration;
+    (* Keep the scan/dependency tickets that the coordinator will replan. Only
+       physical demand registrations belong to the retiring binding. *)
+    let consumers=ref(Hashtbl.to_seq_keys t.bound_consumers |> List.of_seq) in
+    let reads=Queue.create() and cleanup=Queue.create() in
+    Queue.iter(function
+      |Policy.Demand{consumer;_}->consumers:=consumer::!consumers
+      |Policy.Read _ as instruction->Queue.add instruction reads
+      |Policy.Release _ as instruction->Queue.add instruction cleanup)t.queued;
+    let consumers=List.sort_uniq String.compare !consumers in
+    List.iter(fun consumer->Queue.add(Policy.Release consumer)cleanup)consumers;
+    Queue.transfer reads cleanup;
+    t.queued<-cleanup;
+    List.iter(fun consumer->dispatch t (Policy.Backpressure consumer))consumers;
+    pump t)
 ;;
 let bind_coordinated_resources t binding =
   if Option.exists(fun previous->not(Worker.equal_binding previous binding))t.resource_binding
@@ -946,7 +959,11 @@ let bind_coordinated_resources t binding =
   let resume=t.resume_configuration in
   t.resource_binding<-Some binding;t.resume_configuration<-None;
   match resume with
-  |Some(graph_generation,today,settings)->refresh t ~graph_generation ~today ~settings
+  |Some _->
+    (* Resync preserves in-flight read ownership, but discards any sealed scan
+       continuation before rebuilding demand against the replacement binding. *)
+    dispatch t Policy.Resync;
+    dispatch t Policy.Capacity_available
   |None->pump t
 ;;
 
