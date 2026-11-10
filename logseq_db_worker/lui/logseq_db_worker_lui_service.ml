@@ -1021,6 +1021,8 @@ let create ~(dependencies : dependencies) =
       ; auth_enqueued_sequence : int ref
       ; auth_wake : Eio.Condition.t
       ; mutable coordination_registration : int64 option
+      ; mutable coordination_account : Sync.account_scope option
+      ; first_authentication : unit -> bool
       ; coordination_limits : Worker_pure_data.capability_limits
       ; emit_observation : observation_signal -> unit
       ; emit_coordination : coordination_update -> unit
@@ -1062,10 +1064,23 @@ let create ~(dependencies : dependencies) =
            request.request
            "host rejected request"
        | Client_command (Reconcile_authenticated_user { user_id }) ->
-         Option.iter (fun id -> session.Session.emit_coordination
-           (Coordination_revoked(id,"Authentication authority changed"))) session.coordination_registration;
-         session.coordination_registration<-None;
-         Db.revoke_coordination session.worker;
+         (* Confirming the restored account does not change graph authority.
+            Only the first admitted identity can make this transition: a first
+            executed A may hide a coalesced B -> A or signed-out -> A. *)
+         let confirms_restored_account =
+           not !(session.Session.auth_seen) && session.first_authentication ()
+           && match user_id, session.coordination_registration, session.coordination_account with
+           | Some user, Some registration, Some account ->
+             String.equal user account.user_id
+             && Db.coordination_current session.worker ~registration
+           | _ -> false
+         in
+         if not confirms_restored_account then (
+           Option.iter (fun id -> session.Session.emit_coordination
+             (Coordination_revoked(id,"Authentication authority changed"))) session.coordination_registration;
+           session.coordination_registration<-None;
+           session.coordination_account<-None;
+           Db.revoke_coordination session.worker);
          session.Session.authenticated_user := user_id;
          (* Every admitted changed key revoked the old reply ticket, including
            A -> B -> A coalescing. Preserve that invalidation even when only
@@ -1207,6 +1222,9 @@ let create ~(dependencies : dependencies) =
                      ; auth_enqueued_sequence
                      ; auth_wake
                      ; coordination_registration=None
+                     ; coordination_account=None
+                     ; first_authentication=(fun () ->
+                         Journal_worker.Session_context.latest_control_version context ~topic:1 = Some 1)
                      ; coordination_limits=(let limits=Overlay.dependency_limits dependencies.overlay in
                          {response_budget_bytes=min limits.response_budget_bytes
                            (min config.response_budget_bytes Worker_pure_data.maximum_response_bytes);
@@ -1353,7 +1371,10 @@ let create ~(dependencies : dependencies) =
         let baseline snapshot={registration;baseline=snapshot;limits=session.Session.coordination_limits;
           authority_user=(if !(session.auth_seen) then Some !(session.authenticated_user) else None)} in
         (match Db.register_coordination session.worker ~registration
-          ~notify:(fun snapshot -> session.emit_coordination (Coordination_snapshot(baseline snapshot))) with
+          ~notify:(fun snapshot ->
+            if session.coordination_registration=Some registration then
+              session.coordination_account<-snapshot.state.sync.account;
+            session.emit_coordination (Coordination_snapshot(baseline snapshot))) with
          | Error message -> Error message
          | Ok snapshot ->
            (match session.coordination_registration with
@@ -1361,11 +1382,15 @@ let create ~(dependencies : dependencies) =
               (Coordination_revoked(id,"Coordination binding replaced"))
             | _ -> ());
            session.coordination_registration<-Some registration;
+           session.coordination_account<-snapshot.state.sync.account;
            Ok(Coordination_registered(baseline snapshot)))
       | Release_coordination registration ->
         Result.map(fun()->
           (match session.coordination_registration with
-           | Some id when id<=registration -> session.coordination_registration<-None | _ -> ());
+           | Some id when id<=registration ->
+             session.coordination_registration<-None;
+             session.coordination_account<-None
+           | _ -> ());
           Coordination_released registration)(Db.release_coordination session.worker ~registration)
       | Coordination_query {registration;owner;request_id;read} ->
         let Read.Read_query(budget,query)=read in
