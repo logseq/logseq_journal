@@ -3986,6 +3986,10 @@ let start
     |_->false);
   coordinated_media_read := (fun ((Journal_media_runtime.Read request) as original)->
     match current_owner(),ensure_coordination() with
+    | Some _,Ok host when Coordination.bootstrap(Coordination_host.view host)=Wc.Awaiting_baseline->
+      (* The runtime keeps this read queued. A binding/baseline event pumps it;
+         temporary admission closure is not a failed media load. *)
+      false
     | Some owner,Ok host->
       (match Coordination_host.plan_query_when_available host ~owner
          ~maximum_items:request.maximum_items
@@ -4031,6 +4035,7 @@ let start
         Effect.ignore)) in
   coordinated_asset_read := (fun (Journal_asset_runtime.Read request) ->
     match current_owner(),ensure_coordination() with
+    | Some _,Ok host when Coordination.bootstrap(Coordination_host.view host)=Wc.Awaiting_baseline->false
     | Some owner,Ok host ->
       (match Coordination_host.plan_query_when_available host ~owner
           ~maximum_items:request.maximum_items

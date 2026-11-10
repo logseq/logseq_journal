@@ -1519,17 +1519,22 @@ let retire_coordinated_resources t =
   if t.resource_binding<>None then (
     t.resource_binding<-None;
     t.queued<-List.filter(fun outgoing->match outgoing.request with
-      |Release_preview _|Release_consumer _->true
-      |Demand _|Acquire _|Retry_asset _|Perform_read _->retire_outgoing t outgoing;false)t.queued;
-    Hashtbl.iter(fun _ id->t.read_retired id)t.fact_requests;
-    Hashtbl.clear t.fact_requests;Hashtbl.clear t.facts;Hashtbl.clear t.pages;
-    Hashtbl.clear t.page_barriers;Hashtbl.clear t.sources;Hashtbl.clear t.barriers;
+      |Release_preview _|Release_consumer _|Perform_read _->true
+      |Demand _|Acquire _|Retry_asset _->retire_outgoing t outgoing;false)t.queued;
+    (* Binding retirement invalidates resource capabilities, not the graph's
+       logical read owners. The coordinator retains and replans those reads;
+       clearing their slots here would strand shared dependency consumers. *)
     retire_coordinated_previews t;
     Hashtbl.iter(fun _ g->
-      Option.iter t.read_retired g.pending;g.pending<-None;g.cursor<-None;
-      g.membership_changed<-true;g.dependency_failed<-false;g.listing_failed<-false;g.error<-None;
+      g.cursor<-None;
+      if g.pending=None then g.membership_changed<-true;
+      g.dependency_failed<-false;g.listing_failed<-false;g.error<-None;
       List.iter(fun c->dispatch t g c P.Hide)g.controllers;
       notify t g)t.groups;
+    (* Cleanup must not wait for read admission or a successful fresh baseline. *)
+    let cleanup,waiting=List.partition(fun outgoing->match outgoing.request with
+      |Release_preview _|Release_consumer _->true|_->false)t.queued in
+    t.queued<-cleanup @ waiting;
     pump t)
 ;;
 let resume_coordinated_previews t =
