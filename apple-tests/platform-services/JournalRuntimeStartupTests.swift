@@ -6,8 +6,9 @@ import LUIAppleBackend
 @_silgen_name("fixture_reentrant") func reentrant() -> Int32
 @_silgen_name("fixture_mode") func mode(_ m: Int32)
 @_silgen_name("fixture_emit") func emit()
+@_silgen_name("fixture_pump_while_ui_busy") func pumpWhileUIBusy()
 let journalAppIcons: [String: String] = [:]
-@MainActor enum JournalLUIEvents { static func dispatch(_ e: LUIEvent) -> Int32 { 1 } }
+enum JournalLUIEvents { static func dispatch(_ e: LUIEvent) -> Int32 { 1 } }
 @MainActor final class JournalApplicationPlatform {
   var connected = false, hold = true
   var begins = 0
@@ -25,7 +26,7 @@ let journalAppIcons: [String: String] = [:]
 @MainActor @main struct Test {
   static func main() async throws {
     let scenario = CommandLine.arguments[1]
-    mode(["rejected": 1, "patch-failure": 2, "worker": 3, "multiple": 4,"same-tag":5][scenario] ?? 0)
+    mode(["rejected": 1, "patch-failure": 2, "worker": 3, "multiple": 4,"same-tag":5,"core-order":6,"core-lease":7][scenario] ?? 0)
     let p = JournalApplicationPlatform()
     let r = try JournalRuntime(
       platform: p, startupPayload: Data(), extensionRegistry: LUIAppleExtensionRegistry())
@@ -35,7 +36,49 @@ let journalAppIcons: [String: String] = [:]
       try await r.waitForInitialPlatformRequests()
       published = true
     }
-    if scenario == "rejected" || scenario == "patch-failure" {
+    if scenario == "core-lease" {
+      while p.waiters.isEmpty { await Task.yield() }
+      p.waiters.removeFirst().resume(returning: Data([1, 2]))
+      try await boot.value
+      let replacement = try JournalRuntime(
+        platform: p, startupPayload: Data(), extensionRegistry: LUIAppleExtensionRegistry())
+      do { try replacement.start(); preconditionFailure("replaced a live lease") }
+      catch {}
+      precondition(p.connected)
+      precondition(!r.stop(), "fixture stop must fail")
+      do { try replacement.start(); preconditionFailure("started before failed cleanup settled") }
+      catch {}
+      precondition(!p.connected)
+      p.hold = false
+      try replacement.start()
+      try await replacement.waitForInitialPlatformRequests()
+      precondition(r.stop(), "late stop did not retire the old facade")
+      for _ in 0..<20 { await Task.yield() }
+      precondition(p.connected && replacement.failure == nil && r.backend.applied == ["valid"],
+        "retired facade disconnected its replacement or consumed an old patch")
+      precondition(replacement.stop())
+    } else if scenario == "core-order" {
+      while p.waiters.isEmpty { await Task.yield() }
+      p.waiters.removeFirst().resume(returning: Data([1, 2]))
+      try await boot.value
+      pumpWhileUIBusy()
+      var deferred: CheckedContinuation<Void, Never>?
+      r.backend.onApply = { patch in
+        if patch == "2" { r.sendPlatformEvent(Data([1])) }
+        if patch == "6" { deferred?.resume(); deferred = nil }
+      }
+      r.sendPlatformEvent(Data([1]))
+      precondition(r.backend.applied == ["1", "2", "3", "4", "5"],
+        "asynchronous pump, synchronous transaction and nested patch order changed")
+      await withCheckedContinuation { deferred = $0 }
+      precondition(r.backend.applied == ["1", "2", "3", "4", "5", "6"],
+        "the deferred wake was not delivered after the synchronous transaction")
+      pumpWhileUIBusy()
+      r.stop()
+      for _ in 0..<20 { await Task.yield() }
+      precondition(r.backend.applied == ["1", "2", "3", "4", "5", "6"],
+        "a retired generation applied its queued patch")
+    } else if scenario == "rejected" || scenario == "patch-failure" {
       do {
         try await boot.value
         preconditionFailure("rejected startup completed")

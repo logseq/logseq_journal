@@ -3,7 +3,7 @@ import LUIAppleBackend
 
 // Match LUI's typed native ABI. Journal's C adapter also acquires/releases the
 // OCaml runtime lock and delivers an owned patch after releasing it, before
-// returning. A backend patch can therefore synchronously dispatch another event.
+// returning. The host serializes these calls on its fixed application-core thread.
 @_silgen_name("lui_ocaml_appear")
 private func luiOCamlAppear(_ node: Int64) -> Int32
 @_silgen_name("lui_ocaml_press")
@@ -66,7 +66,7 @@ private func journalOCamlExtensionEvent(
   _ node: Int64, _ name: UnsafePointer<CChar>?, _ payload: UnsafePointer<CChar>?
 ) -> Int32
 
-@MainActor enum JournalLUIEvents {
+enum JournalLUIEvents {
   static func dispatch(_ event: LUIEvent) -> Int32 {
     switch event {
     case .appear(let node): return luiOCamlAppear(Int64(node))

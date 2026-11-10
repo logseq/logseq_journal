@@ -46,8 +46,8 @@ import Observation
 /// C bridge entries exported by app/journal_lui_bridge.c (see also
 /// platform/native/lui_ocaml_bridge.c in the lui repository). Every entry that
 /// produces a patch copies it into owned bytes and releases the OCaml runtime
-/// before invoking the synchronous patch callback. All entries run on the main
-/// actor; applying a patch may synchronously reenter an event entry.
+/// before invoking the synchronous patch callback. Entries share one fixed
+/// core thread; the callback only copies into the UI mailbox.
 private typealias PatchCallback = @convention(c) (UnsafePointer<CChar>?) -> Void
 private typealias WakeupCallback = @convention(c) () -> Void
 private typealias PlatformRequestCallback =
@@ -90,24 +90,232 @@ private func journalOCamlSetPlatformRequestCallback(_ callback: PlatformRequestC
   }
 }
 
-nonisolated(unsafe) private var activeRuntime: JournalRuntime?
+private struct JournalCoreResult: Sendable {
+  let accepted: Int32
+  let reason: Int32
+}
 
-/// The C bridge invokes this on the main actor after releasing the runtime.
-/// The copied bytes remain valid until the callback returns, including reentry.
-private let receivePatch: PatchCallback = { source in
-  guard let source else { return }
-  let json = String(cString: source)
-  MainActor.assumeIsolated {
-    activeRuntime?.apply(json: json)
+/// The OCaml primordial thread lives for the process, not a SwiftUI session.
+/// Only this thread enters OCaml, and it never waits for the main actor.
+private final class JournalCoreExecutor: @unchecked Sendable {
+  static let shared = JournalCoreExecutor()
+  private let condition = NSCondition()
+  private var jobs: [@Sendable () -> Void] = []
+  private var nextJob = 0
+  private var thread: Thread?
+  private var publishedIdentity: UUID?
+  private var uiTransactions = 0
+  private var deferredWake: UUID?
+  private var owner: UUID?
+  private var ingress: JournalPatchIngress?
+  private var callbacksInstalled = false
+  private var started = false
+  private var retiring = false
+
+  private final class Receipt: @unchecked Sendable {
+    let completed = DispatchSemaphore(value: 0)
+    var result: JournalCoreResult?
+  }
+
+  private init() {
+    let worker = Thread { [self] in
+      while true {
+        condition.lock()
+        while nextJob == jobs.count { condition.wait() }
+        let job = jobs[nextJob]
+        nextJob += 1
+        if nextJob == jobs.count {
+          jobs = []
+          nextJob = 0
+        }
+        condition.unlock()
+        autoreleasepool { job() }
+      }
+    }
+    worker.name = "Journal application core"
+    worker.qualityOfService = .userInitiated
+    thread = worker
+    worker.start()
+  }
+
+  private func enqueue(_ job: @escaping @Sendable () -> Void) {
+    condition.lock()
+    jobs.append(job)
+    condition.signal()
+    condition.unlock()
+  }
+
+  private func sync(_ action: @escaping @Sendable () -> JournalCoreResult?) -> JournalCoreResult? {
+    precondition(Thread.current !== thread)
+    let receipt = Receipt()
+    enqueue {
+      receipt.result = action()
+      receipt.completed.signal()
+    }
+    receipt.completed.wait()
+    return receipt.result
+  }
+
+  func claim(_ identity: UUID, ingress: JournalPatchIngress) -> Bool {
+    sync { [self] in
+      if owner != nil, retiring {
+        guard luiOCamlStop() == 1 else { return nil }
+        owner = nil
+        self.ingress = nil
+      }
+      guard owner == nil else { return nil }
+      owner = identity
+      started = false
+      retiring = false
+      self.ingress = ingress
+      condition.lock()
+      publishedIdentity = identity
+      condition.unlock()
+      if !callbacksInstalled {
+        journalOCamlSetWakeupCallback(wakeup)
+        journalOCamlSetPlatformRequestCallback(platformRequest)
+        callbacksInstalled = true
+      }
+      return JournalCoreResult(accepted: 1, reason: 0)
+    } != nil
+  }
+
+  func perform(
+    _ identity: UUID, operation: Int32, _ action: @escaping @Sendable () -> Int32
+  ) -> JournalCoreResult? {
+    sync { [self] in
+      guard owner == identity else { return nil }
+      let accepted = action()
+      if operation == 1 { started = accepted == 1 }
+      return JournalCoreResult(
+        accepted: accepted,
+        reason: accepted == 1 ? 0 : journalOCamlFailureReason(operation))
+    }
+  }
+
+  func stop(_ identity: UUID) -> JournalCoreResult? {
+    sync { [self] in
+      guard owner == identity else { return JournalCoreResult(accepted: 1, reason: 0) }
+      retiring = true
+      started = false
+      let accepted = luiOCamlStop()
+      let result = JournalCoreResult(
+        accepted: accepted,
+        reason: accepted == 1 ? 0 : journalOCamlFailureReason(2))
+      if accepted == 1 {
+        started = false
+        owner = nil
+        ingress = nil
+        condition.lock()
+        publishedIdentity = nil
+        condition.unlock()
+      }
+      return result
+    }
+  }
+
+  func receive(_ json: String) {
+    precondition(Thread.current === thread)
+    ingress?.submit(.patch(json))
+  }
+
+  func wake() {
+    condition.lock()
+    let identity = publishedIdentity
+    condition.unlock()
+    guard let identity else { return }
+    enqueuePump(identity)
+  }
+
+  @MainActor func beginUITransaction() {
+    condition.lock()
+    uiTransactions += 1
+    condition.unlock()
+  }
+
+  @MainActor func endUITransaction() {
+    condition.lock()
+    uiTransactions -= 1
+    let identity = uiTransactions == 0 ? deferredWake : nil
+    if uiTransactions == 0 { deferredWake = nil }
+    condition.unlock()
+    if let identity { enqueuePump(identity) }
+  }
+
+  private func enqueuePump(_ identity: UUID) {
+    enqueue { [self] in
+      guard owner == identity, started else { return }
+      condition.lock()
+      if uiTransactions != 0 {
+        deferredWake = identity
+        condition.unlock()
+        return
+      }
+      condition.unlock()
+      if journalOCamlPump() != 1 {
+        ingress?.submit(.failure(.pump, journalOCamlFailureReason(3)))
+      }
+    }
   }
 }
 
-/// Fired on whichever OCaml worker thread enqueued cross-thread work; hop to
-/// the main actor before draining the pump queue.
-private let wakeup: WakeupCallback = {
-  Task { @MainActor in
-    activeRuntime?.pump()
+/// Sync UI transactions and asynchronous pumps drain the same ordered mailbox.
+/// Pop one batch at a time so a batch's deferred UI events can safely reenter.
+private final class JournalPatchIngress: @unchecked Sendable {
+  enum Delivery: Sendable {
+    case patch(String)
+    case failure(JournalRuntime.Failure, Int32)
   }
+  private let lock = NSLock()
+  private var pending: [Delivery] = []
+  private var next = 0
+  private var scheduled = false
+  private let receive: @MainActor @Sendable (Delivery) -> Void
+
+  init(receive: @escaping @MainActor @Sendable (Delivery) -> Void) {
+    self.receive = receive
+  }
+
+  func submit(_ delivery: Delivery) {
+    lock.lock()
+    pending.append(delivery)
+    let needsSchedule = !scheduled
+    scheduled = true
+    lock.unlock()
+    if needsSchedule { DispatchQueue.main.async { self.drain() } }
+  }
+
+  @MainActor func drain() {
+    JournalCoreExecutor.shared.beginUITransaction()
+    defer { JournalCoreExecutor.shared.endUITransaction() }
+    while true {
+      lock.lock()
+      guard next < pending.count else {
+        scheduled = false
+        lock.unlock()
+        return
+      }
+      let delivery = pending[next]
+      next += 1
+      if next == pending.count {
+        pending = []
+        next = 0
+      }
+      lock.unlock()
+      receive(delivery)
+    }
+  }
+}
+
+/// The bridge releases the runtime before calling; copy before it frees bytes.
+private let receivePatch: PatchCallback = { source in
+  guard let source else { return }
+  JournalCoreExecutor.shared.receive(String(cString: source))
+}
+
+/// A worker wakeup never needs the UI actor to advance application state.
+private let wakeup: WakeupCallback = {
+  JournalCoreExecutor.shared.wake()
 }
 
 /// One bridge session owns both buffered startup requests and later deliveries.
@@ -166,7 +374,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
 /// Owns the lui backend, the OCaml runtime, and the platform bridge for one
 /// journal session. Replaces `BonsaiApplicationView` + `BonsaiApplicationBridge`.
 @Observable @MainActor final class JournalRuntime {
-  enum Failure: String, Error, LocalizedError {
+  enum Failure: String, Error, LocalizedError, Sendable {
     case start = "runtime.start.failed"
     case patch = "runtime.patch.failed"
     case pump = "runtime.pump.failed"
@@ -216,8 +424,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   private func record(_ operation:Failure, _ reason:JournalSafeDiagnostic) {
     failure = operation; failureReason = reason; failureCause = nil
   }
-  private func recordBridge(_ failure: Failure, _ operation: Int32) {
-    let code = journalOCamlFailureReason(operation)
+  private func recordBridge(_ failure: Failure, _ code: Int32) {
     let reason: JournalSafeDiagnostic
     switch code {
     case 1: reason = .missingHandler
@@ -248,6 +455,8 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   private(set) var failure: Failure?
   private var started = false
   @ObservationIgnored private var generation = UUID()
+  @ObservationIgnored private var coreIdentity: UUID?
+  @ObservationIgnored private var patchIngress: JournalPatchIngress?
   @ObservationIgnored private var initialPlatformTasks: [Task<Void, Never>] = []
   private var stopPending = false
 
@@ -272,44 +481,53 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   func start() throws {
     if let reportedFailure { throw reportedFailure }
     guard !started else { return }
+    JournalCoreExecutor.shared.beginUITransaction()
+    defer { JournalCoreExecutor.shared.endUITransaction() }
     generation = UUID()
     let identity = generation
+    let ingress = JournalPatchIngress { [weak self] delivery in
+      guard let self, self.generation == identity else { return }
+      switch delivery {
+      case .patch(let json): self.apply(json: json)
+      case .failure(let operation, let code): self.recordBridge(operation, code)
+      }
+    }
+    guard JournalCoreExecutor.shared.claim(identity, ingress: ingress) else {
+      throw FailureDetail(operation: .start, reason: .unknown)
+    }
+    coreIdentity = identity
+    patchIngress = ingress
     platformRequestIngress.begin(identity)
     defer { if !started { platformRequestIngress.close(identity) } }
-    journalOCamlSetWakeupCallback(wakeup)
-    journalOCamlSetPlatformRequestCallback(platformRequest)
-    activeRuntime = self
     #if os(macOS)
     let operatingSystem: Int32 = 1
     #else
     let operatingSystem: Int32 = 2
     #endif
-    let accepted = JournalStartupDiagnostics.measure("ocaml_start") {
-      startupPayload.withUnsafeBytes { bytes in
-        luiOCamlStart(
-          receivePatch,
-          operatingSystem,
-          2,
-          bytes.baseAddress?.assumingMemoryBound(to: CChar.self),
-          Int32(bytes.count))
+    let payload = startupPayload
+    let result = JournalStartupDiagnostics.measure("ocaml_start") {
+      JournalCoreExecutor.shared.perform(identity, operation: 1) {
+        payload.withUnsafeBytes { bytes in
+          luiOCamlStart(
+            receivePatch, operatingSystem, 2,
+            bytes.baseAddress?.assumingMemoryBound(to: CChar.self), Int32(bytes.count))
+        }
       }
     }
+    ingress.drain()
     guard generation == identity else { throw CancellationError() }
-    guard accepted == 1 else {
-      recordBridge(.start,1)
+    guard result?.accepted == 1 else {
+      recordBridge(.start, result?.reason ?? 0)
       let reported = reportedFailure!
-      _ = luiOCamlStop()
-      activeRuntime = nil
+      _ = stopCore()
       throw reported
     }
     if let reportedFailure {
-      _ = luiOCamlStop()
-      activeRuntime = nil
+      _ = stopCore()
       throw reportedFailure
     }
     guard rootID != nil else {
-      _ = luiOCamlStop()
-      activeRuntime = nil
+      _ = stopCore()
       record(.start,.missingRoot)
       throw reportedFailure!
     }
@@ -347,17 +565,45 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   }
 
   @discardableResult func stop() -> Bool {
-    guard started || stopPending else { return true }
-    platformRequestIngress.close(generation)
+    guard coreIdentity != nil else { return true }
+    JournalCoreExecutor.shared.beginUITransaction()
+    defer { JournalCoreExecutor.shared.endUITransaction() }
+    if started {
+      platformRequestIngress.close(generation)
+      for task in initialPlatformTasks { task.cancel() }
+      initialPlatformTasks = []
+      platform.disconnect()
+    }
     generation = UUID()
-    for task in initialPlatformTasks { task.cancel() }
-    initialPlatformTasks = []
-    platform.disconnect()
     started = false
-    activeRuntime = nil
-    stopPending = luiOCamlStop() != 1
-    if stopPending { recordBridge(.stop,2) }
+    return stopCore()
+  }
+
+  private func stopCore() -> Bool {
+    guard let identity = coreIdentity else { return true }
+    generation = UUID()
+    let result = JournalCoreExecutor.shared.stop(identity)
+    stopPending = result?.accepted != 1
+    if stopPending {
+      recordBridge(.stop, result?.reason ?? 0)
+    } else {
+      coreIdentity = nil
+      patchIngress = nil
+    }
     return !stopPending
+  }
+
+  private func perform(
+    _ failure: Failure, operation: Int32, _ action: @escaping @Sendable () -> Int32
+  ) {
+    JournalCoreExecutor.shared.beginUITransaction()
+    defer { JournalCoreExecutor.shared.endUITransaction() }
+    let identity = generation
+    let result = JournalCoreExecutor.shared.perform(identity, operation: operation, action)
+    patchIngress?.drain()
+    if generation == identity, started, let result, result.accepted != 1 {
+      recordBridge(failure, result.reason)
+    }
   }
 
   func apply(json: String) {
@@ -375,8 +621,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
 
   func pump() {
     guard started else { return }
-    let identity = generation, accepted = journalOCamlPump()
-    if generation == identity, started, accepted != 1 { recordBridge(.pump,3) }
+    perform(.pump, operation: 3) { journalOCamlPump() }
   }
 
   /// Marshals one LJP2 request onto the platform actor and ships its response
@@ -398,35 +643,35 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     // result and still completes the original continuation without a ledger row.
     guard let response else { return }
     if response.prefix(4) == Data("LJF1".utf8) {
-      let accepted = response.withUnsafeBytes { buffer in
-        journalOCamlPlatformFailure(buffer.baseAddress?.assumingMemoryBound(to:CChar.self),Int32(buffer.count))
+      perform(.platformFailure, operation: 6) {
+        response.withUnsafeBytes { buffer in
+          journalOCamlPlatformFailure(
+            buffer.baseAddress?.assumingMemoryBound(to: CChar.self), Int32(buffer.count))
+        }
       }
-      if generation == identity, started, accepted != 1 { recordBridge(.platformFailure,6) }
       return
     }
-    let accepted = response.withUnsafeBytes { buffer in
-      journalOCamlPlatformResponse(
-        buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
-        Int32(buffer.count))
+    perform(.platformResponse, operation: 5) {
+      response.withUnsafeBytes { buffer in
+        journalOCamlPlatformResponse(
+          buffer.baseAddress?.assumingMemoryBound(to: CChar.self), Int32(buffer.count))
+      }
     }
-    if generation == identity, started, accepted != 1 { recordBridge(.platformResponse,5) }
   }
 
   /// Pushes one host-originated LJP2 event envelope to OCaml.
   func sendPlatformEvent(_ bytes: Data) {
     guard started else { return }
-    let identity = generation
-    let accepted = bytes.withUnsafeBytes { buffer in
-      journalOCamlPlatformEvent(
-        buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
-        Int32(buffer.count))
+    perform(.platformEvent, operation: 4) {
+      bytes.withUnsafeBytes { buffer in
+        journalOCamlPlatformEvent(
+          buffer.baseAddress?.assumingMemoryBound(to: CChar.self), Int32(buffer.count))
+      }
     }
-    if generation == identity, started, accepted != 1 { recordBridge(.platformEvent,4) }
   }
 
   private func handle(_ event: LUIEvent) {
     guard started else { return }
-    let identity = generation, accepted = JournalLUIEvents.dispatch(event)
-    if generation == identity, started, accepted != 1 { recordBridge(.event,7) }
+    perform(.event, operation: 7) { JournalLUIEvents.dispatch(event) }
   }
 }
