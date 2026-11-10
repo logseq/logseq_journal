@@ -20,7 +20,7 @@ import LUIAppleBackend
   }
 }
 let journalAppIcons: [String: String] = [:]
-@MainActor enum JournalLUIEvents {
+enum JournalLUIEvents {
   static func dispatch(_ event: LUIEvent) -> Int32 { 1 }
 }
 
