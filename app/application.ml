@@ -1381,7 +1381,7 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
          in
          { state with
            timeline
-         ; feed_loaded = true
+         ; feed_loaded = state.feed_loaded || complete
          ; presented_feed_context = Some refresh.context
          ; feed_refresh = (if complete then None else state.feed_refresh)
          })
@@ -1410,7 +1410,7 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
        in
        { state with
          timeline
-       ; feed_loaded = state.feed_loaded || accepted_initial_feed
+       ; feed_loaded = state.feed_loaded || (accepted_initial_feed && complete)
        ; presented_feed_context =
            (if accepted_initial_feed
             then Option.map feed_projection_context state.calendar

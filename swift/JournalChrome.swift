@@ -4,6 +4,23 @@ import SwiftUI
 import UIKit
 #endif
 
+/// One initial native layout handoff for this GraphPages lifetime, not per graph.
+/// Later routes may have no Timeline list; downloads never participate.
+struct JournalGraphInitialPresentation {
+  let nonce = UUID()
+  private var finished = false
+  func covers(page: String?, visible: Bool, loading: Bool, cold: Bool) -> Bool {
+    return page != nil && visible && !loading && !cold && !finished
+  }
+  mutating func ready(page: String, nonce: UUID) {
+    guard nonce == self.nonce else { return }
+    finished = true
+  }
+  mutating func cancel(page: String?) {
+    finished = true
+  }
+}
+
 #if os(iOS)
 /// Fences one gesture and a committed focus request by its original owners.
 /// The target page stays mounted while Save may defer the focus publication.
@@ -298,9 +315,11 @@ struct JournalSheetDismissButton: SwiftUI.View {
     @State private var target:String?
     @State private var graphName = JournalGraphNameFeedback()
     @Environment(\.journalContainerTopInset) private var containerTopInset
+    @Environment(\.journalStartupContainerFrame) private var startupContainerFrame
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @StateObject private var handoff=JournalGraphHandoff()
     @StateObject private var coldMotion=JournalGraphColdMotion()
+    @State private var initialPresentation=JournalGraphInitialPresentation()
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.journalGraphScrollOffsets) private var graphScrollOffsets
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -316,10 +335,15 @@ struct JournalSheetDismissButton: SwiftUI.View {
       let interactive:Bool
       let coldMotion:JournalGraphColdMotion
       let coldNonce:UUID?
+      let initialNonce:UUID?
+      let initialReady:@MainActor @Sendable (String,UUID)->Void
       let loading:Bool
       private var presentationReady:(@MainActor @Sendable (String)->Void)? {
-        guard let coldNonce else{return nil}
-        return {page in coldMotion.ready(page:page,nonce:coldNonce)}
+        guard coldNonce != nil || initialNonce != nil else{return nil}
+        return {page in
+          if let coldNonce {coldMotion.ready(page:page,nonce:coldNonce)}
+          if let initialNonce {initialReady(page,initialNonce)}
+        }
       }
 
       struct Style:Equatable {
@@ -369,6 +393,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
         var node = -1
         var style:Style?
         var coldNonce:UUID?
+        var initialNonce:UUID?
         var loading=false
         var owner:String?
         weak var coldMotion:JournalGraphColdMotion?
@@ -426,7 +451,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .environment(\.journalStartupClock,environment.journalStartupClock)
           .environment(\.journalGraphScrollOffsets,environment.journalGraphScrollOffsets)
           .environment(\.journalGraphScrollScope,JournalGraphScrollScope(pageID:owner,records:records))
-          .environment(\.journalGraphPresentationNonce,coldNonce)
+          .environment(\.journalGraphPresentationNonce,coldNonce ?? initialNonce)
           .environment(\.journalGraphPresentationReady,presentationReady)
           .accessibilityHidden(!interactive)
           .background {
@@ -439,17 +464,17 @@ struct JournalSheetDismissButton: SwiftUI.View {
         let gate=LoadingGate();gate.enabled=loading;gate.owner=owner;gate.nonce=coldNonce;gate.motion=coldMotion
         let controller=Controller(rootView:content(context.environment,gate:gate),loadingGate:gate)
         controller.records=records;controller.interactive=interactive;controller.node=node;controller.style=Style(context.environment)
-        controller.coldNonce=coldNonce;controller.loading=loading;controller.owner=owner;controller.coldMotion=coldMotion
+        controller.coldNonce=coldNonce;controller.initialNonce=initialNonce;controller.loading=loading;controller.owner=owner;controller.coldMotion=coldMotion
         controller.setRole(shown:shown,interactive:interactive)
         coldMotion.register(owner,view:controller.view)
         return controller
       }
       func updateUIViewController(_ controller:Controller,context:Context) {
         let style=Style(context.environment)
-        if controller.node != node || controller.records != records || controller.interactive != interactive || controller.style != style || controller.coldNonce != coldNonce || controller.loading != loading {
+        if controller.node != node || controller.records != records || controller.interactive != interactive || controller.style != style || controller.coldNonce != coldNonce || controller.initialNonce != initialNonce || controller.loading != loading {
           controller.loadingGate.token=UUID();controller.loadingGate.enabled=loading
           controller.loadingGate.owner=owner;controller.loadingGate.nonce=coldNonce
-          controller.node=node;controller.records=records;controller.interactive=interactive;controller.style=style;controller.coldNonce=coldNonce;controller.loading=loading
+          controller.node=node;controller.records=records;controller.interactive=interactive;controller.style=style;controller.coldNonce=coldNonce;controller.initialNonce=initialNonce;controller.loading=loading
           withTransaction(Transaction(animation:nil)) {controller.host.rootView=content(context.environment,gate:controller.loadingGate)}
         }
         controller.setRole(shown:shown,interactive:interactive)
@@ -467,6 +492,11 @@ struct JournalSheetDismissButton: SwiftUI.View {
       return owners.enumerated().compactMap { index,owner in
         index<context.childIDs.count ? (owner,context.childIDs[index]) : nil
       }
+    }
+    private var initialCover:Bool {
+      initialPresentation.covers(page:properties.pageID,visible:properties.visible==true,
+        loading:(properties.loadingPageIDs ?? []).contains(properties.pageID ?? ""),
+        cold:coldMotion.ticket != nil)
     }
     private func emit(_ action:String,source:String?=nil,target:String?=nil) {
       guard let source=source ?? properties.pageID else {return}
@@ -558,8 +588,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
             Pane(context:context,owner:slot.owner,node:slot.node,
               records:current && properties.visible==true && !(settling && committing) && !covered,
               shown:shown,
-              interactive:current && properties.visible==true && !(settling && committing) && !covered,
-              coldMotion:coldMotion,coldNonce:coldNonce,loading:(properties.loadingPageIDs ?? []).contains(slot.owner))
+              interactive:current && properties.visible==true && !(settling && committing) && !covered && !initialCover,
+              coldMotion:coldMotion,coldNonce:coldNonce,
+              initialNonce:(current && initialCover) || covered ? initialPresentation.nonce : nil,
+              initialReady:{page,nonce in initialPresentation.ready(page:page,nonce:nonce)},loading:(properties.loadingPageIDs ?? []).contains(slot.owner))
               .frame(width:bounds.size.width,height:bounds.size.height)
               .offset(x:current ? (ownsMotion ? translation : 0) : incoming ? translation-bounds.size.width : -bounds.size.width)
               .opacity(shown ? 1 : 0)
@@ -569,6 +601,20 @@ struct JournalSheetDismissButton: SwiftUI.View {
         .background(Color(uiColor:.systemBackground))
         .clipped()
         .overlay{JournalGraphColdSurface(owner:coldMotion).allowsHitTesting(false).accessibilityHidden(true)}
+        .overlay {
+          if initialCover {
+            ZStack(alignment:.topLeading) {
+              Color(uiColor:.systemBackground)
+              JournalStartupLoadingSurface(loading:false,initial:true,active:true)
+                .frame(width:bounds.size.width,
+                  height:startupContainerFrame?.height ?? bounds.size.height)
+                .offset(y:startupContainerFrame.map {
+                  $0.minY - bounds.frame(in:.global).minY
+                } ?? 0)
+            }
+            .accessibilityIdentifier("journal-initial-layout-cover")
+          }
+        }
         .overlay(alignment:.top) {
           if let name = graphName.presentation?.name {
             nameCapsule(name)
@@ -579,7 +625,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
               .allowsHitTesting(false)
           }
         }
-        .gesture(RightGraphPan(enabled:properties.enabled==true && !settling && coldMotion.ticket==nil) {handle($0,width:bounds.size.width)})
+        .gesture(RightGraphPan(enabled:properties.enabled==true && !settling && coldMotion.ticket==nil && !initialCover) {handle($0,width:bounds.size.width)})
         .onChange(of:bounds.size) { _,_ in reset(notify:true) }
       }
       // Each native hosting root owns the same window-sized canvas as the
@@ -594,7 +640,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
         graphScrollOffsets?.retain(ids ?? [])
         if let source,let target,!(ids ?? []).contains(source) || !(ids ?? []).contains(target) {reset(notify:false)}
       }
-      .onChange(of:properties.pageID) { _,page in
+      .onChange(of:properties.pageID) { previous,page in
+        // Initial nil -> owner is admission. Replacing that owner interrupts
+        // startup; a retained Favorites/Detail route need not own a List handshake.
+        if previous != nil {initialPresentation.cancel(page:previous)}
         graphName.focusChanged(page)
         let keepName = graphName.presentation?.phase == .confirmed
         let keepCold=committing && coldMotion.ticket?.target==page
@@ -620,10 +669,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
         if prepared == nil && source==properties.pageID && (dragging || settling) {reset(notify:false)}
       }
       .onChange(of:properties.visible) { _,visible in
-        if visible != true {reset(notify:true)} else {acknowledge()}
+        if visible != true {initialPresentation.cancel(page:properties.pageID);reset(notify:true)} else {acknowledge()}
       }
-      .onChange(of:scenePhase) { _,phase in if phase != .active {reset(notify:true)} }
-      .onDisappear {reset(notify:false)}
+      .onChange(of:scenePhase) { _,phase in if phase != .active {initialPresentation.cancel(page:properties.pageID);reset(notify:true)} }
+      .onDisappear {initialPresentation.cancel(page:properties.pageID);reset(notify:false)}
       .task(id:graphName.presentation?.id) {
         guard let name = graphName.presentation,name.phase == .confirmed else { return }
         if UIAccessibility.isVoiceOverRunning {

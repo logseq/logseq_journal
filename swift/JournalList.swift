@@ -445,9 +445,11 @@ extension EnvironmentValues {
       request.complete(y)
     }
     func reportPresentationLayout() {
+      // Empty timelines also have a completed native viewport layout. Requiring
+      // positive content height would strand their initial loading cover.
       guard active, presentationLayout != nil, restoredOffset == nil, !reportingLayout,
         let scrollView, scrollView.window != nil, scrollView.bounds.height > 0,
-        scrollView.contentSize.height > 0 else { return }
+        scrollView.bounds.width > 0 else { return }
       reportingLayout = true
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
