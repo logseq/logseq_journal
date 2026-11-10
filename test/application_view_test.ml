@@ -600,6 +600,7 @@ let run_favorites_native_visibility
       ?(check_covered_update = false)
       ?calendar_change
       ?(timeline_rows = 3)
+      ?(check_initial_feed = false)
       ?(check_generation = false)
       ?(check_reselect = false)
       ?(check_chrome = false)
@@ -696,6 +697,8 @@ let run_favorites_native_visibility
   let reported_graph_generation = Atomic.make None in
   let queried = Atomic.make [] in
   let feed_queried = Atomic.make false in
+  let initial_feed_continuation = Atomic.make false in
+  let initial_feed_release = Atomic.make (not check_initial_feed) in
   let calendar_feed_reads = Atomic.make 0 in
   let calendar_feed_release = Atomic.make false in
   let calendar_refresh_pending = Atomic.make false in
@@ -1177,6 +1180,12 @@ let run_favorites_native_visibility
             | Read.Tree _ ->
               let count = Option.value media_rows ~default:timeline_rows in
               let offset = match cursor with None -> 0 | Some value -> int_of_string (G.Cursor.to_string value) in
+              if check_initial_feed && offset > 0 then (
+                Atomic.set initial_feed_continuation true;
+                while not (Atomic.get initial_feed_release) do
+                  Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+                done);
+              let limit = if check_initial_feed && offset = 0 then 1 else limit in
               let length = max 0 (min limit (count - offset)) in
               (Ok(F.slice ~items:(List.init length (fun index ->
                     { Worker_pure_data.value = timeline_block (offset + index)
@@ -1955,6 +1964,7 @@ let run_favorites_native_visibility
   in
   Fun.protect
     ~finally:(fun () ->
+      Atomic.set initial_feed_release true;
       Atomic.set failed_media_recovery_release true;
       Atomic.set coordination_release_allowed true;
       Atomic.set changed_media_fact_release true;
@@ -2007,6 +2017,22 @@ let run_favorites_native_visibility
          hooks.pump () |> consume;
          Unix.sleepf 0.001
        done;
+       if check_initial_feed then (
+         (* Application owns the feed-completion gate but does not expose a
+            public pure reducer. Exercise its mounted service boundary with a
+            real bounded first feed and hold only its continuation read. *)
+         wait "initial feed publishes a prefix before its final read" (fun () ->
+           Atomic.get initial_feed_continuation);
+         let deadline = Unix.gettimeofday () +. 0.15 in
+         while Unix.gettimeofday () < deadline do
+           hooks.pump () |> consume;
+           Unix.sleepf 0.001
+         done;
+         Alcotest.(check bool) "partial initial feed stays behind startup loading" true
+           (Option.is_none (find "text" "Timeline fixture 0"));
+         Alcotest.(check bool) "loading surface survives partial initial feed" true
+           (Option.is_some (find "_extension" "journal-chrome"));
+         Atomic.set initial_feed_release true);
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
@@ -8850,6 +8876,9 @@ let () =
             `Quick
             (fun () -> test_reference_outer_terminals true)
         ] )
+    ; ( "initial timeline presentation"
+      , [ Alcotest.test_case "waits for the complete bounded feed" `Quick
+            (fun () -> run_favorites_native_visibility ~check_initial_feed:true ()) ] )
     ; ( "root navigation"
       , [ Alcotest.test_case "Timeline reselect ownership" `Quick
             (fun () -> run_favorites_native_visibility ~check_reselect:true ())

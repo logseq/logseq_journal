@@ -38,6 +38,25 @@ import UIKit
   }
   static func settle() async { for _ in 0..<10 { await Task.yield() } }
   static func main() async throws {
+    // Initial presentation owner: native rendering, not an OCaml reducer boundary.
+    var initialPresentation = JournalGraphInitialPresentation()
+    let nonce = initialPresentation.nonce
+    check(initialPresentation.covers(page: "A", visible: true, loading: false, cold: false), "final-data first mount remains covered until layout")
+    check(!initialPresentation.covers(page: "A", visible: true, loading: true, cold: false), "loading and recovery content remain accessible")
+    check(!initialPresentation.covers(page: "A", visible: false, loading: false, cold: false), "hidden manager never gets a cover")
+    check(!initialPresentation.covers(page: "A", visible: true, loading: false, cold: true), "cold swipe retains its existing cover owner")
+    initialPresentation.ready(page: "A", nonce: UUID())
+    check(initialPresentation.covers(page: "A", visible: true, loading: false, cold: false), "stale layout completion cannot reveal content")
+    initialPresentation.ready(page: "A", nonce: nonce)
+    check(!initialPresentation.covers(page: "A", visible: true, loading: false, cold: false), "native layout reveals initial page including empty feed")
+    check(!initialPresentation.covers(page: "A", visible: true, loading: false, cold: false), "resident return does not cover a presented page")
+    check(!initialPresentation.covers(page: "B", visible: true, loading: false, cold: false), "new graph after first presentation never gets a startup cover")
+    check(!initialPresentation.covers(page: "C", visible: true, loading: false, cold: false), "Favorites generation replacement never gets a startup cover")
+    var interruptedPresentation = JournalGraphInitialPresentation()
+    interruptedPresentation.cancel(page: "A")
+    check(!interruptedPresentation.covers(page: "B", visible: true, loading: false, cold: false), "interruption retires startup gate for all subsequent pages")
+    interruptedPresentation.ready(page: "A", nonce: interruptedPresentation.nonce)
+    check(!interruptedPresentation.covers(page: "B", visible: true, loading: false, cold: false), "late old-owner layout cannot rearm gate after initial focus replacement")
     #if os(iOS)
     let handoff = JournalGraphHandoff()
     let cancelledGesture = handoff.startGesture()
