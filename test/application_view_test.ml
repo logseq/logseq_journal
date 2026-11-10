@@ -7670,6 +7670,13 @@ let test_graph_picker_controls scenario () =
     if List.assoc_opt key values = Some (`String value) then Some id else found) props None in
   let node name = match find "accessibility-identifier" name with
     | Some id -> id | None -> failwith ("Missing " ^ name) in
+  let picker_account_action title =
+    let menu = node "journal-startup-menu" in
+    let rec belongs id = id = menu || match Hashtbl.find_opt page_parents id with
+      | None -> false | Some parent -> belongs parent in
+    Hashtbl.to_seq props |> Seq.find_map (fun (id, fields) ->
+      if belongs id && List.assoc_opt "text" fields = Some (`String title)
+      then Some id else None) |> Option.get in
   let picker_list () =
     let marker=node "graph-picker-list" in
     let rec belongs id = id=marker || match Hashtbl.find_opt page_parents id with
@@ -7826,7 +7833,7 @@ let test_graph_picker_controls scenario () =
           Alcotest.(check bool) "superseded native identity is never installed" false
             (List.mem(Some "next-user")!auth_classified))
       | `Sign_out | `Sign_out_unknown ->
-        press(Option.get(find "text" "Sign out"));
+        press(picker_account_action "Sign out");
         wait "sign out consumes actual old-account permission before reconcile" (fun()->
           Atomic.get host_applied=1 && not(Atomic.get current).snapshot.startup.authenticated);
         Alcotest.(check int) "one sign-out prepare" 1(Atomic.get host_prepared);
@@ -7853,7 +7860,7 @@ let test_graph_picker_controls scenario () =
           ((Atomic.get current).snapshot.resident_graphs=[first;uuid 4;uuid 3])
       | `Remove_queued_sign_out ->
         press(node("graph-resident-remove:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
-        press(Option.get(find "text" "Sign out"));
+        press(picker_account_action "Sign out");
         wait "new account intent cancels an unstarted graph close" (fun()-> !native_sign_outs=1);
         Alcotest.(check int) "only the account/stop prepare reaches the Service" 1(List.length(Atomic.get prepare_attempts));
         Alcotest.(check int) "only the newer host permission is applied" 1(Atomic.get host_applied)
@@ -7875,7 +7882,7 @@ let test_graph_picker_controls scenario () =
           wait "provider admits a fresh generation of the same graph" (fun()->
             List.exists(fun(scope:Service.asset_scope)->scope.graph_id=second && scope.graph_generation=4)
               (Atomic.get current).snapshot.resident_scopes));
-        if scenario=`Remove_retry_sign_out then press(Option.get(find "text" "Sign out"));
+        if scenario=`Remove_retry_sign_out then press(picker_account_action "Sign out");
         if scenario=`Remove_retry_terminate then (
           let packet=Bytes.make 32 '\000' in Bytes.blit_string "LJP2" 0 packet 0 4;
           Bytes.set_uint16_le packet 4 2;Bytes.set_uint16_le packet 6 12;
@@ -7916,7 +7923,7 @@ let test_graph_picker_controls scenario () =
         if scenario=`Remove_select then
           press(node("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string(uuid 3)));
         if scenario=`Remove_cancel then press(node "graph-picker-close");
-        if scenario=`Remove_sign_out then press(Option.get(find "text" "Sign out"));
+        if scenario=`Remove_sign_out then press(picker_account_action "Sign out");
         let target=if scenario=`Remove_select then uuid 3
           else if scenario=`Remove_cancel || scenario=`Remove_sign_out then first else second in
         for _=0 to 32 do consume(hooks.pump());Unix.sleepf 0.001 done;
