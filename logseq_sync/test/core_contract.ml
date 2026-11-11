@@ -6299,6 +6299,16 @@ let resident_scope core id = Core.scope_for_graph core ~graph_id:id |> Option.ge
 let resident_ids = [graph.graph_id;other_graph.graph_id;third_graph.graph_id]
 let check_residents expected core =
   Alcotest.(check bool) "configured resident order" true (Core.resident_graphs core = expected)
+let resident_conversion_publishes_retained_scope () =
+  let attached = local_attached () in
+  let ready = Core.step attached.next Core.Local_feed_acknowledged in
+  let configured = Core.step ready.next (Core.Resident_graphs_changed [graph_id]) in
+  let owner = Core.scope_for_graph configured.next ~graph_id |> Option.get in
+  let published = List.fold_left (fun scopes -> function
+    | Core.Publish (Core.Resident_scopes_changed next) -> next
+    | _ -> scopes) [] configured.effects in
+  Alcotest.(check bool) "scope subscribers receive the retained resident owner" true
+    (published = [owner])
 let resident_membership_limits_and_order () =
   let original = resident_catalog () in
   let one = Core.step original (Core.Resident_graphs_changed [graph.graph_id]) in
@@ -6357,7 +6367,8 @@ let resident_catalog_codec_keeps_order () =
   let old = Core.catalog_cache ~user_id:"user" ~graphs:[graph] ~selected_graph:(Some graph.graph_id) in
   Alcotest.(check bool) "legacy single selection migrates" true (Core.catalog_cache_resident_graphs old = [graph.graph_id])
 let scenarios = scenarios @
-  [ Alcotest.test_case "resident membership limits and order" `Quick resident_membership_limits_and_order
+  [ Alcotest.test_case "resident conversion publishes retained scope" `Quick resident_conversion_publishes_retained_scope
+  ; Alcotest.test_case "resident membership limits and order" `Quick resident_membership_limits_and_order
   ; Alcotest.test_case "resident focus preserves lifetimes" `Quick resident_focus_preserves_lifetimes
   ; Alcotest.test_case "resident remove reopen fences callbacks" `Quick resident_removal_reopen_and_late_callback
   ; Alcotest.test_case "resident logout clears membership" `Quick resident_logout_clears_membership

@@ -4658,7 +4658,8 @@ let step core event = let transition=step core event in
 let step core event =
   let transition=step core event in
   let scopes c=List.filter_map (fun id->scope_for_graph c ~graph_id:id) (resident_graphs c) in
-  let changed=transition.next.resident_enabled && scopes core<>scopes transition.next in
+  let changed=transition.next.resident_enabled
+    && (not core.resident_enabled || scopes core<>scopes transition.next) in
   if changed then {transition with effects=transition.effects @ [Publish(Resident_scopes_changed(scopes transition.next))]}
   else transition
 ;;
