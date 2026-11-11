@@ -6302,13 +6302,25 @@ let check_residents expected core =
 let resident_conversion_publishes_retained_scope () =
   let attached = local_attached () in
   let ready = Core.step attached.next Core.Local_feed_acknowledged in
-  let configured = Core.step ready.next (Core.Resident_graphs_changed [graph_id]) in
-  let owner = Core.scope_for_graph configured.next ~graph_id |> Option.get in
-  let published = List.fold_left (fun scopes -> function
-    | Core.Publish (Core.Resident_scopes_changed next) -> next
-    | _ -> scopes) [] configured.effects in
-  Alcotest.(check bool) "scope subscribers receive the retained resident owner" true
-    (published = [owner])
+  let owner = Core.scope_for_graph ready.next ~graph_id |> Option.get in
+  let fence : Core.host_fence =
+    { id = Logseq_db_types.Graph_types.Uuid.of_string "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" |> Result.get_ok
+    ; owner = owner.account
+    ; target = One_graph other_graph_id
+    ; captured_scopes = Rrbvec.empty
+    ; previous = None
+    } in
+  List.iter (fun (label, event) ->
+    let configured = Core.step ready.next event in
+    let published = List.fold_left (fun scopes -> function
+      | Core.Publish (Core.Resident_scopes_changed next) -> next
+      | _ -> scopes) [] configured.effects in
+    Alcotest.(check bool) (label ^ " retains the live graph scope") true
+      (Core.scope_for_graph configured.next ~graph_id = Some owner);
+    Alcotest.(check bool) (label ^ " publishes the retained resident owner") true
+      (published = [owner]))
+    [ "resident configuration", Core.Resident_graphs_changed [graph_id]
+    ; "unrelated host fence", Core.Host_fence_started fence ]
 let resident_membership_limits_and_order () =
   let original = resident_catalog () in
   let one = Core.step original (Core.Resident_graphs_changed [graph.graph_id]) in

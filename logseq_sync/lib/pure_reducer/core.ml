@@ -4655,15 +4655,6 @@ let step core event =
 let step core event = let transition=step core event in
   {transition with next=prune_sessions transition.next}
 
-let step core event =
-  let transition=step core event in
-  let scopes c=List.filter_map (fun id->scope_for_graph c ~graph_id:id) (resident_graphs c) in
-  let changed=transition.next.resident_enabled
-    && (not core.resident_enabled || scopes core<>scopes transition.next) in
-  if changed then {transition with effects=transition.effects @ [Publish(Resident_scopes_changed(scopes transition.next))]}
-  else transition
-;;
-
 let step core = function
   |IO_fence_requested(id,scope)->{next=core;effects=[Run(Await_io(id,scope))]}
   |IO_fence_completed _->unchanged core
@@ -4705,3 +4696,12 @@ let step core = function
   |event->step core event
 ;;
 let host_fence_active core=core.host_fence
+
+let step core event =
+  let transition=step core event in
+  let scopes c=List.filter_map (fun id->scope_for_graph c ~graph_id:id) (resident_graphs c) in
+  let changed=transition.next.resident_enabled
+    && (not core.resident_enabled || scopes core<>scopes transition.next) in
+  if changed then {transition with effects=transition.effects @ [Publish(Resident_scopes_changed(scopes transition.next))]}
+  else transition
+;;

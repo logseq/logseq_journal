@@ -31,6 +31,7 @@
   melange-transit-native
   mtime
   ptime.clock.os
+  rrbvec
   unix
   uri
   x509
