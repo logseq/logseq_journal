@@ -2,14 +2,18 @@ module Ui = Journal_view
 module L = Lui_elements
 
 module Json = struct
-  type preview = { paths : string list; selected_index : int; document : bool option [@default None]; title : string option [@default None] }
+  type preview = { paths : string list; selected_index : int; session : int; document : bool option [@default None]; title : string option [@default None] }
   [@@deriving yojson]
-  type event = { event_type : string [@key "type"] } [@@deriving yojson]
-  let dismissed payload =
+  type event =
+    { event_type : string [@key "type"]
+    ; index : int option [@default None]
+    ; session : int option [@default None]
+    } [@@deriving yojson]
+  let event payload =
     try match Logseq_db_types.Json_codec.decode event_of_yojson (Yojson.Safe.from_string payload) with
-      | Ok { event_type = "dismiss" } -> true
-      | _ -> false
-    with Yojson.Json_error _ -> false
+      | Ok event -> Some event
+      | Error _ -> None
+    with Yojson.Json_error _ -> None
 end
 
 module Store = struct
@@ -190,6 +194,7 @@ type event =
   }
 
 let preview_slot = Signal.state_slot "journal-media-preview"
+let preview_session_slot = Signal.state_slot "journal-media-preview-session"
 let is_image_type = Journal_model.is_image_file_type
 
 let size_text size =
@@ -261,6 +266,14 @@ let view_content
     let preview =
       Signal.state_at context.ui_scheduler context.ui_state_scope preview_slot None
     in
+    let preview_session =
+      Signal.state_at context.ui_scheduler context.ui_state_scope preview_session_slot 0
+    in
+    let next_preview_session () =
+      let session = Signal.sample (Signal.value preview_session) + 1 in
+      Signal.set preview_session session;
+      session
+    in
     let selected_preview = ref [] in
     let unsubscribe_preview = ref (fun () -> ()) in
     let close_preview () =
@@ -268,6 +281,7 @@ let view_content
       selected_preview := [];
       !unsubscribe_preview ();
       (unsubscribe_preview := fun () -> ());
+      ignore (next_preview_session ());
       Signal.set preview None;
       List.iter
         (fun (owner, token, _, slot) ->
@@ -326,7 +340,8 @@ let view_content
           | (_, token, _, _) :: _ when token = item.token -> position
           | _ :: rest -> index (position + 1) rest
         in
-        Signal.set preview (Some (paths, index 0 group, is_image_type item.file_type));
+        let session = next_preview_session () in
+        Signal.set preview (Some (paths, index 0 group, is_image_type item.file_type, session));
         let subscriptions =
           List.map
             (fun ((owner, token, _, _) as member) ->
@@ -571,17 +586,27 @@ let view_content
             ~equal:( = )
             (function
               | None -> L.column ~width:0 ~height:0 []
-              | Some (paths, selected_index, image) ->
+              | Some (paths, selected_index, image, session) ->
                 let payload =
                   Json.preview_to_yojson
-                    { paths; selected_index; document = (if image then None else Some true)
+                    { paths; selected_index; session; document = (if image then None else Some true)
                     ; title = (if image then None else Some (Option.value title ~default:"Attachment")) }
                   |> Yojson.Safe.to_string
                 in
                 Journal_lui_native.image_preview
                   ~payload
                   ~on_event:(fun event ->
-                    if Json.dismissed event.payload then close_preview ())
+                    match Json.event event.payload with
+                    | Some { event_type = "dismiss"; _ } -> close_preview ()
+                    | Some { event_type = "select"; index = Some index; session = Some event_session } ->
+                      (match Signal.sample (Signal.value preview) with
+                       | Some (paths, selected, true, current_session)
+                         when event_session = current_session
+                           && event_session = Signal.sample (Signal.value preview_session)
+                           && index >= 0 && index < List.length paths && index <> selected ->
+                         Signal.set preview (Some (paths, index, true, current_session))
+                       | _ -> ())
+                    | _ -> ())
                   [])
             (Signal.value preview)
         ]

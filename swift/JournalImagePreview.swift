@@ -7,16 +7,22 @@ import UIKit
 #endif
 
 /// The OCaml owner retains every URL until this presentation closes. The native
-/// iOS page controller owns selection within one immutable image snapshot.
+/// iOS page controller reports completed selection within an immutable snapshot.
 @MainActor enum JournalImagePreview {
   struct Properties: Decodable {
     let paths: [String]
     let selected_index: Int
+    let session: Int?
     let document: Bool?
     let title: String?
   }
 
   private struct Event: Encodable { let type: String }
+  private struct SelectionEvent: Encodable {
+    let type: String
+    let index: Int
+    let session: Int
+  }
 
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
@@ -37,6 +43,13 @@ import UIKit
       }
     }
 
+    private func selected(_ index: Int, session: Int?) {
+      guard let session,
+        let data = try? JSONEncoder().encode(SelectionEvent(type: "select", index: index, session: session))
+      else { return }
+      JournalExtensions.emit(context: context, payload: data)
+    }
+
     var body: some SwiftUI.View {
       if let properties {
         let urls = properties.paths.map { URL(fileURLWithPath: $0) }
@@ -49,7 +62,9 @@ import UIKit
                 presented = false
               }.ignoresSafeArea()
             } else {
-              Pager(urls: urls, selectedIndex: properties.selected_index) {
+              Pager(urls: urls, selectedIndex: properties.selected_index, onSelect: {
+                selected($0, session: properties.session)
+              }) {
                 presented = false
               }.ignoresSafeArea()
             }
@@ -126,11 +141,14 @@ import UIKit
   struct Pager: UIViewControllerRepresentable {
     let urls: [URL]
     let selectedIndex: Int
+    let onSelect: (Int) -> Void
     let onClose: () -> Void
 
     func makeUIViewController(context: Context) -> UINavigationController {
       let screen = Screen(preview: Gallery(urls: urls, selectedIndex: selectedIndex))
+      screen.preview.onSelect = onSelect
       screen.onClose = { [weak screen] in
+        screen?.preview.stopSelection()
         screen?.save.close()
         onClose()
       }
@@ -146,6 +164,7 @@ import UIKit
       // A native List may discard temporary hosting instances. Teardown only
       // cancels their local work; SwiftUI owns the actual presentation dismissal.
       if let screen = navigation.viewControllers.first as? Screen {
+        screen.preview.stopSelection()
         screen.save.close()
         screen.onClose = nil
       }
@@ -209,13 +228,15 @@ import UIKit
     }
   }
 
-  final class Gallery: UIPageViewController, UIPageViewControllerDataSource {
+  final class Gallery: UIPageViewController, UIPageViewControllerDataSource, UIPageViewControllerDelegate {
     let urls: [URL]
+    var onSelect: ((Int) -> Void)?
 
     init(urls: [URL], selectedIndex: Int) {
       self.urls = urls
       super.init(transitionStyle: .scroll, navigationOrientation: .horizontal)
       dataSource = urls.count > 1 ? self : nil
+      delegate = self
       if !urls.isEmpty {
         let index = urls.indices.contains(selectedIndex) ? selectedIndex : 0
         setViewControllers(
@@ -226,6 +247,19 @@ import UIKit
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 
     var currentPage: ImagePage? { viewControllers?.first as? ImagePage }
+
+    func stopSelection() {
+      onSelect = nil
+      delegate = nil
+    }
+
+    func pageViewController(
+      _ pageViewController: UIPageViewController, didFinishAnimating finished: Bool,
+      previousViewControllers: [UIViewController], transitionCompleted completed: Bool
+    ) {
+      guard completed, let page = currentPage, urls.indices.contains(page.index) else { return }
+      onSelect?(page.index)
+    }
 
     override func viewDidLoad() {
       super.viewDidLoad()
