@@ -873,6 +873,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .accessibilityAddTraits(.isHeader)
         Spacer(minLength: controlsSize.width > 0 ? controlsSize.width + 16 : 0)
       }
+      #if os(iOS)
+      .background(Color(uiColor: .systemBackground))
+      #endif
     }
   }
 
