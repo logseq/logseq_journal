@@ -4758,9 +4758,14 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
             let ancestor_changed = deleted old_db <> deleted new_db || ancestry old_block <> ancestry new_block in
             let expand_ancestry = (forced || ancestor_changed) && not (Hashtbl.mem ancestry_visited key) in
             if expand_ancestry then Hashtbl.add ancestry_visited key ();
+            let entity_payload db = Option.map (entity_datoms db) (entity_of_uuid db uuid) in
+            let expand_references = fresh && (old_block <> new_block || old_page <> new_page
+              || (Option.is_none old_block && Option.is_none new_block
+                  && Option.is_none old_page && Option.is_none new_page)
+              || Hashtbl.mem revoked_identities key || entity_payload old_db <> entity_payload new_db) in
             List.iter (fun (db, attributes) ->
               match entity_of_uuid db uuid with None -> () | Some entity ->
-                if fresh then (
+                if expand_references then (
                   let inspect_refs attribute = enqueue (entity_jobs db
                     (Datascript.datoms db Datascript.Avet ~a:attribute ~v:(Datascript.Ref entity) ()) false) in
                   List.iter inspect_refs attributes;

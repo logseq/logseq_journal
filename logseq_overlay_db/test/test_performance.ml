@@ -60,11 +60,52 @@ let point_read_collects_real_samples _database snapshot =
   T.require (allocated > 0.) "point-read allocation counter is absent"
 ;;
 
+let timeline_content_edit_does_not_walk_reference_chain database =
+  let open T in
+  let behavior = "timeline content edit does not walk reference chain" in
+  let module J = Transit_core.Json in
+  let id n = T.status_uuid (1000 + n) in
+  let seed cursor first count =
+    let operations = List.init count (fun offset ->
+      let n = first + offset in
+      let entity = J.Int (40000 + n) in
+      [ T.status_add entity "block/uuid" (J.Uuid (Graph.Uuid.to_string (id n)))
+      ; T.status_add entity "block/title" (J.String "Reference chain")
+      ; T.status_add entity "block/parent" (T.status_lookup T.page_uuid)
+      ; T.status_add entity "block/page" (T.status_lookup T.page_uuid)
+      ; T.status_add entity "block/order" (J.String (Printf.sprintf "r%04d" n))
+      ; T.status_add entity "block/refs" (T.status_lookup (id (if n = 0 then 0 else n - 1)))
+      ]) |> List.concat in
+    T.apply_test_transaction database ~cursor operations
+  in
+  let edit ordinal =
+    let expected = T.delete_precondition database ~block:(id 0) ~behavior in
+    let before = Gc.allocated_bytes () in
+    ignore (T.commit_mutation database ~expected
+      (Save_block { mutation_id = T.mutation_uuid ordinal; block = id 0;
+                    title = Printf.sprintf "Edited %d" ordinal }) ~behavior);
+    Gc.allocated_bytes () -. before
+  in
+  seed 1 0 16;
+  ignore (edit 991);
+  let short_chain = edit 992 in
+  seed 2 16 112;
+  let long_chain = edit 993 in
+  Printf.eprintf "timeline reference-chain edit allocations: %.0f -> %.0f bytes\n%!"
+    short_chain long_chain;
+  T.require (long_chain < short_chain *. 3.)
+    "content edit allocation grew with unrelated reference chain: %.0f -> %.0f bytes"
+    short_chain long_chain
+;;
+
 let suite =
   [ Alcotest.test_case
       "manifest freezes every numeric gate"
       `Quick
       manifest_has_every_numeric_gate
+  ; T.database_case
+      "timeline content edit does not walk reference chain"
+      timeline_content_edit_does_not_walk_reference_chain
   ; T.snapshot_case
       "point read records wall time and allocations"
       point_read_collects_real_samples

@@ -1429,6 +1429,31 @@ let task_catalog_uses_database_identity database =
        | _ -> Alcotest.fail "pinned status catalog lost deleted entity")
 ;;
 
+let timeline_scopes_follow_property_class_identity database =
+  let behavior = "timeline scopes follow property class identity" in
+  let module J = Transit_core.Json in
+  let snapshot () = Database.current_snapshot database |> T.require_ok ~behavior in
+  let scope snapshot = Database.timeline_scope_version snapshot (Database.Page_roots T.page_uuid)
+    |> T.require_ok ~behavior in
+  let properties snapshot =
+    match Database.get_outline_blocks snapshot [T.property_holder_uuid] |> T.require_ok ~behavior with
+    | [Present_block {value;_}] -> value.block.properties
+    | _ -> Alcotest.fail "property holder is missing" in
+  let before = snapshot () in
+  let old_scope = scope before in
+  let old_properties = properties before in
+  T.require (List.exists (fun (property : Graph.property_summary) -> property.ident = "test.property/default")
+    old_properties) "fixture has no default property summary";
+  T.apply_test_transaction database ~cursor:1
+    [T.status_add (J.Keyword "logseq.class/Property") "db/ident" (J.Keyword "test.class/FormerProperty")];
+  let after = snapshot () in
+  Fun.protect ~finally:(fun () -> Database.release_snapshot before; Database.release_snapshot after)
+    (fun () ->
+      T.require (old_properties <> properties after) "property class change did not alter the block DTO";
+      T.require (not (Database.equal_timeline_scope_version old_scope (scope after)))
+        "property class change retained the old timeline scope version")
+;;
+
 let timeline_scopes_follow_local_payload_and_snapshot database =
   let behavior = "timeline scopes follow local payload and snapshots" in
   let before = Database.current_snapshot database |> T.require_ok ~behavior in
@@ -1732,7 +1757,8 @@ let timeline_history_retirement_recovers database =
 ;;
 
 let cases =
-  [ T.database_case "timeline history retirement recovers" timeline_history_retirement_recovers
+  [ T.database_case "timeline property class identity invalidates scopes" timeline_scopes_follow_property_class_identity
+  ; T.database_case "timeline history retirement recovers" timeline_history_retirement_recovers
   ; T.database_case "timeline large dependency fanout keeps authority" timeline_large_dependency_fanout_keeps_authority
   ; T.database_case "timeline overlay roots follow remote page metadata" timeline_overlay_roots_follow_remote_page_metadata
   ; T.database_case "timeline remote scopes cover metadata moves and ABA" timeline_remote_scopes_cover_metadata_moves_and_aba
