@@ -156,6 +156,17 @@ let timeline_scope_key = function
   | Page_roots uuid -> "roots:" ^ Graph.Uuid.to_string uuid
   | Parent_children uuid -> "children:" ^ Graph.Uuid.to_string uuid
 
+type timeline_history =
+  { versions : int Uuid_map.t
+  ; count : int
+  ; retirement : int
+  }
+
+let empty_timeline_history () =
+  Array.make 64 { versions = Uuid_map.empty; count = 0; retirement = 0 }
+
+let timeline_bucket key = Hashtbl.hash key mod 64
+
 type t =
   { lock : Eio.Mutex.t
   ; task_catalog_cache : task_catalog_cache option Atomic.t
@@ -175,9 +186,8 @@ type t =
   ; mutable closed : bool
   ; generation : Types.generation
   ; mutable projection : int
-  ; mutable timeline_versions : int Uuid_map.t
+  ; mutable timeline_versions : timeline_history array
   ; mutable timeline_serial : int
-  ; mutable timeline_scope_count : int
   ; mutable timeline_proof_available : bool
   ; mutable timeline_authoritative : Datascript.db
   ; authoritative_connection : Datascript.conn
@@ -201,7 +211,7 @@ type t =
 and snapshot =
   { owner : t
   ; version : Types.snapshot_version
-  ; mutable timeline_versions : int Uuid_map.t
+  ; mutable timeline_versions : timeline_history array
   ; timeline_proof_available : bool
   ; mutable authoritative_database : Datascript.db option
   ; mutable outbox : outbox_record list option
@@ -2133,7 +2143,7 @@ let record_has_active_dependency_shadows (record : outbox_record) =
 ;;
 
 let clear_snapshot_roots (snapshot : snapshot) =
-  snapshot.timeline_versions <- Uuid_map.empty;
+  snapshot.timeline_versions <- empty_timeline_history ();
   snapshot.authoritative_database <- None;
   snapshot.outbox <- None;
   snapshot.block_effects <- None;
@@ -2149,8 +2159,7 @@ let close database =
       then false, [], [], []
       else (
         database.closed <- true;
-        database.timeline_versions <- Uuid_map.empty;
-        database.timeline_scope_count <- 0;
+        database.timeline_versions <- empty_timeline_history ();
         database.release_slot := None;
         let callback_waiters =
           List.filter_map
@@ -4490,18 +4499,20 @@ let get_structure snapshot request =
              (paginate_page_tree snapshot ~page ~maximum_depth ~limit ~offset))))
 ;;
 
-let timeline_scope_version snapshot scope =
-  with_snapshot_read snapshot (fun snapshot ->
-    if not snapshot.timeline_proof_available then Error Types.Read_limit_exceeded
-    else Ok (Printf.sprintf "timeline:v1:%s:%d"
-      (Types.Generation.to_string snapshot.version.generation)
-      (Option.value (Uuid_map.find_opt (timeline_scope_key scope) snapshot.timeline_versions) ~default:0)))
-
 let timeline_version_at (snapshot : snapshot) scope =
   if not snapshot.timeline_proof_available then Error Types.Read_limit_exceeded
-  else Ok (Printf.sprintf "timeline:v1:%s:%d"
-    (Types.Generation.to_string snapshot.version.generation)
-    (Option.value (Uuid_map.find_opt (timeline_scope_key scope) snapshot.timeline_versions) ~default:0))
+  else
+    let key = timeline_scope_key scope in
+    let history = snapshot.timeline_versions.(timeline_bucket key) in
+    let kind, serial = match Uuid_map.find_opt key history.versions with
+      | Some serial -> "written", serial
+      | None -> "retained", history.retirement in
+    Ok (Printf.sprintf "timeline:v2:%s:%s:%d"
+      (Types.Generation.to_string snapshot.version.generation) kind serial)
+;;
+
+let timeline_scope_version snapshot scope =
+  with_snapshot_read snapshot (fun snapshot -> timeline_version_at snapshot scope)
 ;;
 
 let get_timeline_journals snapshot ~from_day ~through_day ~limit ~after =
@@ -4671,7 +4682,7 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
     let reference_attributes db = Datascript.schema db |> List.filter_map (fun (attribute,(schema : Datascript.schema_attr)) ->
       if schema.value_type = Some Datascript.RefType && attribute <> "block/parent" && attribute <> "block/page"
       then Some attribute else None) in
-    let attributes = List.sort_uniq String.compare (reference_attributes old_db @ reference_attributes new_db) in
+    let databases = [old_db, reference_attributes old_db; new_db, reference_attributes new_db] in
     let old_context = ref (read_context before) and new_context = ref (read_context after) in
     let batch_size = 128 in
     let in_batch = ref 0 in
@@ -4686,15 +4697,21 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
     try
       if database.timeline_serial = Int.max_int then raise Timeline_proof_limit;
       let serial = database.timeline_serial + 1 in
-      let versions = ref database.timeline_versions in
-      let count = ref database.timeline_scope_count in
+      let versions = Array.copy database.timeline_versions in
       let mark scope =
         let key = timeline_scope_key scope in
-        if Uuid_map.find_opt key !versions <> Some serial then (
-          if not (Uuid_map.mem key !versions) then (
-            if !count >= 200_000 then raise Timeline_proof_limit;
-            incr count);
-          versions := Uuid_map.add key serial !versions)
+        let bucket = timeline_bucket key in
+        let history = versions.(bucket) in
+        if Uuid_map.find_opt key history.versions <> Some serial then (
+          let present = Uuid_map.mem key history.versions in
+          let history =
+            if not present && history.count = 64 then
+              { versions = Uuid_map.empty; count = 0; retirement = serial }
+            else history in
+          versions.(bucket) <-
+            { history with
+              versions = Uuid_map.add key serial history.versions
+            ; count = history.count + if present then 0 else 1 })
       in
       let mark_parent parent = mark (Parent_children parent); mark (Page_roots parent) in
       let parent_of = function None -> None | Some (record : Types.block_record) -> Some record.block.parent in
@@ -4741,7 +4758,7 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
             let ancestor_changed = deleted old_db <> deleted new_db || ancestry old_block <> ancestry new_block in
             let expand_ancestry = (forced || ancestor_changed) && not (Hashtbl.mem ancestry_visited key) in
             if expand_ancestry then Hashtbl.add ancestry_visited key ();
-            List.iter (fun db ->
+            List.iter (fun (db, attributes) ->
               match entity_of_uuid db uuid with None -> () | Some entity ->
                 if fresh then (
                   let inspect_refs attribute = enqueue (entity_jobs db
@@ -4758,12 +4775,11 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
                    | Seq.Cons _ ->
                      mark_parent uuid;
                      List.iter mark_parent (List.filter_map Fun.id [parent_of old_block;parent_of new_block]));
-                  enqueue (entity_jobs db children true))) [old_db;new_db]);
+                  enqueue (entity_jobs db children true))) databases);
           drain ()
       in
       drain ();
-      database.timeline_versions <- !versions;
-      database.timeline_scope_count <- !count;
+      database.timeline_versions <- versions;
       database.timeline_serial <- serial
     with Timeline_proof_limit -> database.timeline_proof_available <- false)
 ;;
@@ -6358,9 +6374,8 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                      ; closed = false
                      ; generation = current_generation
                      ; projection = 0
-                     ; timeline_versions = Uuid_map.empty
+                     ; timeline_versions = empty_timeline_history ()
                      ; timeline_serial = 0
-                     ; timeline_scope_count = 0
                      ; timeline_proof_available = true
                      ; timeline_authoritative = authoritative_database
                      ; authoritative_connection

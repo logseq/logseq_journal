@@ -1654,8 +1654,86 @@ let timeline_large_dependency_fanout_keeps_authority database =
           "a second large fanout invalidated an unrelated missing scope")))
 ;;
 
+let timeline_history_retirement_recovers database =
+  let behavior = "timeline history retirement recovers" in
+  let module J = Transit_core.Json in
+  let id ordinal = T.uuid (Printf.sprintf "78000000-0000-4000-8000-%012d" ordinal) in
+  let version snapshot ordinal =
+    Database.timeline_scope_version snapshot (Database.Parent_children (id ordinal))
+    |> T.require_ok ~behavior in
+  let parent = id 900000 in
+  let seed ordinal parent order =
+    let entity = J.Int (1900000 + ordinal) in
+    [ T.status_add entity "block/uuid" (J.Uuid (Graph.Uuid.to_string (id ordinal)));
+      T.status_add entity "block/title" (J.String "Pinned history member");
+      T.status_add entity "block/order" (J.String order);
+      T.status_add entity "block/parent" (T.status_lookup parent);
+      T.status_add entity "block/page" (T.status_lookup T.page_uuid) ] in
+  T.apply_test_transaction database ~cursor:1
+    (seed 900000 T.page_uuid "a1" @ seed 900001 parent "a1" @ seed 900002 parent "a2");
+  let read snapshot after =
+    Database.get_timeline_children snapshot ~parent ~limit:1 ~after |> T.require_ok ~behavior in
+  let pinned = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect ~finally:(fun () -> Database.release_snapshot pinned) (fun () ->
+    let first, continuation = read pinned None in
+    let continuation = match continuation with Some value -> value
+      | None -> Alcotest.fail "history fixture did not produce a continuation" in
+    let second, _ = read pinned (Some continuation) in
+    let written = version pinned 900000 in
+    let written_retired = ref false in
+    let original = Array.init 512 (fun ordinal -> version pinned ordinal) in
+    let previous = ref original in
+    for round = 0 to 2 do
+      for batch = 0 to 35 do
+        let operations = List.init 64 (fun index ->
+          let ordinal = 10000 + round * 5000 + batch * 64 + index in
+          let parent = J.Int (100000 + ordinal * 2) in
+          let child = J.Int (100001 + ordinal * 2) in
+          [ T.status_add parent "block/uuid" (J.Uuid (Graph.Uuid.to_string (id ordinal)));
+            T.status_add parent "block/title" (J.String "History parent");
+            T.status_add parent "block/order" (J.String (string_of_int ordinal));
+            T.status_add parent "block/parent" (T.status_lookup T.page_uuid);
+            T.status_add parent "block/page" (T.status_lookup T.page_uuid);
+            T.status_add child "block/uuid" (J.Uuid (Graph.Uuid.to_string (id (ordinal + 100000))));
+            T.status_add child "block/title" (J.String "History child");
+            T.status_add child "block/order" (J.String "a1");
+            T.status_add child "block/parent" (T.status_lookup (id ordinal));
+            T.status_add child "block/page" (T.status_lookup T.page_uuid) ]) |> List.concat in
+        T.apply_test_transaction database ~cursor:(2 + round * 36 + batch) operations
+      done;
+      let current = Database.current_snapshot database |> T.require_ok ~behavior in
+      Fun.protect ~finally:(fun () -> Database.release_snapshot current) (fun () ->
+        if not (Database.equal_timeline_scope_version written (version current 900000)) then (
+          written_retired := true;
+          (match Database.get_timeline_children current ~parent ~limit:1 ~after:(Some continuation) with
+           | Error Stale_read_cursor -> ()
+           | _ -> Alcotest.fail "an evicted written scope accepted its old continuation");
+          let recovered, next = read current None in
+          T.require (recovered = first) "history retirement changed recovered payload";
+          let recovered_second, _ = read current next in
+          T.require (recovered_second = second) "fresh pagination did not recover after retirement");
+        T.require (fst (read pinned (Some continuation)) = second)
+          "history retirement broke a pinned continuation";
+        let fresh = Array.init 512 (fun ordinal -> version current ordinal) in
+        T.require (Array.exists Fun.id (Array.mapi (fun ordinal value ->
+          not (Database.equal_timeline_scope_version value (!previous).(ordinal))) fresh))
+          "historical scope capacity did not retire any old missing-scope proof";
+        Array.iteri (fun ordinal value ->
+          T.require (Database.equal_timeline_scope_version value (version current ordinal))
+            "a recovered read did not retain a stable proof";
+          T.require (Database.equal_timeline_scope_version original.(ordinal) (version pinned ordinal))
+            "history retirement changed a pinned snapshot";
+          if not (Database.equal_timeline_scope_version (!previous).(ordinal) original.(ordinal)) then
+            T.require (not (Database.equal_timeline_scope_version value original.(ordinal)))
+              "a retired proof reused its original identity") fresh;
+        previous := fresh)
+    done;
+    T.require !written_retired "history pressure did not evict the written scope")
+;;
+
 let cases =
-  [ T.database_case "timeline large dependency fanout keeps authority" timeline_large_dependency_fanout_keeps_authority
+  [ T.database_case "timeline history retirement recovers" timeline_history_retirement_recovers
+  ; T.database_case "timeline large dependency fanout keeps authority" timeline_large_dependency_fanout_keeps_authority
   ; T.database_case "timeline overlay roots follow remote page metadata" timeline_overlay_roots_follow_remote_page_metadata
   ; T.database_case "timeline remote scopes cover metadata moves and ABA" timeline_remote_scopes_cover_metadata_moves_and_aba
   ; T.database_case "timeline local scope versions bind payload and snapshots" timeline_scopes_follow_local_payload_and_snapshot

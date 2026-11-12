@@ -1591,7 +1591,13 @@ let test_client_to_typed_read () =
                result
            in
            if more
-           then membership_page (page + 1) seen (child_request output)
+           then membership_page (page + 1) seen (List.find
+             (fun request ->
+                match Journal_graph_runtime.worker_read business request with
+                | Some (Journal_graph_runtime.Read { query = W.Child_members { parent; _ }; _ }) ->
+                  W.Uuid.equal parent favorite_page_id
+                | _ -> false)
+             output.requests)
            else (
              require
                (page = 1 && List.length seen = 2)
@@ -4658,6 +4664,9 @@ let test_retired_query_has_correlated_response () =
 ;;
 
 let () =
+  if Array.mem "--typed-read-only" Sys.argv then (
+    test_client_to_typed_read ();
+    print_endline "Worker coordination real typed client/read passed (1 test)"; exit 0);
   test_cleanup_transport_causes();
   if Array.mem "--cleanup-causes-only" Sys.argv then exit 0;
   if Array.mem "--auth-session-only" Sys.argv then (

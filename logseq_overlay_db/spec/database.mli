@@ -348,7 +348,21 @@ val get_structure
     captured by snapshots and read by bounded map lookup. Equality covers the raw
     DTOs and enumeration, including empty/missing scopes. Versions never reuse an
     earlier value during this database owner lifetime. No collection scan or
-    global projection revision is used as freshness evidence. *)
+    global projection revision is used as freshness evidence.
+
+    Historical entries are bounded to 4096 (64 hash buckets of 64 entries),
+    matching the worker's maximum retained receipt-check budget. Filling a bucket
+    retires its history, not the database owner. Receipts for that bucket may
+    therefore become stale without a DTO change; a fresh read recovers normally.
+    Missing entries use a bucket retirement identity, never a reused zero version.
+    Capacity retirement does not change versions in other buckets. Reads never
+    register scopes or mutate either live history or a snapshot.
+
+    Each snapshot pins at most 4096 entries and 64 bucket headers, with immutable
+    map nodes shared across snapshots. Total retained history is bounded by
+    4096 times the number of distinct live snapshot roots plus the live database;
+    this is not an owner-wide bound independent of borrowed snapshot count.
+    Release every borrowed snapshot to release its history roots. *)
 type timeline_scope =
   | Journal_index
   | Page_roots of Graph.page_uuid
