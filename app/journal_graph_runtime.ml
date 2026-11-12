@@ -746,6 +746,7 @@ let feed_ports t =
     }
 ;;
 
+
 let worker_error code request_id message =
   Error.create ~code ~message ~details:[]
   |> Result.fold ~ok:Fun.id ~error:(fun _ ->
@@ -1312,6 +1313,77 @@ let dispatch_output t output =
       else Some (issue_request t request)
     | None | Some _ -> None) output.requests in
   { output with requests = foreground @ drain_hydration t }
+;;
+
+let retire_timeline t ~before ~after =
+  let pages,entries = Journal_timeline_state.retired ~before ~after in
+  if Rrbvec.is_empty pages && Rrbvec.is_empty entries then empty else (
+    let detail_pages = Hashtbl.create (Hashtbl.length t.children_interests) in
+    Hashtbl.iter (fun _ (interest:children_interest) ->
+      Hashtbl.replace detail_pages (Graph.Uuid.to_string interest.page.uuid) ()) t.children_interests;
+    let retained_blocks = Hashtbl.create (Rrbvec.length entries) in
+    let iter_blocks f (entry:Projection.timeline_entry) =
+      f (Journal_model.id entry.block);
+      List.iter (fun (child:Projection.child_summary) -> f child.block_id) entry.child_summaries in
+    Rrbvec.iter (fun (_,replacement) -> Option.iter
+      (iter_blocks (fun id -> Hashtbl.replace retained_blocks id ())) replacement) entries;
+    let retired_blocks = Hashtbl.create (Rrbvec.length entries) in
+    Rrbvec.iter (fun ((entry:Projection.timeline_entry),_) ->
+      if not (Hashtbl.mem detail_pages (Journal_model.page_id entry.block)) then
+        iter_blocks (fun id -> if not (Hashtbl.mem retained_blocks id) then
+          Hashtbl.replace retired_blocks id ()) entry) entries;
+    Hashtbl.iter (fun id () ->
+      Hashtbl.remove t.projected_blocks id;
+      Hashtbl.remove t.block_revisions id;
+      Hashtbl.remove t.tag_titles id;
+      Hashtbl.remove t.changed_point_epochs id) retired_blocks;
+    if Hashtbl.length retired_blocks > 0 then
+      t.block_pages <- List.filter (fun (id,_) -> not (Hashtbl.mem retired_blocks id)) t.block_pages;
+    let retired_pages = Hashtbl.create (Rrbvec.length pages) in
+    Rrbvec.iter (fun (page:Projection.page) ->
+      Hashtbl.remove t.page_tree_interests page.id;
+      if not (Hashtbl.mem detail_pages page.id) then (
+        Hashtbl.replace retired_pages page.id ();
+        Hashtbl.remove t.graph_pages page.id;
+        Hashtbl.remove t.page_revisions page.id)) pages;
+    if Hashtbl.length retired_pages > 0 then
+      t.pages <- List.filter (fun (id,_) -> not (Hashtbl.mem retired_pages id)) t.pages;
+    if not (Journal_timeline_state.has_retained after) then Feed.reset t.feed else
+      Feed.retire t.feed ~ports:(feed_ports t)
+        ~pages:(Rrbvec.map (fun (page:Projection.page) -> page.id) pages) ~entries
+        ~pending:(Hashtbl.to_seq_values t.pending |> Seq.filter_map (fun pending ->
+          match pending.operation with Feed_read operation -> Some operation | _ -> None));
+    let retired_requests = Hashtbl.create 8 in
+    let rec prune output =
+      let stale = Hashtbl.to_seq t.pending |> Seq.filter_map (fun (key,pending) ->
+        match pending.operation with Feed_read operation when not (Feed.is_current t.feed operation) ->
+          Some (key,pending,operation) | _ -> None) |> Rrbvec.of_seq in
+      if Rrbvec.is_empty stale then output else (
+        let output = Rrbvec.fold_left (fun output (key,pending,operation) ->
+          Hashtbl.remove t.pending key;
+          Hashtbl.remove t.hydration_active key;
+          Hashtbl.replace retired_requests pending.original ();
+          let previous = t.application_context and children = ref Rrbvec.empty in
+          t.application_context <- Option.map (fun token -> token,pending.original,children)
+            pending.change_application;
+          let next = Fun.protect ~finally:(fun () -> t.application_context <- previous)
+            (fun () -> Feed.superseded t.feed ~ports:(feed_ports t) operation |> feed_output) in
+          Option.iter (fun token ->
+            if not (Rrbvec.is_empty !children) then
+              t.on_change (Coordination.Change_consumer_expanded (token,pending.original,!children));
+            t.on_change (Coordination.Change_consumer_retired (token,pending.original))) pending.change_application;
+          let next = if pending.background then background_demands t next else next in
+          {requests=next.requests @ output.requests;responses=next.responses @ output.responses}) output stale in
+        prune output) in
+    let output = prune empty in
+    let keep id = not (Hashtbl.mem retired_requests id) in
+    Option.iter (fun (_,_,children) -> children := Rrbvec.filter keep !children) t.application_context;
+    Hashtbl.iter (fun _ pending -> pending.external_children <- Rrbvec.filter keep pending.external_children) t.pending;
+    for _ = 1 to Queue.length t.hydration_queue do
+      let id = Queue.pop t.hydration_queue in
+      if Hashtbl.mem t.pending (Graph.Uuid.to_string id) then Queue.push id t.hydration_queue
+    done;
+    dispatch_output t output)
 ;;
 
 let capture_chain t ~(command:Projection.capture) =

@@ -7353,8 +7353,24 @@ let start
       calendar=root.calendar;environment=root.environment} in
   let process_transition ~visible model transition =
     Option.iter activate_runtime (timeline_scope model);
+    let before = model in
     let model,eff=transition model in
     Option.iter activate_runtime (timeline_scope model);
+    let retirement = if model_key before = model_key model
+      && before.graph_state.graph_id = model.graph_state.graph_id
+      && before.graph_state.generation = model.graph_state.generation
+      && Option.exists (fun (owner:Graph_service.timeline_scope) ->
+        before.graph_state.graph_id = Some owner.graph_id
+        && before.graph_state.generation = owner.graph_generation) (timeline_scope before) then
+      Journal_graph_runtime.retire_timeline (!graph_runtime_cell)
+        ~before:before.timeline ~after:model.timeline
+      else Journal_graph_runtime.{requests=[];responses=[]} in
+    let eff = if retirement.requests=[] && retirement.responses=[] then eff else Effect.many
+      [ Effect.of_thunk (fun () ->
+          let delivery = deliver_output retirement in
+          if delivery.responses<>[] then
+            Effect.run (apply_graph_responses set_state_and_effect delivery.responses))
+      ; eff ] in
     let previous= !processing_owner in
     processing_owner:=timeline_scope model;
     if visible then (

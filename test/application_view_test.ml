@@ -7742,8 +7742,18 @@ let test_graph_picker_controls scenario () =
             ("picker patch references live native " ^ field) true
             (Hashtbl.mem props (member field op |> to_int))) ["parent";"child"]
         | _ -> ()) in
+  let rec in_graph_page id =
+    let graph_page = match Hashtbl.find_opt props id with
+      | Some fields -> (match List.assoc_opt "payload" fields with
+        | Some (`String payload) -> (try Yojson.Safe.Util.(Yojson.Safe.from_string payload |> member "mode") = `String "graph-pages" with _ -> false)
+        | _ -> false)
+      | None -> false in
+    graph_page || match Hashtbl.find_opt page_parents id with
+      | Some parent -> in_graph_page parent
+      | None -> false in
   let find key value = Hashtbl.fold (fun id values found ->
-    if List.assoc_opt key values = Some (`String value) then Some id else found) props None in
+    if List.assoc_opt key values = Some (`String value)
+       && (value <> "Sign out" || not (in_graph_page id)) then Some id else found) props None in
   let node name = match find "accessibility-identifier" name with
     | Some id -> id | None -> failwith ("Missing " ^ name) in
   let picker_list () =

@@ -93,6 +93,11 @@ val validate_retained : t -> ports:ports -> request_generation:int64 -> refresh:
     initial-feed refresh demand after a successful retained-window check. *)
 
 val reset : t -> unit
+val retire : t -> ports:ports -> pages:string Rrbvec.t -> entries:(Projection.timeline_entry * Projection.timeline_entry option) Rrbvec.t -> pending:operation Seq.t -> unit
+(** Remove absent UI pages/roots and their proofs, prefixes, cursors and page
+    epochs before interpreting more completions. Pending scan accumulators are
+    pruned too; surviving pages keep their receipts and active read demand.
+    Preview-only replacement preserves the retained parent's current proof. *)
 val is_current : t -> operation -> bool
 val superseded : t -> ports:ports -> operation -> output
 

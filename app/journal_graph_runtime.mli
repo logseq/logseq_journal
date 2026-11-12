@@ -141,6 +141,10 @@ type output =
     can supply an explicit pure coordinator snapshot. *)
 val create : ?on_change:(Journal_worker_coordination.Worker_pure_coordinator.event -> unit) -> ?on_projection_changes:(Worker_pure_data.change_window list -> unit) -> ?localtime:(float -> Unix.tm) -> ?validate_session:(Journal_worker_coordination.Worker_api.session -> (unit, Journal_worker_coordination.Worker_api.error) result) -> unit -> t
 val reset : t -> unit
+(** Retire absent Timeline ownership before interpreting further completions.
+    Deliver the returned output: surviving reads may need a replacement check.
+    Removed reads release their business payloads and retire change consumers. *)
+val retire_timeline : t -> before:Journal_timeline_state.t -> after:Journal_timeline_state.t -> output
 val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_types.Graph_types.Uuid.t
 val submit : ?capture_chain:Journal_graph_mutation_confirmation.Pure_insertion.t ->

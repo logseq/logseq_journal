@@ -8452,6 +8452,313 @@ let pending_retained_assembly_check runtime fixture =
   |> fun output -> only "retained assembly check" output.requests
 ;;
 
+(* Runtime owns Timeline interests and serialized read eligibility. These pure
+   calls use its public planner/completion boundary, without an effect runner. *)
+let retirement_probe runtime =
+  Runtime.reconcile_signal runtime ~request_generation:990L
+    (Worker_pure_data.Resync_required {generation="generation-1";reason="retirement probe"})
+;;
+
+let receipt_count runtime (output : Runtime.output) =
+  List.fold_left (fun count request -> match Runtime.worker_read runtime request with
+    | Some (Runtime.Read {query=W.Timeline_check receipts;_}) -> count + Rrbvec.length receipts
+    | _ -> count) 0 output.requests
+;;
+
+let probe_receipts runtime =
+  let output = retirement_probe runtime in
+  let count = receipt_count runtime output in
+  List.iter (Runtime.abandon runtime) output.requests;
+  count
+;;
+
+let retained_feed feed =
+  let module T = Journal_timeline_state in
+  T.empty ~today:20260901
+  |> fun state -> T.begin_request state ~generation:989L (T.Feed {cursor=None})
+  |> fun state -> T.apply_feed state ~generation:989L feed
+;;
+
+let test_retirement_preserves_hidden_rows () =
+  let module T = Journal_timeline_state in
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let first = root_fixture 0 2 0 and second = root_fixture 1 1 0 in
+  let feed,_ = drive_roots runtime [first;second] (initial_roots runtime 989L) in
+  let before = retained_feed feed in
+  Alcotest.(check int) "initial retained receipts" 6 (probe_receipts runtime);
+  let second_page = List.find (fun (d:Journal_graph_projection.day_feed) ->
+    d.page.id = Graph.Uuid.to_string second.owner.uuid) feed.days in
+  let hidden = Journal_graph_projection.block ~page:second_page.page ~revision:"hidden"
+      ~child_count:0 ~time_context:{localtime=Unix.gmtime}
+      {(List.hd second.roots).block with title=""} |> Result.get_ok in
+  let after = T.replace_block before hidden
+    |> fun state -> T.remove_block state ~block_id:(Graph.Uuid.to_string (List.hd first.roots).block.uuid) in
+  ignore (Runtime.retire_timeline runtime ~before ~after);
+  Alcotest.(check bool) "hidden placeholder remains addressable" true
+    (Option.is_some (T.find_block after ~block_id:(Journal_model.id hidden)));
+  Alcotest.(check int) "only the removed root preview is retired" 5 (probe_receipts runtime);
+  ignore (Runtime.retire_timeline runtime ~before:after ~after:(T.observe_visible_range after ~first_index:0 ~last_exclusive:1));
+  Alcotest.(check int) "scroll demand preserves retained proofs" 5 (probe_receipts runtime)
+;;
+
+let test_retirement_removes_pages_and_late_installs () =
+  let module T = Journal_timeline_state in
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let first = root_fixture 0 1 0 and second = root_fixture 1 1 0 in
+  let feed,_ = drive_roots runtime [first;second] (initial_roots runtime 989L) in
+  let before = retained_feed feed in
+  let old = pending_retained_assembly_check runtime first in
+  let reply = Worker_producer.transport runtime old |> Result.get_ok |> check_sample in
+  let after = T.empty ~today:20260901 in
+  ignore (Runtime.retire_timeline runtime ~before ~after);
+  let probe = retirement_probe runtime in
+  Alcotest.(check int) "all receipts retire with the absent window" 0 (receipt_count runtime probe);
+  let roots = List.filter (fun request -> match Runtime.worker_read runtime request with
+    | Some (Runtime.Read {query=W.Timeline_read {query=W.Timeline.Roots _;_};_}) -> true
+    | _ -> false) probe.requests in
+  Alcotest.(check int) "absent page interests schedule no root reads" 0 (List.length roots);
+  List.iter (Runtime.abandon runtime) probe.requests;
+  ignore (drive_roots runtime [first;second] (initial_roots runtime 991L));
+  let late = Worker_producer.deliver runtime old (fun _ -> reply) in
+  Alcotest.(check int) "retired check cannot install into the same page identity" 0 (List.length late.responses);
+  Alcotest.(check int) "retired check creates no replacement requests" 0 (List.length late.requests);
+  Alcotest.(check int) "reloaded receipts are not inflated by old proofs" 5 (probe_receipts runtime);
+  Runtime.reset runtime;
+  Alcotest.(check int) "owner reset retains no receipts" 0 (probe_receipts runtime)
+;;
+
+let test_retirement_fences_page_aba_without_losing_siblings () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let first = root_fixture 0 1 0 and second = root_fixture 1 1 0 in
+  let feed,_ = drive_roots runtime [first;second] (initial_roots runtime 989L) in
+  let before = retained_feed feed in
+  let old = only "held changed root read" (hydration_requests runtime
+    (changed runtime (window ~scopes:[Worker_pure_data.V2_page_tree_interest first.owner.uuid] ()))) in
+  let packet = sample old (fixture_root_tree runtime first old) in
+  let after = retained_feed {feed with days=List.filter
+    (fun (day:Journal_graph_projection.day_feed) -> day.page.id=Graph.Uuid.to_string second.owner.uuid) feed.days} in
+  ignore (Runtime.retire_timeline runtime ~before ~after);
+  let probe = retirement_probe runtime in
+  Alcotest.(check int) "surviving page keeps its root and preview proofs" 3 (receipt_count runtime probe);
+  Alcotest.(check int) "retired interest creates no replacement root request" 0
+    (List.length (List.filter (fun request -> match Runtime.worker_read runtime request with
+      | Some (Runtime.Read {query=W.Timeline_read {query=W.Timeline.Roots _;_};_}) -> true
+      | _ -> false) probe.requests));
+  List.iter (Runtime.abandon runtime) probe.requests;
+  ignore (drive_roots runtime [first;second] (initial_roots runtime 991L));
+  let late = deliver_sample runtime packet in
+  Alcotest.(check int) "old page incarnation cannot publish" 0 (List.length late.responses);
+  Alcotest.(check int) "old page incarnation cannot continue previews" 0 (List.length late.requests)
+;;
+
+let test_replaced_date_query_retires_old_receipts () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixtures = List.init 3 (fun i -> root_fixture i 1 0) in
+  let feed,_ = drive_roots runtime fixtures
+    (Runtime.submit runtime (Journal_graph_request.Load_feed
+      {cursor=None;root_limit=2;day_limit=7;request_generation=989L})) in
+  Alcotest.(check int) "two retained pages and their date query" 5 (probe_receipts runtime);
+  ignore (drive_roots runtime fixtures
+    (Runtime.submit runtime (Journal_graph_request.Load_feed
+      {cursor=feed.continuation;root_limit=30;day_limit=7;request_generation=990L})));
+  Alcotest.(check int) "replacement date query keeps one receipt and all three pages" 7 (probe_receipts runtime)
+;;
+
+let hold_retirement_reply runtime request produce =
+  match Runtime.worker_read runtime request with
+  | Some (Runtime.Read {query;maximum_items}) ->
+    let budget = Worker_producer.budget maximum_items in
+    let operation = W.Query (budget,query) in
+    let source = Worker_producer.I.request Worker_producer.session
+      ~request_id:(W.request_id request) operation |> Result.get_ok in
+    (match Worker_producer.I.reply Worker_producer.session
+      ~request_id:(W.request_id request) operation (produce source) with
+     | Ok (W.Answered (Ok value)) -> Runtime.Query_result (query,value)
+     | _ -> Alcotest.fail "could not hold the original typed retirement reply")
+  | _ -> Alcotest.fail "retirement reply needs a dispatched read"
+;;
+
+let test_full_retirement_revokes_catalog kind () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixtures = List.init 2 (fun i -> root_fixture i 1 0) in
+  let feed,_ = drive_roots runtime fixtures (initial_roots runtime 989L) in
+  let before = retained_feed feed in
+  let journal fixture = Worker_pure_data.{page=fixture.owner;
+    journal_day=(match fixture.owner.kind with Journal_page {journal_day}->journal_day|_->assert false);
+    revision="page-1"} in
+  let old,produce = match kind with
+    | `Dates -> only "held catalog" (initial_roots runtime 990L).requests,
+      journal_sample ~items:(List.map journal fixtures) ~next:None
+    | `Today ->
+      let dates = only "future catalog" (initial_roots runtime 990L).requests in
+      let output = Worker_producer.deliver runtime dates
+        (journal_sample ~items:[journal (List.hd fixtures)] ~next:(Some (root_cursor 1))) in
+      only "priority Today read" output.requests,
+      journal_sample ~items:[] ~next:None
+    | `Publish ->
+      let output = retirement_probe runtime in
+      let check = only "retained window validation" (List.filter (fun request ->
+        match Runtime.worker_read runtime request with
+        | Some (Runtime.Read {query=W.Timeline_check _;_})->true|_->false) output.requests) in
+      List.iter (fun request -> if request<>check then Runtime.abandon runtime request) output.requests;
+      let dates = Worker_producer.deliver runtime check check_sample
+        |> fun output -> only "validated prefix catalog" output.requests in
+      let output = Worker_producer.deliver runtime dates
+        (journal_sample ~items:(List.map journal fixtures) ~next:None) in
+      only "reused prefix publication check" output.requests,check_sample
+  in
+  let reply = hold_retirement_reply runtime old produce in
+  ignore (Runtime.retire_timeline runtime ~before ~after:(Journal_timeline_state.empty ~today:20260901));
+  Alcotest.(check bool) "full retirement releases the original request and payload" true
+    (Runtime.worker_read runtime old=None);
+  let late = Runtime.receive_worker_read runtime ~request_id:old reply in
+  Alcotest.(check int) "retired traversal emits no requests" 0 (List.length late.requests);
+  Alcotest.(check int) "retired traversal installs no projection" 0 (List.length late.responses);
+  Alcotest.(check int) "retired traversal restores no receipts" 0 (probe_receipts runtime)
+;;
+
+let retirement_outline_count runtime (output:Runtime.output) =
+  List.fold_left (fun count request -> match Runtime.worker_read runtime request with
+    | Some (Runtime.Read {query=W.Outline_block _;_})->count+1|_->count) 0 output.requests
+;;
+
+let test_retirement_preserves_cross_page_observations () =
+  let module T = Journal_timeline_state in
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let first = root_fixture 0 1 0 and second = root_fixture 1 1 0 in
+  let feed,_ = drive_roots runtime [first;second] (initial_roots runtime 989L) in
+  let before = retained_feed feed in
+  let original = List.hd first.roots in
+  let moved = {original with block={original.block with page=second.owner.uuid;parent=second.owner.uuid}} in
+  let fresh,_ = drive_roots runtime
+    [{first with roots=[];descendants=[]};{second with roots=moved::second.roots}]
+    (initial_roots runtime 990L) in
+  let entry = List.find (fun (entry:Journal_graph_projection.timeline_entry) ->
+    Journal_model.id entry.block=Graph.Uuid.to_string original.block.uuid)
+    (List.concat_map (fun (day:Journal_graph_projection.day_feed)->day.entries) fresh.days) in
+  let after = T.replace_timeline_entry before entry in
+  ignore (Runtime.retire_timeline runtime ~before ~after);
+  Alcotest.(check bool) "moved root remains retained on B" true
+    (Option.exists (fun block -> Journal_model.page_id block=Graph.Uuid.to_string second.owner.uuid)
+      (T.find_block after ~block_id:(Journal_model.id entry.block)));
+  let output = changed runtime (window ~blocks:[original.block.uuid] ()) in
+  Alcotest.(check int) "B observations still schedule the moved block point read" 1
+    (retirement_outline_count runtime output)
+;;
+
+let test_retirement_removes_preview_only_observations () =
+  let module T = Journal_timeline_state in
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixture = root_fixture 0 1 3 in
+  let feed,_ = drive_roots runtime [fixture] (initial_roots runtime 989L) in
+  let before = retained_feed feed in
+  let entry = List.hd (List.hd feed.days).entries in
+  let removed = List.hd entry.child_summaries in
+  let replacement = {entry with child_summaries=List.tl entry.child_summaries} in
+  let after = T.replace_timeline_entry before replacement in
+  ignore (Runtime.retire_timeline runtime ~before ~after);
+  Alcotest.(check int) "retained parent keeps current preview receipt coverage" 3 (probe_receipts runtime);
+  Alcotest.(check bool) "preview replacement keeps the parent" true
+    (T.find_block after ~block_id:(Journal_model.id entry.block)=Some entry.block);
+  let output = changed runtime (window ~blocks:[uuid removed.block_id] ()) in
+  Alcotest.(check int) "removed preview child no longer schedules point reads" 0
+    (retirement_outline_count runtime output);
+  let kept = List.hd replacement.child_summaries in
+  let output = changed runtime (window ~blocks:[uuid kept.block_id] ()) in
+  Alcotest.(check int) "remaining preview child keeps its observation" 1
+    (retirement_outline_count runtime output)
+;;
+
+let retirement_change_token root scopes =
+  let module C = Journal_worker_coordination.Worker_pure_coordinator in
+  let budget = Worker_producer.budget Worker_pure_data.maximum_page_size in
+  let operation = W.Query (budget,W.Changes {generation="generation-1";after=None}) in
+  let ticket,planned = C.request Worker_producer.state Worker_producer.session operation |> Result.get_ok in
+  let source = Worker_producer.I.request Worker_producer.session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok in
+  let produce = query_sample (fun (Read.Read_query (budget,query))->match query with
+    | Read.Changes _ -> Read.For_worker.answer budget query (Ok (Read.For_worker.change_batch
+        ~change_owner:(Read.For_worker.read_budget_owner budget) ~generation:"generation-1"
+        ~from_exclusive:None ~through:"revision-2" ~windows:[window ~scopes ()] ~next:None))
+    | _ -> Alcotest.fail "expected the token's Changes query") in
+  let batch = match Worker_producer.I.reply Worker_producer.session
+    ~request_id:(C.ticket_id ticket) operation (produce source) with
+    | Ok (W.Answered (Ok batch))->batch|_->Alcotest.fail "could not deliver the token's batch" in
+  let admitted = C.step planned.next (C.Admitted (ticket,Coordination_test_fixture.Id.Worker.Request_id.one)) in
+  let completed = C.step admitted.next (C.Completed (ticket,W.Answered (Ok batch))) in
+  C.begin_change_application completed.next batch ~root |> Result.get_ok |> fst
+;;
+
+let test_retirement_releases_queued_consumers () =
+  let module C = Journal_worker_coordination.Worker_pure_coordinator in
+  let events = ref [] in
+  let runtime = Production_runtime.create ~localtime:Unix.gmtime
+    ~validate_session:Worker_producer.validate_session ~on_change:(fun event->events:=event::!events) () in
+  set_calendar runtime;
+  let fixtures = List.init 8 (fun i -> root_fixture i 1 0) in
+  let feed,_ = drive_roots runtime fixtures (initial_roots runtime 989L) in
+  let scopes = List.map (fun fixture->Worker_pure_data.V2_page_tree_interest fixture.owner.uuid) fixtures in
+  let pull = pull runtime in
+  let token = retirement_change_token pull scopes in
+  Alcotest.(check bool) "attach the delivered pure change application" true
+    (Runtime.set_change_application runtime ~request_id:pull token);
+  bump_fixture_scopes scopes;
+  let output = deliver_sample runtime (sample pull (query_sample (fun (Read.Read_query (budget,query))->match query with
+    | Read.Changes _ -> Read.For_worker.answer budget query (Ok (Read.For_worker.change_batch
+        ~change_owner:(Read.For_worker.read_budget_owner budget) ~generation:"generation-1"
+        ~from_exclusive:None ~through:"revision-2" ~windows:[window ~scopes ()] ~next:None))
+    | _ -> Alcotest.fail "expected the attached Changes query"))) in
+  let children = List.fold_left (fun children -> function
+    | C.Change_consumer_expanded (actual,_,ids) when actual=token -> Rrbvec.append children ids
+    | _ -> children) Rrbvec.empty !events in
+  let roots = Rrbvec.filter (fun id -> match Runtime.worker_read runtime id with
+    | Some (Runtime.Read {query=W.Timeline_read {query=W.Timeline.Roots _;_};_})->true|_->false) children in
+  Alcotest.(check int) "four root reads are active before retirement" 4 (Rrbvec.length roots);
+  ignore (Runtime.retire_timeline runtime ~before:(retained_feed feed) ~after:(Journal_timeline_state.empty ~today:20260901));
+  let retired = List.filter_map (function C.Change_consumer_retired (actual,id) when actual=token->Some id|_->None) !events in
+  Alcotest.(check int) "all eight active and queued Feed consumers retire" 8 (List.length retired);
+  Alcotest.(check bool) "active Feed payloads are released" true
+    (Rrbvec.for_all (fun id->Runtime.worker_read runtime id=None) roots);
+  let ack = only "non-Feed ACK remains independent" (List.filter (fun id->match Runtime.worker_read runtime id with
+    | Some (Runtime.Acknowledge _)->true|_->false) output.requests) in
+  let output = Worker_producer.deliver runtime ack (ack_sample "generation-1" "revision-2") in
+  Alcotest.(check int) "ACK cannot drain retired queued reads" 0 (List.length output.requests)
+;;
+
+let test_retirement_single_entry_allocation () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixture = root_fixture 0 1 0 in
+  let feed,_ = drive_roots runtime [fixture] (initial_roots runtime 989L) in
+  let day = List.hd feed.days in
+  let measure count =
+    let entries = List.init count (fun n ->
+      let record = List.hd fixture.roots in
+      let block = Journal_graph_projection.block ~page:day.page ~revision:"large" ~child_count:0
+        ~time_context:{localtime=Unix.gmtime} {record.block with
+          uuid=uuid (Printf.sprintf "a7600000-0000-4000-8000-%012d" n);order=Printf.sprintf "%012d" n}
+        |> Result.get_ok in
+      ({block;child_summaries=[]}:Journal_graph_projection.timeline_entry)) in
+    let before = retained_feed {feed with days=[{day with entries}];slot_count=count+1} in
+    let entry = List.hd entries in
+    let after = Journal_timeline_state.replace_timeline_entry before
+      {entry with block=Journal_model.with_tag_titles entry.block ~tag_titles:["Changed"]} in
+    let start = Gc.allocated_bytes () in
+    ignore (Journal_timeline_state.retired ~before ~after);
+    Gc.allocated_bytes () -. start
+  in
+  let small = measure 1024 and large = measure 8192 in
+  Printf.eprintf "retirement-allocation: 1024=%.0f bytes; 8192=%.0f bytes\n%!" small large;
+  Alcotest.(check bool) "single-entry retirement does not rebuild all retained collections" true
+    (large < (small *. 4.) +. 16384.)
+;;
+
 let test_assembly_recovers_other_invalid_retained_scope () =
   let runtime = Runtime.create ~localtime:Unix.gmtime () in
   set_calendar runtime;
@@ -8985,6 +9292,19 @@ let () =
         ; Alcotest.test_case "Delete conflict 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Delete_conflict 10050)
         ; Alcotest.test_case "Detail and Copy remain complete" `Quick test_preview_preserves_full_detail_and_copy
         ])
+    ; ( "Timeline retirement rework"
+      , [ Alcotest.test_case "full retirement revokes Root_dates" `Quick (test_full_retirement_revokes_catalog `Dates)
+        ; Alcotest.test_case "full retirement revokes Root_today" `Quick (test_full_retirement_revokes_catalog `Today)
+        ; Alcotest.test_case "full retirement revokes Check Publish" `Quick (test_full_retirement_revokes_catalog `Publish)
+        ; Alcotest.test_case "cross-page observations" `Quick test_retirement_preserves_cross_page_observations
+        ; Alcotest.test_case "preview-only observations" `Quick test_retirement_removes_preview_only_observations
+        ; Alcotest.test_case "active and queued consumers" `Quick test_retirement_releases_queued_consumers
+        ; Alcotest.test_case "single-entry allocation" `Quick test_retirement_single_entry_allocation ])
+    ; ( "Timeline retirement"
+      , [ Alcotest.test_case "retained hidden rows" `Quick test_retirement_preserves_hidden_rows
+        ; Alcotest.test_case "absent pages and late installs" `Quick test_retirement_removes_pages_and_late_installs
+        ; Alcotest.test_case "page ABA and surviving sibling" `Quick test_retirement_fences_page_aba_without_losing_siblings
+        ; Alcotest.test_case "replaced date query" `Quick test_replaced_date_query_retires_old_receipts ])
     ; ( "journal window budget"
       , [ Alcotest.test_case
             "complete metadata fits requested window"

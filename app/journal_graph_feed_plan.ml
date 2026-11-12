@@ -201,10 +201,8 @@ let root_owner_current t = function
 
 let root_batch_current t batch =
   root_owner_current t batch.root_owner
-  && Option.value
-       (Hashtbl.find_opt t.root_page_epochs batch.root_page.Projection.id)
-       ~default:0L
-     = batch.root_epoch
+  && Hashtbl.find_opt t.root_page_epochs batch.root_page.Projection.id
+     = Some batch.root_epoch
 ;;
 
 let scan_failure scan message =
@@ -226,10 +224,14 @@ let make_root_batch t ~ports owner ~page_uuid (page : Projection.page) cursor li
     | _ -> limit in
   Hashtbl.replace t.root_page_limits page.id (max limit (Option.value ~default:1 (Hashtbl.find_opt t.root_page_limits page.id)));
   ports.retain_root_interest page ~minimum_limit:limit;
+  let epoch = match Hashtbl.find_opt t.root_page_epochs page.id with
+    | Some epoch -> epoch
+    | None -> let epoch = ports.now () in
+      Hashtbl.replace t.root_page_epochs page.id epoch; epoch in
   { root_owner = owner
   ; root_page_uuid = page_uuid
   ; root_page = page
-  ; root_epoch = Option.value (Hashtbl.find_opt t.root_page_epochs page.id) ~default:0L
+  ; root_epoch = epoch
   ; root_limit = limit
   ; root_cursor = cursor
   ; root_next = None
@@ -283,6 +285,64 @@ let drop_page t id =
   Hashtbl.remove t.retained_prefixes id;
   Hashtbl.filter_map_inplace (fun scope proof ->
     if scope_page scope = Some id then None else Some proof) t.retained
+;;
+
+let retire t ~ports ~pages ~entries ~pending =
+  let removed_pages = Hashtbl.create (Rrbvec.length pages) in
+  let changed_entries = Hashtbl.create (Rrbvec.length entries) in
+  Rrbvec.iter (fun id -> Hashtbl.replace removed_pages id ()) pages;
+  Rrbvec.iter (fun ((old:Projection.timeline_entry),replacement) ->
+    let same_page = Option.exists (fun (fresh:Projection.timeline_entry) ->
+      Journal_model.page_id old.block = Journal_model.page_id fresh.block) replacement in
+    if not same_page || Option.exists (fun (fresh:Projection.timeline_entry) ->
+      old.child_summaries <> fresh.child_summaries) replacement then
+      Hashtbl.replace changed_entries
+        (Journal_model.page_id old.block,Journal_model.id old.block)
+        (if same_page then replacement else None)) entries;
+  if Hashtbl.length removed_pages > 0 || Hashtbl.length changed_entries > 0 then (
+    let filter_proofs proofs = Hashtbl.filter_map_inplace (fun scope proof ->
+      let removed = match scope with
+        | Dates_scope _ -> false
+        | Roots_scope page -> Hashtbl.mem removed_pages page
+        | Preview_scope (page,root) -> Hashtbl.mem removed_pages page
+            || Hashtbl.find_opt changed_entries (page,root) = Some None in
+      if removed then None else Some proof) proofs in
+    let filter_days days = Rrbvec.filter_map (fun (day:day_feed) ->
+      if Hashtbl.mem removed_pages day.page.id then None else
+      Some {day with entries=Rrbvec.filter_map (fun (entry:Projection.timeline_entry) ->
+        match Hashtbl.find_opt changed_entries (day.page.id,Journal_model.id entry.block) with
+        | None -> Some entry | Some replacement -> replacement) day.entries}) days in
+    t.window_epoch <- Int64.succ t.window_epoch;
+    filter_proofs t.retained;
+    Rrbvec.iter (fun id ->
+      Hashtbl.remove t.retained_prefixes id;
+      Hashtbl.remove t.root_page_limits id;
+      Hashtbl.remove t.root_page_epochs id;
+      Hashtbl.remove t.root_page_counts id;
+      Hashtbl.remove t.root_page_following_days id) pages;
+    Hashtbl.iter (fun (page,_) replacement ->
+      if not (Hashtbl.mem removed_pages page) then (
+        Hashtbl.replace t.root_page_epochs page (ports.now ());
+        if replacement = None then
+          Option.iter (fun count -> Hashtbl.replace t.root_page_counts page (max 0 (count-1)))
+            (Hashtbl.find_opt t.root_page_counts page))) changed_entries;
+    Hashtbl.filter_map_inplace (fun _ day ->
+      Rrbvec.nth_opt (filter_days (Rrbvec.singleton day)) 0) t.retained_prefixes;
+    let clean_scan (scan:feed_scan) =
+      filter_proofs scan.root_proofs;
+      scan.root_days <- filter_days scan.root_days;
+      scan.root_queued <- Rrbvec.filter (fun (page:Projection.page) ->
+        not (Hashtbl.mem removed_pages page.id)) scan.root_queued;
+      Rrbvec.iter (Hashtbl.remove scan.root_consumed_by_page) pages in
+    let clean_batch batch = match batch.root_owner with
+      | Feed_roots scan -> clean_scan scan
+      | Changed_roots _ -> () in
+    Seq.iter (function
+      | Root_dates (scan,_) | Root_today (scan,_) -> clean_scan scan
+      | Root_tree batch | Root_preview {preview_batch=batch;_}
+      | Check {action=Assemble batch;_} -> clean_batch batch
+      | Check {action=Publish_feed scan;_} -> clean_scan scan
+      | Check {action=Window _;_} -> ()) pending)
 ;;
 
 let read_changed_roots t ~ports page limit =
@@ -694,6 +754,10 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
   else (
     t.feed_session <- Int64.succ t.feed_session;
     t.window_epoch <- Int64.succ t.window_epoch;
+    (* A replacement catalog traversal owns its own date scopes. Root and
+       preview receipts still belong to every retained page. *)
+    Hashtbl.filter_map_inplace (fun scope proof -> match scope with
+      | Dates_scope _ -> None | _ -> Some proof) t.retained;
     if cursor = None && after = None
     then t.initial_feed_spec <- Some (root_limit, day_limit);
     let scan =
@@ -748,7 +812,8 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
 ;;
 let superseded_root_batch t ~ports batch =
   match batch.root_owner with
-  | Feed_roots scan when root_owner_current t batch.root_owner ->
+  | Feed_roots scan when root_owner_current t batch.root_owner
+                         && Hashtbl.mem t.root_page_limits batch.root_page.id ->
     (match scan.root_start_day with
      | None ->
        (* A canonical local completion can invalidate a page while startup is
@@ -1050,6 +1115,8 @@ let superseded t ~ports = function
   | Check {action=Assemble batch;_} -> superseded_root_batch t ~ports batch
   | Check {action=Publish_feed scan;_} when root_owner_current t (Feed_roots scan) ->
     check t ~ports (Publish_feed scan)
+  | Check {action=Window {request_generation;refresh};_} when has_retained t ->
+    check t ~ports (Window {request_generation;refresh})
   | Check _ | Root_dates _ | Root_today _ -> empty
   | Root_tree batch -> superseded_root_batch t ~ports batch
   | Root_preview preview -> superseded_root_batch t ~ports preview.preview_batch
