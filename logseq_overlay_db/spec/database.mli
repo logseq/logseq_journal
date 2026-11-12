@@ -342,6 +342,48 @@ val get_structure
   -> Types.structure_request
   -> (Types.structure_result, Types.read_error) result
 
+(** {2 Timeline snapshot scopes and paging}
+
+    Scope versions are maintained by successful local, sync and settlement writes,
+    captured by snapshots and read by bounded map lookup. Equality covers the raw
+    DTOs and enumeration, including empty/missing scopes. Versions never reuse an
+    earlier value during this database owner lifetime. No collection scan or
+    global projection revision is used as freshness evidence. *)
+type timeline_scope =
+  | Journal_index
+  | Page_roots of Graph.page_uuid
+  | Parent_children of Graph.block_uuid
+
+type timeline_scope_version
+val timeline_scope_version : snapshot -> timeline_scope -> (timeline_scope_version, Types.read_error) result
+val equal_timeline_scope_version : timeline_scope_version -> timeline_scope_version -> bool
+val timeline_scope_version_to_string : timeline_scope_version -> string
+
+type journal_position
+type member_position
+val journal_position_to_string : journal_position -> string
+val journal_position_of_string : string -> (journal_position, Types.read_error) result
+val member_position_to_string : member_position -> string
+val member_position_of_string : string -> (member_position, Types.read_error) result
+
+(** Positions are bounded values bound to their exact scope, date bounds and
+    authoritative scope version. Dates use date/UUID keysets; direct members use
+    guarded ordinals preserving existing outline tie behavior. The worker also
+    binds them to its session. Release of a snapshot releases no position-owned
+    resources. A changed scope rejects continuation with [Stale_read_cursor].
+    All operations enforce item, structural and ancestry bounds; errors never
+    silently turn truncated data into exhaustion. *)
+val get_timeline_journals
+  : snapshot -> from_day:int -> through_day:int -> limit:int
+  -> after:journal_position option
+  -> (Types.journal_item list * journal_position option, Types.read_error) result
+val get_timeline_roots
+  : snapshot -> page:Graph.page_uuid -> limit:int -> after:member_position option
+  -> (Types.tree_member list * member_position option, Types.read_error) result
+val get_timeline_children
+  : snapshot -> parent:Graph.block_uuid -> limit:int -> after:member_position option
+  -> (Types.child_member list * member_position option, Types.read_error) result
+
 (** {3 Example: reading one coherent projection}
 
     Every read in the callback observes the roots captured by the same snapshot.

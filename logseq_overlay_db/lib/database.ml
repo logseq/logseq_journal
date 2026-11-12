@@ -135,6 +135,27 @@ type task_catalog_cache =
   ; catalog_items : Graph.task_status_definition array
   }
 
+type timeline_scope = Journal_index | Page_roots of Graph.page_uuid | Parent_children of Graph.block_uuid
+type timeline_scope_version = string
+type journal_position = string
+type member_position = string
+
+let equal_timeline_scope_version = String.equal
+let timeline_scope_version_to_string value = value
+let journal_position_to_string value = value
+let member_position_to_string value = value
+let journal_position_of_string value =
+  if String.length value <= 512 then Ok value
+  else Error (Types.Invalid_read_request "oversized timeline journal position")
+let member_position_of_string value =
+  if String.length value <= 512 then Ok value
+  else Error (Types.Invalid_read_request "oversized timeline member position")
+
+let timeline_scope_key = function
+  | Journal_index -> "journal"
+  | Page_roots uuid -> "roots:" ^ Graph.Uuid.to_string uuid
+  | Parent_children uuid -> "children:" ^ Graph.Uuid.to_string uuid
+
 type t =
   { lock : Eio.Mutex.t
   ; task_catalog_cache : task_catalog_cache option Atomic.t
@@ -154,6 +175,11 @@ type t =
   ; mutable closed : bool
   ; generation : Types.generation
   ; mutable projection : int
+  ; mutable timeline_versions : int Uuid_map.t
+  ; mutable timeline_serial : int
+  ; mutable timeline_scope_count : int
+  ; mutable timeline_proof_available : bool
+  ; mutable timeline_authoritative : Datascript.db
   ; authoritative_connection : Datascript.conn
   ; authoritative_listener : string
   ; authoritative_reports : Datascript.tx_report list ref
@@ -175,6 +201,8 @@ type t =
 and snapshot =
   { owner : t
   ; version : Types.snapshot_version
+  ; mutable timeline_versions : int Uuid_map.t
+  ; timeline_proof_available : bool
   ; mutable authoritative_database : Datascript.db option
   ; mutable outbox : outbox_record list option
   ; mutable block_effects : outbox_record Rrbvec.t Uuid_map.t option
@@ -2105,6 +2133,7 @@ let record_has_active_dependency_shadows (record : outbox_record) =
 ;;
 
 let clear_snapshot_roots (snapshot : snapshot) =
+  snapshot.timeline_versions <- Uuid_map.empty;
   snapshot.authoritative_database <- None;
   snapshot.outbox <- None;
   snapshot.block_effects <- None;
@@ -2120,6 +2149,8 @@ let close database =
       then false, [], [], []
       else (
         database.closed <- true;
+        database.timeline_versions <- Uuid_map.empty;
+        database.timeline_scope_count <- 0;
         database.release_slot := None;
         let callback_waiters =
           List.filter_map
@@ -2279,22 +2310,14 @@ let queryable_outbox_root (records : outbox_record list) =
   , index_children_effects outbox )
 ;;
 
-let refresh_queryable_outbox database =
-  let outbox, block_effects, page_effects, children_effects =
-    queryable_outbox_root database.outbox
-  in
-  database.queryable_outbox <- outbox;
-  database.queryable_block_effects <- block_effects;
-  database.queryable_page_effects <- page_effects;
-  database.queryable_children_effects <- children_effects
-;;
-
 let snapshot_of_database database =
   { owner = database
   ; version =
       { Types.generation = database.generation
       ; projection_revision = projection_revision database.projection
       }
+  ; timeline_versions = database.timeline_versions
+  ; timeline_proof_available = database.timeline_proof_available
   ; authoritative_database = Some (authoritative_database database)
   ; outbox = Some database.queryable_outbox
   ; block_effects = Some database.queryable_block_effects
@@ -2315,6 +2338,8 @@ let snapshot_for_sources database authoritative_database outbox =
       { Types.generation = database.generation
       ; projection_revision = projection_revision database.projection
       }
+  ; timeline_versions = database.timeline_versions
+  ; timeline_proof_available = database.timeline_proof_available
   ; authoritative_database = Some authoritative_database
   ; outbox = Some outbox
   ; block_effects = Some block_effects
@@ -4465,6 +4490,296 @@ let get_structure snapshot request =
              (paginate_page_tree snapshot ~page ~maximum_depth ~limit ~offset))))
 ;;
 
+let timeline_scope_version snapshot scope =
+  with_snapshot_read snapshot (fun snapshot ->
+    if not snapshot.timeline_proof_available then Error Types.Read_limit_exceeded
+    else Ok (Printf.sprintf "timeline:v1:%s:%d"
+      (Types.Generation.to_string snapshot.version.generation)
+      (Option.value (Uuid_map.find_opt (timeline_scope_key scope) snapshot.timeline_versions) ~default:0)))
+
+let timeline_version_at (snapshot : snapshot) scope =
+  if not snapshot.timeline_proof_available then Error Types.Read_limit_exceeded
+  else Ok (Printf.sprintf "timeline:v1:%s:%d"
+    (Types.Generation.to_string snapshot.version.generation)
+    (Option.value (Uuid_map.find_opt (timeline_scope_key scope) snapshot.timeline_versions) ~default:0))
+;;
+
+let get_timeline_journals snapshot ~from_day ~through_day ~limit ~after =
+  Result.bind (timeline_scope_version snapshot Journal_index) (fun version ->
+    let cursor = match after with
+      | None -> Ok None
+      | Some position ->
+        (match String.split_on_char '|' position with
+         | ["tj1"; previous; lower; upper; day; uuid]
+           when int_of_string_opt lower = Some from_day && int_of_string_opt upper = Some through_day ->
+           if previous <> version then Error Types.Stale_read_cursor
+           else (match int_of_string_opt day, Graph.Uuid.of_string uuid with
+             | Some day, Ok uuid when day >= from_day && day <= through_day ->
+               Ok (Some (journal_cursor snapshot ~from_day ~through_day {day; uuid; entity=None}))
+             | _ -> Error (Types.Invalid_read_request "invalid timeline date position"))
+         | _ -> Error (Types.Invalid_read_request "timeline date position belongs to another query"))
+    in
+    Result.bind cursor (fun cursor ->
+      Result.map (fun (result : Types.journal_list_result) ->
+        let next = match result.next_cursor with
+          | None -> None
+          | Some cursor ->
+            (match journal_cursor_position snapshot ~from_day ~through_day cursor with
+             | Ok (Some position) -> Some (Printf.sprintf "tj1|%s|%d|%d|%d|%s"
+                 version from_day through_day position.day (Graph.Uuid.to_string position.uuid))
+             | _ -> assert false)
+        in result.items, next)
+        (get_journals snapshot ~from_day ~through_day ~limit ~cursor)))
+;;
+
+let timeline_member_offset scope version = function
+  | None -> Ok 0
+  | Some position ->
+    (match String.split_on_char '|' position with
+     | ["tm1"; key; previous; offset] when key = timeline_scope_key scope ->
+       if previous <> version then Error Types.Stale_read_cursor
+       else (match int_of_string_opt offset with
+         | Some offset when offset >= 0 && offset <= maximum_cursor_offset -> Ok offset
+         | _ -> Error (Types.Invalid_read_request "invalid timeline member offset"))
+     | _ -> Error (Types.Invalid_read_request "timeline member position belongs to another query"))
+;;
+
+let timeline_direct_members snapshot scope ~parent ~limit ~after =
+  with_snapshot_read snapshot (fun snapshot ->
+    if not (valid_page_limit limit) then Error (Types.Invalid_read_request "limit must be between 1 and 200")
+    else Result.bind (timeline_version_at snapshot scope) (fun version ->
+      Result.bind (timeline_member_offset scope version after) (fun offset ->
+        let database = Option.get snapshot.authoritative_database in
+        let cache =
+          { hydration = hydration_cache ~index_idents:false database
+          ; entities = Hashtbl.create 64; fields = Hashtbl.create 64
+          ; authoritative_candidates = Hashtbl.create 64; logical_candidates = Hashtbl.create 64 }
+        in
+        let identities = Hashtbl.create 64 in
+        let examined = ref 0 in
+        let add uuid =
+          incr examined;
+          if !examined > maximum_cursor_offset * 2 then raise Exit;
+          Hashtbl.replace identities (Graph.Uuid.to_string uuid) uuid
+        in
+        let candidates = try
+          (match tree_entity snapshot cache parent with
+           | None -> ()
+           | Some entity ->
+             Datascript.datoms database Datascript.Avet ~a:"block/parent" ~v:(Datascript.Ref entity) ()
+             |> Seq.iter (fun (datom : Datascript.datom) ->
+               incr examined;
+               if !examined > maximum_cursor_offset then raise Exit;
+               Option.iter (fun uuid -> Hashtbl.replace identities (Graph.Uuid.to_string uuid) uuid)
+                 (cached_uuid_of_entity database cache.hydration datom.e)));
+          Uuid_map.find_opt (Graph.Uuid.to_string parent) (Option.get snapshot.children_effects)
+          |> Option.value ~default:[]
+          |> List.iter (fun (record : outbox_record) ->
+            if record_is_logically_active record then List.iter add record.effect_footprint.block_uuids;
+            if record_has_active_dependency_shadows record then
+              List.iter (fun shadow -> if Graph.Uuid.equal shadow.shadow_parent parent then add shadow.shadow_block_uuid)
+                record.dependency_shadows.shadow_blocks);
+          if Hashtbl.length identities > maximum_cursor_offset then raise Exit;
+          Some (Hashtbl.to_seq_values identities |> Rrbvec.of_seq
+            |> Rrbvec.sort Graph.Uuid.compare
+            |> Rrbvec.filter_map (fun uuid -> match logical_tree_candidate snapshot cache uuid with
+              | Some candidate when Graph.Uuid.equal candidate.tree_parent parent -> Some candidate
+              | _ -> None)
+            |> Rrbvec.sort (fun left right -> String.compare left.tree_order right.tree_order))
+          with Exit -> None
+        in
+        match candidates with
+        | None -> Error Types.Read_limit_exceeded
+        | Some candidates ->
+          let total = Rrbvec.length candidates in
+          if offset > total then Error (Types.Invalid_read_request "timeline offset exceeds scope")
+          else
+            let selected = Rrbvec.to_seq candidates |> Seq.drop offset |> Seq.take limit |> List.of_seq in
+            let context = read_context snapshot in
+            let items = List.filter_map (fun candidate ->
+              Option.map (fun block -> Types.{block; revision=logical_block_revision candidate.tree_uuid (Some block)})
+                (read_block context candidate.tree_uuid)) selected in
+            let consumed = offset + List.length selected in
+            let next = if consumed < total then Some (Printf.sprintf "tm1|%s|%s|%d" (timeline_scope_key scope) version consumed) else None in
+            Ok (items,next))))
+;;
+
+let get_timeline_children snapshot ~parent ~limit ~after =
+  timeline_direct_members snapshot (Parent_children parent) ~parent ~limit ~after
+;;
+
+let get_timeline_roots snapshot ~page ~limit ~after =
+  Result.map (fun (items,next) ->
+    List.map (fun (item : Types.child_member) -> Types.{block=item.block; revision=item.revision;depth=0;parent=page}) items,next)
+    (timeline_direct_members snapshot (Page_roots page) ~parent:page ~limit ~after)
+;;
+
+(* Writes own invalidation under the owner lock. Dependency cursors are lazy;
+   hydration contexts are discarded after each batch. The visited identity sets
+   contain only this write's affected closure and are released on return. *)
+exception Timeline_proof_limit
+
+let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
+  if database.timeline_proof_available then (
+    let old_db = Option.get before.authoritative_database in
+    let new_db = Option.get after.authoritative_database in
+    let visited = Hashtbl.create 64 in
+    let ancestry_visited = Hashtbl.create 64 in
+    let pending = ref [] in
+    let enqueue sequence = pending := sequence :: !pending in
+    let entity_jobs db datoms forced =
+      Seq.filter_map (fun (datom : Datascript.datom) ->
+        Option.map (fun uuid -> uuid, forced) (uuid_of_entity db datom.e)) datoms
+    in
+    let changed_datoms =
+      if old_db == new_db then Seq.empty
+      else !(database.authoritative_reports) |> List.to_seq
+        |> Seq.filter (fun (report : Datascript.tx_report) -> report.db_after.max_tx > old_db.max_tx)
+        |> Seq.flat_map (fun (report : Datascript.tx_report) -> List.to_seq report.tx_data)
+    in
+    let revoked_identities = Hashtbl.create 16 in
+    Seq.iter (fun (datom : Datascript.datom) ->
+      if datom.a = "block/uuid" && not datom.added then
+        Option.iter (fun uuid -> Hashtbl.replace revoked_identities (Graph.Uuid.to_string uuid) ())
+          (uuid_of_entity old_db datom.e)) changed_datoms;
+    enqueue (entity_jobs old_db changed_datoms false);
+    enqueue (entity_jobs new_db changed_datoms false);
+    let index records = List.fold_left (fun map (record : outbox_record) ->
+      Uuid_map.add (Graph.Uuid.to_string record.mutation_id) record map) Uuid_map.empty records in
+    let old_records = index (Option.get before.outbox) and new_records = index (Option.get after.outbox) in
+    let record_jobs (record : outbox_record) =
+      Seq.map (fun uuid -> uuid, false)
+        (Seq.append (List.to_seq record.effect_footprint.block_uuids)
+           (List.to_seq record.effect_footprint.page_uuids))
+    in
+    Uuid_map.merge (fun _ old current ->
+      if old <> current then (
+        Option.iter (fun record -> enqueue (record_jobs record)) old;
+        Option.iter (fun record -> enqueue (record_jobs record)) current);
+      None) old_records new_records |> ignore;
+    if old_db != new_db then (
+      let add_logical_dependents _ (record : outbox_record) =
+        if record_is_logically_active record then enqueue (record_jobs record);
+        if record_has_active_dependency_shadows record then (
+          enqueue (List.to_seq record.dependency_shadows.shadow_blocks
+            |> Seq.map (fun shadow -> shadow.shadow_block_uuid, false));
+          enqueue (List.to_seq record.dependency_shadows.shadow_pages
+            |> Seq.map (fun shadow -> shadow.shadow_page_uuid, false)))
+      in
+      Uuid_map.iter add_logical_dependents old_records;
+      Uuid_map.iter add_logical_dependents new_records);
+    let reference_attributes db = Datascript.schema db |> List.filter_map (fun (attribute,(schema : Datascript.schema_attr)) ->
+      if schema.value_type = Some Datascript.RefType && attribute <> "block/parent" && attribute <> "block/page"
+      then Some attribute else None) in
+    let attributes = List.sort_uniq String.compare (reference_attributes old_db @ reference_attributes new_db) in
+    let old_context = ref (read_context before) and new_context = ref (read_context after) in
+    let batch_size = 128 in
+    let in_batch = ref 0 in
+    let next_contexts () =
+      if !in_batch = batch_size then (
+        old_context := read_context before;
+        new_context := read_context after;
+        in_batch := 0);
+      incr in_batch;
+      !old_context, !new_context
+    in
+    try
+      if database.timeline_serial = Int.max_int then raise Timeline_proof_limit;
+      let serial = database.timeline_serial + 1 in
+      let versions = ref database.timeline_versions in
+      let count = ref database.timeline_scope_count in
+      let mark scope =
+        let key = timeline_scope_key scope in
+        if Uuid_map.find_opt key !versions <> Some serial then (
+          if not (Uuid_map.mem key !versions) then (
+            if !count >= 200_000 then raise Timeline_proof_limit;
+            incr count);
+          versions := Uuid_map.add key serial !versions)
+      in
+      let mark_parent parent = mark (Parent_children parent); mark (Page_roots parent) in
+      let parent_of = function None -> None | Some (record : Types.block_record) -> Some record.block.parent in
+      let tag_titles context tags = List.filter_map (fun uuid ->
+        Option.map (fun (page : Types.page_record) -> uuid,page.page.title) (read_page context uuid)) tags in
+      let block_dto context value = Option.map (fun (record : Types.block_record) -> record,tag_titles context record.block.tags) value in
+      let journal_dto context = function
+        | Some (page : Types.page_record) when not page.page.recycled ->
+          (match page.page.kind with Graph.Journal_page _ -> Some (page,tag_titles context page.page.tags) | _ -> None)
+        | _ -> None in
+      let rec take () =
+        match !pending with
+        | [] -> None
+        | sequence :: rest ->
+          (match sequence () with
+           | Seq.Nil -> pending := rest; take ()
+           | Seq.Cons (job, tail) -> pending := tail :: rest; Some job)
+      in
+      let rec drain () =
+        match take () with
+        | None -> ()
+        | Some (uuid, forced) ->
+          let key = Graph.Uuid.to_string uuid in
+          let fresh = not (Hashtbl.mem visited key) in
+          let fresh_ancestry = forced && not (Hashtbl.mem ancestry_visited key) in
+          if fresh || fresh_ancestry then (
+            let old_context, new_context = next_contexts () in
+            let old_block = read_block old_context uuid and new_block = read_block new_context uuid in
+            let old_page = read_page old_context uuid and new_page = read_page new_context uuid in
+            if fresh then (
+              Hashtbl.add visited key ();
+              let revoked = Hashtbl.mem revoked_identities key in
+              if revoked || block_dto old_context old_block <> block_dto new_context new_block then
+                List.iter mark_parent (List.filter_map Fun.id [parent_of old_block;parent_of new_block]);
+              let old_journal = journal_dto old_context old_page
+              and new_journal = journal_dto new_context new_page in
+              if old_journal <> new_journal
+                 || (revoked && (Option.is_some old_journal || Option.is_some new_journal))
+              then mark Journal_index);
+            let rendered_title = function None -> None | Some (page : Types.page_record) -> Some page.page.title in
+            let title_changed = rendered_title old_page <> rendered_title new_page in
+            let deleted db = Option.bind (entity_of_uuid db uuid) (fun entity -> one db entity "logseq.property/deleted-at") in
+            let ancestry block = Option.map (fun (record : Types.block_record) -> record.block.parent,record.block.page) block in
+            let ancestor_changed = deleted old_db <> deleted new_db || ancestry old_block <> ancestry new_block in
+            let expand_ancestry = (forced || ancestor_changed) && not (Hashtbl.mem ancestry_visited key) in
+            if expand_ancestry then Hashtbl.add ancestry_visited key ();
+            List.iter (fun db ->
+              match entity_of_uuid db uuid with None -> () | Some entity ->
+                if fresh then (
+                  let inspect_refs attribute = enqueue (entity_jobs db
+                    (Datascript.datoms db Datascript.Avet ~a:attribute ~v:(Datascript.Ref entity) ()) false) in
+                  List.iter inspect_refs attributes;
+                  if title_changed then inspect_refs "block/page";
+                  Option.iter (fun ident -> enqueue (entity_jobs db
+                    (Datascript.datoms db Datascript.Aevt ~a:ident ()) false))
+                    (Option.bind (one db entity "db/ident") ident_of_value));
+                if expand_ancestry then (
+                  let children = Datascript.datoms db Datascript.Avet ~a:"block/parent" ~v:(Datascript.Ref entity) () in
+                  (match children () with
+                   | Seq.Nil -> ()
+                   | Seq.Cons _ ->
+                     mark_parent uuid;
+                     List.iter mark_parent (List.filter_map Fun.id [parent_of old_block;parent_of new_block]));
+                  enqueue (entity_jobs db children true))) [old_db;new_db]);
+          drain ()
+      in
+      drain ();
+      database.timeline_versions <- !versions;
+      database.timeline_scope_count <- !count;
+      database.timeline_serial <- serial
+    with Timeline_proof_limit -> database.timeline_proof_available <- false)
+;;
+
+let refresh_queryable_outbox database =
+  let before = { (snapshot_of_database database) with authoritative_database = Some database.timeline_authoritative } in
+  let outbox, block_effects, page_effects, children_effects = queryable_outbox_root database.outbox in
+  database.queryable_outbox <- outbox;
+  database.queryable_block_effects <- block_effects;
+  database.queryable_page_effects <- page_effects;
+  database.queryable_children_effects <- children_effects;
+  let after = snapshot_of_database database in
+  maintain_timeline_scopes database before after;
+  database.timeline_authoritative <- authoritative_database database
+;;
+
 let listen database =
   Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
     if database.closed
@@ -6043,6 +6358,11 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                      ; closed = false
                      ; generation = current_generation
                      ; projection = 0
+                     ; timeline_versions = Uuid_map.empty
+                     ; timeline_serial = 0
+                     ; timeline_scope_count = 0
+                     ; timeline_proof_available = true
+                     ; timeline_authoritative = authoritative_database
                      ; authoritative_connection
                      ; authoritative_listener
                      ; authoritative_reports
@@ -9010,6 +9330,8 @@ let replan_queued_ordinary database authoritative_database records =
            ; block_effects = Some block_effects
            ; page_effects = Some page_effects
            ; children_effects = Some children_effects
+           ; timeline_versions = database.timeline_versions
+           ; timeline_proof_available = database.timeline_proof_available
            ; released = false
            ; active_reads = 0
            ; drain_waiters = []

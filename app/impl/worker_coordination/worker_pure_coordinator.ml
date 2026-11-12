@@ -19,6 +19,10 @@ module Observation_ids = Map.Make (struct
   end)
 
 type _ kind =
+  | Timeline_dates : (Worker_pure_data.journal_item Worker.Timeline.packet,Worker.Timeline.error) result kind
+  | Timeline_roots : (Worker_pure_data.tree_member Worker.Timeline.packet,Worker.Timeline.error) result kind
+  | Timeline_preview : (Worker_pure_data.child_member Worker.Timeline.packet,Worker.Timeline.error) result kind
+  | Timeline_check : Worker.Timeline.check kind
   | Change_ack : Worker.change_ack kind
   | Unit : unit kind
   | Observed : 'a kind -> 'a Worker.observed kind
@@ -48,6 +52,10 @@ type _ kind =
   | Changes : Worker.change_batch kind
 
 let kind : type a. a Worker.query -> a kind = function
+  | Timeline_read{query=Worker.Timeline.Dates _;_}->Timeline_dates
+  | Timeline_read{query=Worker.Timeline.Roots _;_}->Timeline_roots
+  | Timeline_read{query=Worker.Timeline.Preview_children _;_}->Timeline_preview
+  | Timeline_check _->Timeline_check
   | Graph_info -> Info
   | Admission -> Admission
   | Journal _ -> Journal
@@ -73,6 +81,10 @@ let rec same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option 
     (match same_kind a b with
      | Some Refl -> Some Refl
      | None -> None)
+  | Timeline_dates,Timeline_dates -> Some Refl
+  | Timeline_roots,Timeline_roots -> Some Refl
+  | Timeline_preview,Timeline_preview -> Some Refl
+  | Timeline_check,Timeline_check -> Some Refl
   | Change_ack, Change_ack -> Some Refl
   | Unit, Unit -> Some Refl
   | Submission, Submission -> Some Refl
@@ -905,6 +917,7 @@ let validate_continuation_session : type a. Worker.session -> a Worker.query -> 
     | Worker.Favorites after -> Option.map Worker.continuation_budget after
     | Worker.Task_statuses after -> Option.map Worker.continuation_budget after
     | Worker.Assets {after;_} -> Option.map Worker.continuation_budget after
+    | Worker.Timeline_read _ | Worker.Timeline_check _
     | Worker.Graph_info | Worker.Admission | Worker.Journal _ | Worker.Page _
     | Worker.Outline_block _ | Worker.Task_status_definitions _
     | Worker.Asset_descriptors _ | Worker.Changes _ -> None in

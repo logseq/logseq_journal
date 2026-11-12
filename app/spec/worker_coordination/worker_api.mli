@@ -108,7 +108,10 @@ type read_budget = Worker_effect_authority.read_budget
 (** Validate positive item/encoded-byte bounds against this session's advertised
     limits. Every final enriched result, including summary/refs/properties, fits
     both bounds. An oversized singleton fails explicitly; no silent truncation.
-    Requests also validate effective limits on IDs, roots, depth, payload and lists. *)
+    Requests also validate effective limits on IDs, roots, depth, payload and lists.
+    [Timeline_check] produces one aggregate check value: its receipt/result vector
+    uses [Timeline.maximum_receipts], independently of the data-row item budget,
+    and the complete encoded check value still fits the byte budget. *)
 val read_budget
   :  session
   -> maximum_items:int
@@ -237,7 +240,12 @@ type change_ack = Worker_effect_authority.change_ack
     exposes the exact scope revision required by current planners/confirmation.
     Typed results preserve present/missing and full metadata without UI layout
     types. List/lookup result ordering matches input IDs, including missing slots. *)
+module Timeline = Worker_effect_authority.Timeline
+
 type 'a query = 'a Worker_effect_authority.query =
+  | Timeline_read : { query : 'a Timeline.query; after : 'a Timeline.cursor option }
+      -> ('a Timeline.packet, Timeline.error) result query
+  | Timeline_check : Timeline.packed_receipt Rrbvec.t -> Timeline.check query
   | Graph_info : graph_info query
   | Admission : Worker_pure_data.admission_inspection query
   | Journal : journal_day -> page option query

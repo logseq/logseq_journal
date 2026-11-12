@@ -1160,6 +1160,46 @@ let test_observation_release_waits_for_initial_snapshot () =
           dispatcher_capacity=256;wire_batch_max_bytes=262144}in
         let session=F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation
           ~lifecycle:scope.account.lifecycle_generation ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits in
+        (* Timeline receipts and positions belong to the physical snapshot owner,
+           which cannot be exercised through Core.step alone. *)
+        let module Timeline = Read.Timeline in
+        let budget = Read.read_budget session ~maximum_items:1 ~maximum_bytes:16384 |> Result.get_ok in
+        let run : type a. a Read.query -> a = fun query ->
+          match Db.read_for_scope db ~scope (F.pack_query budget query) with
+          | Read.Query_answer (_, actual, answer) ->
+            (match Read.query_result_equality query actual with
+             | Some Read.Refl -> Result.get_ok answer
+             | None -> Alcotest.fail "Timeline query result type changed") in
+        let roots = Timeline.roots ~page:Fixture.page_uuid in
+        let packet = run (Read.Timeline_read { query=roots; after=None }) |> Result.get_ok in
+        require (Rrbvec.length packet.items <= 1) "Timeline root packets respect source item limits";
+        let empty = run (Read.Timeline_read {
+          query=Timeline.roots ~page:Fixture.missing_page_uuid; after=None }) |> Result.get_ok in
+        require (Rrbvec.is_empty empty.items && empty.next=Timeline.End)
+          "empty Timeline scopes retain an exhaustion receipt";
+        let day=Read.journal_day 20260902 |> Result.get_ok in
+        let dates=run (Read.Timeline_read {
+          query=Timeline.dates ~from_day:day ~through_day:day; after=None }) |> Result.get_ok in
+        let receipts=Rrbvec.of_list [Timeline.Receipt packet.receipt;
+          Timeline.Receipt empty.receipt; Timeline.Receipt dates.receipt] in
+        let checked=(run(Read.Timeline_check receipts)).Timeline.results in
+        require (Rrbvec.length checked=3 && Rrbvec.fold_left(fun ok value->ok && value=Ok())true checked)
+          "one Timeline check validates every retained and exhausted scope";
+        (match packet.next with
+         | Timeline.End -> ()
+         | More after ->
+           let next=run(Read.Timeline_read{query=roots;after=Some after}) |> Result.get_ok in
+           require (Rrbvec.fold_left(fun ok item->ok && not(Rrbvec.exists(fun old->
+             Read.Graph.Uuid.equal old.Worker_pure_data.value.block.uuid item.Worker_pure_data.value.block.uuid)packet.items))true next.items)
+             "Timeline root continuation advances without duplicated members";
+           require (match run(Read.Timeline_read{
+             query=Timeline.roots ~page:Fixture.missing_page_uuid;after=Some after}) with
+             |Error(Timeline.Invalid_request _)->true|_->false)
+             "Timeline continuation rejects a different scope");
+        let tiny=Read.read_budget session ~maximum_items:1 ~maximum_bytes:1 |> Result.get_ok in
+        require (match Db.read_for_scope db ~scope (F.pack_query tiny (Read.Timeline_read{query=roots;after=None})) with
+          | Read.Query_answer(_,Read.Timeline_read _,Ok(Error(Timeline.Limit_exceeded _)))->true
+          | _->false) "Timeline singleton reports its final receipt and DTO byte bound";
         (* Slot reconstruction is performed by the physical snapshot reader,
            not Core.step, so exercise it through the existing public Db fixture. *)
         let missing=Fixture.mutation_uuid 29001 in

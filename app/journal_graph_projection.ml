@@ -81,17 +81,7 @@ type child_cursor =
   }
 
 type root_cursor =
-  { session : Journal_worker_coordination.Worker_api.session
-  ; budget : Journal_worker_coordination.Worker_api.read_budget
-  ; maximum_items : int
-  ; page : Logseq_db_types.Graph_types.Uuid.t
-  ; epoch : int64
-  ; after :
-      Worker_pure_data.tree_member
-        Journal_worker_coordination.Worker_api.continuation
-        option
-  ; remaining : Worker_pure_data.tree_member Rrbvec.t
-  }
+  Worker_pure_data.tree_member Journal_worker_coordination.Worker_api.Timeline.cursor
 
 type block_continuation =
   | Root_tree_cursor of root_cursor

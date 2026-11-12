@@ -443,7 +443,7 @@ let reset t =
   Favorites.reset t.favorites;
   Hashtbl.clear t.changed_point_epochs;
   Confirmation.reset t.confirmations;
-  Feed.reset t.feed ~now:(fun () -> t.next_request)
+  Feed.reset t.feed
 ;;
 
 let set_calendar t (calendar : Journal_calendar.t) =
@@ -746,19 +746,18 @@ let feed_ports t =
     }
 ;;
 
-let feed_output t (value : Feed.output) =
-  let rec settle (value : Feed.output) =
-    match value.cached with
-    | None -> value
-    | Some cached ->
-      let next = Feed.resume_cached t.feed ~ports:(feed_ports t) cached in
-      settle
-        { Feed.requests = Rrbvec.append value.requests next.requests
-        ; publications = Rrbvec.append value.publications next.publications
-        ; cached = next.cached
-        }
-  in
-  let value = settle value in
+let worker_error code request_id message =
+  Error.create ~code ~message ~details:[]
+  |> Result.fold ~ok:Fun.id ~error:(fun _ ->
+    let module D=Logseq_db_types.Failure_diagnostic in
+    let detail=D.of_source ~operation:"workerOperation" ~reason:"invalidContent" message in
+    Error.create ~code ~message:(D.message detail)
+      ~details:[Error.{name=D.detail_name;value=Detail_string(D.encode detail)}]
+    |> Result.get_ok)
+  |> fun error -> request_id, error
+;;
+
+let feed_output ?source (value : Feed.output) =
   { requests = Rrbvec.to_list value.requests
   ; responses =
       Rrbvec.to_list
@@ -768,8 +767,20 @@ let feed_output t (value : Feed.output) =
                response (Feed_loaded { request_generation; feed; complete })
              | Reconciled { page; value } ->
                response (Page_tree_reconciled { page; value })
-             | Failed { scope; stale_cursor; message } ->
-               let failure = Projection_failure message in
+             | Failed { scope; stale_cursor; message; cause } ->
+               let failure = match source,cause with
+                 | Some (operation,request_id), Some cause ->
+                   let code = match cause with
+                     | Worker.Db_error error -> Error.code error
+                     | Revoked_session | Host_change_in_progress -> Error.Closed_session
+                     | Response_budget_exceeded -> Error.Response_too_large
+                     | Stale_read _ -> Error.Stale_read_cursor
+                     | Invalid_input _ | Protocol_mismatch _ -> Error.Invalid_request
+                     | Resync_required _ | Service_failed _ | Unsupported_operation _ -> Error.Unsupported_semantics in
+                   let error = match cause with Worker.Db_error error -> error
+                     | _ -> snd (worker_error code request_id message) in
+                   Worker_failure {operation;request_id;error}
+                 | _ -> Projection_failure message in
                response
                  (match scope with
                   | Feed request_generation -> Feed_failed { request_generation; failure }
@@ -979,12 +990,12 @@ let submit_unowned t (request : Journal_graph_request.t) =
   | Inspect_admission request ->
     requests [ read t (Admission_info request) Worker.Admission ]
   | Load_feed { cursor; root_limit; day_limit; request_generation } ->
-    Feed.load_feed t.feed ~ports:(feed_ports t) ~cursor ~root_limit ~day_limit ~request_generation |> feed_output t
+    Feed.load_feed t.feed ~ports:(feed_ports t) ~cursor ~root_limit ~day_limit ~request_generation |> feed_output
   | Load_day_blocks { day; after; limit; request_generation } ->
     (match page_by_day t day with
      | None -> day_failure ~day request_generation "The requested journal page is not retained."
      | Some page ->
-       Feed.load_day t.feed ~ports:(feed_ports t) ~page ~after ~limit ~request_generation |> feed_output t)
+       Feed.load_day t.feed ~ports:(feed_ports t) ~page ~after ~limit ~request_generation |> feed_output)
   | Load_detail { block_id; request_generation; limit; after } ->
     let cursor = Option.bind after (fun cursor -> cursor.Projection.protocol_cursor) in
     let parsed = match cursor with
@@ -1439,7 +1450,7 @@ let hydration_for_changes t ~request_generation windows =
       (function
         | Worker_pure_data.V2_page_tree_interest page ->
           Option.bind (registered_tree t page) (fun interest ->
-            Feed.reconcile_page t.feed ~ports:(feed_ports t)
+            if Feed.retained_page t.feed interest.page.id then None else Feed.reconcile_page t.feed ~ports:(feed_ports t)
               ~page:interest.page ~limit:interest.limit)
         | Worker_pure_data.V2_children_interest _ | Worker_pure_data.V2_journal_index_interest -> None)
       structures
@@ -1496,12 +1507,15 @@ let hydration_for_changes t ~request_generation windows =
         | Worker_pure_data.V2_page_tree_interest u -> `Assoc ["kind", `String "page-tree"; "target", `String (Graph.Uuid.to_string u)]))
     ; "truncated", `Bool (List.length pages > 16 || List.length blocks > 16 || List.length structures > 16)
     ];
+  let timeline = Feed.validate_retained t.feed ~ports:(feed_ports t) ~request_generation ~refresh:journal_changed |> feed_output in
+  let timeline = if journal_changed && Feed.has_retained t.feed then
+    {timeline with responses=response (Feed_refresh_started {request_generation})::timeline.responses} else timeline in
   let journal =
-    if not journal_changed then empty else
+    if not journal_changed || Feed.has_retained t.feed then empty else
       match Feed.refresh_initial t.feed ~ports:(feed_ports t) ~request_generation with
       | None -> empty
       | Some planned ->
-        let output = feed_output t planned in
+        let output = feed_output planned in
         {output with responses=response (Feed_refresh_started {request_generation})::output.responses}
   in
   background_demands
@@ -1513,8 +1527,9 @@ let hydration_for_changes t ~request_generation windows =
         @ children_reads
         @ detail_page_reads
         @ journal.requests
+        @ timeline.requests
         @ favorites.requests
-    ; responses = journal.responses @ favorites.responses
+    ; responses = journal.responses @ timeline.responses @ favorites.responses
     }
 ;;
 
@@ -1529,18 +1544,21 @@ let rehydrate_current_interests t ~request_generation ~generation =
   t.task_catalog_epoch <- t.next_request;
   Hashtbl.clear t.task_lookup_epochs;
   let graph_info = read t Graph_info Worker.Graph_info in
+  let timeline = Feed.validate_retained t.feed ~ports:(feed_ports t) ~request_generation ~refresh:true |> feed_output in
+  let timeline = if Feed.has_retained t.feed then
+    {timeline with responses=response (Feed_refresh_started {request_generation})::timeline.responses} else timeline in
   let journal =
-    match Feed.refresh_initial t.feed ~ports:(feed_ports t) ~request_generation with
+    if Feed.has_retained t.feed then empty else match Feed.refresh_initial t.feed ~ports:(feed_ports t) ~request_generation with
     | None -> empty
     | Some planned ->
-      let output = feed_output t planned in
+      let output = feed_output planned in
       {output with responses=response (Feed_refresh_started {request_generation})::output.responses}
   in
   let tree_requests =
     Hashtbl.to_seq_values t.page_tree_interests
     |> List.of_seq
     |> List.filter_map (fun (interest : page_tree_interest) ->
-      Feed.reconcile_page t.feed ~ports:(feed_ports t)
+      if Feed.retained_page t.feed interest.page.id then None else Feed.reconcile_page t.feed ~ports:(feed_ports t)
         ~page:interest.page ~limit:interest.limit)
   in
   let children_requests =
@@ -1588,14 +1606,14 @@ let rehydrate_current_interests t ~request_generation ~generation =
   background_demands
     t
     { requests =
-        (graph_info :: journal.requests)
+        (graph_info :: (timeline.requests @ journal.requests))
         @ tree_requests
         @ children_requests
         @ detail_roots
         @ detail_page_requests
         @ reference_requests
     ; responses =
-        response Projection_resync :: response Favorites_invalidated :: journal.responses
+        response Projection_resync :: response Favorites_invalidated :: (timeline.responses @ journal.responses)
     }
 ;;
 
@@ -1806,17 +1824,6 @@ let operation_name = function
   | Delete_mutation _ -> "deleteSubtree"
 ;;
 
-let worker_error code request_id message =
-  Error.create ~code ~message ~details:[]
-  |> Result.fold ~ok:Fun.id ~error:(fun _ ->
-    let module D=Logseq_db_types.Failure_diagnostic in
-    let detail=D.of_source ~operation:"workerOperation" ~reason:"invalidContent" message in
-    Error.create ~code ~message:(D.message detail)
-      ~details:[Error.{name=D.detail_name;value=Detail_string(D.encode detail)}]
-    |> Result.get_ok)
-  |> fun error -> request_id, error
-;;
-
 let failure_output
       ~source_epoch
       ?(code = Error.Unsupported_semantics)
@@ -1963,7 +1970,7 @@ let receive_result t ~origin ~request_id result =
   match Hashtbl.find_opt t.pending key with
   | None -> empty
   | Some {operation=Feed_read operation;_} when not (Feed.is_current t.feed operation) ->
-    Hashtbl.remove t.pending key; Feed.superseded t.feed ~ports:(feed_ports t) operation |> feed_output t
+    Hashtbl.remove t.pending key; Feed.superseded t.feed ~ports:(feed_ports t) operation |> feed_output
   | Some {operation;source_epoch;_} when not(changed_point_current t operation source_epoch)->
     Hashtbl.remove t.pending key;empty
   | Some { operation = Target_summary summary; source_epoch; _ }
@@ -1980,13 +1987,13 @@ let receive_result t ~origin ~request_id result =
     Hashtbl.remove t.pending key;
     (match (match operation,result with
        | Feed_read operation,Query_result(query,value) ->
-         Feed.receive t.feed ~ports:(feed_ports t) ?origin operation query value
+         Feed.receive ?session:(Option.map fst origin) t.feed ~ports:(feed_ports t) operation query value
        | Feed_read operation,Read_failed{code;_} ->
          Feed.failed t.feed ~ports:(feed_ports t) operation ~code
        | Feed_read operation,Read_error error ->
          Feed.failed t.feed ~ports:(feed_ports t) operation ~code:(Error.code error)
        | _ -> None) with
-     | Some planned -> feed_output t planned
+     | Some planned -> feed_output ~source:(operation_name operation,request_id) planned
      | _ -> (match result with
      | Query_result (Worker.Favorites _, result) ->
        (match operation with
@@ -2640,6 +2647,10 @@ let receive_delivery_body t ~origin ~request_id result =
           Rrbvec.singleton (Reference.Page { page; detail_owner })
         | Query_result (Worker.Page _, Worker_pure_data.V2_missing_page { uuid; _ }) ->
           Rrbvec.singleton (Reference.Missing_page uuid)
+        | Query_result (Worker.Timeline_read {query=Worker.Timeline.Roots _;_}, Ok packet) ->
+          Rrbvec.map (fun (item:Worker_pure_data.tree_member) -> block item.value) packet.items
+        | Query_result (Worker.Timeline_read {query=Worker.Timeline.Preview_children _;_}, Ok packet) ->
+          Rrbvec.map (fun (item:Worker_pure_data.child_member) -> block item.value) packet.items
         | Query_result (Worker.Child_members _, { items; _ }) ->
           Rrbvec.of_list items |> Rrbvec.map (fun (item : Worker_pure_data.child_member) -> block item.value)
         | Query_result (Worker.Tree _, { items; _ }) ->

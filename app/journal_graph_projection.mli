@@ -1,3 +1,24 @@
+(** {1 TLDR}
+
+    Project bounded graph DTOs into Journal presentation values. This module
+    owns no I/O, persistent state or freshness authority. [timeline_entry_page]
+    projects roots and previews; the feed plan validates their sealed receipts
+    before publishing the assembled values. Detail keeps its independent child
+    continuation and projection policy.
+
+    {1 Minimal usage example}
+
+    The caller supplies [page], [time_context], a bounded [fragment] and handlers:
+    {[
+      match timeline_entry_page ~page ~time_context fragment with
+      | Ok projected -> consume projected.entries projected.continuation
+      | Error message -> report message
+    ]}
+    [consume] and [report] are caller callbacks. A combined Timeline fragment
+    must already have passed the feed plan's same-snapshot receipt check.
+
+    {1 Capability details} *)
+
 type favorite_target =
   | Page of string
   | Block of string
@@ -81,21 +102,11 @@ type child_cursor =
   ; maximum_items : int
   }
 
-(** A bounded remainder of one read packet plus its sealed server continuation.
-    The final server page can still retain items. Session/owner and page epoch
-    must be revalidated before replay; this value owns no Worker resource. *)
+(** A sealed Worker cursor for direct Timeline roots. The feed plan owns its
+    retained freshness receipt, owner generation and request identity. Dropping
+    the cursor releases no resource; Detail child cursors remain independent. *)
 type root_cursor =
-  { session : Journal_worker_coordination.Worker_api.session
-  ; budget : Journal_worker_coordination.Worker_api.read_budget
-  ; maximum_items : int
-  ; page : Logseq_db_types.Graph_types.Uuid.t
-  ; epoch : int64
-  ; after :
-      Worker_pure_data.tree_member
-        Journal_worker_coordination.Worker_api.continuation
-        option
-  ; remaining : Worker_pure_data.tree_member Rrbvec.t
-  }
+  Worker_pure_data.tree_member Journal_worker_coordination.Worker_api.Timeline.cursor
 
 type block_continuation =
   | Root_tree_cursor of root_cursor

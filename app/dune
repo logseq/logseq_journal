@@ -1,3 +1,5 @@
+(copy_files spec/timeline_cursor.mli)
+
 (library
  (name journal_app_business)
  (wrapped false)
@@ -28,6 +30,7 @@
  (name app)
  (wrapped false)
  (modules
+  timeline_cursor
   application
   journal_admission_refresh
   journal_diagnostics_view
@@ -72,6 +75,7 @@
   journal_visual_tokens
   journal_symbols)
  (libraries logseq_db_worker.identity
+  logseq_db_worker.contract
   datascript-ocaml-native
   journal_app_business
   rrbvec

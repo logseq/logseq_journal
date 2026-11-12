@@ -142,7 +142,104 @@ type change_ack =
   ; through : string
   }
 
+type (_, _) equality = Refl : ('a, 'a) equality
+
+module Timeline = struct
+  module Day = Logseq_db_worker_contract.Worker_pure_day
+  type worker_error = error
+  type _ query =
+    | Dates : { from_day : Day.t; through_day : Day.t } -> Data.journal_item query
+    | Roots : Graph.page_uuid -> Data.tree_member query
+    | Preview_children : Graph.block_uuid -> Data.child_member query
+  type invalidation = Owner_changed | Scope_changed
+  type error =
+    | Invalid_request of string
+    | Invalidated of invalidation
+    | Read_failed of worker_error
+    | Limit_exceeded of string
+    | Invalid_source_reply of string
+  type 'a receipt = { owner : session; query : 'a query; version : string }
+  type 'a cursor = { receipt : 'a receipt; position : string }
+  type 'a remaining = End | More of 'a cursor
+  type 'a packet = { items : 'a Rrbvec.t; receipt : 'a receipt; next : 'a remaining }
+  type packed_receipt = Receipt : 'a receipt -> packed_receipt
+  type check = { results : (unit, error) result Rrbvec.t }
+  let maximum_receipts = 4096
+  let dates ~from_day ~through_day = Dates { from_day; through_day }
+  let roots ~page = Roots page
+  let preview_children ~parent = Preview_children parent
+  let worker_error_message = function
+    |Revoked_session->"Worker session was revoked"
+    |Invalid_input message|Stale_read message|Resync_required message|Protocol_mismatch message
+    |Service_failed message|Unsupported_operation message->message
+    |Response_budget_exceeded->"Worker response budget was exceeded"
+    |Host_change_in_progress->"Worker host change is in progress"
+    |Db_error error->Logseq_db_worker_contract.Error.message error
+  let worker_error_json = function
+    |Revoked_session->`String "Revoked_session"
+    |Response_budget_exceeded->`String "Response_budget_exceeded"
+    |Host_change_in_progress->`String "Host_change_in_progress"
+    |Invalid_input text->`List[`String "Invalid_input";`String text]
+    |Stale_read text->`List[`String "Stale_read";`String text]
+    |Resync_required text->`List[`String "Resync_required";`String text]
+    |Protocol_mismatch text->`List[`String "Protocol_mismatch";`String text]
+    |Service_failed text->`List[`String "Service_failed";`String text]
+    |Unsupported_operation text->`List[`String "Unsupported_operation";`String text]
+    |Db_error error->`List[`String "Db_error";Logseq_db_worker_contract.Error.to_yojson error]
+  let error_json = function
+    |Invalid_request text->`List[`String "Invalid_request";`String text]
+    |Limit_exceeded text->`List[`String "Limit_exceeded";`String text]
+    |Invalid_source_reply text->`List[`String "Invalid_source_reply";`String text]
+    |Invalidated Owner_changed->`List[`String "Invalidated";`String "Owner_changed"]
+    |Invalidated Scope_changed->`List[`String "Invalidated";`String "Scope_changed"]
+    |Read_failed error->`List[`String "Read_failed";worker_error_json error]
+  let error_message = function
+    | Invalid_request message | Limit_exceeded message
+    | Invalid_source_reply message -> message
+    | Invalidated Owner_changed -> "Timeline owner changed"
+    | Invalidated Scope_changed -> "Timeline scope changed"
+    | Read_failed error -> worker_error_message error
+  let equal_query : type a. a query -> a query -> bool = fun left right ->
+    match left,right with
+    | Dates left,Dates right -> Day.value left.from_day=Day.value right.from_day
+      && Day.value left.through_day=Day.value right.through_day
+    | Roots left,Roots right -> Uuid.equal left right
+    | Preview_children left,Preview_children right -> Uuid.equal left right
+  let result_equality : type a b. a query -> b query -> (a,b) equality option = fun left right ->
+    match left,right with
+    | Dates _,Dates _ -> Some Refl
+    | Roots _,Roots _ -> Some Refl
+    | Preview_children _,Preview_children _ -> Some Refl
+    | _ -> None
+  let query_json : type a. a query -> Yojson.Safe.t = function
+    | Dates {from_day;through_day} -> `List [`String "Dates";`Int(Day.value from_day);`Int(Day.value through_day)]
+    | Roots page -> `List [`String "Roots";Uuid.to_yojson page]
+    | Preview_children parent -> `List [`String "Preview_children";Uuid.to_yojson parent]
+  let owner_json (owner:session) =
+    `List [`Intlit(Int64.to_string owner.binding.serial);
+      `String(Int64.to_string(Journal_worker_ids.Runtime.Epoch.to_int64 owner.binding.incarnation.runtime_epoch));
+      `String(Int64.to_string(Journal_worker_ids.Worker.Generation.to_int64 owner.binding.incarnation.worker_generation));
+      `String owner.binding.origin;`String owner.binding.user;Uuid.to_yojson owner.graph;
+      `Int owner.account;`Intlit(Int64.to_string owner.lifecycle);`Int owner.generation]
+  let receipt_json receipt = `Assoc ["owner",owner_json receipt.owner;
+    "query",query_json receipt.query;"version",`String receipt.version]
+  let cursor_json (cursor:'a cursor) = `Assoc ["receipt",receipt_json cursor.receipt;"position",`String cursor.position]
+  let packet_json : type a. a query -> a packet -> Yojson.Safe.t = fun query packet ->
+    let encode : a -> Yojson.Safe.t = match query with
+      |Dates _->Data.journal_item_to_yojson|Roots _->Data.tree_member_to_yojson
+      |Preview_children _->Data.child_member_to_yojson in
+    `Assoc ["items",`List(List.map encode(Rrbvec.to_list packet.items));"receipt",receipt_json packet.receipt;
+      "next",(match packet.next with End->`Null|More cursor->cursor_json cursor)]
+  let check_json checks = `Assoc ["results",`List(List.map(function
+    |Ok()->`String "Current"
+    |Error error->`List[`String "Error";error_json error])(Rrbvec.to_list checks.results))]
+
+end
+
 type _ query =
+  | Timeline_read : { query : 'a Timeline.query; after : 'a Timeline.cursor option }
+      -> ('a Timeline.packet, Timeline.error) result query
+  | Timeline_check : Timeline.packed_receipt Rrbvec.t -> Timeline.check query
   | Graph_info : graph_info query
   | Admission : Worker_pure_data.admission_inspection query
   | Journal : journal_day -> page option query
@@ -210,11 +307,12 @@ type packed_query = Read_query : read_budget * 'a query -> packed_query
 
 type answer = Query_answer : read_budget * 'a query * ('a,error) result -> answer
 
-type (_, _) equality = Refl : ('a, 'a) equality
-
 let query_result_equality : type a b. a query -> b query -> (a, b) equality option =
   fun a b ->
   match a, b with
+  | Timeline_read left, Timeline_read right ->
+    (match Timeline.result_equality left.query right.query with Some Refl->Some Refl|None->None)
+  | Timeline_check _,Timeline_check _ -> Some Refl
   | Graph_info, Graph_info -> Some Refl
   | Admission, Admission -> Some Refl
   | Journal _, Journal _ -> Some Refl
@@ -320,6 +418,16 @@ let change_ack_generation (a : change_ack) = a.generation
 let change_ack_through (a : change_ack) = a.through
 
 module For_worker = struct
+  let timeline_check results : Timeline.check = {results}
+  let timeline_receipt ~owner ~query ~version : 'a Timeline.receipt = {owner;query;version}
+  let timeline_packet ~receipt ~items ~next : 'a Timeline.packet =
+    {items;receipt;next=(match next with None->Timeline.End|Some position->More {receipt;position})}
+  let timeline_cursor_position (cursor:'a Timeline.cursor) = cursor.position
+  let timeline_cursor_receipt (cursor:'a Timeline.cursor) = cursor.receipt
+  let timeline_receipt_owner (receipt:'a Timeline.receipt) = receipt.owner
+  let timeline_receipt_query (receipt:'a Timeline.receipt) = receipt.query
+  let timeline_receipt_version (receipt:'a Timeline.receipt) = receipt.version
+
   let pack_query budget query = Read_query(budget,query)
   let answer budget query value = Query_answer(budget,query,value)
   let worker_incarnation_runtime_epoch (value:worker_incarnation) = value.runtime_epoch
@@ -366,7 +474,7 @@ let smaller_page_size : type a. a query -> int -> int option = fun query count -
   match query with
   |Journals _|Block_summary _|Children _|Child_members _|Tree _|Favorites _
   |Task_statuses _|Assets _|Changes _->if count>1 then Some(max 1(count/2))else None
-  |Graph_info|Admission|Journal _|Page _|Outline_block _|Task_status_definitions _|Asset_descriptors _->None
+  |Timeline_read _|Timeline_check _|Graph_info|Admission|Journal _|Page _|Outline_block _|Task_status_definitions _|Asset_descriptors _->None
 ;;
 
 let query_json : type a. read_budget -> a query -> Graph.Cursor.t option -> Yojson.Safe.t =
@@ -378,6 +486,10 @@ let query_json : type a. read_budget -> a query -> Graph.Cursor.t option -> Yojs
   let cursor=optional Graph.Cursor.to_yojson cursor in
   let page fields=("maximum_items",integer budget.maximum_items)::("cursor",cursor)::fields in
   let kind,fields=match query with
+    |Timeline_read{query;after}->"Timeline_read",["query",Timeline.query_json query;
+      "after",optional Timeline.cursor_json after]
+    |Timeline_check receipts->"Timeline_check",["receipts",`List(List.map(fun(Timeline.Receipt receipt)->
+      Timeline.receipt_json receipt)(Rrbvec.to_list receipts))]
     |Graph_info->"Graph_info",[]
     |Admission->"Admission",[]
     |Journal day->"Journal",["day",integer (For_worker.journal_day_value day)]
@@ -424,7 +536,10 @@ let checked_query : type a. session -> read_budget -> a query -> (Graph.Cursor.t
   fun session budget query ->
   let invalid message=Error(Db_error(Logseq_db_worker_contract.Error.create
     ~code:Invalid_request ~message ~details:[] |> Result.get_ok)) in
-  let count=match query with Task_status_definitions ids|Asset_descriptors ids->List.length ids|_->1 in
+  let count=match query with
+    |Task_status_definitions ids|Asset_descriptors ids->List.length ids
+    |Timeline_check receipts->if Rrbvec.length receipts>Timeline.maximum_receipts then max_int else 1
+    |_->1 in
   if not(equal_session session budget.owner) then Error Revoked_session
   else if count>budget.maximum_items then Error(Invalid_input "Lookup exceeds item budget") else
   let valid=match query with
@@ -461,6 +576,8 @@ let asset_listing_json (value:asset_listing)=`Assoc[
   "items",json_list Logseq_db_types.Asset_descriptor.to_yojson value.items;"next",continuation_json value.next]
 let value_json : type a. a query -> a -> Yojson.Safe.t = fun query value->
   match query with
+  |Timeline_read{query;_}->(match value with Ok packet->Timeline.packet_json query packet|Error _->`Null)
+  |Timeline_check _->Timeline.check_json value
   |Graph_info->`Assoc[
     "graph_uuid",Uuid.to_yojson value.graph_uuid;"graph_name",`String value.graph_name;
     "schema",Graph.schema_version_to_yojson value.schema;"admission_facts",json_list Graph.admission_fact_to_yojson value.admission_facts;
@@ -495,11 +612,16 @@ let value_json : type a. a query -> a -> Yojson.Safe.t = fun query value->
     "generation",`String value.generation;"from_exclusive",json_optional(fun text->`String text)value.from_exclusive;
     "through",`String value.through;"windows",json_list Data.change_window_to_yojson value.windows;"next",json_optional(fun text->`String text)value.next]
 ;;
-let encoded_value_bytes query value = String.length(Yojson.Safe.to_string(value_json query value))
+let encoded_value_bytes : type a. a query -> a -> int = fun query value ->
+  match query,value with
+  |Timeline_read _,Error _->0
+  |_->String.length(Yojson.Safe.to_string(value_json query value))
 
 let validate_value : type a. session -> read_budget -> a query -> a -> (unit,error) result =
   fun session budget query value ->
   let count=match query with
+    |Timeline_read _->(match value with Ok packet->Rrbvec.length packet.items|Error _->0)
+    |Timeline_check _->if Rrbvec.length value.Timeline.results>Timeline.maximum_receipts then max_int else 1
     |Journals _->List.length value.items
     |Block_summary _->List.length value.items
     |Children _->List.length value.items
@@ -515,6 +637,9 @@ let validate_value : type a. session -> read_budget -> a query -> a -> (unit,err
   let block_matches uuid = function Data.V2_present_block{value;_}->Uuid.equal uuid value.block.uuid|V2_missing_block{uuid=actual;_}->Uuid.equal uuid actual in
   let page_matches uuid = function Data.V2_present_page{page;_}->Uuid.equal uuid page.uuid|V2_missing_page{uuid=actual;_}->Uuid.equal uuid actual in
   let matches=match query with
+    |Timeline_read{query;_}->(match value with Error _->true|Ok packet->
+      equal_session session packet.receipt.owner && Timeline.equal_query query packet.receipt.query)
+    |Timeline_check receipts->Rrbvec.length receipts=Rrbvec.length value.Timeline.results
     |Graph_info->Uuid.equal session.graph value.graph_uuid
     |Page{uuid;_}->page_matches uuid value
     |Outline_block{uuid;_}->block_matches uuid value
@@ -542,6 +667,7 @@ let validate_value : type a. session -> read_budget -> a query -> a -> (unit,err
   if not(equal_session session budget.owner) then Error Revoked_session
   else if count>budget.maximum_items then Error Response_budget_exceeded
   else if not matches then Error(Protocol_mismatch "Response does not match the typed query")
+  else if (match query,value with Timeline_read _,Error _->true|_->false) then Ok()
   else let json=value_json query value in
     match Logseq_db_types.Json_codec.validate json with
     |Error _->Error(Protocol_mismatch "The typed query result is not valid JSON data")

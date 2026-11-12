@@ -1429,8 +1429,238 @@ let task_catalog_uses_database_identity database =
        | _ -> Alcotest.fail "pinned status catalog lost deleted entity")
 ;;
 
+let timeline_scopes_follow_local_payload_and_snapshot database =
+  let behavior = "timeline scopes follow local payload and snapshots" in
+  let before = Database.current_snapshot database |> T.require_ok ~behavior in
+  let scope scope = Database.timeline_scope_version before scope |> T.require_ok ~behavior in
+  let roots = scope (Database.Page_roots T.page_uuid) in
+  let children = scope (Database.Parent_children T.page_uuid) in
+  let unrelated = scope (Database.Parent_children T.missing_block_uuid) in
+  let dates = scope Database.Journal_index in
+  let expected = T.delete_precondition database ~block:T.authoritative_block_uuid ~behavior in
+  ignore (T.commit_mutation database ~expected
+    (Save_block { mutation_id = T.mutation_uuid 981; block = T.authoritative_block_uuid; title = "Scope changed" }) ~behavior);
+  let after = Database.current_snapshot database |> T.require_ok ~behavior in
+  let latest scope = Database.timeline_scope_version after scope |> T.require_ok ~behavior in
+  T.require (not (Database.equal_timeline_scope_version roots (latest (Database.Page_roots T.page_uuid))))
+    "root payload edit retained its old scope version";
+  T.require (not (Database.equal_timeline_scope_version children (latest (Database.Parent_children T.page_uuid))))
+    "child payload edit retained its old scope version";
+  T.require (Database.equal_timeline_scope_version unrelated (latest (Database.Parent_children T.missing_block_uuid)))
+    "unrelated empty parent scope was invalidated";
+  T.require (Database.equal_timeline_scope_version dates (latest Database.Journal_index))
+    "block payload edit invalidated an unchanged journal index";
+  T.require (Database.equal_timeline_scope_version roots (scope (Database.Page_roots T.page_uuid)))
+    "old snapshot scope version changed after commit";
+  Database.release_snapshot before;
+  Database.release_snapshot after
+;;
+
+let timeline_pages_continue_across_unrelated_scopes database =
+  let behavior = "timeline scope-bound direct pagination" in
+  let before = Database.current_snapshot database |> T.require_ok ~behavior in
+  let first, next = Database.get_timeline_roots before ~page:T.page_uuid ~limit:1 ~after:None
+    |> T.require_ok ~behavior in
+  T.require (List.length first = 1) "timeline root first packet is missing";
+  let revision = match Database.get_pages before [T.missing_page_uuid] |> T.require_ok ~behavior with
+    | [Missing_page {revision;_}] -> revision | _ -> Alcotest.fail "journal fixture UUID exists" in
+  let expected = Database.write_precondition ~blocks:[] ~pages:[T.missing_page_uuid,revision] ~scopes:[] |> T.require_ok ~behavior in
+  ignore (T.commit_mutation database ~expected
+    (T.create_journal_page ~ordinal:982 ()) ~behavior);
+  let after = Database.current_snapshot database |> T.require_ok ~behavior in
+  (match next with
+   | None -> ()
+   | Some position ->
+     ignore (Database.get_timeline_roots after ~page:T.page_uuid ~limit:1 ~after:(Some position)
+       |> T.require_ok ~behavior));
+  let journals, _ = Database.get_timeline_journals after ~from_day:20260902 ~through_day:20260902 ~limit:1 ~after:None
+    |> T.require_ok ~behavior in
+  T.require (List.length journals = 1) "timeline journal packet omitted the created day";
+  (match Database.get_timeline_roots after ~page:T.page_uuid ~limit:0 ~after:None with
+   | Error (Invalid_read_request _) -> () | _ -> Alcotest.fail "timeline accepted a zero packet limit");
+  Database.release_snapshot before;
+  Database.release_snapshot after
+;;
+
+let timeline_remote_scopes_cover_metadata_moves_and_aba database =
+  let behavior = "timeline authoritative metadata, moves and ABA" in
+  let module J = Transit_core.Json in
+  let id n = T.uuid (Printf.sprintf "76000000-0000-4000-8000-%012d" n) in
+  let lookup n = T.status_lookup (id n) in
+  let add n a v = T.status_add (lookup n) a v in
+  let entity n = J.Int (30000+n) in
+  let create n a v = T.status_add (entity n) a v in
+  let page n day =
+    [create n "block/uuid" (J.Uuid (Graph.Uuid.to_string (id n)));
+     create n "block/title" (J.String (Printf.sprintf "Day %d" day));
+     create n "block/name" (J.String (Printf.sprintf "day-%d" day));
+     create n "block/journal-day" (J.Int day)] in
+  let block n parent order =
+    [create n "block/uuid" (J.Uuid (Graph.Uuid.to_string (id n)));
+     create n "block/title" (J.String (Printf.sprintf "Block %d" n));
+     create n "block/parent" (lookup parent);create n "block/page" (lookup 1);
+     create n "block/order" (J.String order)] in
+  let apply cursor operations = T.apply_test_transaction database ~cursor operations in
+  let version scope =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot)
+      (fun () -> Database.timeline_scope_version snapshot scope |> T.require_ok ~behavior) in
+  let changed label old scope = T.require (not (Database.equal_timeline_scope_version old (version scope))) label in
+  let unchanged label old scope = T.require (Database.equal_timeline_scope_version old (version scope)) label in
+  apply 1 (page 1 20261101 @ page 2 20261102 @ block 3 1 "same" @ block 4 1 "same"
+    @ block 5 3 "a" @ [add 3 "block/tags" (lookup 2)]);
+  let roots_scope = Database.Page_roots (id 1) and child_scope = Database.Parent_children (id 3) in
+  let roots = version roots_scope and dates = version Database.Journal_index in
+  apply 2 [add 2 "block/title" (J.String "Renamed tag")];
+  changed "tag title rename did not invalidate enriched root DTO" roots roots_scope;
+  changed "journal title rename did not invalidate index metadata" dates Database.Journal_index;
+  let roots = version roots_scope and child = version child_scope in
+  apply 3 [add 5 "block/title" (J.String "Edited descendant")];
+  unchanged "descendant content edit invalidated direct roots" roots roots_scope;
+  changed "direct child content edit retained preview scope" child child_scope;
+  let dates = version Database.Journal_index and roots = version roots_scope in
+  apply 4 [add 1 "block/updated-at" (J.Int 999)];
+  changed "journal updated-at retained index receipt" dates Database.Journal_index;
+  unchanged "page timestamp changed unchanged root DTOs" roots roots_scope;
+  let source = version child_scope and destination = version (Database.Parent_children (id 4)) in
+  apply 5 [add 5 "block/parent" (lookup 4)];
+  changed "move retained source preview scope" source child_scope;
+  changed "move retained destination preview scope" destination (Database.Parent_children (id 4));
+  let full = version (Database.Parent_children (id 4)) in
+  apply 6 [J.Array [J.Keyword "db/retractEntity"; lookup 5]];
+  let absent = version (Database.Parent_children (id 4)) in
+  apply 7 (block 5 4 "a");
+  changed "delete/recreate reused full collection version" full (Database.Parent_children (id 4));
+  changed "recreate retained empty collection version" absent (Database.Parent_children (id 4));
+  let recreated = version (Database.Parent_children (id 4)) in
+  apply 8 (J.Array [J.Keyword "db/retractEntity"; lookup 5] :: block 5 4 "a");
+  changed "atomic delete/recreate reused the old collection version" recreated (Database.Parent_children (id 4));
+  let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  let first,next = Database.get_timeline_roots snapshot ~page:(id 1) ~limit:1 ~after:None |> T.require_ok ~behavior in
+  let position = match next with Some next -> next | None -> Alcotest.fail "tied roots omitted continuation" in
+  let second,last = Database.get_timeline_roots snapshot ~page:(id 1) ~limit:1 ~after:(Some position) |> T.require_ok ~behavior in
+  T.require (List.length first=1 && List.length second=1 && Option.is_none last) "tied roots pagination lost a member";
+  T.require (not (Graph.Uuid.equal (List.hd first).block.block.uuid (List.hd second).block.block.uuid)) "tied roots pagination duplicated a member";
+  Database.release_snapshot snapshot;
+  apply 9 [add 3 "block/title" (J.String "Changed root")];
+  let latest = Database.current_snapshot database |> T.require_ok ~behavior in
+  (match Database.get_timeline_roots latest ~page:(id 1) ~limit:1 ~after:(Some position) with
+   | Error Stale_read_cursor -> () | _ -> Alcotest.fail "changed root scope accepted old ordinal");
+  Database.release_snapshot latest;
+  let preview = version (Database.Parent_children (id 4)) in
+  apply 10 [add 1 "logseq.property/deleted-at" (J.Int 1234)];
+  changed "ancestor recycling retained preview receipt" preview (Database.Parent_children (id 4))
+;;
+
+let timeline_overlay_roots_follow_remote_page_metadata database =
+  let behavior = "timeline overlay roots follow remote page metadata" in
+  let module J = Transit_core.Json in
+  let page = T.mutation_uuid 983 in
+  T.apply_test_transaction database ~cursor:1
+    [T.status_add (J.String "empty-timeline-page") "block/uuid" (J.Uuid (Graph.Uuid.to_string page));
+     T.status_add (J.String "empty-timeline-page") "block/title" (J.String "Empty page");
+     T.status_add (J.String "empty-timeline-page") "block/name" (J.String "empty-timeline-page")];
+  let expected = T.insert_precondition database ~parent:page ~behavior in
+  let mutation = Insert_blocks {mutation_id=T.mutation_uuid 982;parent=page;asset=None;
+    tree={uuid=T.block_uuid;title="Local-only root";children=[]}} in
+  ignore (T.commit_mutation database ~expected mutation ~behavior);
+  let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, request = Database.begin_outbox_transition database
+    ~expected:(sync_view_token sync) (Submit_group [T.mutation_uuid 982])
+    |> T.require_ok ~behavior in
+  let request = Option.get request in
+  let envelope = Transit_native.Transit.Json.to_string
+    (J.Array [J.Binary "iv";J.Binary "ciphertext"]) in
+  let encrypted = Database.protection_plaintexts request
+    |> List.map (fun (item, _) -> item, envelope) in
+  ignore (Database.apply_outbox_transition database prepared ~encrypted:(Some (request, encrypted))
+    |> T.require_ok ~behavior);
+  let before = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect ~finally:(fun () -> Database.release_snapshot before) (fun () ->
+    let scope = Database.Page_roots page in
+    let version = Database.timeline_scope_version before scope |> T.require_ok ~behavior in
+    let read snapshot =
+      Database.get_outline_blocks snapshot [T.block_uuid] |> T.require_ok ~behavior
+      |> function
+      | [Present_block {value;_}] -> value.rendered_page_title
+      | _ -> Alcotest.fail "local-only root is missing" in
+    let old_title = read before in
+    T.apply_test_transaction database ~cursor:2
+      [T.status_add (T.status_lookup page) "block/title" (J.String "Remote page title")];
+    let after = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> Database.release_snapshot after) (fun () ->
+      T.require (old_title <> read after) "remote page rename did not reach local-only root DTO";
+      let latest = Database.timeline_scope_version after scope |> T.require_ok ~behavior in
+      T.require (not (Database.equal_timeline_scope_version version latest))
+        "local-only root metadata changed without invalidating its receipt"))
+;;
+
+let timeline_large_dependency_fanout_keeps_authority database =
+  let behavior = "timeline large dependency fanout keeps authority" in
+  let module J = Transit_core.Json in
+  let id ordinal = T.uuid (Printf.sprintf "77000000-0000-4000-8000-%012d" ordinal) in
+  for batch = 0 to 40 do
+    let operations = List.init 256 (fun index ->
+      let ordinal = batch * 256 + index in
+      let entity = J.Int (100000 + ordinal) in
+      [T.status_add entity "block/uuid" (J.Uuid (Graph.Uuid.to_string (id ordinal)));
+       T.status_add entity "block/title" (J.String "Fanout member");
+       T.status_add entity "block/parent" (T.status_lookup T.authoritative_block_uuid);
+       T.status_add entity "block/page" (T.status_lookup T.page_uuid);
+       T.status_add entity "block/order" (J.String (string_of_int ordinal));
+       T.status_add entity "block/tags" (T.status_lookup T.page_uuid)])
+      |> List.concat in
+    T.apply_test_transaction database ~cursor:(batch + 1) operations
+  done;
+  let before = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect ~finally:(fun () -> Database.release_snapshot before) (fun () ->
+    let affected = Database.Parent_children T.authoritative_block_uuid in
+    let unrelated = Database.Parent_children T.missing_block_uuid in
+    let version snapshot scope = Database.timeline_scope_version snapshot scope |> T.require_ok ~behavior in
+    let old_version = version before affected in
+    let old_unrelated = version before unrelated in
+    let old_journals = version before Database.Journal_index in
+    let payload snapshot = Database.get_outline_blocks snapshot [id 0] |> T.require_ok ~behavior in
+    let old_payload = payload before in
+    let old_page_title = Database.get_pages before [T.page_uuid] |> T.require_ok ~behavior
+      |> function
+      | [Present_page {value;_}] -> value.page.title
+      | _ -> Alcotest.fail "fanout fixture page is missing" in
+    T.apply_test_transaction database ~cursor:42
+      [T.status_add (T.status_lookup T.page_uuid) "block/title" (J.String "Large fanout rename")];
+    let after = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> Database.release_snapshot after) (fun () ->
+      let new_version = version after affected in
+      T.require (old_payload <> payload after) "large fanout did not change its public DTO";
+      T.require (not (Database.equal_timeline_scope_version old_version new_version))
+        "large fanout retained the affected collection version";
+      T.require (Database.equal_timeline_scope_version old_unrelated (version after unrelated))
+        "large fanout invalidated an unrelated missing scope";
+      T.require (Database.equal_timeline_scope_version old_journals (version after Database.Journal_index))
+        "large fanout invalidated an unrelated journal index";
+      T.require (Database.equal_timeline_scope_version old_version (version before affected)
+                 && old_payload = payload before)
+        "large fanout mutated a pinned snapshot";
+      T.apply_test_transaction database ~cursor:43
+        [T.status_add (T.status_lookup T.page_uuid) "block/title" (J.String old_page_title)];
+      let latest = Database.current_snapshot database |> T.require_ok ~behavior in
+      Fun.protect ~finally:(fun () -> Database.release_snapshot latest) (fun () ->
+        let latest_version = version latest affected in
+        T.require (payload latest = old_payload) "fanout ABA did not restore the original public DTO";
+        T.require (not (Database.equal_timeline_scope_version new_version latest_version)
+                   && not (Database.equal_timeline_scope_version old_version latest_version))
+          "a second large fanout reused a previous collection version";
+        T.require (Database.equal_timeline_scope_version old_unrelated (version latest unrelated))
+          "a second large fanout invalidated an unrelated missing scope")))
+;;
+
 let cases =
-  [ T.database_case
+  [ T.database_case "timeline large dependency fanout keeps authority" timeline_large_dependency_fanout_keeps_authority
+  ; T.database_case "timeline overlay roots follow remote page metadata" timeline_overlay_roots_follow_remote_page_metadata
+  ; T.database_case "timeline remote scopes cover metadata moves and ABA" timeline_remote_scopes_cover_metadata_moves_and_aba
+  ; T.database_case "timeline local scope versions bind payload and snapshots" timeline_scopes_follow_local_payload_and_snapshot
+  ; T.database_case "timeline direct paging survives unrelated scopes" timeline_pages_continue_across_unrelated_scopes
+  ; T.database_case
       "task catalog reads N identities and lifecycle"
       task_catalog_uses_database_identity
   ; T.database_case
