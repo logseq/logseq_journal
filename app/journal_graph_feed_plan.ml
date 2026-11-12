@@ -1,7 +1,7 @@
 module Graph = Logseq_db_types.Graph_types
 module Projection = Journal_graph_projection
 module Worker = Journal_worker_coordination.Worker_api
-module Paging = Timeline_cursor
+module Paging = Journal_timeline_cursor.Timeline_cursor
 
 type scope = Dates_scope of Worker.journal_day * Worker.journal_day | Roots_scope of string | Preview_scope of string * string
 type proofs = (scope, Paging.packed_receipt) Hashtbl.t
