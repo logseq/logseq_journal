@@ -57,6 +57,14 @@ val retained_slot : t -> int -> slot option
 (** Fold retained slots from first to last without materializing an intermediate collection. *)
 val fold_slots : ('a -> slot -> 'a) -> 'a -> t -> 'a
 
+(** Whether any visible or hidden day is still retained. *)
+val has_retained : t -> bool
+
+(** Removed pages and changed entries paired with their next retained value.
+    Includes hidden placeholders and preview-only changes. Unchanged retention
+    is O(1); point updates index only changed entries, with a linear slot walk. *)
+val retired : before:t -> after:t -> Journal_graph_projection.page Rrbvec.t * (Journal_graph_projection.timeline_entry * Journal_graph_projection.timeline_entry option) Rrbvec.t
+
 (** Includes a hidden placeholder while its day remains known. *)
 val find_block : t -> block_id:string -> Journal_model.t option
 

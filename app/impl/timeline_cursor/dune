@@ -1,0 +1,5 @@
+(library
+ (name journal_timeline_cursor_impl)
+ (implements journal_timeline_cursor)
+ (modules timeline_cursor)
+ (libraries logseq_journal.worker_coordination))

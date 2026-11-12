@@ -1,6 +1,35 @@
 module Read = Worker_pure_read
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
+(* Synthetic Timeline packets use a stable scope version. Keep their typed
+   receipts and cursor positions on the same owner/query as the real protocol. *)
+let fixture_timeline_packet budget query ~items ~next =
+  let module F = Read.For_worker in
+  let receipt = F.timeline_receipt ~owner:(F.read_budget_owner budget)
+      ~query ~version:"fixture" in
+  F.timeline_packet ~receipt ~items:(Rrbvec.of_list items) ~next
+;;
+
+let fixture_timeline_check budget receipts =
+  let module F = Read.For_worker in
+  F.timeline_check (Rrbvec.map (fun (Read.Timeline.Receipt receipt) ->
+    if not (Read.equal_session (F.read_budget_owner budget) (F.timeline_receipt_owner receipt))
+    then Error (Read.Timeline.Invalidated Owner_changed)
+    else if F.timeline_receipt_version receipt <> "fixture"
+    then Error (Read.Timeline.Invalidated Scope_changed)
+    else Ok ()) receipts)
+;;
+
+let fixture_read_cursor : type a. Read.read_budget -> a Read.query ->
+    Logseq_db_types.Graph_types.Cursor.t option = fun budget query ->
+  match query with
+  | Read.Timeline_read {after;_} ->
+    Option.map (fun cursor -> Read.For_worker.timeline_cursor_position cursor
+      |> Logseq_db_types.Graph_types.Cursor.of_string |> Result.get_ok) after
+  | _ -> Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query
+      |> Result.get_ok
+;;
+
 (* Synthetic observation registration uses the same query handler, while
    preserving the real Service envelopes, identity, epochs and release ACK. *)
 let fixture_observations ?(observed=(fun _->())) ?(released=(fun _->()))
@@ -1143,8 +1172,78 @@ let run_favorites_native_visibility
           let module F=Read.For_worker in
           let owner=F.read_budget_owner budget in
           let limit=F.read_budget_maximum_items budget in
-          let cursor=Read.query_cursor owner budget query|>Result.get_ok in
+          let cursor=fixture_read_cursor budget query in
           let next cursor=Option.map(fun cursor->F.continuation ~owner ~budget ~key:(Read.query_key budget query) ~cursor)cursor in
+          let child_items parent =
+            match parent with
+            | parent when Option.is_some detail_capture ->
+              let existing =
+                if G.Uuid.equal parent (uuid 1)
+                then (
+                  let value = timeline_block 1 in
+                  [ { Worker_pure_data.value = { value with block = { value.block with parent } }
+                    ; revision = "child"
+                    }
+                  ])
+                else []
+              in
+              (existing
+                    @ List.filter_map
+                        (fun (owner, (root : Worker_pure_data.block_tree)) ->
+                           if not (G.Uuid.equal owner parent)
+                           then None
+                           else (
+                             let value = timeline_block 0 in
+                             Some
+                               { Worker_pure_data.value =
+                                   { value with
+                                     block =
+                                       { value.block with
+                                         uuid = root.uuid
+                                       ; title = root.title
+                                       ; parent
+                                       ; order = "999"
+                                       }
+                                   }
+                               ; revision = "appended"
+                               }))
+                        (Atomic.get detail_captures), None)
+            | parent
+              when Atomic.get detail_fixture && G.Uuid.equal parent (uuid 1) ->
+              if check_copy && Atomic.get detail_initial_limit = None
+              then Atomic.set detail_initial_limit (Some limit);
+              let value = timeline_block 1 in
+              (List.init
+                      (if check_detail_wait then 2 else 1)
+                      (fun i ->
+                       let value = if i = 0 then value else timeline_block 2 in
+                       { Worker_pure_data.value = { value with block = { value.block with parent } }
+                       ; revision = "child"
+                         }), None)
+            | parent ->
+              if Atomic.get detail_fixture && (check_detail_discovery || check_detail_wait) && G.Uuid.equal parent (uuid 2)
+              then Atomic.set discovery_reads (limit :: Atomic.get discovery_reads);
+              (* Initial first pages complete before publication. The wait
+                 scenario delays only a later explicit continuation read. *)
+              if Atomic.get detail_fixture && check_detail_wait && G.Uuid.equal parent (uuid 2) && cursor <> None then
+                while not (Atomic.get detail_wait_release) do
+                  Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+                done;
+              ((if G.Uuid.equal parent favorites_page.uuid
+                     then List.init 65 favorite_membership
+                     else if Atomic.get detail_fixture && check_detail_wait && cursor = None
+                          && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
+                     then (
+                       let value = timeline_block (if G.Uuid.equal parent (uuid 2) then 63 else 64) in
+                       [ { Worker_pure_data.value = { value with block = { value.block with parent } }
+                         ; revision = "child-first-page"
+                         }
+                       ])
+                     else []), (if Atomic.get detail_fixture && check_detail_wait && cursor = None
+                        && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
+                     then Some (G.Cursor.of_string "later-child-page" |> Result.get_ok)
+                     else None))
+          in
           match query with
           |Read.Block_summary{block;_} when confirmation && durable_status=Some `Absence->
             Ok(F.block_summary ~lookup:(Worker_pure_data.V2_missing_block{uuid=block;revision="missing"})
@@ -1170,14 +1269,15 @@ let run_favorites_native_visibility
                     ; dispatcher_capacity = 256
                     ; wire_batch_max_bytes = 262144
                     }) ~generation:("g") ~projection_revision:("p")))
-            | Read.Journals _ ->
+            | Read.Timeline_read {query=(Read.Timeline.Dates _ as timeline);_} ->
               Atomic.set feed_queried true;
               let _ = Atomic.fetch_and_add calendar_feed_reads 1 in
               if Atomic.get calendar_refresh_pending then (
                 while not (Atomic.get calendar_feed_release) do Unix.sleepf 0.001 done;
                 (Error(fixture_error ("FixtureCalendarRefresh") ("Calendar refresh fixture failed"))))
-              else (Ok(F.slice ~items:([ Worker_pure_data.{ page; journal_day = 20260901; revision = "p" } ]) ~next:(next (None))))
-            | Read.Tree _ ->
+              else Ok (Ok (fixture_timeline_packet budget timeline
+                ~items:[ Worker_pure_data.{ page; journal_day = 20260901; revision = "p" } ] ~next:None))
+            | Read.Timeline_read {query=(Read.Timeline.Roots _ as timeline);_} ->
               let count = Option.value media_rows ~default:timeline_rows in
               let offset = match cursor with None -> 0 | Some value -> int_of_string (G.Cursor.to_string value) in
               if check_initial_feed && offset > 0 then (
@@ -1187,12 +1287,22 @@ let run_favorites_native_visibility
                 done);
               let limit = if check_initial_feed && offset = 0 then 1 else limit in
               let length = max 0 (min limit (count - offset)) in
-              (Ok(F.slice ~items:(List.init length (fun index ->
-                    { Worker_pure_data.value = timeline_block (offset + index)
-                    ; revision = status_revision ()
-                    ; depth = 0
-                    ; parent = page.uuid })) ~next:(next ((if offset + length < count
-                     then Some (G.Cursor.of_string (string_of_int (offset + length)) |> Result.get_ok) else None)))))
+              Ok (Ok (fixture_timeline_packet budget timeline
+                ~items:(List.init length (fun index ->
+                  { Worker_pure_data.value = timeline_block (offset + index)
+                  ; revision = status_revision ()
+                  ; depth = 0
+                  ; parent = page.uuid }))
+                ~next:(if offset + length < count then Some (string_of_int (offset + length)) else None)))
+            | Read.Timeline_read {query=(Read.Timeline.Preview_children parent as timeline);_} ->
+              let items, next = child_items parent in
+              Ok (Ok (fixture_timeline_packet budget timeline ~items
+                ~next:(Option.map G.Cursor.to_string next)))
+            | Read.Timeline_check receipts -> Ok (fixture_timeline_check budget receipts)
+            | Read.Journals _ ->
+              (* Offline asset discovery still uses the general journal catalog. *)
+              Ok (F.slice ~items:[ Worker_pure_data.{ page; journal_day = 20260901; revision = "p" } ]
+                ~next:(next None))
             | Read.Changes {generation;after} ->
               Atomic.incr change_pull_reads;
               (Ok(F.change_batch ~change_owner:owner ~generation:(generation) ~from_exclusive:(after) ~through:("p2") ~next:(None) ~windows:([ { id = "p2"
@@ -1362,73 +1472,10 @@ let run_favorites_native_visibility
                 (match known with
                  | Some page -> Worker_pure_data.V2_present_page { page; revision = "p" }
                  | None -> Worker_pure_data.V2_missing_page { uuid = requested; revision = "p" })
-            | Read.Child_members { parent; _ } when Option.is_some detail_capture ->
-              let existing =
-                if G.Uuid.equal parent (uuid 1)
-                then (
-                  let value = timeline_block 1 in
-                  [ { Worker_pure_data.value = { value with block = { value.block with parent } }
-                    ; revision = "child"
-                    }
-                  ])
-                else []
-              in
-              (Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("children") ~items:(existing
-                    @ List.filter_map
-                        (fun (owner, (root : Worker_pure_data.block_tree)) ->
-                           if not (G.Uuid.equal owner parent)
-                           then None
-                           else (
-                             let value = timeline_block 0 in
-                             Some
-                               { Worker_pure_data.value =
-                                   { value with
-                                     block =
-                                       { value.block with
-                                         uuid = root.uuid
-                                       ; title = root.title
-                                       ; parent
-                                       ; order = "999"
-                                       }
-                                   }
-                               ; revision = "appended"
-                               }))
-                        (Atomic.get detail_captures)) ~next:(next (None))))
-            | Read.Child_members { parent; _ }
-              when Atomic.get detail_fixture && G.Uuid.equal parent (uuid 1) ->
-              if check_copy && Atomic.get detail_initial_limit = None
-              then Atomic.set detail_initial_limit (Some limit);
-              let value = timeline_block 1 in
-              (Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("children") ~items:(List.init
-                      (if check_detail_wait then 2 else 1)
-                      (fun i ->
-                       let value = if i = 0 then value else timeline_block 2 in
-                       { Worker_pure_data.value = { value with block = { value.block with parent } }
-                       ; revision = "child"
-                         })) ~next:(next (None))))
             | Read.Child_members { parent; _ } ->
-              if Atomic.get detail_fixture && (check_detail_discovery || check_detail_wait) && G.Uuid.equal parent (uuid 2)
-              then Atomic.set discovery_reads (limit :: Atomic.get discovery_reads);
-              (* Initial first pages complete before publication. The wait
-                 scenario delays only a later explicit continuation read. *)
-              if Atomic.get detail_fixture && check_detail_wait && G.Uuid.equal parent (uuid 2) && cursor <> None then
-                while not (Atomic.get detail_wait_release) do
-                  Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
-                done;
-              (Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("children") ~items:((if G.Uuid.equal parent favorites_page.uuid
-                     then List.init 65 favorite_membership
-                     else if Atomic.get detail_fixture && check_detail_wait && cursor = None
-                          && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
-                     then (
-                       let value = timeline_block (if G.Uuid.equal parent (uuid 2) then 63 else 64) in
-                       [ { Worker_pure_data.value = { value with block = { value.block with parent } }
-                         ; revision = "child-first-page"
-                         }
-                       ])
-                     else [])) ~next:(next ((if Atomic.get detail_fixture && check_detail_wait && cursor = None
-                        && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
-                     then Some (G.Cursor.of_string "later-child-page" |> Result.get_ok)
-                     else None)))))
+              let items, after = child_items parent in
+              Ok (F.children ~parent ~revision_scope:(Worker_pure_data.V2_children_revision parent)
+                ~scope_revision:"children" ~items ~next:(next after))
             | Read.Favorites _ ->
               let offset =
                 match cursor with
@@ -5261,17 +5308,16 @@ let test_reference_outer_terminals cancel =
                       ; dispatcher_capacity = 256
                       ; wire_batch_max_bytes = 262144
                       }) ~generation:("g") ~projection_revision:("p"))))
-           | Read.Journals _ ->
-             completed query
-               ((Ok(F.slice ~items:([ Worker_pure_data.{ page; journal_day = 20260901; revision = "p" } ]) ~next:(next (None)))))
-           | Read.Tree _ ->
-             completed query
-               ((Ok(F.slice ~items:([ { Worker_pure_data.value = record block
-                        ; revision = "root"
-                        ; depth = 0
-                        ; parent = page.uuid
-                        }
-                      ]) ~next:(next (None)))))
+           | Read.Timeline_read {query=(Read.Timeline.Dates _ as timeline);_} ->
+             completed query (Ok (Ok (fixture_timeline_packet budget timeline
+               ~items:[ Worker_pure_data.{ page; journal_day = 20260901; revision = "p" } ] ~next:None)))
+           | Read.Timeline_read {query=(Read.Timeline.Roots _ as timeline);_} ->
+             completed query (Ok (Ok (fixture_timeline_packet budget timeline
+               ~items:[ { Worker_pure_data.value = record block; revision = "root"; depth = 0; parent = page.uuid } ]
+               ~next:None)))
+           | Read.Timeline_read {query=(Read.Timeline.Preview_children _ as timeline);_} ->
+             completed query (Ok (Ok (fixture_timeline_packet budget timeline ~items:[] ~next:None)))
+           | Read.Timeline_check receipts -> completed query (Ok (fixture_timeline_check budget receipts))
            | Read.Child_members{parent;_} ->
              completed query ((Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("children") ~items:([]) ~next:(next (None)))))
            | Read.Changes{generation;after} ->
@@ -5739,7 +5785,9 @@ let test_favorite_page_uses_shared_reference_lookup () =
           | Read.Graph_info -> (Ok(F.graph_info ~graph_uuid:(uuid 9) ~graph_name:("Fixture") ~schema:({ major = 65; minor = 33 }) ~admission_facts:([]) ~journal_title_format:(None) ~generation:("g") ~projection_revision:("p") ~limits:({ response_budget_bytes = Worker_pure_data.maximum_response_bytes; outbox_max_records = 4096
                   ; outbox_max_bytes = 8388608; change_max_items = 4096; change_max_bytes = 1048576
                   ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 })))
-          | Read.Journals _ -> (Ok(F.slice ~items:([]) ~next:(next (None))))
+          | Read.Timeline_read {query=timeline;_} ->
+            Ok (Ok (fixture_timeline_packet budget timeline ~items:[] ~next:None))
+          | Read.Timeline_check receipts -> Ok (fixture_timeline_check budget receipts)
           | Read.Favorites _ -> (Ok(F.favorites ~favorites_page:(None) ~generation:("g") ~projection_revision:("p") ~next:(next (None)) ~items:([{ membership_uuid = uuid 10; membership_order = "a"; membership_revision = "m"
                    ; target = Worker_pure_data.V2_favorite_page { uuid = page.uuid; title = page.title; revision = "p" } }
                   ;{ membership_uuid = uuid 11; membership_order = "b"; membership_revision = "m"
@@ -6476,15 +6524,15 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
         | Coordination_query source when attach_mirror ->
           let Read.Read_query(budget,query)=source.read in
           let module F=Read.For_worker in
-          let owner=F.read_budget_owner budget in
-          let next cursor=Option.map(fun cursor->F.continuation ~owner ~budget ~key:(Read.query_key budget query) ~cursor)cursor in
           let sample :type a. a Read.query -> (a,Read.error)result=fun query->match query with
 
             | Read.Graph_info -> (Ok(F.graph_info ~graph_uuid:(graph_id) ~graph_name:("Synthetic") ~schema:({ major = 65; minor = 33 }) ~admission_facts:([]) ~journal_title_format:(None) ~limits:({ response_budget_bytes = Worker_pure_data.maximum_response_bytes
                   ; outbox_max_records = 4096; outbox_max_bytes = 8388608
                   ; change_max_items = 4096; change_max_bytes = 1048576
                   ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }) ~generation:("g") ~projection_revision:("p")))
-            | Read.Journals _ -> (Ok(F.slice ~items:([]) ~next:(next (None))))
+            | Read.Timeline_read {query=timeline;_} ->
+              Ok (Ok (fixture_timeline_packet budget timeline ~items:[] ~next:None))
+            | Read.Timeline_check receipts -> Ok (fixture_timeline_check budget receipts)
             | _ -> (Error((fun code message->Read.Service_failed(code^": "^message)) ("UnusedFixtureRead") ("Unused unlock fixture read")))
 
           in Ok(Service.Coordination_queried{registration=source.registration;owner=source.owner;
@@ -7609,7 +7657,9 @@ let test_graph_picker_controls scenario () =
                   ; outbox_max_records = 4096; outbox_max_bytes = 8388608
                   ; change_max_items = 4096; change_max_bytes = 1048576
                   ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }) ~generation:("g") ~projection_revision:("p")))
-            | Read.Journals _ -> (Ok(F.slice ~items:([]) ~next:(next (None))))
+            | Read.Timeline_read {query=timeline;_} ->
+              Ok (Ok (fixture_timeline_packet budget timeline ~items:[] ~next:None))
+            | Read.Timeline_check receipts -> Ok (fixture_timeline_check budget receipts)
             | Read.Favorites _ when scenario = `Late_graph_cancel
                 && (Atomic.get current).snapshot.selected_graph = Some first ->
               Fun.protect ~finally:(fun () ->
@@ -7692,8 +7742,18 @@ let test_graph_picker_controls scenario () =
             ("picker patch references live native " ^ field) true
             (Hashtbl.mem props (member field op |> to_int))) ["parent";"child"]
         | _ -> ()) in
+  let rec in_graph_page id =
+    let graph_page = match Hashtbl.find_opt props id with
+      | Some fields -> (match List.assoc_opt "payload" fields with
+        | Some (`String payload) -> (try Yojson.Safe.Util.(Yojson.Safe.from_string payload |> member "mode") = `String "graph-pages" with _ -> false)
+        | _ -> false)
+      | None -> false in
+    graph_page || match Hashtbl.find_opt page_parents id with
+      | Some parent -> in_graph_page parent
+      | None -> false in
   let find key value = Hashtbl.fold (fun id values found ->
-    if List.assoc_opt key values = Some (`String value) then Some id else found) props None in
+    if List.assoc_opt key values = Some (`String value)
+       && (value <> "Sign out" || not (in_graph_page id)) then Some id else found) props None in
   let node name = match find "accessibility-identifier" name with
     | Some id -> id | None -> failwith ("Missing " ^ name) in
   let picker_list () =

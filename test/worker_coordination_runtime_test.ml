@@ -1130,6 +1130,43 @@ let test_client_to_typed_read () =
     Journal_graph_runtime.set_calendar
       business
       (Journal_calendar.Sampler.sample calendar |> Result.get_ok);
+    let receipt_checks = ref [] in
+    let record_check read_limit receipts =
+      require (read_limit = 1) "Timeline_check must use its single aggregate row budget";
+      let count = Rrbvec.length receipts in
+      require (count > 0 && count <= W.Timeline.maximum_receipts)
+        "Timeline_check lost its independent retained-receipt bound";
+      receipt_checks := count :: !receipt_checks
+    in
+    let checked_results receipts value =
+      require (Rrbvec.length value.W.Timeline.results = Rrbvec.length receipts)
+        "real receipt validation lost scope correspondence";
+      require (Rrbvec.for_all Result.is_ok value.results)
+        "unchanged synthetic Timeline scopes failed same-snapshot validation"
+    in
+    let rec settle_checks (output : Journal_graph_runtime.output) : Journal_graph_runtime.output =
+      List.fold_left (fun (kept:Journal_graph_runtime.output) original ->
+        match Journal_graph_runtime.worker_read business original with
+        | Some (Journal_graph_runtime.Read {query=W.Timeline_check receipts;maximum_items}) ->
+          record_check maximum_items receipts;
+          require (not (List.exists (fun response -> match response.Journal_graph_runtime.payload with
+            | Feed_loaded {complete=true;_} -> true | _ -> false) output.responses))
+            "unverified Timeline assembly was published before its receipt check";
+          let budget = W.read_budget session ~maximum_items ~maximum_bytes:65536 |> Result.get_ok in
+          let ticket, reply = request (W.Query (budget,W.Timeline_check receipts)) in
+          (match reply with
+           | W.Answered (Ok checked) ->
+             checked_results receipts checked;
+             let next = Journal_graph_runtime.receive_worker_read
+                 ?origin:(C.query_origin (C.view !state) ticket) business ~request_id:original
+                 (Journal_graph_runtime.Query_result(W.Timeline_check receipts,checked))
+               |> settle_checks in
+             {Journal_graph_runtime.requests=kept.requests @ next.requests;
+              responses=kept.responses @ next.responses}
+           | _ -> failwith "real typed Timeline receipt check failed")
+        | _ -> {kept with requests=kept.requests @ [original]})
+        {Journal_graph_runtime.requests=[];responses=output.responses} output.requests
+    in
     let dates =
       Journal_graph_runtime.submit
         business
@@ -1143,7 +1180,7 @@ let test_client_to_typed_read () =
       List.find
         (fun r ->
            match Journal_graph_runtime.worker_read business r with
-           | Some(Journal_graph_runtime.Read{query=W.Journals _;_}) -> true
+           | Some(Journal_graph_runtime.Read{query=W.Timeline_read {query=W.Timeline.Dates _;_};_}) -> true
            | _ -> false)
         o.requests
     in
@@ -1154,9 +1191,10 @@ let test_client_to_typed_read () =
         (match reply with
          | W.Answered (Ok value) ->
            let result = Journal_graph_runtime.Query_result(read.query,value) in
-           let items, next =
+           let (items, next) : Worker_pure_data.tree_member list * Journal_graph_projection.root_cursor option =
              match result with
-             | Journal_graph_runtime.Query_result(W.Tree _,value) -> value.items, value.next
+             | Journal_graph_runtime.Query_result(W.Timeline_read {query=W.Timeline.Roots _;_},Ok packet) ->
+               Rrbvec.to_list packet.items, (match packet.next with W.Timeline.End -> None | More cursor -> Some cursor)
              | _ -> failwith "root lost typed result"
            in
            ( items
@@ -1165,7 +1203,7 @@ let test_client_to_typed_read () =
                ?origin:(C.query_origin (C.view !state) ticket)
                business
                ~request_id:original
-               result )
+               result |> settle_checks )
          | _ -> failwith "actual root query failed")
       | _ -> failwith "production root dispatch bypassed coordinator"
     in
@@ -1175,14 +1213,14 @@ let test_client_to_typed_read () =
       match Journal_graph_runtime.worker_read business original with
       | Some (Journal_graph_runtime.Read read) ->
         require (read.maximum_items = 1) "date planner lost requested budget";
-        let _, reply = request (W.Query (budget, read.query)) in
+        let ticket, reply = request (W.Query (budget, read.query)) in
         (match reply with
          | W.Answered (Ok value) ->
            let result = Journal_graph_runtime.Query_result(read.query,value) in
-           let items, more =
+           let (items, more) : Worker_pure_data.journal_item list * bool =
              match result with
-             | Journal_graph_runtime.Query_result(W.Journals _,value) ->
-               value.items, Option.is_some value.next
+             | Journal_graph_runtime.Query_result(W.Timeline_read {query=W.Timeline.Dates _;_},Ok packet) ->
+               Rrbvec.to_list packet.items, (match packet.next with W.Timeline.End -> false | More _ -> true)
              | _ -> failwith "date result lost typed family"
            in
            require (List.length items = 1) "real date page lost item bound";
@@ -1194,6 +1232,7 @@ let test_client_to_typed_read () =
            seen := item.page.uuid :: !seen;
            let output =
              Journal_graph_runtime.receive_worker_read
+               ?origin:(C.query_origin (C.view !state) ticket)
                business
                ~request_id:original
                result
@@ -1211,7 +1250,7 @@ let test_client_to_typed_read () =
              List.find
                (fun r ->
                   match Journal_graph_runtime.worker_read business r with
-                  | Some(Journal_graph_runtime.Read{query=W.Tree _;_}) -> true
+                  | Some(Journal_graph_runtime.Read{query=W.Timeline_read {query=W.Timeline.Roots _;_};_}) -> true
                   | _ -> false)
                output.requests
            in
@@ -1227,7 +1266,7 @@ let test_client_to_typed_read () =
                List.find
                  (fun r ->
                     match Journal_graph_runtime.worker_read business r with
-                    | Some(Journal_graph_runtime.Read{query=W.Journals _;_}) -> true
+                    | Some(Journal_graph_runtime.Read{query=W.Timeline_read {query=W.Timeline.Dates _;_};_}) -> true
                     | _ -> false)
                  output.requests
              in
@@ -1251,7 +1290,7 @@ let test_client_to_typed_read () =
       List.find
         (fun r ->
            match Journal_graph_runtime.worker_read business r with
-           | Some(Journal_graph_runtime.Read{query=W.Child_members _;_}) -> true
+           | Some(Journal_graph_runtime.Read{query=W.Timeline_read {query=W.Timeline.Preview_children _;_};_}) -> true
            | _ -> false)
         output.Journal_graph_runtime.requests
     in
@@ -1259,20 +1298,22 @@ let test_client_to_typed_read () =
       require (page < 10) "actual preview did not terminate";
       match Journal_graph_runtime.worker_read business original with
       | Some (Journal_graph_runtime.Read read) ->
-        let _, reply = request (W.Query (budget, read.query)) in
+        let ticket, reply = request (W.Query (budget, read.query)) in
         (match reply with
          | W.Answered (Ok value) ->
            let result = Journal_graph_runtime.Query_result(read.query,value) in
            let more =
              match result with
-             | Journal_graph_runtime.Query_result(W.Child_members _,value) -> Option.is_some value.next
+             | Journal_graph_runtime.Query_result(W.Timeline_read {query=W.Timeline.Preview_children _;_},Ok packet) ->
+               (match packet.next with W.Timeline.End -> false | More _ -> true)
              | _ -> failwith "preview lost typed child result"
            in
            let output =
              Journal_graph_runtime.receive_worker_read
+               ?origin:(C.query_origin (C.view !state) ticket)
                business
                ~request_id:original
-               result
+               result |> settle_checks
            in
            if more
            then preview_page (page + 1) (child_request output)
@@ -1305,6 +1346,10 @@ let test_client_to_typed_read () =
       let queue = Queue.create ()
       and responses = ref []
       and root_reads = ref [] in
+      let remaining = ref (match demand with
+        | Journal_graph_request.Load_feed {root_limit;_} -> root_limit
+        | Load_day_blocks {limit;_} -> limit
+        | _ -> failwith "Expected a bounded Timeline root demand") in
       let add output =
         responses := List.rev_append output.Journal_graph_runtime.responses !responses;
         List.iter (fun request -> Queue.add request queue) output.requests
@@ -1316,7 +1361,10 @@ let test_client_to_typed_read () =
         require (!turns < 1000) "actual root quota read did not converge";
         let original = Queue.take queue in
         (match Journal_graph_runtime.worker_read business original with
-         | Some(Journal_graph_runtime.Read{query=W.Tree _;maximum_items=limit}) -> root_reads := limit :: !root_reads
+         | Some(Journal_graph_runtime.Read{query=W.Timeline_read {query=W.Timeline.Roots _;_};maximum_items=limit}) ->
+           require (limit = min !remaining Worker_pure_data.maximum_page_size)
+             "Timeline root admission changed the exact remaining visible quota budget";
+           root_reads := limit :: !root_reads
          | _ -> ());
         match Journal_graph_runtime.worker_read business original with
         | Some (Journal_graph_runtime.Read read) ->
@@ -1327,6 +1375,20 @@ let test_client_to_typed_read () =
           let ticket, reply = request (W.Query (budget, read.query)) in
           (match reply with
            | W.Answered (Ok value) ->
+             (match read.query with
+              | W.Timeline_check receipts -> record_check read.maximum_items receipts; checked_results receipts value
+              | W.Timeline_read {query=W.Timeline.Roots _;_} ->
+                (match value with
+                 | Ok packet ->
+                   require (Rrbvec.length packet.items <= read.maximum_items)
+                     "real Timeline root packet exceeded its unchanged admitted budget";
+                   (* These declared fixtures contain only ordinary roots and
+                      blank roots; the latter consume no visible quota. *)
+                   remaining := !remaining - Rrbvec.fold_left
+                     (fun count (member:Worker_pure_data.tree_member) ->
+                       count + if member.value.block.title = "" then 0 else 1) 0 packet.items
+                 | Error error -> failwith (W.Timeline.error_message error))
+              | _ -> ());
              add
                (Journal_graph_runtime.receive_worker_read
                   ?origin:(C.query_origin (C.view !state) ticket)
@@ -1356,15 +1418,12 @@ let test_client_to_typed_read () =
            ; request_generation = 330L
            })
     in
-    require (reads = [ 30; 30 ]) "actual Tree continuation changed the sealed item budget";
+    require (reads = [ 30; 20 ]) "Timeline root packets lost the remaining visible quota budget";
     let day = List.hd first.days in
-    require (List.length day.entries = 30) "actual first Tree page exceeded visible quota";
+    require (List.length day.entries = 30) "actual first Timeline batch exceeded visible quota";
     (match (Option.get day.continuation).protocol_cursor with
-     | Some (Journal_graph_projection.Root_tree_cursor cursor) ->
-       require
-         (cursor.after = None && Rrbvec.length cursor.remaining = 10)
-         "actual final DB page did not retain its bounded over-read tail"
-     | _ -> failwith "actual root cursor lost execution provenance");
+     | Some (Journal_graph_projection.Root_tree_cursor _) -> ()
+     | _ -> failwith "actual root cursor lost its sealed Timeline continuation");
     let second, reads =
       drive_feed
         (Load_day_blocks
@@ -1374,7 +1433,7 @@ let test_client_to_typed_read () =
            ; request_generation = 331L
            })
     in
-    require (reads = []) "retained final-page roots unnecessarily reread the DB";
+    require (reads = [30]) "sealed Timeline continuation did not read its final ten roots at the requested budget";
     let entries =
       List.concat_map
         (fun (day : Journal_graph_projection.day_feed) -> day.entries)
@@ -1382,7 +1441,7 @@ let test_client_to_typed_read () =
     in
     require
       (List.length entries = 10 && second.continuation = None)
-      "actual retained final-page tail did not exhaust exactly";
+      "actual Timeline continuation did not exhaust exactly ten roots";
     let all =
       day.entries @ entries
       |> List.map (fun (entry : Journal_graph_projection.timeline_entry) ->
@@ -1390,7 +1449,9 @@ let test_client_to_typed_read () =
     in
     require
       (List.length (List.sort_uniq String.compare all) = 40)
-      "actual final-page Tree tail lost or repeated visible roots";
+      "actual Timeline continuation lost or repeated visible roots";
+    require (all = List.init 40 (fun index -> W.Uuid.to_string (quota_root (index+21))))
+      "actual Timeline batches lost, reordered or replaced seeded visible roots";
     let first, reads =
       drive_feed
         ~maximum_bytes:16384
@@ -1402,12 +1463,14 @@ let test_client_to_typed_read () =
            })
     in
     require
-      (reads <> [] && List.for_all (( = ) 30) reads)
-      "byte-budget fixture changed the sealed item budget";
+      (reads <> [] && List.hd reads = 30 && List.for_all (fun limit -> limit > 0 && limit <= 30) reads)
+      "byte-budget fixture lost its bounded remaining root demand";
     let day = List.hd first.days in
     require
       (List.length day.entries = 30 && day.continuation <> None)
       "byte-budget first page lost continuation";
+    let first_byte_ids = List.map (fun (entry:Journal_graph_projection.timeline_entry) ->
+      Journal_model.id entry.block) day.entries in
     let second, reads =
       drive_feed
         ~maximum_bytes:16384
@@ -1419,8 +1482,10 @@ let test_client_to_typed_read () =
            })
     in
     require
-      (List.length reads > 1 && List.for_all (( = ) 30) reads)
-      "server changed the client's sealed item budget while fitting encoded bytes";
+      (List.length reads > 1 && List.hd reads = 30 &&
+       List.for_all (fun limit -> limit > 0 && limit <= 30) reads &&
+       List.sort_uniq (fun a b -> Int.compare b a) reads = reads)
+      "byte-fitting Timeline packets lost stable, decreasing remaining-demand budgets";
     let day = List.hd second.days in
     require
       (List.length day.entries = 30 && day.continuation = None)
@@ -1431,6 +1496,12 @@ let test_client_to_typed_read () =
             String.length (Journal_model.source entry.block) >= 3001)
          day.entries)
       "byte fitting truncated canonical DTO source text";
+    let all_byte_ids = first_byte_ids @ List.map (fun (entry:Journal_graph_projection.timeline_entry) ->
+      Journal_model.id entry.block) day.entries in
+    require (all_byte_ids = List.init 60 (fun index -> W.Uuid.to_string (byte_root (index+1))))
+      "byte-fitting Timeline pagination lost, reordered or duplicated canonical roots";
+    require (List.exists (fun count -> count >= 42) !receipt_checks)
+      "real combined root/preview reads lost retained End-scope receipts";
     let favorites_request : Journal_graph_request.favorites_request =
       { graph_generation = owner.graph_generation
       ; request_generation = 310L
@@ -1520,7 +1591,13 @@ let test_client_to_typed_read () =
                result
            in
            if more
-           then membership_page (page + 1) seen (child_request output)
+           then membership_page (page + 1) seen (List.find
+             (fun request ->
+                match Journal_graph_runtime.worker_read business request with
+                | Some (Journal_graph_runtime.Read { query = W.Child_members { parent; _ }; _ }) ->
+                  W.Uuid.equal parent favorite_page_id
+                | _ -> false)
+             output.requests)
            else (
              require
                (page = 1 && List.length seen = 2)
@@ -4587,6 +4664,9 @@ let test_retired_query_has_correlated_response () =
 ;;
 
 let () =
+  if Array.mem "--typed-read-only" Sys.argv then (
+    test_client_to_typed_read ();
+    print_endline "Worker coordination real typed client/read passed (1 test)"; exit 0);
   test_cleanup_transport_causes();
   if Array.mem "--cleanup-causes-only" Sys.argv then exit 0;
   if Array.mem "--auth-session-only" Sys.argv then (

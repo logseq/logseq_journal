@@ -72,6 +72,7 @@
   journal_visual_tokens
   journal_symbols)
  (libraries logseq_db_worker.identity
+  logseq_db_worker.contract
   datascript-ocaml-native
   journal_app_business
   rrbvec
@@ -83,6 +84,8 @@
   logseq_db_worker.lui
   logseq_journal.worker_coordination
   journal_worker_coordination_impl
+  logseq_journal.timeline_cursor
+  journal_timeline_cursor_impl
   threads
   unix
   ppx_deriving_yojson.runtime

@@ -1797,6 +1797,51 @@ let equal_presentation (left : t) (right : t) =
 let retained_slot (state : t) index = Rrbvec.nth_opt state.slots index
 let fold_slots f initial (state : t) = Rrbvec.fold_left f initial state.slots
 
+let has_retained (state:t) = not (Days.is_empty state.days)
+
+let retired ~before ~after =
+  if before.slots == after.slots && before.days == after.days then
+    Rrbvec.empty, Rrbvec.empty
+  else (
+    (* Same-position point updates share every unchanged slot. Only changed
+       entries need identity tables; structural insertions/removals use a
+       linear transient index instead of rebuilding persistent maps. *)
+    let old_entries = Hashtbl.create 8 and new_entries = Hashtbl.create 8 in
+    let add entries (entry:Journal_graph_projection.timeline_entry) =
+      Hashtbl.replace entries (Journal_model.id entry.block) entry in
+    let add_slot entries = function Top_level entry -> add entries entry | _ -> () in
+    if before.slots != after.slots then (
+      if Rrbvec.length before.slots = Rrbvec.length after.slots then
+        Rrbvec.iter2 (fun old fresh -> if old != fresh then (
+          add_slot old_entries old; add_slot new_entries fresh)) before.slots after.slots
+      else (
+        Rrbvec.iter (add_slot old_entries) before.slots;
+        Rrbvec.iter (add_slot new_entries) after.slots));
+    let pages = ref Rrbvec.empty in
+    if before.days != after.days then (
+      Days.iter (fun day knowledge ->
+        let fresh = Days.find_opt day after.days in
+        if not (Option.exists (fun fresh -> fresh.page.id = knowledge.page.id) fresh) then
+          pages := Rrbvec.push_back !pages knowledge.page;
+        let fresh_hidden = Option.bind fresh (fun knowledge -> knowledge.hidden_entry) in
+        if not (Option.equal ( == ) knowledge.hidden_entry fresh_hidden) then (
+          Option.iter (add old_entries) knowledge.hidden_entry;
+          Option.iter (add new_entries) fresh_hidden)) before.days;
+      Days.iter (fun day knowledge ->
+        if not (Days.mem day before.days) then
+          Option.iter (add new_entries) knowledge.hidden_entry) after.days);
+    let pages = if Rrbvec.is_empty !pages then !pages else (
+      let retained_pages = Hashtbl.create (Days.cardinal after.days) in
+      Days.iter (fun _ knowledge -> Hashtbl.replace retained_pages knowledge.page.id ()) after.days;
+      Rrbvec.filter (fun (page:Journal_graph_projection.page) ->
+        not (Hashtbl.mem retained_pages page.id)) !pages) in
+    let entries = Hashtbl.to_seq old_entries |> Seq.filter_map (fun (id,entry) ->
+      let replacement = Hashtbl.find_opt new_entries id in
+      if Option.exists (( == ) entry) replacement then None else Some (entry,replacement))
+      |> Rrbvec.of_seq in
+    pages, entries)
+;;
+
 let find_block (state : t) ~block_id =
   let visible =
     Rrbvec.find_map

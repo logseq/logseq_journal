@@ -148,6 +148,7 @@
  (name logseq_db_worker_application_integration_test)
  (modules logseq_db_worker_application_integration_test)
  (libraries datascript-ocaml-native logseq_db_worker.typed_read coordination_test_fixture alcotest app
+  rrbvec
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.contract

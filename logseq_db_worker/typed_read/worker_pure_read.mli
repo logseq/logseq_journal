@@ -1,7 +1,25 @@
-(** App/Worker coordination boundary. Pure data belongs to [Worker_pure_data];
-    sealed authority is issued by the trusted
-    Worker runner. Abstraction is not authentication: every message, continuation,
-    receipt and resource is validated against its actual channel and owner. *)
+(** {1 TLDR}
+    Define pure typed read queries and sealed session-owned paging values for the
+    existing Worker coordination channel. The effect runner executes packed
+    queries and validates complete final DTOs against advertised budgets. This
+    module performs no I/O and owns no snapshot, subscription or persistence.
+    Timeline reads carry local-scope receipts; other read families retain their
+    existing projection-bound continuation semantics.
+
+    {1 Minimal usage example}
+    Trusted Worker code receives [session] from its live authority and sends the
+    packed query to its existing executor:
+    {[
+      match read_budget session ~maximum_items:20 ~maximum_bytes:65536 with
+      | Error error -> report error
+      | Ok budget ->
+        execute (For_worker.pack_query budget
+          (Timeline_read { query = Timeline.roots ~page; after = None }))
+    ]}
+    [page], [report] and [execute] are caller-provided values. Application code
+    obtains these types through Worker_api and submits its typed Query request.
+
+    {1 Construction and validation} *)
 module Graph = Logseq_db_types.Graph_types
 
 module Uuid = Graph.Uuid
@@ -53,7 +71,10 @@ type read_budget
 (** Validate positive item/encoded-byte bounds against this session's advertised
     limits. Every final enriched result, including summary/refs/properties, fits
     both bounds. An oversized singleton fails explicitly; no silent truncation.
-    Requests also validate effective limits on IDs, roots, depth, payload and lists. *)
+    Requests also validate effective limits on IDs, roots, depth, payload and lists.
+    [Timeline_check] produces one aggregate check value: its receipt/result vector
+    uses [Timeline.maximum_receipts], independently of the data-row item budget,
+    and the complete encoded check value still fits the byte budget. *)
 val read_budget
   :  session
   -> maximum_items:int
@@ -178,7 +199,73 @@ type change_ack = private
     exposes the exact scope revision required by current planners/confirmation.
     Typed results preserve present/missing and full metadata without UI layout
     types. List/lookup result ordering matches input IDs, including missing slots. *)
+module Timeline : sig
+  (** {1 TLDR}
+      Typed queries enumerate dates, direct page roots or direct preview children.
+      Every packet, including an empty final packet, carries a freshness receipt.
+      Execute through [Timeline_read] and validate retained receipts together with
+      [Timeline_check]; each request borrows and releases one immutable snapshot. *)
+  module Day = Logseq_db_worker_contract.Worker_pure_day
+  type worker_error = error
+  type _ query = private
+    | Dates : { from_day : Day.t; through_day : Day.t } -> Data.journal_item query
+    | Roots : Graph.page_uuid -> Data.tree_member query
+    | Preview_children : Graph.block_uuid -> Data.child_member query
+  type invalidation = Owner_changed | Scope_changed
+  type error =
+    | Invalid_request of string
+    | Invalidated of invalidation
+    | Read_failed of worker_error
+    | Limit_exceeded of string
+    | Invalid_source_reply of string
+  type 'a receipt
+  type 'a cursor
+  type 'a remaining = End | More of 'a cursor
+  type 'a packet = private { items : 'a Rrbvec.t; receipt : 'a receipt; next : 'a remaining }
+  type packed_receipt = Receipt : 'a receipt -> packed_receipt
+  type check = private { results : (unit, error) result Rrbvec.t }
+  val maximum_receipts : int
+
+  (** {1 Minimal usage example}
+      The caller supplies [page], [budget] and the existing session executor [run]:
+      {[
+        let query = roots ~page in
+        match run (Timeline_read { query; after = None }) with
+        | Ok (Ok packet) -> retain packet.items packet.receipt packet.next
+        | Ok (Error error) -> report_paging_error error
+        | Error error -> report_worker_error error
+      ]}
+      [retain], [report_paging_error] and [report_worker_error] are caller
+      callbacks. Worker transport errors remain separate from the inner paging
+      result. *)
+
+  (** {1 Construction and validation} *)
+  val dates : from_day:Day.t -> through_day:Day.t -> Data.journal_item query
+  val roots : page:Graph.page_uuid -> Data.tree_member query
+  val preview_children : parent:Graph.block_uuid -> Data.child_member query
+
+  (** {1 Lifecycle and recovery}
+      Cursors and receipts bind the exact session owner, query and write-maintained
+      DB scope version. They contain bounded values only and do not survive owner
+      revocation. A changed scope invalidates both an active continuation and an
+      exhausted receipt. Drop that scope's prefix before reloading; another scope
+      may remain loaded. [Timeline_check] checks its bounded vector against one
+      borrowed snapshot, preserves input order and returns every concrete cause.
+      Freshness uses authoritative lookups, never collection scans or global
+      projection revisions. Dates cover the journal index; roots and previews
+      cover only their returned direct-member DTOs. A packet bound includes the
+      final enriched DTOs, receipt and continuation. Oversized singletons fail.
+      Error control frames are outside the successful packet data-byte budget.
+      Inverted date ranges are empty. Outline ordering preserves DB tie behavior.
+      Visibility and selecting three preview summaries remain caller-owned. *)
+  val equal_query : 'a query -> 'a query -> bool
+  val error_message : error -> string
+end
+
 type _ query =
+  | Timeline_read : { query : 'a Timeline.query; after : 'a Timeline.cursor option }
+      -> ('a Timeline.packet, Timeline.error) result query
+  | Timeline_check : Timeline.packed_receipt Rrbvec.t -> Timeline.check query
   | Graph_info : graph_info query
   | Admission : Worker_pure_data.admission_inspection query
   | Journal : journal_day -> page option query
@@ -259,6 +346,15 @@ val change_ack_through : change_ack -> string
 (** Trusted construction and access to original representations. Business
     libraries depend on Worker_api and cannot name this implementation library. *)
 module For_worker : sig
+  val timeline_check : (unit, Timeline.error) result Rrbvec.t -> Timeline.check
+  val timeline_receipt : owner:session -> query:'a Timeline.query -> version:string -> 'a Timeline.receipt
+  val timeline_packet : receipt:'a Timeline.receipt -> items:'a Rrbvec.t -> next:string option -> 'a Timeline.packet
+  val timeline_cursor_position : 'a Timeline.cursor -> string
+  val timeline_cursor_receipt : 'a Timeline.cursor -> 'a Timeline.receipt
+  val timeline_receipt_owner : 'a Timeline.receipt -> session
+  val timeline_receipt_query : 'a Timeline.receipt -> 'a Timeline.query
+  val timeline_receipt_version : 'a Timeline.receipt -> string
+
   val pack_query : read_budget -> 'a query -> packed_query
   val answer : read_budget -> 'a query -> ('a,error) result -> answer
   val worker_incarnation_runtime_epoch : worker_incarnation -> Journal_worker_ids.Runtime.epoch
@@ -307,8 +403,10 @@ val checked_query : session -> read_budget -> 'a query -> (Graph.Cursor.t option
 val validate_query : session -> read_budget -> 'a query -> (unit,error) result
 val observable : 'a query -> bool
 
-(** Size the enriched data and cursor payload. Session/query authority is held
-    by the existing channel/interest; it is never encoded again as DTO fields. *)
+(** Size the complete enriched result and continuation payload. Timeline packets
+    include their receipt and any continuation receipt, including owner/query
+    identities; check values include every receipt result. Other query families
+    retain their existing data-only encoding. *)
 val encoded_value_bytes : 'a query -> 'a -> int
 val validate_value : session -> read_budget -> 'a query -> 'a -> (unit,error) result
 

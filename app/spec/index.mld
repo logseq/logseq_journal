@@ -8,3 +8,9 @@ durable writes, synchronization and resource retirement through the existing spe
 {1 Library logseq_journal.worker_coordination}
 
 The App/Worker coordination API is {!module-Journal_worker_coordination}.
+
+{1 Library logseq_journal.timeline_cursor}
+
+The App Timeline paging contract is
+{!module-Journal_timeline_cursor.Timeline_cursor}. It preserves the worker's
+sealed paging types; the App explicitly links its implementation.
