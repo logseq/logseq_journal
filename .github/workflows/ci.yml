@@ -35,15 +35,29 @@ jobs:
       OPAMJOBS: 3
       OPAMEXTERNALSOLVER: builtin-0install
       OPAMPRECISETRACKING: 1
+      DUNE_CACHE: enabled
+      DUNE_CACHE_ROOT: ${{ runner.temp }}/journal-dune-cache
+      DUNE_CACHE_STORAGE_MODE: copy
     steps:
       - uses: actions/checkout@v4
-      - name: Verify Apple app icon packaging
-        run: python3 .agents/skills/journal-build/scripts/test_apple_app_icon.py
-      - name: Verify Swift runtime and graph feedback boundaries
+      - name: Verify Apple packaging, Swift runtime and graph feedback boundaries
         run: |
-          python3 tool/test_journal_runtime_startup.py
-          python3 tool/test_journal_runtime_failure.py
-          python3 tool/test_graph_name.py
+          mkdir -p .ci-reports/boundaries
+          pids=()
+          for script in \
+            .agents/skills/journal-build/scripts/test_apple_app_icon.py \
+            tool/test_journal_runtime_startup.py \
+            tool/test_journal_runtime_failure.py \
+            tool/test_graph_name.py; do
+            python3 "$script" > ".ci-reports/boundaries/$(basename "$script").log" 2>&1 &
+            pids+=("$!")
+          done
+          result=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || result=1
+          done
+          cat .ci-reports/boundaries/*.log
+          exit "$result"
       - name: Prepare native system libraries before cache lookup
         run: |
           brew install pkg-config gmp sqlite zlib zstd
@@ -108,24 +122,43 @@ jobs:
         run: python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py --check-native-cache
       - name: Install locked dependencies
         run: opam install . --deps-only --with-test --locked --ignore-pin-depends --yes
-      - name: Verify build and cache helper boundaries
-        env:
-          # Apple CLI boundary fixtures deliberately reject ambient pkg-config.
-          # The CI identity fixture selects its own explicit providers.
-          PKG_CONFIG_PATH: ''
-          JOURNAL_TEST_SWITCH: ${{ github.workspace }}
-          PYTHONDONTWRITEBYTECODE: 1
-        run: python3 .agents/skills/journal-build/scripts/test_journal_build.py
+      - name: Restore content-addressed Dune build artifacts
+        id: dune-cache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: ${{ env.DUNE_CACHE_ROOT }}
+          key: journal-dune-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}-${{ steps.dependency-identity.outputs.native-key }}-${{ github.sha }}
+          restore-keys: journal-dune-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}-${{ steps.dependency-identity.outputs.native-key }}-
       - name: Record installed package versions
         if: always()
         run: opam list --installed --columns=name,installed-version --short --color=never > .ci-reports/packages.txt
-      - name: Build all targets and native embed
+      - name: Verify helper boundaries alongside full build and forced regression
+        env:
+          JOURNAL_TEST_SWITCH: ${{ github.workspace }}
+          PYTHONDONTWRITEBYTECODE: 1
         run: |
-          opam exec -- dune build @all app/native_embed.exe.o
-      - name: Run full regression suite
-        run: opam exec -- dune runtest --force
+          PKG_CONFIG_PATH='' python3 .agents/skills/journal-build/scripts/test_journal_build.py \
+            > .ci-reports/helper-boundaries.log 2>&1 &
+          helper_pid=$!
+          result=0
+          (
+            opam exec -- dune build @all app/native_embed.exe.o &&
+            opam exec -- dune runtest --force
+          ) || result=1
+          wait "$helper_pid" || result=1
+          cat .ci-reports/helper-boundaries.log
+          exit "$result"
       - name: Verify final cache inputs and seal installed state
         run: python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py --seal-cache
+      - name: Bound content-addressed build artifact storage
+        run: opam exec -- dune cache trim --size=1073741824
+      - name: Save content-addressed Dune build artifacts
+        if: success() && steps.dune-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.DUNE_CACHE_ROOT }}
+          key: journal-dune-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}-${{ steps.dependency-identity.outputs.native-key }}-${{ github.sha }}
       - name: Save compiler, installed dependencies and opam metadata
         if: success() && steps.dependency-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
