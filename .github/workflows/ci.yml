@@ -139,15 +139,15 @@ jobs:
           JOURNAL_TEST_SWITCH: ${{ github.workspace }}
           PYTHONDONTWRITEBYTECODE: 1
         run: |
-          PKG_CONFIG_PATH='' python3 .agents/skills/journal-build/scripts/test_journal_build.py \
-            > .ci-reports/helper-boundaries.log 2>&1 &
-          helper_pid=$!
-          result=0
           (
             opam exec -- dune build @all app/native_embed.exe.o &&
             opam exec -- dune runtest --force
-          ) || result=1
-          wait "$helper_pid" || result=1
+          ) &
+          regression_pid=$!
+          result=0
+          PKG_CONFIG_PATH='' python3 .agents/skills/journal-build/scripts/test_journal_build.py \
+            > .ci-reports/helper-boundaries.log 2>&1 || result=1
+          wait "$regression_pid" || result=1
           cat .ci-reports/helper-boundaries.log
           exit "$result"
       - name: Verify final cache inputs and seal installed state
