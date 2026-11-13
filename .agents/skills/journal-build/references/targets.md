@@ -42,6 +42,10 @@ bash .agents/skills/journal-build/scripts/build_journal_apple.sh ios-simulator \
 
 `--preflight` checks without compilation; remove it for the macOS build. Unset ambient compiler/OCaml/SDK lookup overrides; SDK selection is explicit. Pins come from active switch state; raw source metadata may omit `url`, while any recorded installed source must still agree. CI local pins require their matching resolution record and clean resolved commit. Provision dependencies separately with `.agents/skills/journal-build/scripts/prepare_ci_dependencies.py`, which fetches and pins; use only an authorized switch. The builder never repairs it implicitly. Offline moving refs have no remote freshness claim.
 
+For an explicitly authorized build/install/launch on a freshly created device,
+use the [isolated Simulator runbook](../../../../docs/isolated-ios-simulator.md).
+It retains current manifests and never targets an existing simulator.
+
 ## Accept and hand off
 
 
