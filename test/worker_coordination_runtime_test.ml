@@ -379,6 +379,34 @@ let with_client ?epoch_ms ?favorites ?assets ?statuses ?change_max_items ?prepar
     (fun start -> f (start ()))
 ;;
 
+let with_client_output_wait ?epoch_ms ?prepare ?change_max_items f =
+  let input, output = Unix.pipe ~cloexec:true () in
+  Fun.protect
+    ~finally:(fun () -> Unix.close input; Unix.close output)
+    (fun () ->
+       Unix.set_nonblock input;
+       Unix.set_nonblock output;
+       let signal = Bytes.make 1 '\000' and buffer = Bytes.create 4096 in
+       with_client ?epoch_ms ?prepare ?change_max_items (fun client ->
+         Mailbox.Private.set_output_wakeup client (fun () ->
+           try ignore (Unix.write output signal 0 1) with
+           | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> ());
+         let wait ~pump ~timeout ~label predicate =
+           let deadline = Unix.gettimeofday () +. timeout in
+           while not (predicate ()) && Unix.gettimeofday () < deadline do
+             (try ignore (Unix.read input buffer 0 (Bytes.length buffer)) with
+              | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> ());
+             pump ();
+             let remaining = deadline -. Unix.gettimeofday () in
+             if not (predicate ()) && remaining > 0. then
+               (try ignore (Unix.select [input] [] [] (min remaining 0.01)) with
+                | Unix.Unix_error (Unix.EINTR, _, _) -> ())
+           done;
+           require (predicate ()) label
+         in
+         f client ~wait))
+;;
+
 (* The pure route reducer has no manager push or host handoff input.
    Drive public mounted hooks over the actual Service, DB and resource owners. *)
 (* These failures originate in mailbox-outcome decoding, outside the pure
@@ -3275,7 +3303,7 @@ let test_changefeed_business_waits_for_ui_application () =
 ;;
 
 let with_observation_service ?epoch_ms ?prepare ?change_max_items ?(observe_push=fun _->()) f =
-  with_client ?epoch_ms ?prepare ?change_max_items (fun client ->
+  with_client_output_wait ?epoch_ms ?prepare ?change_max_items (fun client ~wait:wait_output ->
     let replies = Hashtbl.create 16
     and baseline = ref None
     and notices = ref Rrbvec.empty in
@@ -3293,12 +3321,8 @@ let with_observation_service ?epoch_ms ?prepare ?change_max_items ?(observe_push
         notices := Rrbvec.append !notices updates
       | _ -> ());
     let wait predicate =
-      let deadline = Unix.gettimeofday () +. 5. in
-      while (not (predicate ())) && Unix.gettimeofday () < deadline do
-        Mailbox.Private.deliver client ~max_events:64;
-        Thread.delay 0.001
-      done;
-      require (predicate ()) "real observation Service did not settle"
+      wait_output ~pump:(fun () -> Mailbox.Private.deliver client ~max_events:64)
+        ~timeout:5. ~label:"real observation Service did not settle" predicate
     in
     let send value =
       match Mailbox.send client value with
@@ -4509,7 +4533,7 @@ let test_service_changefeed_has_one_owner () =
 (* Only the real Mailbox allocates the interleaved physical IDs. Core's public
    reducer cannot reproduce a runner lifetime-history admission limit. *)
 let test_mixed_mailbox_requests_do_not_exhaust_history () =
-  with_client(fun client->
+  with_client_output_wait(fun client ~wait:wait_output->
     let events=Queue.create() and state=ref(C.initial ~client_id) in
     let runner=R.create ~client ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
       ~post:(fun event->Queue.add event events) ~publish:(fun _->()) |> Result.get_ok in
@@ -4526,9 +4550,7 @@ let test_mixed_mailbox_requests_do_not_exhaust_history () =
       let count=Queue.length events in
       for _=1 to count do apply(C.step !state(Queue.take events))done in
     let wait label predicate=
-      let deadline=Unix.gettimeofday()+.8. in
-      while not(predicate()) && Unix.gettimeofday()<deadline do pump();Thread.delay 0.0005 done;
-      require(predicate())label in
+      wait_output ~pump ~timeout:8. ~label predicate in
     ignore(Mailbox.send client(Service.Client_command(Restore_local_account{user_id="user-1"})));
     let current_session()=Option.bind(C.projection(C.view !state))(fun projection->
       List.find_map(fun resident->if resident.W.phase=W.Open then Some resident.session else None)(W.residents projection)) in
