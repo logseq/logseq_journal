@@ -153,7 +153,7 @@ jobs:
       - name: Verify final cache inputs and seal installed state
         run: python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py --seal-cache
       - name: Bound content-addressed build artifact storage
-        run: opam exec -- dune cache trim --size=1073741824
+        run: opam exec -- dune cache trim --size=1GiB
       - name: Save content-addressed Dune build artifacts
         if: success() && steps.dune-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
