@@ -25,6 +25,36 @@ SCRIPTS = ROOT / ".agents/skills/journal-build/scripts"
 SCRIPT = ROOT / ".agents/skills/journal-build/scripts/build_journal_apple.sh"
 
 
+class IsolatedSourceTests(unittest.TestCase):
+    def test_install_guard_rejects_changed_or_untracked_worktree_inputs(self):
+        spec = importlib.util.spec_from_file_location('isolated_runner', SCRIPTS / 'run_isolated_simulator.py')
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'app').mkdir()
+            unit = root / 'app/unit.ml'
+            unit.write_text('let value = 1\n')
+            spec = importlib.util.spec_from_file_location('source_builder', SCRIPTS / 'journal_build.py')
+            builder = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(builder)
+            with patch.object(builder, 'ROOT', root):
+                original = builder.source_inputs()
+                manifest = dict(inputs=dict(source=original))
+                self.assertTrue(hasattr(runner, 'verify_manifest_sources'),
+                                'install guard must compare manifest hashes to current worktree')
+                runner.verify_manifest_sources(manifest, builder.source_inputs())
+                unit.write_text('let value = 2\n')
+                with self.assertRaisesRegex(RuntimeError, 'worktree'):
+                    runner.verify_manifest_sources(manifest, builder.source_inputs())
+                unit.write_text('let value = 1\n')
+                (root / 'app/untracked.ml').write_text('let added = true\n')
+                with self.assertRaisesRegex(RuntimeError, 'worktree'):
+                    runner.verify_manifest_sources(manifest, builder.source_inputs())
+                with self.assertRaisesRegex(RuntimeError, 'worktree'):
+                    runner.verify_manifest_sources({}, original)
+
+
 class BuildBoundaryTests(unittest.TestCase):
     def cli(self, *args, env=None):
         return subprocess.run(["bash", str(SCRIPT), *args], text=True,
@@ -979,6 +1009,7 @@ while True: time.sleep(1)
                             '-cclib', '-llogseq_sync_effect_runner_impl_stubs'], check=True, capture_output=True)
             # The fixture rule is opaque to the builder: it must read actual Dune argv.
             command = [str(compiler), '-output-complete-obj', '-w', '@1..3', '-o', 'app/native_embed.exe.o',
+                       '-cclib', '-Llogseq_sync/lib/effect_runner', '-cclib', 'app/libgmp.a',
                        '-I', 'logseq_sync/lib/effect_runner', 'logseq_sync/lib/effect_runner/' + archive.name,
                        f.provenance['xmlm']['installed_archive'], f.provenance['mldoc']['installed_archive'],
                        'app/unit.cmx']
@@ -990,7 +1021,7 @@ while True: time.sleep(1)
                            for path in effect.iterdir() if path.suffix in ('.cmxa', '.a'))
                 + ') (action (chdir .. (run ' + ' '.join(map(atom, command)) + '))))\n')
             shutil.copyfile(stub, repo / 'app/libgmp.a')
-            workspace = f.root / 'workspace'
+            workspace = f.root / "workspace with spaces 'and quotes'"
             workspace.mkdir()
             dune_dir = workspace / 'dune'
             def opam(*argv):

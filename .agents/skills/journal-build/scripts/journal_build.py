@@ -799,8 +799,18 @@ class Build:
                     arg = str(copied if path == effect else path)
                     includes.append(Path(arg))
                 elif previous == "-cclib" and arg.startswith("-L") and len(arg) > 2:
-                    arg = "-L" + str(absolute(arg[2:]))
+                    if re.search(r"[\s'\"\\]", arg):
+                        raise ValueError("native -cclib input must be one unquoted token")
+                    path = absolute(arg[2:])
+                    path = copied if path == effect else path
+                    command[-1] = "-I"
+                    arg = str(path)
+                    includes.append(path)
                 elif previous not in {"-w", "-warn-error"} and not arg.startswith("-") and Path(arg).suffix in {".cmxa", ".cmx", ".a", ".o"}:
+                    if previous == "-cclib":
+                        if re.search(r"[\s'\"\\]", arg) or Path(arg).suffix not in {".a", ".o"}:
+                            raise ValueError("native -cclib input must be one unquoted archive/object token")
+                        command.pop()
                     path = absolute(arg)
                     path = copied / path.name if path == effects[0] else path
                     arg = str(path)

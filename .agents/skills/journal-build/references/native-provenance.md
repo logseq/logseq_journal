@@ -22,7 +22,13 @@ Schema 2 supports the object-only Dune link form: the fixed code-generation
 switches, `-w`/`-warn-error` values (including `@` warning sets), `-I`, `-o`, and
 `-cclib` with one unquoted token naming an explicit bound archive/object or `-L`
 directory; whitespace, quotes and backslashes in that value are refused because
-OCaml can split it into additional linker arguments. Source files,
+OCaml splits it on whitespace without interpreting shell quoting. Before resolving
+Dune's safe single-token relative paths, the producer converts `-cclib -Ldir` to
+`-I dir` and explicit `-cclib archive.a/object.o` to positional archive/object
+arguments. These OCaml interfaces preserve real absolute paths containing spaces
+or quotes, without relaxing the importer's rejection of split linker options.
+Generated search directories (including the owned host-stub directory) are also
+included in the archive hash binding. Source files,
 plugins, response files, `-l` providers, `-ccopt` and other unrecognized options
 are refused rather than treated as proved inputs. Relative argv paths resolve
 through the recorded working directory for every later archive/stub check.
