@@ -36,10 +36,11 @@ jobs:
       OPAMEXTERNALSOLVER: builtin-0install
       OPAMPRECISETRACKING: 1
       DUNE_CACHE: enabled
-      DUNE_CACHE_ROOT: ${{ runner.temp }}/journal-dune-cache
       DUNE_CACHE_STORAGE_MODE: copy
     steps:
       - uses: actions/checkout@v4
+      - name: Initialize runner-local Dune cache path
+        run: printf 'DUNE_CACHE_ROOT=%s/journal-dune-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Verify Apple packaging, Swift runtime and graph feedback boundaries
         run: |
           mkdir -p .ci-reports/boundaries
