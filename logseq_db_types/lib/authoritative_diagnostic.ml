@@ -79,8 +79,18 @@ let integrity_counters =
   ]
 ;;
 
+let exceptions = [ "invalid-argument"; "failure"; "not-found"; "other" ]
+
+let simulation_causes =
+  [ "lookup-ref-missing"; "lookup-ref-not-unique"; "cas-mismatch"; "unique-constraint"
+  ; "nil-value"; "value-type-mismatch"; "tuple-arity"; "tuple-write"; "unknown"
+  ]
+;;
+
 let integrity_descriptors =
-  [ "outboxState", [ "queued"; "submitted"; "accepted"; "stale-rejected"; "blocked" ]
+  [ "simulationCause", simulation_causes
+  ; "exception", exceptions
+  ; "outboxState", [ "queued"; "submitted"; "accepted"; "stale-rejected"; "blocked" ]
   ; ( "mutation"
     , [ "save-block"
       ; "insert-blocks"
@@ -147,8 +157,6 @@ let kinds =
   ]
 ;;
 
-let exceptions = [ "invalid-argument"; "failure"; "not-found"; "other" ]
-
 let counter_keys =
   [ "transaction"; "operationIndex"; "operationCount"; "lookupRefs"; "arity" ]
 ;;
@@ -161,6 +169,7 @@ let string_lists =
   ; "field", fields
   ; "type", kinds
   ; "exception", exceptions
+  ; "simulationCause", simulation_causes
   ]
 ;;
 
@@ -177,6 +186,7 @@ let key_order =
   ; "field"
   ; "type"
   ; "exception"
+  ; "simulationCause"
   ; "checkpoint"
   ; "through"
   ; "expectedCursor"
