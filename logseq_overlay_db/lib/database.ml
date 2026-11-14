@@ -8028,6 +8028,13 @@ let synchronized_record_operations (record : outbox_record) =
   |> Sync_tx_codec.synchronized_operations
 ;;
 
+let authoritative_exception_kind = function
+  | Invalid_argument _ -> "invalid-argument"
+  | Failure _ -> "failure"
+  | Not_found -> "not-found"
+  | _ -> "other"
+;;
+
 let expected_record_transaction_data database record =
   try
     Ok
@@ -8038,7 +8045,7 @@ let expected_record_transaction_data database record =
        : Datascript.tx_report)
         .tx_data
   with
-  | exn -> Error (Printexc.to_string exn)
+  | exn -> Error exn
 ;;
 
 let equal_transaction_data left right = List.sort compare left = List.sort compare right
@@ -8351,9 +8358,11 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
                        | None -> "expected-cursor-missing", []
                        | Some (_, actual, root_before) ->
                          (match expected_record_transaction_data root_before record with
-                          | Error _ ->
+                          | Error cause ->
                             ( "expected-simulation-failed"
-                            , [ "actualDatoms", string_of_int (List.length actual) ] )
+                            , [ "exception", authoritative_exception_kind cause
+                              ; "actualDatoms", string_of_int (List.length actual)
+                              ] )
                           | Ok expected_data ->
                             let rec operations_at_cursor cursors transactions =
                               match cursors, transactions with
@@ -8766,13 +8775,6 @@ let authoritative_lookup_refs operations =
          operations)
   with
   | _ -> None
-;;
-
-let authoritative_exception_kind = function
-  | Invalid_argument _ -> "invalid-argument"
-  | Failure _ -> "failure"
-  | Not_found -> "not-found"
-  | _ -> "other"
 ;;
 
 let authoritative_application_error ~transaction operations exn =
