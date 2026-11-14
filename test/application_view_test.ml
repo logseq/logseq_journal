@@ -4640,6 +4640,8 @@ let run_favorites_native_visibility
              for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
              Alcotest.(check int) "failed durable lock dispatches no physical mutation" 0
                (Atomic.get capture_append_writes);
+             Alcotest.(check bool) "failed durable lock is visibly explained" true
+               (Option.is_some (find "text" "Nothing was submitted. Draft storage: Is a directory"));
              raise Exit);
            (match capture_case with
             | Some (`Held|`Edit_pending|`Reopen_pending)->

@@ -405,11 +405,8 @@ let view_impl
          |> V.padding ~insets:(Ui.Layout.Edge_insets.all 8.))
   in
   let body =
-    match context with
-    | Context.Journals -> body
-    | Favorites ->
       let visible presentation =
-        presentation.sync_phase = Some Graph_service.Connecting
+        (context = Context.Favorites && presentation.sync_phase = Some Graph_service.Connecting)
         || Option.is_some presentation.sync_error
       in
       let wrap ?visible_signal () =

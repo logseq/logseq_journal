@@ -7367,8 +7367,10 @@ let start
     let before = model in
     let model,eff=transition model in
     match !before_transition_effect before model with
-    | Error cause -> report_ui_error before ~operation:"saveDraft" ~phase:"localStorage"
-        ~message:("Nothing was submitted. " ^ cause)
+    | Error cause ->
+      let message = "Nothing was submitted. " ^ cause in
+      let state = report_ui_error before ~operation:"saveDraft" ~phase:"localStorage" ~message in
+      show_sync_error state (Non_worker_sync_failure message)
     | Ok () ->
     Option.iter activate_runtime (timeline_scope model);
     let retirement = if model_key before = model_key model
