@@ -3370,6 +3370,29 @@ let receipt_history_open_is_bounded () =
                [ "overlay_mutation_receipts"; "overlay_terminal_batch_receipts" ]))))
 ;;
 
+let receipt_open_errors_are_results () =
+  let behavior = "receipt open failure is a result" in
+  T.with_temp_directory "receipt-open-failure-" (fun support ->
+    let path = T.seed_mirror support in
+    Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
+      let dependencies, _, inspection = location_and_inspection support behavior in
+      let database = Database.open_ ~sw dependencies inspection ~graph_name:"receipt-open"
+        |> T.require_ok ~behavior in
+      let moved = path ^ ".moved" in
+      Fun.protect
+        ~finally:(fun () ->
+          Unix.rename moved path;
+          Database.close database |> T.require_ok ~behavior)
+        (fun () ->
+          Unix.rename path moved;
+          match Database.inspect_local_mutation database
+            (Save_block {mutation_id=T.uuid "10000000-0000-4000-8000-000000099999";
+              block=T.authoritative_block_uuid;title="Must not replay"}) with
+          | Error (Local_commit_persistence_failed _) -> ()
+          | Error _ -> Alcotest.fail "receipt open failure lost persistence classification"
+          | Ok _ -> Alcotest.fail "receipt open failure became absent receipt"))))
+;;
+
 let receipt_lookup_schema_errors_are_results () =
   let module Store = Logseq_db_storage.Mutation_receipt_store in
   let check_lookup table key_column read =
@@ -3657,6 +3680,7 @@ let () =
     ; ( "receipt history"
       , [ Alcotest.test_case "bounded opening and fail-closed validation" `Quick receipt_history_open_is_bounded
         ; Alcotest.test_case "lookup schema errors are results" `Quick receipt_lookup_schema_errors_are_results
+        ; Alcotest.test_case "open errors are results" `Quick receipt_open_errors_are_results
         ] )
     ; ( "cursor checkpoint"
       , [ Alcotest.test_case
