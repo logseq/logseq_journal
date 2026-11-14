@@ -66,25 +66,25 @@ let validate_database db ~is_valid =
 let read_mutation db key =
   if not (valid_key key)
   then Error "mutation receipt key must be a lowercase SHA-256 value"
-  else (
-    let statement =
-      Sqlite3.prepare
-        db
-        "SELECT receipt FROM overlay_mutation_receipts WHERE receipt_key = ?"
-    in
-    Fun.protect
-      ~finally:(fun () -> ignore (Sqlite3.finalize statement))
-      (fun () ->
-         try
+  else
+    try
+      let statement =
+        Sqlite3.prepare
+          db
+          "SELECT receipt FROM overlay_mutation_receipts WHERE receipt_key = ?"
+      in
+      Fun.protect
+        ~finally:(fun () -> ignore (Sqlite3.finalize statement))
+        (fun () ->
            Sqlite3.Rc.check (Sqlite3.bind_text statement 1 key);
            match Sqlite3.step statement with
            | Sqlite3.Rc.ROW -> Ok (Some (Sqlite3.column_text statement 0))
            | DONE -> Ok None
            | rc ->
              Sqlite3.Rc.check rc;
-             assert false
-         with
-         | exn -> Error (Printexc.to_string exn)))
+             assert false)
+    with
+    | exn -> Error (Printexc.to_string exn)
 ;;
 
 let insert_receipts db statement receipts =
@@ -120,25 +120,25 @@ let upsert_mutations db receipts =
 let read_terminal_batch db key =
   if not (valid_key key)
   then Error "terminal batch key must be a lowercase SHA-256 value"
-  else (
-    let statement =
-      Sqlite3.prepare
-        db
-        "SELECT receipt FROM overlay_terminal_batch_receipts WHERE batch_key = ?"
-    in
-    Fun.protect
-      ~finally:(fun () -> ignore (Sqlite3.finalize statement))
-      (fun () ->
-         try
+  else
+    try
+      let statement =
+        Sqlite3.prepare
+          db
+          "SELECT receipt FROM overlay_terminal_batch_receipts WHERE batch_key = ?"
+      in
+      Fun.protect
+        ~finally:(fun () -> ignore (Sqlite3.finalize statement))
+        (fun () ->
            Sqlite3.Rc.check (Sqlite3.bind_text statement 1 key);
            match Sqlite3.step statement with
            | Sqlite3.Rc.ROW -> Ok (Some (Sqlite3.column_text statement 0))
            | DONE -> Ok None
            | rc ->
              Sqlite3.Rc.check rc;
-             assert false
-         with
-         | exn -> Error (Printexc.to_string exn)))
+             assert false)
+    with
+    | exn -> Error (Printexc.to_string exn)
 ;;
 
 let upsert_terminal_batches db receipts =

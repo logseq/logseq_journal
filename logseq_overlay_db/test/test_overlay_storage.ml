@@ -3370,6 +3370,26 @@ let receipt_history_open_is_bounded () =
                [ "overlay_mutation_receipts"; "overlay_terminal_batch_receipts" ]))))
 ;;
 
+let receipt_lookup_schema_errors_are_results () =
+  let module Store = Logseq_db_storage.Mutation_receipt_store in
+  let check_lookup table key_column read =
+    let sqlite = Sqlite3.db_open ":memory:" in
+    Fun.protect
+      ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+      (fun () ->
+         Sqlite3.Rc.check
+           (Sqlite3.exec sqlite ("CREATE TABLE " ^ table ^ " (" ^ key_column ^ " TEXT PRIMARY KEY)"));
+         match read sqlite (String.make 64 'a') with
+         | Error message ->
+           Alcotest.(check string) "missing receipt column cause is preserved"
+             "Sqlite3.Error(\"Sqlite3.prepare: no such column: receipt\")"
+             message
+         | Ok _ -> Alcotest.fail "malformed receipt table was treated as an absent key")
+  in
+  check_lookup "overlay_mutation_receipts" "receipt_key" Store.read_mutation;
+  check_lookup "overlay_terminal_batch_receipts" "batch_key" Store.read_terminal_batch
+;;
+
 let sqlite_full_int64_checkpoint () =
   let module Checkpoint = Logseq_db_types.Sync_checkpoint in
   let module Store = Logseq_db_storage.Sync_checkpoint_store in
@@ -3635,7 +3655,9 @@ let () =
             pre_uuid_status_outbox_preserves_identity
         ] )
     ; ( "receipt history"
-      , [ Alcotest.test_case "bounded opening and fail-closed validation" `Quick receipt_history_open_is_bounded ] )
+      , [ Alcotest.test_case "bounded opening and fail-closed validation" `Quick receipt_history_open_is_bounded
+        ; Alcotest.test_case "lookup schema errors are results" `Quick receipt_lookup_schema_errors_are_results
+        ] )
     ; ( "cursor checkpoint"
       , [ Alcotest.test_case
             "submit interval overflow is rejected"
