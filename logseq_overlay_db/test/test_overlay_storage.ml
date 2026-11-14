@@ -3278,6 +3278,7 @@ let receipt_history_open_is_bounded () =
              let dependencies, _, inspection = location_and_inspection support behavior in
              Gc.compact ();
              let baseline = (Gc.stat ()).live_words in
+             let allocated_before = Gc.allocated_bytes () in
              let peak = ref baseline in
              let alarm =
                Gc.create_alarm (fun () -> peak := max !peak (Gc.stat ()).live_words)
@@ -3294,10 +3295,15 @@ let receipt_history_open_is_bounded () =
                     |> T.require_ok ~behavior
                   in
                   Database.close database |> T.require_ok ~behavior);
+             let allocated_bytes = Gc.allocated_bytes () -. allocated_before in
              let peak_bytes = 8 * (!peak - baseline) in
              Printf.printf
-               "receipt history rows=100000 peak_live_growth_bytes=%d\n%!"
-               peak_bytes;
+               "receipt history rows=100000 peak_live_growth_bytes=%d allocated_bytes=%.0f\n%!"
+               peak_bytes
+               allocated_bytes;
+             T.require
+               (allocated_bytes < 16. *. 1024. *. 1024.)
+               "opening decoded historical receipt payloads";
              T.require
                (peak_bytes < 4 * 1024 * 1024)
                "opening retained unbounded receipt history";
@@ -3319,17 +3325,31 @@ let receipt_history_open_is_bounded () =
                     (Sqlite3.exec
                        sqlite
                        ("UPDATE " ^ table ^ " SET receipt = '{}' WHERE rowid = 25000"));
-                  (match
-                     Database.open_
-                       ~sw
-                       dependencies
-                       (inspect_mirror support behavior)
-                       ~graph_name:"invalid-receipt"
-                   with
-                   | Error _ -> ()
-                   | Ok opened ->
-                     ignore (Database.close opened);
-                     Alcotest.fail "invalid receipt accepted");
+                  let opened =
+                    Database.open_
+                      ~sw
+                      dependencies
+                      (inspect_mirror support behavior)
+                      ~graph_name:"invalid-receipt"
+                    |> T.require_ok ~behavior
+                  in
+                  Fun.protect
+                    ~finally:(fun () -> Database.close opened |> T.require_ok ~behavior)
+                    (fun () ->
+                       if table = "overlay_mutation_receipts"
+                       then
+                         match
+                           Database.inspect_local_mutation
+                             opened
+                             (Save_block
+                                { mutation_id = T.uuid "10000000-0000-4000-8000-000000025000"
+                                ; block = T.authoritative_block_uuid
+                                ; title = "Must not replay a corrupt receipt"
+                                })
+                         with
+                         | Error (Local_commit_persistence_failed _) -> ()
+                         | Error _ -> Alcotest.fail "receipt lookup lost the storage cause"
+                         | Ok _ -> Alcotest.fail "corrupt receipt was treated as missing");
                   (match Database.collect_garbage (inspect_mirror support behavior) with
                    | Error _ -> ()
                    | Ok _ -> Alcotest.fail "garbage collection accepted invalid receipt");

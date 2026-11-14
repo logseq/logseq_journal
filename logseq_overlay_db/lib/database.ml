@@ -2089,14 +2089,12 @@ let migrate_outbox path ~revision ~expected_records rows =
       (ordered_durable_rows rows))
 ;;
 
-let validate_durable_receipts path =
+let initialize_durable_receipts path =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
   Fun.protect
     ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
     (fun () ->
-       let ( let* ) = Result.bind in
-       let* () = Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite in
-       Result.map (fun _ -> ()) (validate_receipts sqlite))
+       Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite)
 ;;
 
 let read_durable_receipt path mutation_id =
@@ -5537,9 +5535,8 @@ let find_receipt database id =
       (fun (candidate, _, _) -> Graph.Uuid.equal id candidate)
       database.receipts
   with
-  | Some _ as receipt -> receipt
-  | None ->
-    Result.to_option (read_durable_receipt database.database_path id) |> Option.join
+  | Some _ as receipt -> Ok receipt
+  | None -> read_durable_receipt database.database_path id
 ;;
 
 let duplicate_commit database commit =
@@ -5628,7 +5625,8 @@ let existing_mutation database id fingerprint =
       (fun (record : outbox_record) -> Graph.Uuid.equal id record.mutation_id)
       database.outbox
   with
-  | Some record when not (String.equal record.fingerprint fingerprint) -> Error ()
+  | Some record when not (String.equal record.fingerprint fingerprint) ->
+    Error Types.Mutation_identity_conflict
   | Some { transport_state = Types.Blocked; _ } as blocked ->
     let record = Option.get blocked in
     (match record.blocked_prior_state, record.blocked_reason with
@@ -5642,19 +5640,21 @@ let existing_mutation database id fingerprint =
                ; reason
                ; same_id_retry_eligible = record.same_id_retry_eligible
                }))
-     | _ -> Error ())
+     | _ -> Error Types.Mutation_identity_conflict)
   | Some record ->
     Ok (Some (Types.Existing_applied (active_duplicate_commit database record)))
   | None ->
     (match find_receipt database id with
-     | None -> Ok None
-     | Some (_, existing_fingerprint, _)
-       when not (String.equal existing_fingerprint fingerprint) -> Error ()
-     | Some (_, _, Commit_receipt commit) ->
+     | Error message -> Error (Types.Local_commit_persistence_failed message)
+     | Ok None -> Ok None
+     | Ok (Some (_, existing_fingerprint, _))
+       when not (String.equal existing_fingerprint fingerprint) ->
+       Error Types.Mutation_identity_conflict
+     | Ok (Some (_, _, Commit_receipt commit)) ->
        Ok (Some (Types.Existing_applied (duplicate_commit database commit)))
-     | Some (_, _, Discarded_receipt (commit, _)) ->
+     | Ok (Some (_, _, Discarded_receipt (commit, _))) ->
        Ok (Some (Types.Existing_discarded commit))
-     | Some (_, _, Remote_won_entry receipt) ->
+     | Ok (Some (_, _, Remote_won_entry receipt)) ->
        Ok (Some (Types.Existing_remote_won receipt)))
 ;;
 
@@ -6277,7 +6277,7 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
   if not (Sys.file_exists path)
   then Error Types.Attachment_stale
   else (
-    match read_outbox path, validate_durable_receipts path with
+    match read_outbox path, initialize_durable_receipts path with
     | Error message, _ -> Error (Types.Corrupt_outbox message)
     | _, Error message -> Error (Types.Corrupt_mutation_receipt message)
     | Ok (encoded, durable_revision), Ok () ->
@@ -6664,7 +6664,7 @@ let commit_local_with_intent ?intent database ~expected mutation =
                   | Ok (Some _) when Option.is_some intent ->
                     None, Error Types.Mutation_identity_conflict
                   | Ok (Some existing) -> None, Ok (Types.Local_existing existing)
-                  | Error () -> None, Error Types.Mutation_identity_conflict
+                  | Error error -> None, Error error
                   | Ok None ->
                     let context = read_context (snapshot_of_database database) in
                     (match required_preconditions expected mutation with
@@ -11382,8 +11382,7 @@ let inspect_local_mutation database mutation =
     if database.closed
     then Error Types.Local_database_closed
     else
-      existing_mutation database (mutation_id mutation) (fingerprint mutation)
-      |> Result.map_error (fun () -> Types.Mutation_identity_conflict))
+      existing_mutation database (mutation_id mutation) (fingerprint mutation))
 ;;
 
 let set_asset_reference database ~expected ~mutation_id ~block ~previous ~asset =
