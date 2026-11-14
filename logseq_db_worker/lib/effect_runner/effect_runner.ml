@@ -2068,9 +2068,9 @@ let durable_mutation t ~scope ~intent ~current =
                 let outcome=try run_durable_mutation t ~scope ~intent ~current with
                   | Eio.Cancel.Cancelled _ -> Wire.Unknown
                   | error ->
-                    if not t.stopped && current () then publish_failure (report_current_graph t scope)
-                      (exception_failure ~operation:"commitLocal" ~reason:"resourceFailed" error);
-                    Wire.Unknown in
+                    let cause=exception_failure ~operation:"commitLocal" ~reason:"resourceFailed" error in
+                    if not t.stopped && current () then publish_failure (report_current_graph t scope) cause;
+                    Wire.Unknown_with_cause cause in
                 ignore(Eio.Promise.try_resolve resolve outcome:bool)));
           submitted:=true);
         Eio.Promise.await promise)

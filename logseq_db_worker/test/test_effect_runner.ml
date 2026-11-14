@@ -3305,7 +3305,22 @@ let test_durable_commit_notifies_own_graph ~resident () =
         require(match mutate(intent 29812)with Mutation.Committed _->true|_->false)
           "physical commit retains evidence when presentation retires";
         require(not !authority) "fixture retires authority during actual commit publication";
-        require(notices()=[scope]) "caller retirement cannot strand a successfully committed outbox"))))
+        require(notices()=[scope]) "caller retirement cannot strand a successfully committed outbox";
+        let cancelled=Runner.durable_mutation runner ~scope ~intent:(intent 29813)
+          ~current:(fun()->raise(Eio.Cancel.Cancelled(Failure "synthetic cancellation"))) in
+        require(cancelled=Mutation.Unknown) "cancellation retains legacy Unknown";
+        let raised=ref false in
+        let outcome=Runner.durable_mutation runner ~scope ~intent:(intent 29814)
+          ~current:(fun()->if !raised then true else (
+            raised:=true;raise(Unix.Unix_error(Unix.EACCES,"open","PRIVATE_SYNTHETIC_PAYLOAD")))) in
+        match outcome with
+        | Mutation.Unknown_with_cause cause ->
+          let module D=Logseq_db_types.Failure_diagnostic in
+          Alcotest.(check string) "resource exception operation is request bound" "commitLocal" (D.operation cause);
+          Alcotest.(check string) "resource exception reason is request bound" "resourceFailed" (D.reason cause);
+          Alcotest.(check string) "resource exception has safe classification" "io-permission" (D.source_class cause);
+          require(not(String.contains(D.encode cause) '/')) "resource exception excludes private paths"
+        | _ -> Alcotest.fail "non-cancel resource exception must return a request-bound cause"))))
 ;;
 
 let test_durable_commit_during_protection ?(resident=false) mode () =
