@@ -652,6 +652,9 @@ let run_favorites_native_visibility
       ?media_rows
       ?(shared_media = false)
       ?(single_graph_shape = false)
+      ?(support_directory = "/tmp/journal-favorites-synthetic")
+      ?(before_capture_send = fun () -> ())
+      ?(check_draft_write_failure = false)
       ?(check_media_rebind = false)
       ?(check_point_read_owner = false)
       ?(check_media_change_ack = false)
@@ -664,6 +667,15 @@ let run_favorites_native_visibility
       ?media_navigation
       ()
   =
+  let owns_support = support_directory="/tmp/journal-favorites-synthetic"
+    && (check_capture_imports || Option.is_some detail_capture) in
+  let support_directory = if owns_support then (
+    let path=Filename.temp_file "journal-draft-fixture-" "" in
+    Unix.unlink path;Unix.mkdir path 0o700;path) else support_directory in
+  let rec remove_support path =
+    if (Unix.lstat path).st_kind=Unix.S_DIR then (
+      Array.iter(fun name->remove_support(Filename.concat path name))(Sys.readdir path);
+      Unix.rmdir path) else Unix.unlink path in
   let module W = Logseq_db_worker_lui.Journal_worker in
   let module G = Logseq_db_types.Graph_types in
   let uuid n =
@@ -1792,6 +1804,18 @@ let run_favorites_native_visibility
               let candidate=value.page and root=value.root in
               let journal_day=Logseq_db_worker_contract.Worker_pure_day.value value.day in
 
+              let module Drafts=Journal_platform.Draft_store in
+              let store=Drafts.create ~directory:support_directory
+                ~binding:{user_id="fixture";managed_sync_origin="https://example.invalid"} in
+              let recovered=Result.get_ok(Drafts.load store) in
+              let locked=List.exists(fun(draft:Drafts.draft)->
+                draft.graph=G.Uuid.to_string scope.graph_id
+                && Journal_capture.retry_identity_locked draft.capture
+                && not(Journal_capture.can_save draft.capture))recovered in
+              List.iter(fun(draft:Drafts.draft)->
+                List.iter Journal_asset_import.discard_staged_file
+                  (Journal_capture.pending_attachments draft.capture))recovered;
+              Alcotest.(check bool) "physical Append sees a durable non-editable lock" true locked;
               Atomic.incr capture_append_writes;
               Alcotest.(check int) "the full attachment-only capture has one root" 0(Rrbvec.length root.children);
               let captured={page with uuid=uuid 94321;name=string_of_int journal_day;
@@ -1999,7 +2023,7 @@ let run_favorites_native_visibility
   in
   let startup =
     Logseq_db_worker.Config.create
-      ~application_support_directory:"/tmp/journal-favorites-synthetic"
+      ~application_support_directory:support_directory
       ~target:(Managed_sync { base_url = "https://example.invalid" })
       ~compatibility_profile:Logseq_65_33_or_newer
       ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
@@ -2030,10 +2054,11 @@ let run_favorites_native_visibility
       ignore (hooks.dispose ());
       Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client;
       List.iter (fun path -> if Sys.file_exists path then Sys.remove path) (!staged_paths @ Atomic.get durable_paths);
+      if owns_support then remove_support support_directory;
       check_fixture_worker_idle ())
     (fun () ->
        hooks.init 2 2 startup |> consume;
-       if check_copy || single_graph_shape then (
+       if check_copy || single_graph_shape || check_capture_imports || Option.is_some detail_capture then (
          let json = Yojson.Safe.to_string (`Assoc
            [ "userId", `String "fixture";
              "managedSyncOrigin", `String "https://example.invalid" ]) in
@@ -4609,7 +4634,13 @@ let run_favorites_native_visibility
                 (find
                    "accessibility-identifier"
                    ("composer-attachment:" ^ G.Uuid.to_string (uuid 30001))));
+           before_capture_send ();
            dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Send")));
+           if check_draft_write_failure then (
+             for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+             Alcotest.(check int) "failed durable lock dispatches no physical mutation" 0
+               (Atomic.get capture_append_writes);
+             raise Exit);
            (match capture_case with
             | Some (`Held|`Edit_pending|`Reopen_pending)->
               wait "Capture canonical read is held" (fun()->Atomic.get status_confirm_entered);
@@ -8743,7 +8774,26 @@ let () =
           ; "status-rejected"
           ] )
     ; ( "Capture attachment imports"
-      , [ Alcotest.test_case
+      , [ Alcotest.test_case "durable draft lock failure prevents dispatch" `Quick
+            (fun () ->
+              let support=Filename.temp_file "journal-draft-dispatch-" "" in
+              Unix.unlink support;Unix.mkdir support 0o700;
+              let rec remove path =
+                if (Unix.lstat path).st_kind=Unix.S_DIR then (
+                  Array.iter(fun name->remove(Filename.concat path name))(Sys.readdir path);
+                  Unix.rmdir path)
+                else Unix.unlink path in
+              Fun.protect ~finally:(fun()->remove support) (fun()->
+                let before_capture_send () =
+                  let owned=Filename.concat support "JournalDrafts-v1" in
+                  let account=Filename.concat owned (Array.get(Sys.readdir owned)0) in
+                  let manifest=Filename.concat account "state.json" in
+                  Unix.unlink manifest;Unix.mkdir manifest 0o700 in
+                try run_favorites_native_visibility ~single_graph_shape:true
+                  ~support_directory:support ~check_capture_imports:true
+                  ~before_capture_send ~check_draft_write_failure:true ()
+                with Exit->()));
+          Alcotest.test_case
             "ordered partial failure and staging release"
             `Quick
             (fun () -> run_favorites_native_visibility ~check_capture_imports:true ());

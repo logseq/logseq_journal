@@ -5681,6 +5681,7 @@ let start
         in
         { state with calendar = Some calendar; graph_error })
   in
+  let flush_restart_drafts = ref (fun () -> ()) in
   let calendar_foreground = ref true in
   let sample_calendar () =
     Effect.of_thunk (fun () -> Journal_calendar.Sampler.sample calendar_sampler)
@@ -5689,6 +5690,7 @@ let start
     match Journal_platform.decode_network_lifecycle payload with
     | Error _ -> Effect.ignore
     | Ok (Backgrounded _) ->
+      !flush_restart_drafts ();
       calendar_foreground := false;
       Effect.bind (set_state (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Foreground false)}))
@@ -5807,6 +5809,7 @@ let start
     | Error _ -> if Journal_platform.is_prepare_to_terminate_event payload
     then Effect.of_thunk(fun()->
       if not !termination_in_flight then (
+        !flush_restart_drafts ();
         account_lifecycle:=Account_pure_lifecycle.stop !account_lifecycle;
         let owner=ensure_coordination() in
         termination_in_flight:=true;termination_host_completed:=false;
@@ -7358,10 +7361,15 @@ let start
       local_copies=root.local_copies;local_copy_check=root.local_copy_check;
       local_copy_deleting=root.local_copy_deleting;local_copy_message=root.local_copy_message;
       calendar=root.calendar;environment=root.environment} in
+  let before_transition_effect = ref (fun (_ : state) (_ : state) -> Ok ()) in
   let process_transition ~visible model transition =
     Option.iter activate_runtime (timeline_scope model);
     let before = model in
     let model,eff=transition model in
+    match !before_transition_effect before model with
+    | Error cause -> report_ui_error before ~operation:"saveDraft" ~phase:"localStorage"
+        ~message:("Nothing was submitted. " ^ cause)
+    | Ok () ->
     Option.iter activate_runtime (timeline_scope model);
     let retirement = if model_key before = model_key model
       && before.graph_state.graph_id = model.graph_state.graph_id
@@ -7423,7 +7431,9 @@ let start
   let module Draft_store = Journal_platform.Draft_store in
   let draft_store : (Journal_platform.local_account_binding * Draft_store.t) option ref = ref None in
   let draft_account : (string * Journal_platform.local_account_binding) option ref = ref None in
-  let last_draft_snapshot : Draft_store.draft list option ref = ref None in
+  let draft_writer : Draft_store.Writer.t option ref = ref None in
+  let draft_epoch = ref 0 in
+  let last_draft_state : state option ref = ref None in
   let draft_storage_blocked = ref false in
   let draft_storage_error = ref None in
   let draft_failure state cause =
@@ -7466,17 +7476,21 @@ let start
         items(Journal_routes.recovery_captures draft.append_drafts))saved []
     |> List.filter(fun(draft:Draft_store.draft)->Journal_capture.source draft.capture<>""
       || Journal_capture.pending_attachments draft.capture<>[] || Journal_capture.retry_identity_locked draft.capture) in
-  let same_snapshot left right =
-    List.length left=List.length right && List.for_all2(fun (left:Draft_store.draft) (right:Draft_store.draft)->
-      left.graph=right.graph && left.parent=right.parent && left.capture==right.capture)left right in
+  let same_draft_state left right =
+    left.graph_state.graph_id=right.graph_state.graph_id
+    && left.direct_capture==right.direct_capture && left.routes==right.routes
+    && left.graph_drafts==right.graph_drafts && left.resident_states==right.resident_states in
   let checkpoint_drafts state =
     let state=match !draft_account with
       |Some(directory,binding) when !coordination_account=Some None
           || (match !coordination_account with Some(Some user)->user<>binding.user_id|None|Some None->false)->
+        incr draft_epoch;
+        Option.iter(fun writer->ignore(Draft_store.Writer.close writer)) !draft_writer;
+        draft_writer:=None;
         let store=Draft_store.create ~directory ~binding in
         (match Draft_store.clear store with
         |Error cause->draft_storage_blocked:=true;draft_failure state cause
-        |Ok()->draft_account:=None;draft_store:=None;last_draft_snapshot:=None;draft_storage_blocked:=false;
+        |Ok()->draft_account:=None;draft_store:=None;last_draft_state:=None;draft_storage_blocked:=false;
           draft_storage_error:=None;state)
       |None|Some _->state in
     (match !draft_account,!draft_support_directory,!coordination_account with
@@ -7497,17 +7511,54 @@ let start
           draft_store:=Some(binding,store);
           match Draft_store.load store with
           |Error cause->draft_storage_blocked:=true;draft_failure state cause
-          |Ok drafts->restore_restart_drafts state drafts)
+          |Ok drafts->
+            let epoch= !draft_epoch in
+            let on_complete = function
+              |Ok ()->()
+              |Error cause->Journal_pump.enqueue pump (fun()->
+                if epoch= !draft_epoch then
+                  send_action(Update(fun state->draft_failure state cause,Effect.ignore))) in
+            draft_writer:=Some(Draft_store.Writer.create ~on_complete store);
+            restore_restart_drafts state drafts)
       |_->state in
-    match !draft_store with
+    match !draft_writer with
     |None->state
-    |Some(_,store) when not !draft_storage_blocked->
-      let drafts=draft_snapshot state in
-      if Option.fold ~none:false ~some:(same_snapshot drafts)!last_draft_snapshot then state else
-      (match Draft_store.save store drafts with
+    |Some writer when not !draft_storage_blocked->
+      if Option.fold ~none:false ~some:(same_draft_state state)!last_draft_state then state else
+      (match Draft_store.Writer.enqueue writer (fun()->draft_snapshot state) with
       |Error cause->draft_failure state cause
-      |Ok()->last_draft_snapshot:=Some drafts;draft_storage_error:=None;state)
+      |Ok()->last_draft_state:=Some state;state)
     |Some _->state in
+  let flush_drafts () =
+    match !draft_writer with
+    |None->Error "Draft recovery has not been opened for this account."
+    |Some _ when !draft_storage_blocked->Error "Draft recovery is blocked for this account."
+    |Some writer->Draft_store.Writer.flush writer in
+  flush_restart_drafts := (fun()->
+    match !draft_writer with
+    |None->()
+    |Some _->match flush_drafts () with
+      |Ok()->()
+      |Error cause->send_action(Update(fun state->draft_failure state cause,Effect.ignore)));
+  before_transition_effect := (fun before next->
+    let previous=draft_snapshot before in
+    let submitting=List.exists(fun(draft:Draft_store.draft)->
+      Journal_capture.phase draft.capture=Saving
+      && not(List.exists(fun(old:Draft_store.draft)->old.graph=draft.graph
+        && old.parent=draft.parent && Journal_capture.phase old.capture=Saving)previous))
+      (draft_snapshot next) in
+    if not submitting then Ok() else (
+      let root= !state_ref in
+      let snapshot=if root.graph_state.graph_id=next.graph_state.graph_id then next else
+        let key=match model_key next with Some key->key|None->"" in
+        {root with resident_states=Graph_drafts.add key next root.resident_states} in
+      ignore(checkpoint_drafts snapshot);
+      match !draft_writer with
+      |None->Error "A durable draft lock could not be created for this account."
+      |Some writer when not !draft_storage_blocked->
+        (match Draft_store.Writer.enqueue writer (fun()->draft_snapshot snapshot) with
+        |Error cause->Error cause |Ok()->flush_drafts())
+      |Some _->Error "Draft recovery is blocked for this account."));
   let update_without_checkpoint = update in
   let update state action =
     let next=checkpoint_drafts(update_without_checkpoint state action) in
@@ -8394,6 +8445,12 @@ let start
   prev_startup_loading_key := startup_loading_key initial_state;
   Option.iter arm_startup_loading_timer !prev_startup_loading_key;
   let release_staging () =
+    incr draft_epoch;
+    Option.iter(fun writer->
+      match Draft_store.Writer.close writer with
+      |Ok()->()
+      |Error cause->Printf.eprintf "journal: draft shutdown flush failed: %s\n%!" cause) !draft_writer;
+    draft_writer:=None;
     ignore (finish_cleanup (with_cleanup (fun ~discard -> clear_account_drafts ~discard !state_ref)));
     save_runtime ();
     let all=Hashtbl.to_seq runtime_sessions |> List.of_seq

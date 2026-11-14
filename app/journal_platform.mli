@@ -84,4 +84,34 @@ module Draft_store : sig
   val save : t -> draft list -> (unit, string) result
   val load : t -> (draft list, string) result
   val clear : t -> (unit, string) result
+
+  (** Fault injection at the manifest directory-sync syscall boundary; all
+      publication, media ownership and error handling remain production code. *)
+  module For_testing : sig
+    val with_directory_sync : t -> (string -> unit) -> t
+  end
+
+  (** {2 Serial asynchronous snapshots}
+      A single application-thread producer owns each writer. It retains at most
+      one running snapshot, one latest pending snapshot and one last-successful
+      snapshot for unchanged-owner comparison; replacing pending work never
+      loses the latest revision. Snapshot thunks run on the writer
+      thread and must only read immutable retained state. They must not touch UI
+      signals. Keep attachment sources alive until [flush] or [close] completes.
+      Never call [save], [load], or [clear] concurrently with a writer for the
+      same store. [on_complete] runs on the writer thread.
+
+      [flush] waits for all snapshots enqueued before the call and reports the
+      latest saved revision's result. A submission must enqueue its locked
+      snapshot and successfully flush before dispatching any mutation. [close]
+      flushes and joins the thread even on failure; only then may account cleanup
+      run or staging sources be released. Closing is idempotent. *)
+  module Writer : sig
+    type store = t
+    type t
+    val create : ?on_complete:((unit, string) result -> unit) -> store -> t
+    val enqueue : t -> (unit -> draft list) -> (unit, string) result
+    val flush : t -> (unit, string) result
+    val close : t -> (unit, string) result
+  end
 end

@@ -261,7 +261,8 @@ let decode_copy_text_response bytes =
 ;;
 
 module Draft_store = struct
-  type t = { directory : string; binding : local_account_binding }
+  type t = { directory : string; binding : local_account_binding
+    ; directory_sync : (string -> unit) option }
   type draft = { graph : string; parent : string option; capture : Journal_capture.t }
 
   module Wire = struct
@@ -274,7 +275,10 @@ module Draft_store = struct
     [@@deriving yojson]
   end
 
-  let create ~directory ~binding = {directory;binding}
+  let create ~directory ~binding = {directory;binding;directory_sync=None}
+  module For_testing = struct
+    let with_directory_sync t synchronize = {t with directory_sync=Some synchronize}
+  end
   let maximum_metadata = 2 * 1024 * 1024
   let maximum_media = 128 * 1024 * 1024
   let maximum_file = 32 * 1024 * 1024
@@ -312,7 +316,7 @@ module Draft_store = struct
   let sync_directory path =
     let descriptor=Unix.openfile path [Unix.O_RDONLY] 0 in
     Fun.protect ~finally:(fun()->Unix.close descriptor)(fun()->Unix.fsync descriptor)
-  let atomic ?(committed=fun()->()) path write =
+  let atomic ?(committed=fun()->()) ?(synchronize=sync_directory) path write =
     let temporary,channel=Filename.open_temp_file ~temp_dir:(Filename.dirname path)
       ~mode:[Open_binary] "pending-" ".tmp" in
     Fun.protect ~finally:(fun()->close_out_noerr channel;
@@ -320,7 +324,7 @@ module Draft_store = struct
       Unix.chmod temporary 0o600;
       write channel;
       flush channel;Unix.fsync(Unix.descr_of_out_channel channel);close_out channel;
-      Unix.rename temporary path;committed();sync_directory(Filename.dirname path))
+      Unix.rename temporary path;committed();synchronize(Filename.dirname path))
   let read path limit =
     let size=regular path limit in
     let channel=open_in_bin path in
@@ -423,7 +427,9 @@ module Draft_store = struct
     (try
       List.iter(fun(source,name)->let destination=Filename.concat(directory t)name in
         if not(exists destination) then (created:=destination::!created;copy source destination))copies;
-      atomic ~committed:(fun()->published:=true) (Filename.concat(directory t)"state.json")
+      atomic ~committed:(fun()->published:=true)
+        ~synchronize:(Option.value t.directory_sync ~default:sync_directory)
+        (Filename.concat(directory t)"state.json")
         (fun channel->output_string channel encoded)
     with error->
       if !published then
@@ -469,4 +475,52 @@ module Draft_store = struct
           else capture in
         {graph=draft.graph;parent=draft.parent;capture})drafts
       with error->List.iter(fun path->if exists path then Unix.unlink path)!staged_files;raise error))
+
+  module Writer = struct
+    type store = t
+    type job = { revision : int; snapshot : unit -> draft list }
+    type t =
+      { pending : job option Atomic.t
+      ; completed : (int * (unit, string) result) Atomic.t
+      ; running : bool Atomic.t
+      ; mutable revision : int
+      ; mutable thread : Thread.t option
+      }
+    let create ?(on_complete=fun _->()) store =
+      let writer={pending=Atomic.make None;completed=Atomic.make(0,Ok());
+        running=Atomic.make true;revision=0;thread=None} in
+      let last_saved = ref None in
+      let same_snapshot left right =
+        List.length left=List.length right && List.for_all2(fun left right->
+          left.graph=right.graph && left.parent=right.parent && left.capture==right.capture)left right in
+      let rec work () =
+        match Atomic.exchange writer.pending None with
+        |Some job->
+          let result=try
+            let drafts=job.snapshot () in
+            if Option.fold ~none:false ~some:(same_snapshot drafts) !last_saved then Ok() else
+            let result=save store drafts in
+            (match result with Ok()->last_saved:=Some drafts|Error _->());result
+          with _->Error "Draft storage worker failed; restart recovery is unavailable." in
+          Atomic.set writer.completed (job.revision,result);
+          (try on_complete result with _->());work ()
+        |None when Atomic.get writer.running->Unix.sleepf 0.005;work ()
+        |None->() in
+      writer.thread<-Some(Thread.create work ());writer
+    let enqueue writer snapshot =
+      if not(Atomic.get writer.running) then Error "Draft storage writer is closed."
+      else (
+        writer.revision<-writer.revision+1;
+        Atomic.set writer.pending (Some{revision=writer.revision;snapshot});Ok())
+    let flush writer =
+      let target=writer.revision in
+      let rec wait () =
+        let revision,result=Atomic.get writer.completed in
+        if revision>=target then result else (Unix.sleepf 0.001;wait ()) in
+      wait ()
+    let close writer =
+      let result=flush writer in
+      Atomic.set writer.running false;
+      Option.iter Thread.join writer.thread;writer.thread<-None;result
+  end
 end

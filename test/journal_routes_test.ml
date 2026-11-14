@@ -5762,6 +5762,19 @@ let test_restart_draft_store () =
     require(parent=graph && Journal_capture.source roundtrip="unsaved 中文") "append restart adapter lost owner or text";
     let retained=Journal_detail.recover_composer ~parent:graph restored.capture in
     require(Journal_detail.retained_pending_submission retained=None) "append restart restored execution authority";
+    let old_media=Array.to_list(Sys.readdir account)
+      |>List.filter(fun name->String.ends_with ~suffix:".media" name) in
+    let uncertain=S.For_testing.with_directory_sync store
+      (fun path->raise(Unix.Unix_error(Unix.EIO,"fsync",path))) in
+    let result=S.save uncertain [{item with capture=Journal_capture.create
+      ~session_number:3L ~source:"published uncertain"}] in
+    require(match result with Error cause->String.starts_with ~prefix:"Draft manifest was published" cause|Ok()->false)
+      "directory-sync failure falsely reported rollback or success";
+    require(List.for_all(fun name->Sys.file_exists(Filename.concat account name))old_media)
+      "uncertain publication swept old attachments";
+    let published=List.hd(Result.get_ok(S.load store)) in
+    require(Journal_capture.source published.capture="published uncertain") "rename was not the declared publication point";
+    replace good;
     let cleanup_obstacle=Filename.concat account "pending-obstacle.tmp" in
     Unix.mkdir cleanup_obstacle 0o700;
     let published=S.save store [{item with capture=Journal_capture.create ~session_number:3L ~source:"published replacement"}] in
@@ -5777,3 +5790,43 @@ let test_restart_draft_store () =
 ;;
 
 let () = test_restart_draft_store ()
+
+let test_serial_draft_writer () =
+  let module S=Journal_platform.Draft_store in
+  let root=Filename.temp_file "journal-writer-test-" "" in
+  Unix.unlink root;Unix.mkdir root 0o700;
+  let binding:Journal_platform.local_account_binding=
+    {user_id="writer-user";managed_sync_origin="https://example.invalid"} in
+  let store=S.create ~directory:root ~binding in
+  let graph="70000000-0000-4000-a000-000000000001" in
+  let draft source=S.{graph;parent=None;
+    capture=Journal_capture.create ~session_number:1L ~source} in
+  let entered=Atomic.make false and release=Atomic.make false in
+  let evaluated=Atomic.make 0 in
+  let writer=S.Writer.create store in
+  Fun.protect ~finally:(fun()->
+    Atomic.set release true;ignore(S.Writer.close writer);
+    ignore(S.clear store);Unix.rmdir(Filename.concat root "JournalDrafts-v1");Unix.rmdir root)
+    (fun()->
+      Result.get_ok(S.Writer.enqueue writer (fun()->
+        Atomic.incr evaluated;Atomic.set entered true;
+        while not(Atomic.get release) do Unix.sleepf 0.001 done;
+        [draft "first"]));
+      let deadline=Unix.gettimeofday()+.2. in
+      while not(Atomic.get entered) && Unix.gettimeofday()<deadline do Unix.sleepf 0.001 done;
+      require(Atomic.get entered) "writer did not run independently of the producer";
+      for revision=1 to 1000 do
+        Result.get_ok(S.Writer.enqueue writer (fun()->
+          Atomic.incr evaluated;[draft(string_of_int revision)]))
+      done;
+      require(Atomic.get evaluated=1) "producer serialized snapshots or pending work ran concurrently";
+      Atomic.set release true;
+      Result.get_ok(S.Writer.close writer);
+      require(Atomic.get evaluated=2) "writer retained a per-edit queue rather than a bounded latest snapshot";
+      let recovered=List.hd(Result.get_ok(S.load store)) in
+      require(Journal_capture.source recovered.capture="1000") "lifecycle close lost the latest pending edit";
+      require(Result.is_error(S.Writer.enqueue writer (fun()->[draft "late"]))) "closed writer accepted a resurrection";
+      Result.get_ok(S.clear store);
+      require(Result.get_ok(S.load store)=[]) "closed writer resurrected a revoked account")
+;;
+let ()=test_serial_draft_writer ()
