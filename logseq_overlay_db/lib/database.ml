@@ -2097,12 +2097,19 @@ let initialize_durable_receipts path =
        Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite)
 ;;
 
+let with_receipt_database path read =
+  try
+    let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
+    Fun.protect
+      ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
+      (fun () -> read sqlite)
+  with
+  | exn -> Error (Printexc.to_string exn)
+;;
+
 let read_durable_receipt path mutation_id =
   let key = Persistence_receipt_v1.receipt_key mutation_id in
-  let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
-  Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
-    (fun () ->
+  with_receipt_database path (fun sqlite ->
        Result.bind
          (Logseq_db_storage.Mutation_receipt_store.read_mutation sqlite key)
          (function
@@ -2118,10 +2125,7 @@ let read_durable_receipt path mutation_id =
 
 let read_terminal_batch database batch_id =
   let key = Persistence_receipt_v1.terminal_batch_key batch_id in
-  let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database.database_path in
-  Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
-    (fun () ->
+  with_receipt_database database.database_path (fun sqlite ->
        Result.bind
          (Logseq_db_storage.Mutation_receipt_store.read_terminal_batch sqlite key)
          (function
