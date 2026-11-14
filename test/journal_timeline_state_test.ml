@@ -849,32 +849,83 @@ let test_feed_refresh_supersedes_recovery_between_chunks () =
     "feed refresh lost its authoritative rows"
 ;;
 
-let test_recovery_work_budget_and_empty_heading_context () =
+let test_recovery_advances_across_small_packets () =
   let state = paginating_day () |> fun state -> stale_day state 2L in
   let rec chunks generation count state =
-    if count = 16
-    then state
-    else (
+    if count = 31 then state else (
       let state = begin_next state generation in
       let value = block ~order:(Printf.sprintf "%04d" count) (count + 10) in
       let continuation = continuation_of_entries ~more:true [ entry value ] in
-      chunks
-        (Int64.succ generation)
-        (count + 1)
-        (Timeline.apply_timeline_entry_page
-           state
-           ~generation
-           (timeline_page ~continuation [ value ])))
+      let updated = Timeline.apply_timeline_entry_page state ~generation
+        (timeline_page ~continuation [ value ]) in
+      require (Timeline.day_error updated ~day:20260809 = None)
+        "bounded recovery failed instead of advancing at packet %d" count;
+      if count < 30 then require_equal_string_list (slot_keys updated) (slot_keys state)
+        "incomplete recovery changed visible rows";
+      chunks (Int64.succ generation) (count + 1) updated)
   in
-  let bounded = chunks 3L 0 state in
-  require (Timeline.pending_request bounded = None) "work limit retained Loading";
-  require
-    (Option.is_some (Timeline.day_error bounded ~day:20260809))
-    "work exhaustion claimed success";
-  require_equal_string_list
-    (slot_keys bounded)
-    (slot_keys state)
-    "work exhaustion published incomplete staging";
+  let recovered = chunks 3L 0 state in
+  require (Timeline.retained_slot_count recovered = 33)
+    "recovery did not publish the rebuilt prefix and continuations";
+  require (Timeline.pending_request recovered = None) "completed recovery retained Loading"
+;;
+
+let test_deep_recovery_has_no_fixed_total_budget () =
+  let values = Array.init 1230 (fun n -> block ~order:(Printf.sprintf "%06d" n) (10000 + n)) in
+  let packet offset count = Array.sub values offset count |> Array.to_list in
+  let cursor offset = continuation_of_entries ~more:true (List.map entry (packet offset 30)) in
+  let initial = Timeline.empty ~today:20260809
+    |> begin_and_apply_feed ~generation:1L ~before_day:None
+      (feed ~more:true [day_feed ~more:true 20260809 "Today" (packet 0 30)]) in
+  let rec load offset generation state =
+    if offset = 1200 then state else
+    let after = cursor (offset - 30) in
+    let state = Timeline.begin_request state ~generation (Day {day=20260809;after}) in
+    let state = Timeline.apply_timeline_entry_page state ~generation
+      (timeline_page ~continuation:(cursor offset) (packet offset 30)) in
+    load (offset + 30) (Int64.succ generation) state
+  in
+  let loaded = load 30 2L initial in
+  let loaded = Timeline.observe_visible_range loaded ~first_index:1150 ~last_exclusive:1201 in
+  let pending = Timeline.begin_request loaded ~generation:100L
+    (Day {day=20260809;after=cursor 1170}) in
+  let recovering = stale_day pending 100L in
+  let rec recover offset generation state =
+    let state = begin_next state generation in
+    let state = Timeline.apply_timeline_entry_page state ~generation
+      (timeline_page ~continuation:(cursor offset) (packet offset 30)) in
+    require (Timeline.day_error state ~day:20260809 = None)
+      "deep recovery exhausted a fixed budget at offset %d" offset;
+    if offset < 1200 then (
+      require_equal_string_list (slot_keys state) (slot_keys loaded)
+        "partial deep recovery replaced the existing prefix";
+      recover (offset + 30) (Int64.succ generation) state)
+    else state
+  in
+  let recovered = recover 0 101L recovering in
+  require (Timeline.find_block recovered ~block_id:(id "block" 11229) <> None)
+    "deep recovery never reached the next page";
+  require (Timeline.first_visible_index recovered = 1150)
+    "deep recovery moved a surviving visible anchor";
+  require (Timeline.retained_slot_count recovered = 1232)
+    "deep recovery dropped rows or continuation"
+;;
+
+let test_recovery_rejects_nonadvancing_packets () =
+  let state = paginating_day () |> fun state -> stale_day state 2L |> fun state -> begin_next state 3L in
+  let value = block ~order:"a" 10 in
+  let continuation = continuation_of_entries ~more:true [entry value] in
+  let state = Timeline.apply_timeline_entry_page state ~generation:3L
+    (timeline_page ~continuation [value]) |> fun state -> begin_next state 4L in
+  List.iter (fun packet ->
+    let failed = Timeline.apply_timeline_entry_page state ~generation:4L packet in
+    require (Option.is_some (Timeline.day_error failed ~day:20260809))
+      "nonadvancing recovery did not expose a concrete bug";
+    require (Timeline.pending_request failed = None) "invalid packet retained Loading")
+    [timeline_page ~continuation [value]; timeline_page ~continuation []]
+;;
+
+let test_recovery_work_budget_and_empty_heading_context () =
   let empty_days =
     Timeline.empty ~today:20260809
     |> begin_and_apply_feed
@@ -2906,6 +2957,9 @@ let () =
   test_repeated_staleness_stops_until_retry_and_does_not_block_feed ();
   test_terminal_day_failure_and_listener_supersession ();
   test_feed_refresh_supersedes_recovery_between_chunks ();
+  test_recovery_advances_across_small_packets ();
+  test_deep_recovery_has_no_fixed_total_budget ();
+  test_recovery_rejects_nonadvancing_packets ();
   test_recovery_work_budget_and_empty_heading_context ();
   test_empty_days_remain_absent_after_history_paging ();
   test_page_replacement_invalidates_pending_continuation ();
