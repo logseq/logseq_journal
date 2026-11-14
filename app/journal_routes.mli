@@ -1,3 +1,18 @@
+(** {1 TLDR}
+    Own native navigation and process-local per-parent composers. Retained drafts
+    keep content across graph switches; the application owns restart storage.
+
+    {1 Minimal usage example}
+    {[
+      let retained = retain_drafts ~interrupted:false routes in
+      let content = recovery_captures retained in
+      let restored = recover_captures content in
+      restore_drafts (create ()) restored
+    ]}
+    Restart callers persist only bounded content and bind its account and graph.
+
+    {1 Navigation capabilities} *)
+
 type destination =
   | Journals
   | Favorites
@@ -145,6 +160,11 @@ end
 
 (** Process-local composer storage; the application owns its graph identity. *)
 type retained_drafts
+
+(** Content-only restart boundary. The application binds the graph/account and
+    enforces its persistence limits; details reload before a composer is shown. *)
+val recovery_captures : retained_drafts -> (string * Journal_capture.t) list
+val recover_captures : (string * Journal_capture.t) list -> retained_drafts
 
 val retained_attachments : retained_drafts -> Journal_asset_import.staged list
 val retain_drafts : interrupted:bool -> t -> retained_drafts

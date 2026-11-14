@@ -5676,3 +5676,93 @@ let test_delayed_recovery_cannot_borrow_another_submission () =
   require(actual=wire) "current submission timer did not retain its own payload"
 ;;
 let ()=test_delayed_recovery_cannot_borrow_another_submission()
+
+let test_restart_draft_store () =
+  let module S = Journal_platform.Draft_store in
+  let root = Filename.temp_file "journal-drafts-test-" "" in
+  Unix.unlink root;
+  Unix.mkdir root 0o700;
+  let binding : Journal_platform.local_account_binding =
+    {user_id="synthetic-user";managed_sync_origin="https://api.logseq.io"} in
+  let graph = "70000000-0000-4000-a000-000000000001" in
+  let capture = Journal_capture.create ~session_number:1L ~source:"unsaved 中文" in
+  let item : S.draft = {graph;parent=None;capture} in
+  let store = S.create ~directory:root ~binding in
+  let cleanup () =
+    ignore(S.clear store);
+    let owned=Filename.concat root "JournalDrafts-v1" in
+    (try Unix.rmdir owned with Unix.Unix_error(Unix.ENOENT,_,_)->());
+    Unix.rmdir root in
+  Fun.protect ~finally:cleanup (fun () ->
+    Result.get_ok(S.save store [item]);
+    let recovered = Result.get_ok(S.load(S.create ~directory:root ~binding)) in
+    require(List.length recovered=1) "restart did not recover draft";
+    let recovered=List.hd recovered in
+    require(Journal_capture.source recovered.capture="unsaved 中文") "restart lost text";
+    require(Journal_capture.can_save recovered.capture) "editing draft was not editable";
+    let other=S.create ~directory:root ~binding:{binding with user_id="other-user"} in
+    require(Result.get_ok(S.load other)=[]) "draft leaked across accounts";
+    let other=S.create ~directory:root ~binding:{binding with managed_sync_origin="https://other.example"} in
+    require(Result.get_ok(S.load other)=[]) "draft leaked across origins";
+    let oversized={item with capture=Journal_capture.create ~session_number:2L
+      ~source:(String.make (256*1024+1) 'x')} in
+    require(Result.is_error(S.save store [oversized])) "oversized source accepted";
+    require(List.length(Result.get_ok(S.load store))=1) "failed write destroyed last good snapshot";
+    let interrupted=Journal_capture.begin_submission capture in
+    Result.get_ok(S.save store [{item with parent=Some graph;capture=interrupted}]);
+    let restored=List.hd(Result.get_ok(S.load store)) in
+    require(restored.parent=Some graph) "append parent not retained";
+    require(not(Journal_capture.can_save restored.capture)) "interrupted save became a new mutation";
+    require(Journal_capture.attachment_imports restored.capture=None) "execution authority survived restart";
+    let media=Filename.temp_file "journal-import-test-" ".bin" in
+    let channel=open_out_bin media in output_string channel "synthetic-media";close_out channel;
+    let selection=`Assoc["operation",`String graph;"asset",`String graph;
+      "localMutation",`String graph;"metadataMutation",`String graph;
+      "path",`String media;"title",`String "photo";"type",`String "bin"] in
+    let staged=match Journal_asset_import.decode_event(Yojson.Safe.to_string
+      (`Assoc["action",`String "picked";"selection",selection])) with
+      |Ok(Picked(staged,_))->staged |_->failwith "invalid synthetic pick" in
+    let with_media=Journal_capture.add_attachment capture staged in
+    Result.get_ok(S.save store [{item with capture=with_media}]);
+    Unix.unlink media;
+    let recovered=List.hd(Result.get_ok(S.load store)) in
+    let restored_media=List.hd(Journal_capture.pending_attachments recovered.capture) in
+    let channel=open_in_bin(Journal_asset_import.staged_path restored_media) in
+    let actual=really_input_string channel (in_channel_length channel) in close_in channel;
+    require(actual="synthetic-media") "restart depended on deleted temporary pick";
+    require(Journal_asset_import.staged_token restored_media<>graph) "picker execution identity persisted";
+    Journal_asset_import.discard_staged_file restored_media;
+    let owned=Filename.concat root "JournalDrafts-v1" in
+    let account=Filename.concat owned (Array.get(Sys.readdir owned)0) in
+    let manifest=Filename.concat account "state.json" in
+    let channel=open_in_bin manifest in
+    let good=really_input_string channel(in_channel_length channel) in close_in channel;
+    let replace content=let channel=open_out_bin manifest in output_string channel content;close_out channel in
+    replace "{not json";
+    require(Result.is_error(S.load store)) "malformed recovery metadata accepted";
+    let json=Yojson.Safe.from_string good in
+    let fields=Yojson.Safe.Util.to_assoc json in
+    replace(Yojson.Safe.to_string(`Assoc(("version",`Int 99)::List.remove_assoc "version" fields)));
+    require(Result.is_error(S.load store)) "future recovery version accepted";
+    replace(Yojson.Safe.to_string(`Assoc(("user",`String "foreign")::List.remove_assoc "user" fields)));
+    require(Result.is_error(S.load store)) "foreign account envelope accepted";
+    replace(String.make(2*1024*1024+1)'x');
+    require(Result.is_error(S.load store)) "oversized recovery read accepted";
+    Unix.unlink manifest;
+    let target=Filename.temp_file "journal-drafts-sentinel-" "" in
+    Unix.symlink target manifest;
+    require(Result.is_error(S.load store)) "recovery followed manifest symlink";
+    Unix.unlink manifest;Unix.unlink target;replace good;
+    let retained=Journal_routes.recover_captures [graph,capture] in
+    let parent,roundtrip=List.hd(Journal_routes.recovery_captures retained) in
+    require(parent=graph && Journal_capture.source roundtrip="unsaved 中文") "append restart adapter lost owner or text";
+    let retained=Journal_detail.recover_composer ~parent:graph restored.capture in
+    require(Journal_detail.retained_pending_submission retained=None) "append restart restored execution authority";
+    Result.get_ok(S.save store []);
+    require(Result.get_ok(S.load store)=[]) "discard did not remove durable draft";
+    Result.get_ok(S.save store [item]);
+    Result.get_ok(S.clear store);
+    require(Result.get_ok(S.load store)=[]) "logout did not remove durable draft")
+;;
+
+let () = test_restart_draft_store ()

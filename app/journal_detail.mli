@@ -1,3 +1,17 @@
+(** {1 TLDR}
+    Own one outline projection and its append composer. Retained composers carry
+    process-local state; restart recovery accepts content only and reloads rows.
+
+    {1 Minimal usage example}
+    Caller-provided [capture] has already passed bounded restart decoding:
+    {[
+      let retained = recover_composer ~parent capture in
+      restore_composer (create ~session_number projection) retained
+    ]}
+    [projection] is freshly read for the same parent.
+
+    {1 Detail capabilities} *)
+
 module ID = Journal_ids
 
 type mode =
@@ -112,6 +126,10 @@ val remove_block : t -> block_id:string -> t option
 
 (** Only composer ownership is retained; reopening loads a fresh outline projection. *)
 type retained_composer
+
+(** Recover content only; the parent is reloaded before use. No pending mutation,
+    projection receipt or execution authority is restored. *)
+val recover_composer : parent:string -> Journal_capture.t -> retained_composer
 
 val retained_attachments : retained_composer -> Journal_asset_import.staged list
 val retained_capture : retained_composer -> Journal_capture.t

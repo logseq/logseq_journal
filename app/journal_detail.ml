@@ -76,6 +76,10 @@ type retained_composer =
   ; draft_error : string option
   }
 
+let recover_composer ~parent capture =
+  { draft_parent=parent;draft_capture=capture;draft_mode=Reading;draft_pending=None;
+    draft_projection=None;draft_error=None }
+
 let invalidate_rows (t : t) = { t with row_snapshot = ref None }
 
 let equal_presentation (left : t) (right : t) =

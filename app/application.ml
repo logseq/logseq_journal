@@ -3063,6 +3063,7 @@ let manager_page ?picker_signal state dispatch =
 
 let identity_sequence = ref 0L
 let managed_sync_origin = ref "https://api.logseq.io"
+let draft_support_directory = ref None
 
 let fresh_identity () =
   identity_sequence := Int64.succ !identity_sequence;
@@ -7419,6 +7420,92 @@ let start
     | Environment_changed snapshot ->
       prepare_presentation (sync_startup_presentation { model with environment = snapshot })
   in
+  let module Draft_store = Journal_platform.Draft_store in
+  let draft_store : (Journal_platform.local_account_binding * Draft_store.t) option ref = ref None in
+  let last_draft_snapshot : Draft_store.draft list option ref = ref None in
+  let draft_storage_blocked = ref false in
+  let draft_storage_error = ref None in
+  let draft_failure state cause =
+    if !draft_storage_error=Some cause then state else (
+      draft_storage_error:=Some cause;
+      report_ui_error state ~operation:"recoverDraft" ~phase:"localStorage"
+        ~message:("Restart recovery is unavailable. " ^ cause)) in
+  let restore_restart_drafts state drafts =
+    let grouped=List.fold_left(fun grouped (draft:Draft_store.draft)->
+      let capture,append=Option.value(Graph_drafts.find_opt draft.graph grouped) ~default:(None,[]) in
+      let value=match draft.parent with None->Some draft.capture,append
+        |Some parent->capture,(parent,draft.capture)::append in
+      Graph_drafts.add draft.graph value grouped)Graph_drafts.empty drafts in
+    let recovered=Graph_drafts.map(fun(capture_draft,append)->
+      {capture_draft;append_drafts=Journal_routes.recover_captures append})grouped in
+    let graph_drafts=Graph_drafts.union(fun _ existing _->Some existing)state.graph_drafts recovered in
+    let state={state with graph_drafts} in
+    match state.graph_state.graph_id with
+    |None->state
+    |Some graph_id->
+      let key=Logseq_db_types.Graph_types.Uuid.to_string graph_id in
+      match Graph_drafts.find_opt key graph_drafts with
+      |None->state
+      |Some recovered->
+        {state with draft_graph=Some graph_id;
+          direct_capture=(match state.direct_capture with Some _ as existing->existing|None->recovered.capture_draft);
+          routes=Journal_routes.restore_drafts state.routes recovered.append_drafts;
+          graph_drafts=Graph_drafts.remove key graph_drafts} in
+  let draft_snapshot state =
+    let add state saved = match state.graph_state.graph_id with
+      |None->saved
+      |Some graph_id->Graph_drafts.add(Logseq_db_types.Graph_types.Uuid.to_string graph_id)
+        {capture_draft=state.direct_capture;append_drafts=Journal_routes.retain_drafts ~interrupted:false state.routes}saved in
+    let saved=Graph_drafts.fold(fun _ resident saved->add resident saved)state.resident_states state.graph_drafts
+      |> add state in
+    Graph_drafts.fold(fun graph draft items->
+      let items=match draft.capture_draft with None->items
+        |Some capture->Draft_store.{graph;parent=None;capture}::items in
+      List.fold_left(fun items (parent,capture)->Draft_store.{graph;parent=Some parent;capture}::items)
+        items(Journal_routes.recovery_captures draft.append_drafts))saved []
+    |> List.filter(fun(draft:Draft_store.draft)->Journal_capture.source draft.capture<>""
+      || Journal_capture.pending_attachments draft.capture<>[] || Journal_capture.retry_identity_locked draft.capture) in
+  let same_snapshot left right =
+    List.length left=List.length right && List.for_all2(fun (left:Draft_store.draft) (right:Draft_store.draft)->
+      left.graph=right.graph && left.parent=right.parent && left.capture==right.capture)left right in
+  let checkpoint_drafts state =
+    let state=match !draft_store with
+      |Some(binding,store) when !coordination_account=Some None
+          || (match !coordination_account with Some(Some user)->user<>binding.user_id|None|Some None->false)->
+        (match Draft_store.clear store with
+        |Error cause->draft_storage_blocked:=true;draft_failure state cause
+        |Ok()->draft_store:=None;last_draft_snapshot:=None;draft_storage_blocked:=false;
+          draft_storage_error:=None;state)
+      |None|Some _->state in
+    let state=match !draft_store,!draft_support_directory,state.manager with
+      |None,Some directory,Some manager->
+        let scope=List.find_opt(fun(scope:Graph_service.asset_scope)->
+          Some scope.graph_id=state.graph_state.graph_id
+          && scope.account.account_generation=manager.startup.account_generation
+          && !coordination_account=Some(Some scope.account.user_id)
+          && Uri.to_string scope.account.managed_sync_origin= !managed_sync_origin)manager.resident_scopes in
+        (match scope with None->state |Some scope->
+          let binding:Journal_platform.local_account_binding=
+            {user_id=scope.account.user_id;managed_sync_origin=Uri.to_string scope.account.managed_sync_origin} in
+          let store=Draft_store.create ~directory ~binding in
+          draft_store:=Some(binding,store);
+          match Draft_store.load store with
+          |Error cause->draft_storage_blocked:=true;draft_failure state cause
+          |Ok drafts->restore_restart_drafts state drafts)
+      |_->state in
+    match !draft_store with
+    |None->state
+    |Some(_,store) when not !draft_storage_blocked->
+      let drafts=draft_snapshot state in
+      if Option.fold ~none:false ~some:(same_snapshot drafts)!last_draft_snapshot then state else
+      (match Draft_store.save store drafts with
+      |Error cause->draft_failure state cause
+      |Ok()->last_draft_snapshot:=Some drafts;draft_storage_error:=None;state)
+    |Some _->state in
+  let update_without_checkpoint = update in
+  let update state action =
+    let next=checkpoint_drafts(update_without_checkpoint state action) in
+    state_ref:=next;next in
   (* These subscriptions use complete presentation dependencies. They compare
      persistent owners rather than walking retained rows on every input event. *)
   let same_actions left right =
@@ -8426,6 +8513,7 @@ let decode_config payload =
   | Ok startup ->
     let (Managed_sync { base_url }) = startup.Logseq_db_worker.Config.target in
     managed_sync_origin := base_url;
+    draft_support_directory := Some startup.application_support_directory;
     Ok startup
   | Error error -> Error (Journal_startup.Error.to_string error)
 ;;

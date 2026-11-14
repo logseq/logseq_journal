@@ -1,3 +1,19 @@
+(** {1 TLDR}
+    Typed native platform envelopes and account-scoped restart draft storage.
+    Platform replies are validated before use; draft storage never restores
+    execution sessions or mutation authority.
+
+    {1 Minimal usage example}
+    Caller-provided [directory] is the configured application support directory:
+    {[
+      let store = Draft_store.create ~directory ~binding in
+      match Draft_store.load store with
+      | Ok drafts -> install_drafts drafts
+      | Error cause -> report_draft_failure cause
+    ]}
+
+    {1 Platform capabilities} *)
+
 type network_lifecycle =
   | Backgrounded of { generation : int64 }
   | Foreground_resumed of { generation : int64 }
@@ -48,3 +64,18 @@ val scoped_online_cancelled_request : Logseq_db_worker_lui.Logseq_db_worker_lui_
 val scoped_timeline_presented_request : Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope -> bytes
 val decode_online_event : bytes -> (bool * Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope, string) result
 val decode_authenticated_scope : bytes -> (Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope, string) result
+
+(** {1 Restart draft lifecycle}
+    At most 128 drafts, 256 attachments, 256 KiB per text, 2 MiB metadata and 128 MiB media
+    per account. Media is copied into private owned storage (32 MiB per file).
+    Failed saves preserve the last complete snapshot. Save/discard replace the
+    snapshot; [clear] removes only this account's owned files. Caller serializes
+    operations and reports errors. Recovered interrupted saves remain locked. *)
+module Draft_store : sig
+  type t
+  type draft = { graph : string; parent : string option; capture : Journal_capture.t }
+  val create : directory:string -> binding:local_account_binding -> t
+  val save : t -> draft list -> (unit, string) result
+  val load : t -> (draft list, string) result
+  val clear : t -> (unit, string) result
+end
