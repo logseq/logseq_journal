@@ -7478,15 +7478,14 @@ let start
           draft_storage_error:=None;state)
       |None|Some _->state in
     let state=match !draft_store,!draft_support_directory,state.manager with
-      |None,Some directory,Some manager->
-        let scope=List.find_opt(fun(scope:Graph_service.asset_scope)->
-          Some scope.graph_id=state.graph_state.graph_id
-          && scope.account.account_generation=manager.startup.account_generation
-          && !coordination_account=Some(Some scope.account.user_id)
-          && Uri.to_string scope.account.managed_sync_origin= !managed_sync_origin)manager.resident_scopes in
-        (match scope with None->state |Some scope->
+      |None,Some directory,Some manager
+          when manager.startup.local_access=Local_available
+            && manager.selected_graph=state.graph_state.graph_id
+            && Option.is_some manager.selected_graph
+            && not(Account_pure_lifecycle.waiting !account_lifecycle)->
+        (match !coordination_account with None|Some None->state |Some(Some user_id)->
           let binding:Journal_platform.local_account_binding=
-            {user_id=scope.account.user_id;managed_sync_origin=Uri.to_string scope.account.managed_sync_origin} in
+            {user_id;managed_sync_origin= !managed_sync_origin} in
           let store=Draft_store.create ~directory ~binding in
           draft_store:=Some(binding,store);
           match Draft_store.load store with
