@@ -1754,6 +1754,21 @@ let test_authoritative_integrity_rows () =
     ; "mutation=insert-blocks"
     ];
   List.iter
+    (fun kind ->
+       let module D = Logseq_db_types.Authoritative_diagnostic in
+       let detail =
+         D.integrity ~reason:"expected-simulation-failed"
+           ~context:[ "exception", kind; "actualDatoms", "1" ] ()
+       in
+       let _, _, message = Service.diagnostic_report (prefix ^ D.encode detail) in
+       T.require
+         (contains message ("exception=" ^ kind))
+         "simulation failure lost its safe exception cause";
+       T.require
+         (Option.map D.message (D.decode (D.encode detail)) = Some (D.message detail))
+         "simulation cause failed bounded diagnostic roundtrip")
+    [ "invalid-argument"; "failure"; "not-found"; "other" ];
+  List.iter
     (fun bad ->
        let _, _, message = Service.diagnostic_report (prefix ^ carrier ^ bad) in
        T.require
@@ -1763,6 +1778,7 @@ let test_authoritative_integrity_rows () =
          (not (contains message "reason=payload-mismatch"))
          "invalid integrity partly accepted")
     [ {|{"stage":"integrity","reason":"payload-mismatch","raw":"PRIVATE_SYNTHETIC_PAYLOAD"}|}
+    ; {|{"stage":"integrity","reason":"payload-mismatch","exception":"Failure(PRIVATE_SYNTHETIC_PAYLOAD)"}|}
     ; {|{"stage":"integrity","reason":"payload-mismatch","checkpoint":"-1"}|}
     ; {|{"stage":"integrity","reason":"payload-mismatch","checkpoint":"9223372036854775808"}|}
     ; {|{"stage":"integrity","reason":"payload-mismatch","checkpoint":1}|}
