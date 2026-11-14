@@ -4368,8 +4368,10 @@ let start
       (match Option.bind(Coordination.projection(Coordination_host.view host))Wc.selected with
        | Some presentation when Wc.matches_scope(Wc.presentation_session presentation)owner ->
          let session=Wc.presentation_session presentation in
-         (match Journal_graph_runtime.worker_intent (!graph_runtime_cell) request session with
-          | Ok intent when Journal_graph_runtime.bind_mutation (!graph_runtime_cell)request ~presentation ~intent ->
+         (match Result.bind (Journal_graph_runtime.worker_intent (!graph_runtime_cell) request session)
+            (fun intent -> Journal_graph_runtime.bind_mutation (!graph_runtime_cell) request ~presentation ~intent
+              |> Result.map (fun () -> intent)) with
+          | Ok intent ->
             let rec watch ticket =
               watch_mutation_result host ticket ~f:(fun reply->
                 match reply with
@@ -4400,7 +4402,7 @@ let start
                    | _-> !coordinated_mutation_finished owner request
                      (Error "The entry could not be admitted."))));
                Journal_graph_transport.Accepted)
-          | _->Journal_graph_transport.Not_ready)
+          | Error error->refuse_coordination error)
        | _->Journal_graph_transport.Not_ready)
     | _->Journal_graph_transport.Not_ready in
   let send_coordinated_child_ack request (intent,applied_presentation) =
@@ -4421,13 +4423,15 @@ let start
             let bound=Journal_graph_runtime.rebind_child_ack (!graph_runtime_cell)request ~presentation in
             let rec watch ticket=watch_mutation_result host ticket ~f:(fun reply->
               match reply with
-              | Wc.Answered(Ok(Wc.Committed_pending_presentation _)) when bound ->
+              | Wc.Answered(Ok(Wc.Committed_pending_presentation _)) when Result.is_ok bound ->
                 (match Coordination_host.reconcile_mutation host ~presentation intent with
                  | Ok ticket->watch ticket
                  | Error error-> !coordinated_mutation_finished owner request(Error(coordinated_error_message error)))
-              | Answered(Ok progress) when bound -> !coordinated_mutation_finished owner request(Ok progress)
+              | Answered(Ok progress) when Result.is_ok bound -> !coordinated_mutation_finished owner request(Ok progress)
               | failed-> !coordinated_mutation_finished owner request(Error
-                  (Coordination_host.reply_error_message ~fallback:"The child could not be reconciled." failed))) in
+                  (match bound with
+                   | Error error -> coordinated_error_message error
+                   | Ok () -> Coordination_host.reply_error_message ~fallback:"The child could not be reconciled." failed))) in
             watch ticket;Journal_graph_transport.Accepted)
        | _->Journal_graph_transport.Not_ready)
     | _->Journal_graph_transport.Not_ready in
@@ -4529,15 +4533,17 @@ let start
                    | Some pending when pending.settled_intent=Some(intent,applied_presentation)->
                      {state with pending_delete=Some{pending with settled_intent=None}}
                    | _->state)));
-               ignore(Journal_graph_runtime.bind_mutation (!graph_runtime_cell)request ~presentation ~intent);
                let finish result=Option.iter(fun owner-> !coordinated_mutation_finished owner request result)owner in
+               let bound=Journal_graph_runtime.bind_mutation (!graph_runtime_cell) request ~presentation ~intent in
                let rec watch ticket=watch_mutation_result host ticket ~f:(function
                  | Wc.Answered(Ok(Wc.Committed_pending_presentation _))->
                    (match Coordination_host.reconcile_mutation host ~presentation intent with
                     | Ok ticket->watch ticket
                     | Error error->finish(Error(coordinated_error_message error)))
                  | Wc.Answered(Ok progress)->finish(Ok progress)
-                 | failed->finish(Error(Coordination_host.reply_error_message ~fallback:"The change could not be confirmed." failed))) in
+                 | failed->finish(Error(match bound with
+                   | Error error->coordinated_error_message error
+                   | Ok ()->Coordination_host.reply_error_message ~fallback:"The change could not be confirmed." failed))) in
                watch ticket))) in
   mutation_acknowledgements_changed:=(fun()->
     match !coordination_host,timeline_scope !state_ref with

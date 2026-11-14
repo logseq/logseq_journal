@@ -1,3 +1,25 @@
+(** {1 TLDR}
+
+    Own the app's graph requests, retained projections and mutation chains in
+    memory. The host executes outputs and returns worker completions. Binding a
+    mutation returns [Ok ()] only after its business owner records the intent;
+    errors retain their specific cause and leave that binding uninstalled.
+
+    {1 Minimal usage example}
+
+    The caller supplies the runtime, dispatched request, session and presentation:
+    {[
+      match worker_intent runtime request session with
+      | Error error -> report_worker_error error
+      | Ok intent ->
+        match bind_mutation runtime request ~presentation ~intent with
+        | Error error -> report_binding_error error
+        | Ok () -> dispatch intent
+    ]}
+    [report_worker_error], [report_binding_error] and [dispatch] belong to the host.
+
+    {1 Capability details} *)
+
 type worker_failure =
   { operation : string
   ; request_id : Logseq_db_types.Graph_types.Uuid.t
@@ -221,7 +243,7 @@ val worker_intent : t -> Worker.Uuid.t -> Worker.session ->
   (Worker.durable_intent, Worker.error) result
 val bind_mutation : t -> Logseq_db_types.Graph_types.Uuid.t ->
   presentation:Journal_worker_coordination.Worker_api.presentation ->
-  intent:Journal_worker_coordination.Worker_api.durable_intent -> bool
+  intent:Journal_worker_coordination.Worker_api.durable_intent -> (unit, Worker.error) result
 val pending_mutation : t -> mutation_id:string -> Logseq_db_types.Graph_types.Uuid.t option
 val mutation_waiting : t -> Logseq_db_types.Graph_types.Uuid.t -> string -> output
 val receive_mutation : t -> Logseq_db_types.Graph_types.Uuid.t ->
@@ -239,7 +261,7 @@ val claim_mutation_ack_recovery : t -> Journal_worker_coordination.Worker_api.du
 val worker_child_ack : t -> Logseq_db_types.Graph_types.Uuid.t ->
   (Journal_worker_coordination.Worker_api.durable_intent * Journal_worker_coordination.Worker_api.presentation) option
 val rebind_child_ack : t -> Logseq_db_types.Graph_types.Uuid.t ->
-  presentation:Journal_worker_coordination.Worker_api.presentation -> bool
+  presentation:Journal_worker_coordination.Worker_api.presentation -> (unit, Worker.error) result
 val receive_child_ack : t -> Logseq_db_types.Graph_types.Uuid.t -> (unit,string) result -> output
 val child_projection_applied : t -> root:Logseq_db_types.Graph_types.Uuid.t -> round:int64
   -> presentation:Journal_worker_coordination.Worker_api.presentation -> output

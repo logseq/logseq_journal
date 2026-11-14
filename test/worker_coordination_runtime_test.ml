@@ -2373,7 +2373,7 @@ let test_host_durable_recovery_confirmation_ack () =
           let stage=Child.stage state index in
           let durable=Child.stage_intent session stage |> Result.get_ok in
           let intent=match durable with W.Mutation_intent intent->intent|_->assert false in
-          let state=Child.bind state ~index ~round ~intent:(W.Mutation_intent intent) ~presentation |> Option.get in
+          let state=Child.bind state ~index ~round ~intent:(W.Mutation_intent intent) ~presentation |> Result.get_ok in
           let receipt=match value(call(W.Mutate intent)) with
             | W.Submission_committed receipt->receipt|_->failwith "real Child lost durable commit" in
           proofs:=(intent,receipt):: !proofs;
@@ -3083,7 +3083,7 @@ let test_changefeed_business_waits_for_ui_application () =
       | None ->
         let presentation=Option.get(Option.bind(C.projection(Host.view host))W.selected) in
         let intent=Business.worker_intent business request session |> Result.get_ok in
-        require(Business.bind_mutation business request ~presentation ~intent) "business intent did not bind";
+        require(Result.is_ok (Business.bind_mutation business request ~presentation ~intent)) "business intent did not bind";
         let rec watch = function
           |C.Submission_ticket ticket->Host.watch host ticket ~f:(function
             |W.Answered(Ok(W.Submission_committed _))->

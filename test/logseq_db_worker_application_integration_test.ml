@@ -333,7 +333,7 @@ let test_status_conflict_refreshes_authoritative_block () =
   let presentation=Option.get(W.selected Read_fixture.projection) in
   let intent=match Runtime.worker_intent runtime mutation session |> Result.get_ok with W.Mutation_intent intent->intent|_->assert false in
   Alcotest.(check bool) "typed status conflict keeps original intent" true
-    (Runtime.bind_mutation runtime mutation ~presentation ~intent:(W.Mutation_intent intent));
+    (Result.is_ok (Runtime.bind_mutation runtime mutation ~presentation ~intent:(W.Mutation_intent intent)));
   let operation=W.Mutate intent in
   let request_id=W.request_id mutation in
   ignore(I.request session ~request_id operation |> Result.get_ok);
