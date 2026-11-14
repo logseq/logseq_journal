@@ -106,15 +106,18 @@ let upsert_mutations db receipts =
   match List.find_opt (fun (key, _) -> not (valid_key key)) receipts with
   | Some _ -> Error "mutation receipt key must be a lowercase SHA-256 value"
   | None ->
-    let statement =
-      Sqlite3.prepare
-        db
-        "INSERT INTO overlay_mutation_receipts(receipt_key, receipt) VALUES(?, ?) ON \
-         CONFLICT(receipt_key) DO UPDATE SET receipt = excluded.receipt"
-    in
-    Fun.protect
-      ~finally:(fun () -> ignore (Sqlite3.finalize statement))
-      (fun () -> insert_receipts db statement receipts)
+    try
+      let statement =
+        Sqlite3.prepare
+          db
+          "INSERT INTO overlay_mutation_receipts(receipt_key, receipt) VALUES(?, ?) ON \
+           CONFLICT(receipt_key) DO UPDATE SET receipt = excluded.receipt"
+      in
+      Fun.protect
+        ~finally:(fun () -> ignore (Sqlite3.finalize statement))
+        (fun () -> insert_receipts db statement receipts)
+    with
+    | exn -> Error (Printexc.to_string exn)
 ;;
 
 let read_terminal_batch db key =
@@ -145,13 +148,16 @@ let upsert_terminal_batches db receipts =
   match List.find_opt (fun (key, _) -> not (valid_key key)) receipts with
   | Some _ -> Error "terminal batch key must be a lowercase SHA-256 value"
   | None ->
-    let statement =
-      Sqlite3.prepare
-        db
-        "INSERT INTO overlay_terminal_batch_receipts(batch_key, receipt) VALUES(?, ?) ON \
-         CONFLICT(batch_key) DO UPDATE SET receipt = excluded.receipt"
-    in
-    Fun.protect
-      ~finally:(fun () -> ignore (Sqlite3.finalize statement))
-      (fun () -> insert_receipts db statement receipts)
+    try
+      let statement =
+        Sqlite3.prepare
+          db
+          "INSERT INTO overlay_terminal_batch_receipts(batch_key, receipt) VALUES(?, ?) ON \
+           CONFLICT(batch_key) DO UPDATE SET receipt = excluded.receipt"
+      in
+      Fun.protect
+        ~finally:(fun () -> ignore (Sqlite3.finalize statement))
+        (fun () -> insert_receipts db statement receipts)
+    with
+    | exn -> Error (Printexc.to_string exn)
 ;;
