@@ -72,6 +72,14 @@ let rec ensure_directory path =
     Unix.mkdir path 0o700)
 ;;
 
+let set_physical_outbox_rejection database_path ~enabled =
+  let db = Sqlite3.db_open database_path in
+  Fun.protect ~finally:(fun () -> ignore (Sqlite3.db_close db)) (fun () ->
+    Sqlite3.Rc.check (Sqlite3.exec db (if enabled then
+      "CREATE TRIGGER synthetic_rejection BEFORE INSERT ON sync_outbox BEGIN SELECT RAISE(ABORT,'MAIN acceptance physical outbox rejection private-title secret-key'); END"
+      else "DROP TRIGGER synthetic_rejection")))
+;;
+
 let copy_storage_fixture database_path =
   let open Yojson.Safe.Util in
   let fixture_path =

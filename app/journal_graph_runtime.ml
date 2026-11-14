@@ -3167,6 +3167,8 @@ let receive_mutation t (request:Graph.Uuid.t) progress =
          Option.iter(fun pending->Hashtbl.replace t.pending key {pending with durable=Some durable})
            (Hashtbl.find_opt t.pending key))output.requests;
        {output with responses=List.map(fun value->{payload=Mutation_settled(durable.intent,durable.presentation,value.payload)})output.responses}
+     | Outcome_unknown_with_cause cause ->
+       mutation_waiting t request (Logseq_db_types.Failure_diagnostic.encode cause)
      | Confirmed _ | Outcome_unknown | Committed_pending_presentation _ ->
        mutation_waiting t request "The change is awaiting confirmation.")
   | _->empty

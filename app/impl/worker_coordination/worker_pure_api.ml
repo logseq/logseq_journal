@@ -98,11 +98,13 @@ type confirmation =
 type submission_outcome =
   | Submission_rejected of error
   | Submission_unknown
+  | Submission_unknown_with_cause of Logseq_db_types.Failure_diagnostic.t
   | Submission_committed of receipt
 
 type mutation_progress =
   | Rejected of error
   | Outcome_unknown
+  | Outcome_unknown_with_cause of Logseq_db_types.Failure_diagnostic.t
   | Committed_pending_presentation of receipt
   | Confirmed of confirmation
 
@@ -401,6 +403,10 @@ let validate_recovery session ~after ~maximum_items ~maximum_bytes =
 let decode_submission_outcome session ~intent outcome =
   Result.bind(validate_intent session intent)(fun()->match outcome with
     |Mutation.Unknown->Ok Submission_unknown
+    |Mutation.Unknown_with_cause cause->
+      if String.length(Logseq_db_types.Failure_diagnostic.encode cause)
+        >(For_worker.session_limits session).response_budget_bytes
+      then Error Response_budget_exceeded else Ok(Submission_unknown_with_cause cause)
     |Mutation.Committed proof->decode_mutation_receipt session ~intent proof
       |>Result.map(fun receipt->Submission_committed receipt)
     |Mutation.Rejected error->
@@ -414,6 +420,7 @@ let decode_mutation_progress session ~intent outcome =
   |> Result.map (function
     | Submission_rejected error -> Rejected error
     | Submission_unknown -> Outcome_unknown
+    | Submission_unknown_with_cause cause -> Outcome_unknown_with_cause cause
     | Submission_committed receipt -> Committed_pending_presentation receipt)
 ;;
 

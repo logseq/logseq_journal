@@ -1501,19 +1501,21 @@ let retain_submission_result intents ~key ~admitted (result : Worker.submission_
   let progress : Worker.mutation_progress option =
     match result with
     | Worker.Answered (Ok (Worker.Submission_rejected error)) -> Some (Worker.Rejected error)
-    | Worker.Answered (Ok Worker.Submission_unknown) -> Some Worker.Outcome_unknown
+    | Worker.Answered (Ok Worker.Submission_unknown) ->
+      (match previous with Some(Worker.Outcome_unknown_with_cause _)->previous | _->Some Worker.Outcome_unknown)
+    | Worker.Answered (Ok (Worker.Submission_unknown_with_cause cause)) -> Some(Worker.Outcome_unknown_with_cause cause)
     | Worker.Answered (Ok (Worker.Submission_committed receipt)) -> Some (Worker.Committed_pending_presentation receipt)
     | Worker.Not_admitted _ when not admitted -> previous
     | _ ->
       (match previous with
        | Some
-           (Worker.Committed_pending_presentation _ | Confirmed _ | Rejected _)
+           (Worker.Committed_pending_presentation _ | Confirmed _ | Rejected _ | Outcome_unknown_with_cause _)
          -> previous
        | _ -> Some Worker.Outcome_unknown)
   in
   (match previous, progress with
    | ( Some (Worker.Committed_pending_presentation _ | Confirmed _)
-     , Some (Worker.Outcome_unknown | Rejected _) ) -> intents
+     , Some (Worker.Outcome_unknown | Outcome_unknown_with_cause _ | Rejected _) ) -> intents
    | Some (Worker.Confirmed _), Some (Worker.Committed_pending_presentation _)
      -> intents
    | Some (Worker.Rejected _), _ -> intents
@@ -1541,7 +1543,8 @@ let recovered_intents facts session (page:Worker.mutation_recovery) =
           | _->true in
         if not valid then Error(Worker.Protocol_mismatch "Recovered intent replaced settled evidence") else
         let progress=match old,item.progress with
-          | Some((Worker.Rejected _|Committed_pending_presentation _|Confirmed _) as known),Worker.Outcome_unknown->known
+          | Some((Worker.Rejected _|Committed_pending_presentation _|Confirmed _) as known),(Worker.Outcome_unknown|Outcome_unknown_with_cause _)->known
+          | Some(Worker.Outcome_unknown_with_cause _ as known),Worker.Outcome_unknown->known
           | Some(Worker.Confirmed _ as known),Worker.Committed_pending_presentation _->known
           | _,progress->progress in
         Ok(Intents.add key progress intents))))(Ok facts.intents)page.items in
@@ -3987,7 +3990,7 @@ let reconcile_mutation state ~presentation intent =
     (match intent_progress (view state) intent with
       | Some (Worker.Committed_pending_presentation receipt) -> confirm receipt
       | Some (Worker.Confirmed confirmation) -> confirm(Worker.confirmation_receipt confirmation)
-      | None | Some (Worker.Outcome_unknown | Worker.Rejected _) ->
+      | None | Some (Worker.Outcome_unknown | Worker.Outcome_unknown_with_cause _ | Worker.Rejected _) ->
         match intent with Worker.Append_intent intent->submit(Worker.Append intent)|Mutation_intent intent->submit(Worker.Mutate intent))
   | _ -> Error Worker.Revoked_session
 ;;

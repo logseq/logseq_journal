@@ -449,16 +449,22 @@ val confirmation_receipt : confirmation -> receipt
 val confirmation_presentation : confirmation -> presentation
 
 (** Result of submitting an immutable durable intent. A successful submission
-    may establish commitment, but never establishes presentation confirmation. *)
+    may establish commitment, but never establishes presentation confirmation.
+    [Submission_unknown_with_cause] retains only an allowlisted diagnostic of at
+    most 1024 encoded bytes, bound to this request and its checked session. It is
+    not evidence of rejection or rollback and does not authorize a new retry.
+    Raw exception text, journal values, UUIDs and credentials are not retained. *)
 type submission_outcome = Worker_effect_authority.submission_outcome =
   | Submission_rejected of error
   | Submission_unknown
+  | Submission_unknown_with_cause of Logseq_db_types.Failure_diagnostic.t
   | Submission_committed of receipt
 
 (** Lifecycle/recovery state, separate from a single operation's result. *)
 type mutation_progress = Worker_effect_authority.mutation_progress =
   | Rejected of error
   | Outcome_unknown
+  | Outcome_unknown_with_cause of Logseq_db_types.Failure_diagnostic.t
   | Committed_pending_presentation of receipt
   | Confirmed of confirmation
 

@@ -1451,6 +1451,7 @@ module Target_fixture = struct
     |Ok(W.Answered(Ok submission))->intent,(match submission with
       |W.Submission_rejected error->W.Rejected error
       |Submission_unknown->W.Outcome_unknown
+      |Submission_unknown_with_cause cause->W.Outcome_unknown_with_cause cause
       |Submission_committed receipt->W.Committed_pending_presentation receipt)
     |_->failwith "Original typed mutation proof was rejected"
 

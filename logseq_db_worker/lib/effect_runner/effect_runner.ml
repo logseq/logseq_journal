@@ -1982,22 +1982,35 @@ let run_durable_mutation t ~(scope:Sync.graph_scope) ~intent ~current =
     let matching prepared=Database.local_intent_payload prepared=payload in
     let report error = if not t.stopped && current () then
       report_worker_error (report_current_graph t scope) error in
-    let report_commit error = report (local_commit_error error) in
+    let unknown error =
+      let module D = Logseq_db_types.Failure_diagnostic in
+      let detail=List.find_map(fun (detail:Logseq_db_worker_contract.Error.detail)->
+        match detail.value with
+        | Detail_string value when detail.name=D.detail_name -> D.decode value
+        | _ -> None)(Logseq_db_worker_contract.Error.details error) in
+      Mutation.Unknown_with_cause(Option.value detail
+        ~default:(D.create ~operation:"commitLocal" ~reason:"persistenceFailed" ())) in
+    let report_commit error =
+      let error=local_commit_error error in report error; unknown error in
     let report_read error = match typed_read_error error with
       | Read.Db_error error -> report error | _ -> () in
     let reject error=Mutation.Rejected(local_commit_error error)in
     let prepare()=match existing()with
-      |Error error->report_commit error; Error Mutation.Unknown
+      |Error error->Error(report_commit error)
       |Ok(Some prepared)when matching prepared->Ok prepared
       |Ok(Some _)->Error(reject Overlay.Mutation_identity_conflict)
       |Ok None->
         let append_title=match intent with
           |Mutation.Append_intent append->
             (match Database.current_snapshot session.database with
-             |Error error->report_read error; Error Mutation.Unknown
+             |Error error->report_read error;
+                 Error(unknown(match typed_read_error error with Read.Db_error error->error
+                   | _->worker_error ~code:Storage_busy "The mutation read failed."))
              |Ok snapshot->Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
                match Database.graph_info snapshot with
-               |Error error->report_read error; Error Mutation.Unknown
+               |Error error->report_read error;
+                 Error(unknown(match typed_read_error error with Read.Db_error error->error
+                   | _->worker_error ~code:Storage_busy "The mutation read failed."))
                |Ok info->Ok(Some(journal_append_title info.journal_title_format
                   (Logseq_db_worker_contract.Worker_pure_day.value(Mutation.append_parameters append).day)))))
           |Mutation.Mutation_intent _->Ok None in
@@ -2012,18 +2025,18 @@ let run_durable_mutation t ~(scope:Sync.graph_scope) ~intent ~current =
             |Error(Overlay.Invalid_local_mutation _ as error)
             |Error(Overlay.Mutation_identity_conflict as error)->
               (match existing()with Ok(Some prepared)when matching prepared->Ok prepared|_->Error(reject error))
-            |Error error->report_commit error; Error Mutation.Unknown)in
+            |Error error->Error(report_commit error))in
     match prepare()with
     |Error outcome->outcome
     |Ok prepared->
       if t.stopped || not(current())then Mutation.Unknown else
       match Database.commit_local_intent session.database prepared with
       |Error error->
-        report_commit error;
+        let cause=report_commit error in
         (match Database.inspect_local_intent session.database prepared with
          | Ok(Database.Intent_rejected error)->reject error
-         | Error error->report_commit error; Mutation.Unknown
-         | Ok _->Mutation.Unknown)
+         | Error error->ignore(report_commit error); cause
+         | Ok _->cause)
       |Ok proof->
         (* A durable commit (including replay) must wake its own graph even if
            the caller registration retired while storage was committing. The

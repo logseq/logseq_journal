@@ -345,6 +345,7 @@ let test_status_conflict_refreshes_authoritative_block () =
     |Ok(W.Answered(Ok submission))->(match submission with
       |W.Submission_rejected error->W.Rejected error
       |Submission_unknown->W.Outcome_unknown
+      |Submission_unknown_with_cause cause->W.Outcome_unknown_with_cause cause
       |Submission_committed receipt->W.Committed_pending_presentation receipt)
     |_->Alcotest.fail "known conflict proof was not decoded" in
   let refresh = Runtime.receive_mutation runtime mutation progress
