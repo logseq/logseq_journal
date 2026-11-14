@@ -237,7 +237,6 @@ let view
       ~on_copy
       ()
   =
-  let slots = Timeline.fold_slots (fun acc slot -> slot :: acc) [] state |> List.rev in
   let today = Timeline.today state in
   let current_day = Option.value current_day ~default:today in
   let metadata index slot : Journal_native_collection.row =
@@ -321,25 +320,30 @@ let view
     , V.column ~key:(Ui.Key.string ("day:" ^ section)) [ heading day "Date unavailable" ]
     )
   in
-  let rec present previous_section previous_slot = function
-    | [] -> []
-    | (index, slot) :: rest ->
-      let row = metadata index slot in
-      let date =
-        match slot with
-        | Timeline.Top_level entry -> Some (Journal_model.journal_day entry.block)
-        | Day_continuation { day; _ } -> Some day
-        | Day_heading _ | Feed_continuation _ -> None
-      in
-      let header =
-        match date with
-        | Some day when previous_section <> Some row.section -> [ synthetic_heading day ]
-        | _ -> []
-      in
-      header
-      @ ((row, render previous_slot slot) :: present (Some row.section) (Some slot) rest)
+  let _, _, _, presented =
+    Timeline.fold_slots
+      (fun (index, previous_section, previous_slot, presented) slot ->
+         let row = metadata index slot in
+         let date =
+           match slot with
+           | Timeline.Top_level entry -> Some (Journal_model.journal_day entry.block)
+           | Day_continuation { day; _ } -> Some day
+           | Day_heading _ | Feed_continuation _ -> None
+         in
+         let presented =
+           match date with
+           | Some day when previous_section <> Some row.section ->
+             synthetic_heading day :: presented
+           | _ -> presented
+         in
+         ( index + 1
+         , Some row.section
+         , Some slot
+         , (row, render previous_slot slot) :: presented ))
+      (0, None, None, [])
+      state
   in
-  let presented = present None None (List.mapi (fun index slot -> index, slot) slots) in
+  let presented = List.rev presented in
   let presented =
     if
       not
