@@ -5713,6 +5713,10 @@ let test_restart_draft_store () =
     let restored=List.hd(Result.get_ok(S.load store)) in
     require(restored.parent=Some graph) "append parent not retained";
     require(not(Journal_capture.can_save restored.capture)) "interrupted save became a new mutation";
+    let edited=Journal_capture.update_source restored.capture ~source:"must not become editable" in
+    require(Journal_capture.source edited="unsaved 中文") "interrupted recovery allowed editing an unknown submission";
+    let _,retry=Journal_capture.retry edited in
+    require(retry=None) "interrupted recovery admitted another mutation";
     require(Journal_capture.attachment_imports restored.capture=None) "execution authority survived restart";
     let media=Filename.temp_file "journal-import-test-" ".bin" in
     let channel=open_out_bin media in output_string channel "synthetic-media";close_out channel;
@@ -5758,6 +5762,13 @@ let test_restart_draft_store () =
     require(parent=graph && Journal_capture.source roundtrip="unsaved 中文") "append restart adapter lost owner or text";
     let retained=Journal_detail.recover_composer ~parent:graph restored.capture in
     require(Journal_detail.retained_pending_submission retained=None) "append restart restored execution authority";
+    let cleanup_obstacle=Filename.concat account "pending-obstacle.tmp" in
+    Unix.mkdir cleanup_obstacle 0o700;
+    let published=S.save store [{item with capture=Journal_capture.create ~session_number:3L ~source:"published replacement"}] in
+    Unix.rmdir cleanup_obstacle;
+    require(Result.is_ok published) "post-publication cleanup reported a failed save after replacing the manifest";
+    let published=List.hd(Result.get_ok(S.load store)) in
+    require(Journal_capture.source published.capture="published replacement") "published replacement was not readable";
     Result.get_ok(S.save store []);
     require(Result.get_ok(S.load store)=[]) "discard did not remove durable draft";
     Result.get_ok(S.save store [item]);

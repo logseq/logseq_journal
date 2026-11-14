@@ -68,9 +68,15 @@ val decode_authenticated_scope : bytes -> (Logseq_db_worker_lui.Logseq_db_worker
 (** {1 Restart draft lifecycle}
     At most 128 drafts, 256 attachments, 256 KiB per text, 2 MiB metadata and 128 MiB media
     per account. Media is copied into private owned storage (32 MiB per file).
-    Failed saves preserve the last complete snapshot. Save/discard replace the
-    snapshot; [clear] removes only this account's owned files. Caller serializes
-    operations and reports errors. Recovered interrupted saves remain locked. *)
+    Before manifest rename, failed saves preserve the last complete snapshot.
+    Rename publishes the replacement; directory synchronization confirms its
+    restart durability. A synchronization error after publication is explicitly
+    reported as an unknown durable outcome, not a rollback, and must prevent
+    mutation dispatch. Old media is retained in that case. After confirmed
+    publication, orphan cleanup is best-effort and cannot turn success into an
+    error; a later save retries cleanup. Save/discard replace the snapshot;
+    [clear] removes only this account's owned files. Caller serializes operations
+    and reports errors. Recovered interrupted saves remain locked. *)
 module Draft_store : sig
   type t
   type draft = { graph : string; parent : string option; capture : Journal_capture.t }

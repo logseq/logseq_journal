@@ -425,8 +425,13 @@ module Draft_store = struct
         if not(exists destination) then (created:=destination::!created;copy source destination))copies;
       atomic ~committed:(fun()->published:=true) (Filename.concat(directory t)"state.json")
         (fun channel->output_string channel encoded)
-    with error->if not !published then List.iter(fun path->if exists path then Unix.unlink path)!created;raise error);
-    sweep t (List.map snd copies))
+    with error->
+      if !published then
+        fail "Draft manifest was published, but directory synchronization failed. Its restart durability is unknown; do not submit."
+      else (
+        List.iter(fun path->if exists path then Unix.unlink path)!created;
+        raise error));
+    ignore(protect(fun()->sweep t (List.map snd copies))))
   let fresh_uuid () =
     let channel=open_in_bin "/dev/urandom" in
     let bytes=Fun.protect ~finally:(fun()->close_in_noerr channel)(fun()->really_input_string channel 16) in
@@ -459,7 +464,7 @@ module Draft_store = struct
           |Ok(Picked(staged,_))->Journal_capture.add_attachment capture staged
           |_->fail "Draft attachment could not be recovered.")capture draft.assets in
         let capture=if draft.interrupted then
-          Journal_capture.fail (Journal_capture.begin_submission capture)
+          Journal_capture.fail (Journal_capture.lock_for_retry capture)
             ~message:"The previous save could not be confirmed. Check the graph before discarding this draft."
           else capture in
         {graph=draft.graph;parent=draft.parent;capture})drafts

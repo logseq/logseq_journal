@@ -6785,15 +6785,35 @@ let test_native_authority_precedes_delayed_local_binding () =
       Bytes.set_int32_le bytes 24 (Int32.of_int (String.length json));
       Bytes.blit_string json 0 bytes 32 (String.length json);
       Bytes.to_string bytes in
+    let support=Filename.temp_file "journal-account-drafts-" "" in
+    Unix.unlink support;Unix.mkdir support 0o700;
+    let module Drafts=Journal_platform.Draft_store in
+    let store=Drafts.create ~directory:support ~binding:{user_id="stale-local-A";managed_sync_origin="https://example.invalid"} in
+    let media=Filename.concat support "picked.bin" in
+    Out_channel.with_open_bin media(fun channel->output_string channel "private account attachment");
+    let identity="70000000-0000-4000-a000-000000000001" in
+    let selection=`Assoc["operation",`String identity;"asset",`String identity;
+      "localMutation",`String identity;"metadataMutation",`String identity;
+      "path",`String media;"title",`String "private attachment";"type",`String "bin"] in
+    let staged=match Journal_asset_import.decode_event(Yojson.Safe.to_string
+      (`Assoc["action",`String "picked";"selection",selection])) with
+      |Ok(Picked(staged,_))->staged|_->failwith "invalid account attachment fixture" in
+    let capture=Journal_capture.create ~session_number:1L ~source:"private account draft"
+      |> fun capture->Journal_capture.add_attachment capture staged in
+    Result.get_ok(Drafts.save store [Drafts.{graph=identity;parent=None;capture}]);
+    Unix.unlink media;
     let startup = Logseq_db_worker.Config.create
-        ~application_support_directory:"/tmp/journal-auth-local-order-synthetic"
+        ~application_support_directory:support
         ~target:(Managed_sync {base_url="https://example.invalid"})
         ~compatibility_profile:Logseq_65_33_or_newer
         ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
         ~default_page_size:Worker_pure_data.default_page_size
         |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
     Fun.protect ~finally:(fun () -> Atomic.set release true; ignore(hooks.dispose());
-      Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
+      Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client;
+      ignore(Drafts.clear store);
+      ignore(Drafts.clear(Drafts.create ~directory:support ~binding:{user_id="current-B";managed_sync_origin="https://example.invalid"}));
+      Unix.rmdir(Filename.concat support "JournalDrafts-v1");Unix.rmdir support) (fun () ->
       ignore(hooks.init 2 2 startup);
       let deadline = Unix.gettimeofday () +. 2. in
       while not(List.exists(fun bytes->Bytes.length bytes>=8 && Bytes.get_uint16_le bytes 6=20) !requests)
@@ -6812,7 +6832,17 @@ let test_native_authority_precedes_delayed_local_binding () =
         "managedSyncOrigin",`String "https://example.invalid"]));
       for _=1 to 20 do ignore(hooks.pump());Unix.sleepf 0.001 done;
       Alcotest.(check int) "local restoration respects current SDK identity" expected_restores
-        (Atomic.get local_commands))) [Some "current-B",0;None,0;Some "stale-local-A",1]
+        (Atomic.get local_commands);
+      if expected_restores=1 then (
+        hooks.platform_event(packet 7 (`Assoc["userId",`Null;
+          "startupScope",`Assoc["accountGeneration",`Int 1;"presentationGeneration",`Int 2]]));
+        for _=1 to 20 do ignore(hooks.pump());Unix.sleepf 0.001 done;
+        Alcotest.(check int) "revocation before opening a graph removes account drafts" 0
+          (List.length(Result.get_ok(Drafts.load store)));
+        let account=Filename.concat(Filename.concat support "JournalDrafts-v1")
+          (Digest.to_hex(Digest.string "https://example.invalid\000stale-local-A")) in
+        Alcotest.(check bool) "revocation removes private attachment directory without an open store" false
+          (Sys.file_exists account)))) [Some "current-B",0;None,0;Some "stale-local-A",1]
 ;;
 
 let capture_unlock_logs run =

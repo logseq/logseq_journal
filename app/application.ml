@@ -7422,6 +7422,7 @@ let start
   in
   let module Draft_store = Journal_platform.Draft_store in
   let draft_store : (Journal_platform.local_account_binding * Draft_store.t) option ref = ref None in
+  let draft_account : (string * Journal_platform.local_account_binding) option ref = ref None in
   let last_draft_snapshot : Draft_store.draft list option ref = ref None in
   let draft_storage_blocked = ref false in
   let draft_storage_error = ref None in
@@ -7469,19 +7470,25 @@ let start
     List.length left=List.length right && List.for_all2(fun (left:Draft_store.draft) (right:Draft_store.draft)->
       left.graph=right.graph && left.parent=right.parent && left.capture==right.capture)left right in
   let checkpoint_drafts state =
-    let state=match !draft_store with
-      |Some(binding,store) when !coordination_account=Some None
+    let state=match !draft_account with
+      |Some(directory,binding) when !coordination_account=Some None
           || (match !coordination_account with Some(Some user)->user<>binding.user_id|None|Some None->false)->
+        let store=Draft_store.create ~directory ~binding in
         (match Draft_store.clear store with
         |Error cause->draft_storage_blocked:=true;draft_failure state cause
-        |Ok()->draft_store:=None;last_draft_snapshot:=None;draft_storage_blocked:=false;
+        |Ok()->draft_account:=None;draft_store:=None;last_draft_snapshot:=None;draft_storage_blocked:=false;
           draft_storage_error:=None;state)
       |None|Some _->state in
+    (match !draft_account,!draft_support_directory,!coordination_account with
+    |None,Some directory,Some(Some user_id)->
+      draft_account:=Some(directory,{user_id;managed_sync_origin= !managed_sync_origin})
+    |_->());
     let state=match !draft_store,!draft_support_directory,state.manager with
       |None,Some directory,Some manager
           when manager.startup.local_access=Local_available
             && manager.selected_graph=state.graph_state.graph_id
             && Option.is_some manager.selected_graph
+            && not !draft_storage_blocked
             && not(Account_pure_lifecycle.waiting !account_lifecycle)->
         (match !coordination_account with None|Some None->state |Some(Some user_id)->
           let binding:Journal_platform.local_account_binding=
