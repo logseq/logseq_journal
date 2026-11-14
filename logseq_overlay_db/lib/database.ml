@@ -8035,6 +8035,33 @@ let authoritative_exception_kind = function
   | _ -> "other"
 ;;
 
+let simulation_failure_context exn =
+  let cause = match exn with
+    | Invalid_argument message ->
+      let prefixes =
+        [ "Nothing found for entity id [", "lookup-ref-missing"
+        ; "Lookup ref attribute should be marked as :db/unique:", "lookup-ref-not-unique"
+        ; ":db.fn/cas failed on datom [", "cas-mismatch"
+        ; "tuple attribute value arity mismatch:", "tuple-arity"
+        ; "string attribute requires string value:", "value-type-mismatch"
+        ; "keyword attribute requires keyword value:", "value-type-mismatch"
+        ; "number attribute requires numeric value:", "value-type-mismatch"
+        ; "uuid attribute requires uuid value:", "value-type-mismatch"
+        ; "instant attribute requires instant value:", "value-type-mismatch"
+        ; "tuple attribute element type mismatch:", "value-type-mismatch"
+        ; "tuple attribute requires tuple value:", "value-type-mismatch"
+        ] in
+      (match message with
+       | "unique constraint" -> "unique-constraint"
+       | "Cannot store nil as a value" -> "nil-value"
+       | "cannot modify tuple attributes directly" -> "tuple-write"
+       | _ -> Option.value ~default:"unknown"
+           (List.find_map (fun (prefix,cause) ->
+             if String.starts_with ~prefix message then Some cause else None) prefixes))
+    | _ -> "unknown" in
+  [ "exception", authoritative_exception_kind exn; "simulationCause", cause ]
+;;
+
 let expected_record_transaction_data database record =
   try
     Ok
@@ -8045,7 +8072,7 @@ let expected_record_transaction_data database record =
        : Datascript.tx_report)
         .tx_data
   with
-  | exn -> Error exn
+  | exn -> Error (simulation_failure_context exn)
 ;;
 
 let equal_transaction_data left right = List.sort compare left = List.sort compare right
@@ -8360,9 +8387,7 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
                          (match expected_record_transaction_data root_before record with
                           | Error cause ->
                             ( "expected-simulation-failed"
-                            , [ "exception", authoritative_exception_kind cause
-                              ; "actualDatoms", string_of_int (List.length actual)
-                              ] )
+                            , ("actualDatoms", string_of_int (List.length actual)) :: cause )
                           | Ok expected_data ->
                             let rec operations_at_cursor cursors transactions =
                               match cursors, transactions with
