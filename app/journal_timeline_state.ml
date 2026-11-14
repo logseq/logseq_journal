@@ -14,17 +14,17 @@ type slot =
       }
   | Feed_continuation of { cursor : Journal_graph_projection.feed_cursor }
 
+module Days = Map.Make (Int)
+module Entries = Map.Make (String)
+
 type recovery =
   { day : int
   ; target_count : int
-  ; anchor_ids : string list
-  ; entries : Journal_graph_projection.timeline_entry list
+  ; anchor_ids : string Rrbvec.t
+  ; entries : Journal_graph_projection.timeline_entry Rrbvec.t
+  ; entry_ids : unit Entries.t
   ; next_cursor : Journal_graph_projection.block_cursor option
-  ; reads : int
   }
-
-module Days = Map.Make (Int)
-module Entries = Map.Make (String)
 
 (* Loaded rows remain addressable for native List navigation.
    Hidden placeholders remain available for updates without visible rows. *)
@@ -52,7 +52,7 @@ type t =
   }
 
 let maximum_hidden_days = 512
-let maximum_recovery_entries = 512
+let maximum_recovery_packet = 512
 let initial_visible_count = 40
 let prefetch_margin = 4
 
@@ -385,40 +385,32 @@ let terminal_day_failure (state : t) ~day message =
 ;;
 
 let start_recovery (state : t) ~day =
-  let day_entries =
-    filter_map_slots
-      (function
-        | Top_level entry when Journal_model.journal_day entry.block = day -> Some entry
-        | _ -> None)
-      state.slots
-  in
-  let anchor_ids =
-    let anchor_index = max 0 state.visible_first in
-    let indexed = ref [] in
-    Rrbvec.iteri
-      (fun index slot ->
-         match slot_block slot with
-         | Some block -> indexed := (index, Journal_model.id block) :: !indexed
-         | None -> ())
-      state.slots;
-    !indexed
-    |> List.sort (fun (left, _) (right, _) ->
-      match Int.compare (abs (left - anchor_index)) (abs (right - anchor_index)) with
-      | 0 -> Int.compare right left
-      | order -> order)
-    |> List.map snd
-  in
+  let day_count = Rrbvec.fold_left (fun count -> function
+    | Top_level entry when Journal_model.journal_day entry.block = day -> count + 1
+    | _ -> count) 0 state.slots in
+  let anchor_ids = ref Rrbvec.empty in
+  let length = Rrbvec.length state.slots in
+  let anchor_index = min (max 0 (length - 1)) (max 0 state.visible_first) in
+  let add_anchor index = match Rrbvec.nth_opt state.slots index with
+    | Some (Top_level entry) ->
+      anchor_ids := Rrbvec.push_back !anchor_ids (Journal_model.id entry.block)
+    | _ -> () in
+  add_anchor anchor_index;
+  for distance = 1 to max anchor_index (length - 1 - anchor_index) do
+    add_anchor (anchor_index + distance);
+    add_anchor (anchor_index - distance)
+  done;
   { state with
     pending = None
   ; day_failures = List.remove_assoc day state.day_failures
   ; recovery =
       Some
         { day
-        ; target_count = List.length day_entries + 30
-        ; anchor_ids
-        ; entries = []
+        ; target_count = day_count + 30
+        ; anchor_ids = !anchor_ids
+        ; entries = Rrbvec.empty
+        ; entry_ids = Entries.empty
         ; next_cursor = None
-        ; reads = 0
         }
   }
 ;;
@@ -1352,20 +1344,21 @@ let replace_timeline_entry
     finish_change before state
 ;;
 
-let replace_timeline_entry_page
+let replace_timeline_entries
       (state : t)
       ~(page : Journal_graph_projection.page)
-      (replacement : Journal_graph_projection.timeline_entry_page)
+      ~entries
+      ~continuation
   =
   let before = state in
   let ids, body, count =
-    List.fold_left
+    Rrbvec.fold_left
       (fun (ids, slots, count) (entry : Journal_graph_projection.timeline_entry) ->
          ( Entries.add (Journal_model.id entry.block) () ids
          , Rrbvec.push_back slots (Top_level entry)
          , count + 1 ))
       (Entries.empty, Rrbvec.empty, 0)
-      replacement.entries
+      entries
   in
   let removed = ref Days.empty in
   let slots =
@@ -1414,7 +1407,7 @@ let replace_timeline_entry_page
       page.day
       { page
       ; block_count = count
-      ; complete = Option.is_none replacement.continuation
+      ; complete = Option.is_none continuation
       ; hidden = false
       ; hidden_entry = None
       }
@@ -1426,7 +1419,7 @@ let replace_timeline_entry_page
     else Rrbvec.append (Rrbvec.singleton (Day_heading page)) body
   in
   let body =
-    match replacement.continuation with
+    match continuation with
     | None -> body
     | Some after ->
       Rrbvec.push_back body (Day_continuation { day = page.day; after = Some after })
@@ -1459,6 +1452,11 @@ let replace_timeline_entry_page
   |> finish_change before
 ;;
 
+let replace_timeline_entry_page state ~page (replacement : Journal_graph_projection.timeline_entry_page) =
+  replace_timeline_entries state ~page ~entries:(Rrbvec.of_list replacement.entries)
+    ~continuation:replacement.continuation
+;;
+
 let apply_timeline_entry_page
       (state : t)
       ~generation
@@ -1467,50 +1465,31 @@ let apply_timeline_entry_page
   match state.pending, state.recovery with
   | Some (expected, Day request), Some recovery
     when Int64.equal generation expected && request.day = recovery.day ->
-    let entries = recovery.entries @ page.entries in
-    let ids =
-      List.map
-        (fun (entry : Journal_graph_projection.timeline_entry) ->
-           Journal_model.id entry.block)
-        entries
-    in
-    let reads = recovery.reads + 1 in
-    let invalid =
-      List.length ids <> List.length (List.sort_uniq String.compare ids)
+    let packet_count = List.length page.entries in
+    let entry_ids, duplicate = List.fold_left
+      (fun (ids, duplicate) (entry : Journal_graph_projection.timeline_entry) ->
+        let id = Journal_model.id entry.block in
+        Entries.add id () ids, duplicate || Entries.mem id ids)
+      (recovery.entry_ids, false) page.entries in
+    let invalid = duplicate
+      || packet_count > maximum_recovery_packet
       || (Option.is_some page.continuation
-          && (page.entries = [] || page.continuation = request.after))
-    in
-    let anchor_present =
-      match recovery.anchor_ids with
-      | [] -> true
-      | anchor :: _ ->
-        List.mem anchor ids
-        || Rrbvec.exists
-             (function
-               | Top_level entry ->
-                 Journal_model.journal_day entry.block <> recovery.day
-                 && String.equal (Journal_model.id entry.block) anchor
-               | _ -> false)
-             state.slots
-    in
-    let complete =
-      Option.is_none page.continuation
-      || (List.length entries >= recovery.target_count && anchor_present)
-    in
-    if
-      invalid
-      || List.length entries > maximum_recovery_entries
-      || ((not complete) && reads >= 16)
-    then
-      terminal_day_failure
-        state
-        ~day:recovery.day
-        "Unable to reload this journal within the loading limit."
-    else if not complete
+          && (page.entries = [] || page.continuation = request.after)) in
+    if invalid then
+      terminal_day_failure state ~day:recovery.day
+        "The journal recovery returned a duplicate, oversized or nonadvancing page."
+    else
+    let entries = Rrbvec.append recovery.entries (Rrbvec.of_list page.entries) in
+    (* Each completion consumes one bounded packet. Staging is limited to the
+       already loaded prefix plus the requested next page and one final packet;
+       a deleted anchor cannot force a scan of the entire journal. *)
+    let complete = Option.is_none page.continuation
+      || Rrbvec.length entries >= recovery.target_count in
+    if not complete
     then
       { state with
         pending = None
-      ; recovery = Some { recovery with entries; reads; next_cursor = page.continuation }
+      ; recovery = Some { recovery with entries; entry_ids; next_cursor = page.continuation }
       }
     else (
       let owner_page =
@@ -1524,29 +1503,18 @@ let apply_timeline_entry_page
           "This journal is no longer available."
       | Some owner_page ->
         let updated =
-          replace_timeline_entry_page
-            state
-            ~page:owner_page
-            { entries; continuation = page.continuation }
+          replace_timeline_entries state ~page:owner_page ~entries
+            ~continuation:page.continuation
         in
-        let anchor_id =
-          List.find_opt
-            (fun id ->
-               Rrbvec.exists
-                 (function
-                   | Top_level entry -> String.equal id (Journal_model.id entry.block)
-                   | _ -> false)
-                 updated.slots)
-            recovery.anchor_ids
-        in
-        let anchor_key =
-          match anchor_id with
-          | Some id -> "block:" ^ id
-          | None -> "day:" ^ string_of_int recovery.day
-        in
+        let positions = ref Entries.empty in
+        Rrbvec.iteri (fun index -> function
+          | Top_level entry -> positions := Entries.add (Journal_model.id entry.block) index !positions
+          | _ -> ()) updated.slots;
         let visible_first =
-          find_slot_index (fun slot -> slot_key slot = anchor_key) updated.slots
-          |> Option.fold ~none:state.visible_first ~some:(fun offset -> offset)
+          Rrbvec.find_map (fun id -> Entries.find_opt id !positions) recovery.anchor_ids
+          |> Option.value ~default:(
+            find_slot_index (fun slot -> slot_key slot = "day:" ^ string_of_int recovery.day) updated.slots
+            |> Option.value ~default:state.visible_first)
         in
         { updated with
           visible_first
