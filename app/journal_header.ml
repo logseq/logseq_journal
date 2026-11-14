@@ -390,7 +390,7 @@ let view_impl
          and sync_error = presentation.sync_error in
          V.column
            ~spacing:4.
-           [ (if sync_phase = Some Graph_service.Connecting
+           [ (if context = Context.Favorites && sync_phase = Some Graph_service.Connecting
               then
                 V.loading ~message:"Connecting" ()
                 |> test_id "journal-header-sync-progress"
