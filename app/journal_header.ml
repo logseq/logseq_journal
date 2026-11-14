@@ -429,6 +429,7 @@ let view_impl
       ~key
       ~props_for:(fun presentation ->
         props ~mode:"page" ?title:(match context with Journals -> None | Favorites -> Some "Favorites")
+          ?message:presentation.sync_error
           ~connecting:(sync_active presentation.sync_phase)
           ~controls:(controls presentation) ()) (* Keep absent slots mounted so the native child indexes stay stable. *)
       ~children:

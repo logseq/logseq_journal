@@ -7520,7 +7520,13 @@ let start
               |Error cause->Journal_pump.enqueue pump (fun()->
                 if epoch= !draft_epoch then
                   send_action(Update(fun state->draft_failure state cause,Effect.ignore))) in
-            draft_writer:=Some(Draft_store.Writer.create ~on_complete store);
+            let on_cleanup_warning cause=Journal_pump.enqueue pump (fun()->
+              if epoch= !draft_epoch then
+                send_action(Update(fun state->
+                  let state=report_ui_error state ~operation:"cleanupDraft" ~phase:"localStorage"
+                    ~message:cause in
+                  show_sync_error state (Non_worker_sync_failure cause),Effect.ignore))) in
+            draft_writer:=Some(Draft_store.Writer.create ~on_complete ~on_cleanup_warning store);
             restore_restart_drafts state drafts)
       |_->state in
     match !draft_writer with

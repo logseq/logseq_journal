@@ -81,7 +81,11 @@ module Draft_store : sig
   type t
   type draft = { graph : string; parent : string option; capture : Journal_capture.t }
   val create : directory:string -> binding:local_account_binding -> t
-  val save : t -> draft list -> (unit, string) result
+  (** A successful manifest commit remains [Ok ()] if orphan cleanup fails.
+      [on_cleanup_warning] receives the cleanup cause, independently of commit
+      success; by default it is written to stderr. The writer retries outstanding
+      cleanup once per later snapshot, including unchanged snapshots. *)
+  val save : ?on_cleanup_warning:(string -> unit) -> t -> draft list -> (unit, string) result
   val load : t -> (draft list, string) result
   val clear : t -> (unit, string) result
 
@@ -109,7 +113,7 @@ module Draft_store : sig
   module Writer : sig
     type store = t
     type t
-    val create : ?on_complete:((unit, string) result -> unit) -> store -> t
+    val create : ?on_complete:((unit, string) result -> unit) -> ?on_cleanup_warning:(string -> unit) -> store -> t
     val enqueue : t -> (unit -> draft list) -> (unit, string) result
     val flush : t -> (unit, string) result
     val close : t -> (unit, string) result

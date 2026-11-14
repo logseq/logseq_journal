@@ -5777,9 +5777,13 @@ let test_restart_draft_store () =
     replace good;
     let cleanup_obstacle=Filename.concat account "pending-obstacle.tmp" in
     Unix.mkdir cleanup_obstacle 0o700;
-    let published=S.save store [{item with capture=Journal_capture.create ~session_number:3L ~source:"published replacement"}] in
+    let cleanup_warning=ref None in
+    let published=S.save ~on_cleanup_warning:(fun cause->cleanup_warning:=Some cause) store
+      [{item with capture=Journal_capture.create ~session_number:3L ~source:"published replacement"}] in
     Unix.rmdir cleanup_obstacle;
     require(Result.is_ok published) "post-publication cleanup reported a failed save after replacing the manifest";
+    require(!cleanup_warning=Some "Draft saved, but cleanup is pending: Draft recovery file is unsafe or exceeds its size limit.")
+      "direct store save swallowed cleanup cause";
     let published=List.hd(Result.get_ok(S.load store)) in
     require(Journal_capture.source published.capture="published replacement") "published replacement was not readable";
     Result.get_ok(S.save store []);
@@ -5830,3 +5834,69 @@ let test_serial_draft_writer () =
       require(Result.get_ok(S.load store)=[]) "closed writer resurrected a revoked account")
 ;;
 let ()=test_serial_draft_writer ()
+
+let test_writer_invalidates_uncertain_snapshot () =
+  let module S=Journal_platform.Draft_store in
+  let root=Filename.temp_file "journal-writer-uncertain-" "" in
+  Unix.unlink root;Unix.mkdir root 0o700;
+  let binding:Journal_platform.local_account_binding=
+    {user_id="writer-user";managed_sync_origin="https://example.invalid"} in
+  let store=S.create ~directory:root ~binding in
+  let fail_sync=Atomic.make false in
+  let uncertain=S.For_testing.with_directory_sync store (fun path->
+    if Atomic.get fail_sync then raise(Unix.Unix_error(Unix.EIO,"fsync",path))
+    else let fd=Unix.openfile path [Unix.O_RDONLY] 0 in
+      Fun.protect ~finally:(fun()->Unix.close fd)(fun()->Unix.fsync fd)) in
+  let writer=S.Writer.create uncertain in
+  Fun.protect ~finally:(fun()->ignore(S.Writer.close writer);ignore(S.clear store);
+    Unix.rmdir(Filename.concat root "JournalDrafts-v1");Unix.rmdir root) (fun()->
+    let save drafts=
+      Result.get_ok(S.Writer.enqueue writer (fun()->drafts));S.Writer.flush writer in
+    Result.get_ok(save []);
+    Atomic.set fail_sync true;
+    let draft:S.draft={graph="70000000-0000-4000-a000-000000000001";parent=None;
+      capture=Journal_capture.create ~session_number:1L ~source:"must not resurrect"} in
+    require(Result.is_error(save [draft])) "uncertain publication reported success";
+    require(List.length(Result.get_ok(S.load store))=1) "failure did not follow rename";
+    Atomic.set fail_sync false;
+    Result.get_ok(save []);
+    require(Result.get_ok(S.load(S.create ~directory:root ~binding))=[])
+      "discard reused stale empty cache and resurrected the uncertain draft")
+;;
+let ()=test_writer_invalidates_uncertain_snapshot ()
+
+let test_writer_cleanup_warning_and_retry () =
+  let module S=Journal_platform.Draft_store in
+  let root=Filename.temp_file "journal-writer-cleanup-" "" in
+  Unix.unlink root;Unix.mkdir root 0o700;
+  let binding:Journal_platform.local_account_binding=
+    {user_id="cleanup-user";managed_sync_origin="https://example.invalid"} in
+  let store=S.create ~directory:root ~binding in
+  Result.get_ok(S.save store []);
+  let parent=Filename.concat root "JournalDrafts-v1" in
+  let account=Filename.concat parent (Sys.readdir parent).(0) in
+  let obstacle=Filename.concat account "pending-obstacle.tmp" in
+  Unix.mkdir obstacle 0o700;
+  let warnings=Atomic.make [] in
+  let writer=S.Writer.create ~on_cleanup_warning:(fun cause->
+    Atomic.set warnings (cause::Atomic.get warnings)) store in
+  Fun.protect ~finally:(fun()->ignore(S.Writer.close writer);
+    (try Unix.rmdir obstacle with Unix.Unix_error(Unix.ENOENT,_,_)->());
+    ignore(S.clear store);Unix.rmdir parent;Unix.rmdir root) (fun()->
+    let capture=Journal_capture.create ~session_number:1L ~source:"committed despite cleanup" in
+    let drafts=[S.{graph="70000000-0000-4000-a000-000000000001";parent=None;capture}] in
+    let save ()=Result.get_ok(S.Writer.enqueue writer (fun()->drafts));S.Writer.flush writer in
+    Result.get_ok(save());
+    require(List.length(Result.get_ok(S.load store))=1) "cleanup failure lost committed draft";
+    let first=Atomic.get warnings in
+    require(first=["Draft saved, but cleanup is pending: Draft recovery file is unsafe or exceeds its size limit."])
+      "committed save swallowed cleanup cause";
+    Unix.sleepf 0.025;
+    require(Atomic.get warnings=first) "cleanup retried without a bounded snapshot trigger";
+    Unix.rmdir obstacle;
+    let channel=open_out_bin obstacle in output_string channel "orphan";close_out channel;
+    Result.get_ok(save());
+    require(not(Sys.file_exists obstacle)) "unchanged snapshot skipped pending orphan cleanup";
+    require(Atomic.get warnings=first) "successful cleanup invented another warning")
+;;
+let ()=test_writer_cleanup_warning_and_retry ()

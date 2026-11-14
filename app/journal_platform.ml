@@ -262,7 +262,8 @@ let decode_copy_text_response bytes =
 
 module Draft_store = struct
   type t = { directory : string; binding : local_account_binding
-    ; directory_sync : (string -> unit) option }
+    ; directory_sync : (string -> unit) option
+    ; cleanup_pending : string list option ref }
   type draft = { graph : string; parent : string option; capture : Journal_capture.t }
 
   module Wire = struct
@@ -275,7 +276,7 @@ module Draft_store = struct
     [@@deriving yojson]
   end
 
-  let create ~directory ~binding = {directory;binding;directory_sync=None}
+  let create ~directory ~binding = {directory;binding;directory_sync=None;cleanup_pending=ref None}
   module For_testing = struct
     let with_directory_sync t synchronize = {t with directory_sync=Some synchronize}
   end
@@ -398,7 +399,18 @@ module Draft_store = struct
         ignore(regular(Filename.concat(directory t)name)(max maximum_file maximum_metadata)))names;
       List.iter(fun name->Unix.unlink(Filename.concat(directory t)name))names;
       Unix.rmdir(directory t);sync_directory(parent t)))
-  let save t drafts = protect(fun()->
+  let report_cleanup_warning cause =
+    Printf.eprintf "journal: draft committed; cleanup pending: %s\n%!" cause
+  let retry_cleanup t on_cleanup_warning =
+    match !(t.cleanup_pending) with
+    |None->()
+    |Some keep->
+      (match protect(fun()->sweep t keep) with
+      |Ok()->t.cleanup_pending:=None
+      |Error cause->
+        let warning="Draft saved, but cleanup is pending: " ^ cause in
+        (try on_cleanup_warning warning with _->report_cleanup_warning warning))
+  let save ?(on_cleanup_warning=report_cleanup_warning) t drafts = protect(fun()->
     prepare t;
     let copies=ref [] in
     let wire=List.map(fun (draft:draft)->
@@ -437,7 +449,8 @@ module Draft_store = struct
       else (
         List.iter(fun path->if exists path then Unix.unlink path)!created;
         raise error));
-    ignore(protect(fun()->sweep t (List.map snd copies))))
+    t.cleanup_pending:=Some(List.map snd copies);
+    retry_cleanup t on_cleanup_warning)
   let fresh_uuid () =
     let channel=open_in_bin "/dev/urandom" in
     let bytes=Fun.protect ~finally:(fun()->close_in_noerr channel)(fun()->really_input_string channel 16) in
@@ -486,7 +499,7 @@ module Draft_store = struct
       ; mutable revision : int
       ; mutable thread : Thread.t option
       }
-    let create ?(on_complete=fun _->()) store =
+    let create ?(on_complete=fun _->()) ?(on_cleanup_warning=report_cleanup_warning) store =
       let writer={pending=Atomic.make None;completed=Atomic.make(0,Ok());
         running=Atomic.make true;revision=0;thread=None} in
       let last_saved = ref None in
@@ -498,10 +511,11 @@ module Draft_store = struct
         |Some job->
           let result=try
             let drafts=job.snapshot () in
-            if Option.fold ~none:false ~some:(same_snapshot drafts) !last_saved then Ok() else
-            let result=save store drafts in
-            (match result with Ok()->last_saved:=Some drafts|Error _->());result
-          with _->Error "Draft storage worker failed; restart recovery is unavailable." in
+            if Option.fold ~none:false ~some:(same_snapshot drafts) !last_saved then (
+              retry_cleanup store on_cleanup_warning;Ok()) else
+            let result=save ~on_cleanup_warning store drafts in
+            (match result with Ok()->last_saved:=Some drafts|Error _->last_saved:=None);result
+          with _->last_saved:=None;Error "Draft storage worker failed; restart recovery is unavailable." in
           Atomic.set writer.completed (job.revision,result);
           (try on_complete result with _->());work ()
         |None when Atomic.get writer.running->Unix.sleepf 0.005;work ()
