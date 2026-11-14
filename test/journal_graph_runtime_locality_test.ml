@@ -1442,7 +1442,7 @@ module Target_fixture = struct
   let mutation runtime original outcome =
     let intent=match Production_runtime.worker_intent runtime original session |> Result.get_ok with W.Mutation_intent intent->intent|_->assert false in
     Alcotest.(check bool) "original typed target intent binds before execution" true
-      (Production_runtime.bind_mutation runtime original ~presentation ~intent:(W.Mutation_intent intent));
+      (Result.is_ok (Production_runtime.bind_mutation runtime original ~presentation ~intent:(W.Mutation_intent intent)));
     let request_id=W.request_id original in
     let operation=W.Mutate intent in
     ignore(I.request session ~request_id operation |> Result.get_ok);
@@ -1594,7 +1594,7 @@ let test_ordinary_delete_readback committed paged () =
     let intent=match Runtime.worker_intent runtime request session |> Result.get_ok with W.Mutation_intent intent->intent|_->assert false in
     let mutation_id=W.mutation_intent_id intent in
     Alcotest.(check bool) "ordinary mutation business owner bound" true
-      (Production_runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent));
+      (Result.is_ok (Production_runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent)));
     let receipt=(let receipt_request_id=request in let packet=((Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(mutation_id) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:("projection:v1:0") ~after:("projection:v1:1"))) in
       match I.reply session ~request_id:(W.request_id request) (W.Mutate intent)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
@@ -2022,7 +2022,7 @@ let test_target_newer_confirmation_fences_old () =
   (match pending.operation with
    |Target_fixture.W.Confirm(presentation,receipt)->
      Alcotest.(check bool) "new confirmation attempt rebinds the original durable intent" true
-       (Runtime.bind_mutation runtime retry ~presentation ~intent:(Target_fixture.W.receipt_intent receipt));
+       (Result.is_ok (Runtime.bind_mutation runtime retry ~presentation ~intent:(Target_fixture.W.receipt_intent receipt)));
      let recovered=Target_fixture.summary original_confirm page
        (Worker_pure_data.V2_present_block{value=newer;revision="canonical-3"}) [] None "projection-3" in
      (match (only "fresh confirmation applies before original intent settlement" recovered.responses).payload with
@@ -5665,7 +5665,7 @@ let test_page_detail_root_and_append () =
     let intent=match Runtime.worker_intent runtime request Worker_producer.session |> Result.get_ok with W.Mutation_intent intent->intent|_->assert false in
     let mutation_id=W.mutation_intent_id intent in
     Alcotest.(check bool) "page insertion bound to typed owner" true
-      (Runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent));
+      (Result.is_ok (Runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent)));
     let receipt=(let receipt_request_id=request in let packet=((Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(mutation_id) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:("projection:v1:1") ~after:("projection:v1:2"))) in
       match I.reply Worker_producer.session ~request_id:(W.request_id request) (W.Mutate intent)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
@@ -6243,13 +6243,13 @@ let test_catalog_and_lookup_cross_fences () =
 ;;
 
 (* Core cannot reproduce the business Runtime's old sub-operation allocator. *)
-let child_identity_insert runtime =
+let child_identity_insert ?(revision=0L) runtime =
   let child=uuid "a1000000-0000-4000-9000-000000000081" in
   let mutation_id=uuid "a1000000-0000-4000-a000-000000000081" in
   let command : Journal_graph_projection.create_child =
     {mutation_id=Graph.Uuid.to_string mutation_id;block_id=Graph.Uuid.to_string child;
      parent_block_id=Graph.Uuid.to_string block_uuid;calendar_generation=1L;
-     status_intent_revision=0L;expected_parent_revision="block-detail-1";sibling_order="a";source="Stable child";
+     status_intent_revision=revision;expected_parent_revision="block-detail-1";sibling_order="a";source="Stable child";
      task_state=Status "00000002-1615-5853-7700-000000000000";status_confirmation=true;
      creation_time=Journal_time.create ~instant_unix_ms:1_788_192_000_000L
        ~local_day:20260901 ~local_minute_of_day:0 |> Result.get_ok} in
@@ -6264,14 +6264,14 @@ let test_unknown_mutation_recovery_issues_original () =
     let presentation=Option.get(W.selected Worker_producer.projection) in
     let intent=match Runtime.worker_intent runtime request Worker_producer.session |> Result.get_ok with W.Mutation_intent intent->intent|_->assert false in
     Alcotest.(check bool) "original mutation bound before Unknown" true
-      (Runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent));
+      (Result.is_ok (Runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent)));
     let output=Runtime.receive_mutation runtime request W.Outcome_unknown in
     let resumed=only "one automatic original-intent continuation" output.requests in
     Alcotest.(check bool) "continuation preserves original wire" true (resumed=request);
     Alcotest.(check bool) "public transition issues continuation before returning" true
       (Runtime.worker_intent runtime resumed Worker_producer.session=Ok(W.Mutation_intent intent));
     Alcotest.(check bool) "same-intent continuation can bind its next receipt" true
-      (Runtime.bind_mutation runtime resumed ~presentation ~intent:(W.Mutation_intent intent))
+      (Result.is_ok (Runtime.bind_mutation runtime resumed ~presentation ~intent:(W.Mutation_intent intent)))
 ;;
 
 let child_identity_runtime () =
@@ -6286,7 +6286,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
   let presentation=Option.get(W.selected projection) in
   let original=match Runtime.worker_intent runtime (insert) session |> Result.get_ok with W.Mutation_intent intent->intent|_->assert false in
   let mutation_id=W.mutation_intent_id original in
-  Alcotest.(check bool) "original Child binds" true(Runtime.bind_mutation runtime insert ~presentation ~intent:(W.Mutation_intent original));
+  Alcotest.(check bool) "original Child binds" true(Result.is_ok (Runtime.bind_mutation runtime insert ~presentation ~intent:(W.Mutation_intent original)));
   let original=if not status then (
     ignore(Runtime.receive_mutation runtime insert W.Outcome_unknown); original)
     else (
@@ -6314,7 +6314,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
       let pending=Production_runtime.receive_worker_read runtime ~request_id:canonical (Journal_graph_runtime.Query_result(W.Block_summary{block=root;after=None},value))
         |> fun output->only "original status attempt" output.Runtime.requests in
       let intent=match Runtime.worker_intent runtime (pending) session |> Result.get_ok with W.Mutation_intent intent->intent|_->assert false in
-      Alcotest.(check bool) "original status binds" true(Runtime.bind_mutation runtime pending ~presentation ~intent:(W.Mutation_intent intent));
+      Alcotest.(check bool) "original status binds" true(Result.is_ok (Runtime.bind_mutation runtime pending ~presentation ~intent:(W.Mutation_intent intent)));
       ignore(Runtime.receive_mutation runtime pending W.Outcome_unknown);intent) in
   let business_command,chain=Production_runtime.retained_child_chains runtime |> fun values->Rrbvec.nth values 0 in
   Runtime.reset runtime;set_calendar runtime;
@@ -6324,6 +6324,50 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
   let retried=match Runtime.worker_intent runtime (retry) session |> Result.get_ok with W.Mutation_intent intent->intent|_->assert false in
   Alcotest.(check string) "unknown Child keeps the complete original intent across reset"
     (Bytes.to_string(W.encode_durable_intent(W.Mutation_intent original)))(Bytes.to_string(W.encode_durable_intent(W.Mutation_intent retried)))
+;;
+
+(* Pure_insertion already reports its construction error; only the public
+   Runtime dispatcher owns the lossy translation during business binding. *)
+let test_binding_preserves_construction_and_status_errors () =
+  let presentation = Option.get (W.selected Worker_producer.projection) in
+  let bind runtime request =
+    let intent = Runtime.worker_intent runtime request Worker_producer.session |> Result.get_ok in
+    Runtime.bind_mutation runtime request ~presentation ~intent in
+  let check_cause expected = function
+    | Error error -> Alcotest.(check string) "exact binding cause reaches caller" expected
+        (Journal_worker_coordination_host.error_message error)
+    | Ok () -> Alcotest.fail "invalid business payload was bound" in
+  let runtime = child_identity_runtime () in
+  let request = child_identity_insert ~revision:(-1L) runtime in
+  check_cause "The initial child payload does not match its admitted business command." (bind runtime request);
+  let runtime = child_identity_runtime () in
+  let command : Journal_graph_projection.capture =
+    { mutation_id="a1000000-0000-4000-a000-000000000082";
+      block_id="a1000000-0000-4000-9000-000000000082";
+      sibling_order="a";source="Invalid revision capture";task_state=No_status;
+      status_confirmation=false;status_intent_revision=(-1L);children=[];
+      creation_time=Journal_time.create ~instant_unix_ms:1_788_192_000_000L
+        ~local_day:20260901 ~local_minute_of_day:0 |> Result.get_ok } in
+  let valid_request = Runtime.submit runtime (Capture {calendar_generation=1L;command={command with status_intent_revision=0L}})
+    |> fun output -> only "valid capture binding request" output.Runtime.requests in
+  let intent = Runtime.worker_intent runtime valid_request Worker_producer.session |> Result.get_ok in
+  let request = Runtime.submit runtime (Capture {calendar_generation=1L;command})
+    |> fun output -> only "capture binding request" output.Runtime.requests in
+  check_cause "The initial child payload does not match its admitted business command."
+    (Runtime.bind_mutation runtime request ~presentation ~intent);
+  let runtime = child_identity_runtime () in
+  let request = child_identity_insert runtime in
+  let intent = Runtime.worker_intent runtime request Worker_producer.session |> Result.get_ok in
+  let catalog = Runtime.submit runtime Load_task_statuses
+    |> fun output -> only "status catalog refresh" output.Runtime.requests in
+  ignore (deliver_sample runtime (sample catalog (query_sample (fun (Read.Read_query(budget,query)) ->
+    match query with
+    | Read.Task_statuses _ -> Read.For_worker.answer budget query
+      (Ok (Read.For_worker.task_status_catalog ~property_uuid:(Some page_uuid)
+        ~default_status:None ~items:[] ~next:None))
+    | _ -> failwith "Expected task status catalog"))));
+  check_cause "This task status is unavailable. Choose another status before saving."
+    (Runtime.bind_mutation runtime request ~presentation ~intent)
 ;;
 
 let test_child_typed_insert_admission () =
@@ -6351,7 +6395,7 @@ let test_typed_child_planning_refusal_retains_transport () =
     let intent=match Runtime.worker_intent runtime (insert) session |> Result.get_ok with W.Mutation_intent intent->intent|_->assert false in
   let id=W.mutation_intent_id intent in
     Alcotest.(check bool) "typed child bound before admission" true
-      (Runtime.bind_mutation runtime insert ~presentation ~intent:(W.Mutation_intent intent));
+      (Result.is_ok (Runtime.bind_mutation runtime insert ~presentation ~intent:(W.Mutation_intent intent)));
     let delivery=Journal_graph_transport.deliver ~runtime ~send:(fun _->refusal)
       {Runtime.requests=[insert];responses=[]} in
     Alcotest.(check (option string)) "retryable Child admission does not retire the graph" None delivery.error;
@@ -6393,7 +6437,7 @@ let test_child_error_continuations_retire () =
   for _=1 to 20 do
     let intent=match Runtime.worker_intent runtime (!request) session |> Result.get_ok with W.Mutation_intent intent->intent|_->assert false in
     Alcotest.(check bool) "actual continuation binds before its completion"true
-      (Runtime.bind_mutation runtime !request ~presentation ~intent:(W.Mutation_intent intent));
+      (Result.is_ok (Runtime.bind_mutation runtime !request ~presentation ~intent:(W.Mutation_intent intent)));
     let previous= !request in
     let output=Runtime.mutation_waiting runtime previous "Transient confirmation failure"in
     if previous<>original then
@@ -9320,6 +9364,7 @@ let () =
             test_feed_window_bounds_and_singleton_failure
         ] )
     ; ("child status identity",[
+        Alcotest.test_case "binding preserves construction and status errors" `Quick test_binding_preserves_construction_and_status_errors;
         Alcotest.test_case "typed insertion admission" `Quick test_child_typed_insert_admission;
         Alcotest.test_case "unknown Child preserves wire across reset" `Quick (fun ()->test_child_unknown_wire_survives_reset ());
         Alcotest.test_case "unknown Child status preserves preconditions across reset" `Quick (fun ()->test_child_unknown_wire_survives_reset ~status:true ());

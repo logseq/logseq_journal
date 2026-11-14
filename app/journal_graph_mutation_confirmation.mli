@@ -1,3 +1,22 @@
+(** {1 TLDR}
+
+    Plan canonical mutation readback and own pure insertion/capture chains.
+    The host executes the returned read/write actions. No I/O or persistent data
+    is owned here; [Pure_insertion.bind] preserves Worker errors and installs no
+    state when intent, presentation or round validation fails.
+
+    {1 Minimal usage example}
+
+    With a caller-owned chain, current stage/round, intent and presentation:
+    {[
+      match Pure_insertion.bind chain ~index ~round ~intent ~presentation with
+      | Error error -> report_error error
+      | Ok bound -> install_chain bound
+    ]}
+    [report_error] and [install_chain] are supplied by the host.
+
+    {1 Capability details} *)
+
 module Graph = Logseq_db_types.Graph_types
 module Worker = Journal_worker_coordination.Worker_api
 
@@ -100,7 +119,7 @@ module Pure_insertion : sig
   val matches_capture : t -> Journal_graph_projection.capture -> bool
   val retarget_capture : t -> command:Journal_graph_projection.capture -> resolved_status:Graph.Uuid.t option -> (t,string) result
   val bind : t -> index:int -> round:int64 -> intent:Worker.durable_intent
-    -> presentation:Worker.presentation -> t option
+    -> presentation:Worker.presentation -> (t, Worker.error) result
   val receive : t -> index:int -> round:int64 -> Worker.mutation_progress -> t * action
   val read_child : t -> round:int64 -> Worker.block_summary -> t * action
   val projection_ready : t -> round:int64 -> t * action
@@ -113,5 +132,5 @@ module Pure_insertion : sig
   val applied : t -> round:int64 -> Worker.presentation -> t * action
   val acknowledged : t -> index:int -> round:int64 -> (unit,string) result -> t * action
   val rebind_ack : t -> index:int -> round:int64 -> intent:Worker.durable_intent
-    -> presentation:Worker.presentation -> t option
+    -> presentation:Worker.presentation -> (t, Worker.error) result
 end
