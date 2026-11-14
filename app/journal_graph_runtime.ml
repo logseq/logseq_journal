@@ -2999,30 +2999,30 @@ let bind_mutation t request ~presentation ~intent =
      | Append root->
        let resolved_status=root.task_status in
        (match Child.start_capture ~command ~resolved_status ~root with
-        | Error _->false
+        | Error message->Error (Worker.Invalid_input message)
         | Ok(chain,_)->match Child.bind chain ~index:0 ~round:1L ~intent ~presentation with
-          | None->false
-          | Some chain->Hashtbl.replace t.pending key
-            {pending with operation=Capture_chain{chain;projection=None;command};planned=Stage};true)
-     | _->false)
+          | Error error->Error error
+          | Ok chain->Hashtbl.replace t.pending key
+            {pending with operation=Capture_chain{chain;projection=None;command};planned=Stage};Ok ())
+     | _->Error (Worker.Invalid_input "The capture request does not contain an append plan."))
   | Some ({operation=Child_insert(command,page);delivery=Dispatched;_} as pending) ->
     (match task_status_uuid t command.task_state with
-     | Error _->false
+     | Error message->Error (Worker.Invalid_input message)
      | Ok resolved_status->
        (match pending.planned with Mutation{command=insert;_}->
        (match Child.start ~command ~page ~resolved_status ~insert with
-        | Error _->false
+        | Error message->Error (Worker.Invalid_input message)
         | Ok(chain,_)->
           (match Child.bind chain ~index:0 ~round:1L ~intent ~presentation with
-           | None->false
-           | Some chain->Hashtbl.replace t.pending key {pending with operation=Child_chain{chain;projection=None};planned=Stage};true))
-       |_->false))
+           | Error error->Error error
+           | Ok chain->Hashtbl.replace t.pending key {pending with operation=Child_chain{chain;projection=None};planned=Stage};Ok ()))
+       |_->Error (Worker.Invalid_input "The child request does not contain an insertion plan.")))
   | Some {operation=Child_write{root;index;round};delivery=Dispatched;_} ->
     (match child_root t root with
-     | None->false
+     | None->Error (Worker.Invalid_input "The child chain no longer owns this write request.")
      | Some(_,chain,projection)->
        (match Child.bind chain ~index ~round ~intent ~presentation with
-        | None->false|Some chain->update_child_root t root chain projection;true))
+        | Error error->Error error|Ok chain->update_child_root t root chain projection;Ok ()))
   | Some pending when pending.delivery=Dispatched ->
     (match pending.operation with
      |Mutation_refresh{page;_}->Hashtbl.replace t.page_tree_interests page.Projection.id
@@ -3034,8 +3034,8 @@ let bind_mutation t request ~presentation ~intent =
           submission_recovered=false;acknowledgement_recovered=None;acknowledgement_in_flight=false} in
     let source_epoch=t.next_request in
     t.next_request<-Int64.succ t.next_request;
-    Hashtbl.replace t.pending key {pending with durable=Some durable;source_epoch;planned=Stage};true
-  | _->false
+    Hashtbl.replace t.pending key {pending with durable=Some durable;source_epoch;planned=Stage};Ok ()
+  | _->Error (Worker.Invalid_input "The mutation is no longer owned by a dispatched business request.")
 ;;
 
 let mutation_presentation t (request:Graph.Uuid.t) =
@@ -3180,10 +3180,13 @@ let worker_child_ack t (request:Graph.Uuid.t) =
 let rebind_child_ack t (request:Graph.Uuid.t) ~presentation =
   match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request) with
   | Some{operation=Child_ack{root;index;round;intent;_};delivery=Dispatched;_}->
-    (match child_root t root with None->false|Some(_,chain,projection)->
+    (match child_root t root with
+     | None -> Error (Worker.Invalid_input "The child chain no longer owns this acknowledgement.")
+     | Some(_,chain,projection)->
       match Child.rebind_ack chain ~index ~round ~intent ~presentation with
-      | None->false|Some chain->update_child_root t root chain projection;true)
-  | _->false
+      | Error error -> Error error
+      | Ok chain -> update_child_root t root chain projection; Ok ())
+  | _ -> Error (Worker.Invalid_input "The child acknowledgement is no longer dispatched.")
 ;;
 let resume_insertion_recovery t ~root recovery =
   dispatch_output t(child_step t root(fun chain->Child.resume_recovery chain recovery))

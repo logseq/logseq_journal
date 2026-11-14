@@ -4636,7 +4636,7 @@ module Child_chain_fixture = struct
     let index,round,_=write fixture state action in
     let stage=C.stage state index in
     let intent=C.stage_intent fixture.session stage |> Result.get_ok in
-    let state=C.bind state ~index ~round ~intent ~presentation:fixture.presentation |> Option.get in
+    let state=C.bind state ~index ~round ~intent ~presentation:fixture.presentation |> Result.get_ok in
     state,index,round,intent
   let confirm fixture state action =
     let state,index,round,intent=bind fixture state action in
@@ -4678,7 +4678,7 @@ let test_child_canonical_admission_keeps_recovery () =
   let initial=R.submit ~child_chain:fixture.initial runtime
     (Journal_graph_request.Create_child fixture.command) |> only in
   let intent=R.worker_intent runtime initial fixture.session |> Result.get_ok in
-  require(R.bind_mutation runtime initial ~presentation:fixture.presentation ~intent)
+  require(Result.is_ok (R.bind_mutation runtime initial ~presentation:fixture.presentation ~intent))
     "original child mutation did not bind";
   let canonical=R.receive_mutation runtime initial (fixture.confirm 0 intent fixture.presentation) in
   let canonical_id=only canonical in
@@ -4743,7 +4743,7 @@ let test_capture_retained_attempt_survives_runtime_reset () =
   let initial=R.submit runtime (Option.get request) |> only in
   let intent=R.worker_intent runtime initial fixture.session |> Result.get_ok in
   let wire=F.W.encode_durable_intent intent in
-  require(R.bind_mutation runtime initial ~presentation:fixture.presentation ~intent) "Capture did not bind original Append";
+  require(Result.is_ok (R.bind_mutation runtime initial ~presentation:fixture.presentation ~intent)) "Capture did not bind original Append";
   ignore(R.receive_mutation runtime initial F.W.Outcome_unknown);
   let command=Journal_capture.pending_command capture |> Option.get in
   let chain=R.capture_chain runtime ~command |> Option.get in
@@ -4755,7 +4755,7 @@ let test_capture_retained_attempt_survives_runtime_reset () =
   let resumed_wire=R.worker_intent runtime resumed fixture.session |> Result.get_ok |> F.W.encode_durable_intent in
   require(resumed_wire=wire) "Runtime reset reconstructed the accepted Append with a new status payload";
   require(Journal_capture.source capture=fixture.command.source) "Runtime reset lost frozen source";
-  require(R.bind_mutation runtime resumed ~presentation:fixture.presentation ~intent) "restored Append did not bind";
+  require(Result.is_ok (R.bind_mutation runtime resumed ~presentation:fixture.presentation ~intent)) "restored Append did not bind";
   let progress=fixture.confirm 0 intent fixture.presentation in
   let output=R.receive_mutation runtime resumed progress in
   let root,round=List.find_map(fun response->match response.R.payload with
@@ -4766,7 +4766,7 @@ let test_capture_retained_attempt_survives_runtime_reset () =
     | Confirmed_block summary->summary|_->assert false)|_->assert false in
   let status=R.receive_worker_read runtime ~request_id:canonical (R.Query_result(F.W.Block_summary{block=root;after=None},summary)) |> only in
   let status_intent=R.worker_intent runtime status fixture.session |> Result.get_ok in
-  require(R.bind_mutation runtime status ~presentation:fixture.presentation ~intent:status_intent)
+  require(Result.is_ok (R.bind_mutation runtime status ~presentation:fixture.presentation ~intent:status_intent))
     "status continuation did not bind";
   ignore(R.receive_mutation runtime status F.W.Outcome_unknown);
   let command=Journal_capture.pending_command capture |> Option.get in
@@ -4779,7 +4779,7 @@ let test_capture_retained_attempt_survives_runtime_reset () =
   let _,_,projection,session=Coordination_test_fixture.fixture 5520L in
   let presentation=Option.get(F.W.selected projection) in
   let intent=R.worker_intent runtime resumed session |> Result.get_ok in
-  require(R.bind_mutation runtime resumed ~presentation ~intent)
+  require(Result.is_ok (R.bind_mutation runtime resumed ~presentation ~intent))
     "fresh execution did not adopt its original logical operation"
 ;;
 
@@ -5053,7 +5053,7 @@ let test_child_rejected_status_rebound_canonical () =
   let parent,action=C.read_child rejected ~round:read_round(Option.get(C.canonical rejected)) in
   let applied,ack=F.applied fixture parent action in
   let index,round,intent=match ack with C.Acknowledge(i,r,intent,_)->i,r,intent|_->fail "status rejection lost ACK" in
-  let rebound=C.rebind_ack applied ~index ~round ~intent ~presentation:fixture.presentation |> Option.get in
+  let rebound=C.rebind_ack applied ~index ~round ~intent ~presentation:fixture.presentation |> Result.get_ok in
   let rejected,action=C.receive rebound ~index ~round(F.W.Rejected(Service_failed "Known status rejection")) in
   let round=match action with C.Read_child round->round|_->fail "rebound rejection lost canonical read" in
   let parent,action=C.read_child rejected ~round(Option.get(C.canonical rejected)) in
@@ -5099,10 +5099,10 @@ let test_child_chain_generated_traces ?(append=false) () =
           (match Hashtbl.find_opt frozen id with None->Hashtbl.add frozen id wire
            |Some previous->require(previous=wire) "one child intent acquired a different payload");
           let intent=C.stage_intent fixture.session (C.stage !state index) |> Result.get_ok in
-          state:=C.bind !state ~index ~round ~intent ~presentation:fixture.presentation |> Option.get;
-          require(C.bind !state ~index ~round ~intent ~presentation:foreign=None)
+          state:=C.bind !state ~index ~round ~intent ~presentation:fixture.presentation |> Result.get_ok;
+          require(Result.is_error (C.bind !state ~index ~round ~intent ~presentation:foreign))
             "foreign logical graph bound a child stage";
-          state:=C.bind !state ~index ~round ~intent ~presentation:fixture.presentation |> Option.get;
+          state:=C.bind !state ~index ~round ~intent ~presentation:fixture.presentation |> Result.get_ok;
           let progress=if n mod 5=0 then F.W.Outcome_unknown
             else if n mod 7=0 then F.W.Rejected(Service_failed "Generated noncommit")
             else fixture.confirm index intent fixture.presentation in
@@ -5382,7 +5382,7 @@ let () =
   require(wire=F.W.encode_durable_intent(F.W.Append_intent expected)) "initial Append did not freeze the resolved default";
   catalog status_b;
   require(F.W.encode_durable_intent(R.worker_intent runtime request fixture.session |> Result.get_ok)=wire) "catalog update replaced the planned atomic payload";
-  require(R.bind_mutation runtime request ~presentation:fixture.presentation ~intent)
+  require(Result.is_ok (R.bind_mutation runtime request ~presentation:fixture.presentation ~intent))
     "catalog update re-resolved and rejected the already frozen default"
 ;;
 
@@ -5428,7 +5428,7 @@ let test_insertion_recovers_without_user_retry () =
     require(snapshot=Marshal.to_string state []) "background recovery mutated its input";
     let same,late=C.receive next ~index ~round F.W.Outcome_unknown in
     require(same==next && late=C.Ignore) "late original completion restarted recovery";
-    let next=C.bind next ~index:i ~round:r ~intent ~presentation:fixture.presentation |> Option.get in
+    let next=C.bind next ~index:i ~round:r ~intent ~presentation:fixture.presentation |> Result.get_ok in
     let _,again=C.receive next ~index:i ~round:r F.W.Outcome_unknown in
     require(match again with C.Wait _->true|_->false) "persistent local error entered an automatic loop";
     let confirmed,parent=F.confirm fixture next action in

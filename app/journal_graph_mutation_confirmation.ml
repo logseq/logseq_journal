@@ -345,12 +345,13 @@ module Pure_insertion = struct
       let current=stage t index in
       let same_origin=Option.fold ~none:true ~some:(fun previous->Worker.same_logical_graph
         previous (Worker.presentation_session presentation)) t.origin in
-      if not same_origin then None else
+      if not same_origin then Error (Worker.Invalid_input "The child presentation belongs to another logical graph.") else
       (match stage_intent (Worker.presentation_session presentation) current with
+       | Error error -> Error error
        | Ok expected when Worker.encode_durable_intent expected=Worker.encode_durable_intent intent ->
-         Some{(replace_stage t index {current with payload=Bound(intent,presentation);acknowledged=false}) with current=Some presentation;origin=Some(Worker.presentation_session presentation)}
-       | _ -> None)
-    | _ -> None
+         Ok {(replace_stage t index {current with payload=Bound(intent,presentation);acknowledged=false}) with current=Some presentation;origin=Some(Worker.presentation_session presentation)}
+       | Ok _ -> Error (Worker.Invalid_input "The child intent does not match its admitted payload."))
+    | _ -> Error (Worker.Invalid_input "The child attempt no longer owns this stage and round.")
   let exact_child t (summary:Worker.block_summary) =
     match summary.lookup,summary.page with
     | Worker_pure_data.V2_present_block {value;_},Some(Worker_pure_data.V2_present_page {page;_}) ->
@@ -512,7 +513,7 @@ module Pure_insertion = struct
     match t.phase with
     | Acknowledging expected when expected=index && round=t.round ->
       bind {t with phase=Writing index;applied=None} ~index ~round ~intent ~presentation
-    | _ -> None
+    | _ -> Error (Worker.Invalid_input "The child acknowledgement no longer owns this stage and round.")
 
   let resolved_status t = t.desired.resolved
   let interrupted t ~index ~round message = match t.phase with
