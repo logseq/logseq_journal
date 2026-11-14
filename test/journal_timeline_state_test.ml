@@ -747,6 +747,37 @@ let test_terminal_day_failure_and_listener_supersession () =
     (Timeline.next_request failed = None)
     "ordinary failure automatically started recovery";
   let recovering = stale_day state 2L |> fun state -> begin_next state 3L in
+  List.iter
+    (fun (label, update) ->
+       let changed = update recovering in
+       require
+         (Timeline.pending_request changed = None)
+         "%s retained superseded recovery ownership" label;
+       require
+         (Timeline.next_request changed = Some (Day { day = 20260809; after = None }))
+         "%s stranded local recovery" label;
+       require
+         (Timeline.day_error changed ~day:20260809 = None)
+         "%s exposed normal local invalidation as a retry error" label;
+       let late =
+         Timeline.apply_timeline_entry_page changed ~generation:3L (timeline_page [ block 9 ])
+       in
+       require_equal_string_list (slot_keys late) (slot_keys changed)
+         (label ^ " accepted a superseded recovery completion"))
+    [ "entry update", (fun state ->
+        Timeline.replace_timeline_entry state (entry (block ~source:"Live update" 1)))
+    ; "capture", (fun state ->
+        Timeline.prepend_timeline_entry state (entry (block ~order:"0" 2)))
+    ; "delete", (fun state -> Timeline.remove_block state ~block_id:(id "block" 1))
+    ];
+  let deleted = Timeline.remove_block recovering ~block_id:(id "block" 1) in
+  let deleted = begin_next deleted 4L in
+  let deleted =
+    Timeline.apply_timeline_entry_page deleted ~generation:4L (timeline_page [])
+  in
+  require
+    (Timeline.day_error deleted ~day:20260809 = None)
+    "deleting the last visible entry made a retained journal unavailable";
   let changed = Timeline.replace_block recovering (block ~source:"Live update" 1) in
   require
     (Timeline.pending_request changed = None)
@@ -758,6 +789,26 @@ let test_terminal_day_failure_and_listener_supersession () =
     (slot_keys late)
     (slot_keys changed)
     "late recovery overwrote a listener update";
+  require
+    (Timeline.next_request late = Some (Day { day = 20260809; after = None }))
+    "listener update stranded local pagination instead of restarting recovery";
+  require
+    (Timeline.day_error late ~day:20260809 = None)
+    "normal listener invalidation became a user retry error";
+  let restarted = begin_next late 4L in
+  let completed =
+    Timeline.apply_timeline_entry_page
+      restarted
+      ~generation:4L
+      (timeline_page [ block ~source:"Live update" 1; block ~order:"z" 2 ])
+  in
+  require
+    (Timeline.next_request completed = None)
+    "listener recovery did not finish";
+  require
+    (Option.map Journal_model.source (Timeline.find_block completed ~block_id:(id "block" 1))
+     = Some "Live update")
+    "listener recovery lost the current entry";
   let fresh_graph = Timeline.empty ~today:20260809 in
   let late_graph =
     Timeline.apply_timeline_entry_page

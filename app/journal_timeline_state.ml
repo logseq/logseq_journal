@@ -441,11 +441,7 @@ let retry_day (state : t) ~day =
 
 let invalidate_recovery_for_day (state : t) day =
   match state.recovery with
-  | Some recovery when recovery.day = day ->
-    terminal_day_failure
-      state
-      ~day
-      "Journal entries changed while reloading. Retry to continue."
+  | Some recovery when recovery.day = day -> start_recovery state ~day
   | _ -> state
 ;;
 
@@ -1509,7 +1505,7 @@ let apply_timeline_entry_page
       terminal_day_failure
         state
         ~day:recovery.day
-        "Unable to reload this journal within the loading limit. Retry to continue."
+        "Unable to reload this journal within the loading limit."
     else if not complete
     then
       { state with
@@ -1518,18 +1514,7 @@ let apply_timeline_entry_page
       }
     else (
       let owner_page =
-        Rrbvec.find_map
-          (function
-            | Day_heading page when page.Journal_graph_projection.day = recovery.day ->
-              Some page
-            | Top_level entry when Journal_model.journal_day entry.block = recovery.day ->
-              Some
-                { Journal_graph_projection.id = Journal_model.page_id entry.block
-                ; day = recovery.day
-                ; title = ""
-                }
-            | _ -> None)
-          state.slots
+        Option.map (fun knowledge -> knowledge.page) (Days.find_opt recovery.day state.days)
       in
       match owner_page with
       | None ->
