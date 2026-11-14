@@ -79,8 +79,11 @@ let integrity_counters =
   ]
 ;;
 
+let exceptions = [ "invalid-argument"; "failure"; "not-found"; "other" ]
+
 let integrity_descriptors =
-  [ "outboxState", [ "queued"; "submitted"; "accepted"; "stale-rejected"; "blocked" ]
+  [ "exception", exceptions
+  ; "outboxState", [ "queued"; "submitted"; "accepted"; "stale-rejected"; "blocked" ]
   ; ( "mutation"
     , [ "save-block"
       ; "insert-blocks"
@@ -146,8 +149,6 @@ let kinds =
   ; "unknown"
   ]
 ;;
-
-let exceptions = [ "invalid-argument"; "failure"; "not-found"; "other" ]
 
 let counter_keys =
   [ "transaction"; "operationIndex"; "operationCount"; "lookupRefs"; "arity" ]
