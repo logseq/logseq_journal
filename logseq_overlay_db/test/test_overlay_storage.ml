@@ -2093,6 +2093,90 @@ let outbox_persistence_failure_is_atomic () =
         ignore (Database.close database))))
 ;;
 
+let receipt_writer_schema_failure_is_atomic () =
+  let behavior = "receipt writer schema failure is atomic" in
+  T.with_temp_directory "overlay-receipt-writer-failure-" (fun support ->
+    let database_path = T.seed_mirror support in
+    let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database_path in
+    Fun.protect
+      ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+      (fun () ->
+         Sqlite3.Rc.check (Sqlite3.exec sqlite
+           "CREATE TABLE overlay_terminal_batch_receipts (batch_key TEXT PRIMARY KEY)"));
+    let dependencies, _location, inspection = location_and_inspection support behavior in
+    Eio_main.run (fun _environment ->
+      Eio.Switch.run (fun sw ->
+        let database = Database.open_ ~sw dependencies inspection ~graph_name:"oracle-graph"
+          |> T.require_ok ~behavior in
+        Fun.protect
+          ~finally:(fun () -> ignore (Database.close database))
+          (fun () ->
+             let before = Database.current_snapshot database |> T.require_ok ~behavior in
+             let before_version = Database.snapshot_version before in
+             Database.release_snapshot before;
+             let before_sync = Database.inspect_sync database |> T.require_ok ~behavior in
+             let expected = T.insert_precondition database ~parent:T.page_uuid ~behavior in
+             let mutation = T.insert_blocks ~ordinal:411 () in
+             (match Database.commit_local database ~expected mutation with
+              | Error (Local_commit_persistence_failed message) ->
+                Alcotest.(check string) "receipt writer preserves the storage cause"
+                  "Sqlite3.Error(\"Sqlite3.prepare: table overlay_terminal_batch_receipts has no column named receipt\")"
+                  message
+              | Error _ -> Alcotest.fail "receipt writer returned the wrong commit error"
+              | Ok _ -> Alcotest.fail "receipt writer exposed a successful commit");
+             let after = Database.current_snapshot database |> T.require_ok ~behavior in
+             T.require (Projection_revision.equal before_version.projection_revision
+               (Database.snapshot_version after).projection_revision)
+               "receipt writer failure advanced projection revision";
+             (match Database.get_outline_blocks after [ T.block_uuid ] |> T.require_ok ~behavior with
+              | [ Missing_block _ ] -> ()
+              | _ -> Alcotest.fail "receipt writer failure exposed the pending block");
+             Database.release_snapshot after;
+             let after_sync = Database.inspect_sync database |> T.require_ok ~behavior in
+             T.require (sync_token_equal (sync_view_token before_sync) (sync_view_token after_sync))
+               "receipt writer failure advanced sync token";
+             T.require (sync_view_submissions after_sync = [])
+               "receipt writer failure exposed a submission";
+             let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database_path in
+             Fun.protect
+               ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+               (fun () ->
+                  Alcotest.(check int) "durable outbox rolled back" 0
+                    (List.length (Logseq_db_storage.Sync_outbox_store.read_database sqlite
+                      |> T.require_ok ~behavior));
+                  Alcotest.(check int) "durable mutation receipt rolled back" 0
+                    (List.length (Logseq_db_storage.Mutation_receipt_store.read_database sqlite
+                      |> T.require_ok ~behavior));
+                  Sqlite3.Rc.check (Sqlite3.exec sqlite "DROP TABLE overlay_terminal_batch_receipts");
+                  Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite
+                  |> T.require_ok ~behavior);
+             (match Database.commit_local database ~expected mutation |> T.require_ok ~behavior with
+              | Local_committed _ -> ()
+              | _ -> Alcotest.fail "same mutation retry retained a failed receipt")))))
+;;
+
+let receipt_writer_schema_errors_are_results () =
+  let module Store = Logseq_db_storage.Mutation_receipt_store in
+  let check_writer table key_column write =
+    List.iter (fun receipts ->
+      let sqlite = Sqlite3.db_open ":memory:" in
+      Fun.protect
+        ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+        (fun () ->
+           Sqlite3.Rc.check (Sqlite3.exec sqlite
+             ("CREATE TABLE " ^ table ^ " (" ^ key_column ^ " TEXT PRIMARY KEY)"));
+           match write sqlite receipts with
+           | Error message ->
+             Alcotest.(check string) "receipt writer preserves the prepare cause"
+               ("Sqlite3.Error(\"Sqlite3.prepare: table " ^ table ^ " has no column named receipt\")")
+               message
+           | Ok () -> Alcotest.fail "malformed receipt writer reported success"))
+      [ []; [ String.make 64 'a', "{}" ] ]
+  in
+  check_writer "overlay_mutation_receipts" "receipt_key" Store.upsert_mutations;
+  check_writer "overlay_terminal_batch_receipts" "batch_key" Store.upsert_terminal_batches
+;;
+
 let submit_persistence_failure_restores_queued_state () =
   let behavior = "submit persistence failure restores queued state" in
   T.with_temp_directory "overlay-submit-failure-" (fun support ->
@@ -3278,6 +3362,7 @@ let receipt_history_open_is_bounded () =
              let dependencies, _, inspection = location_and_inspection support behavior in
              Gc.compact ();
              let baseline = (Gc.stat ()).live_words in
+             let allocated_before = Gc.allocated_bytes () in
              let peak = ref baseline in
              let alarm =
                Gc.create_alarm (fun () -> peak := max !peak (Gc.stat ()).live_words)
@@ -3294,10 +3379,15 @@ let receipt_history_open_is_bounded () =
                     |> T.require_ok ~behavior
                   in
                   Database.close database |> T.require_ok ~behavior);
+             let allocated_bytes = Gc.allocated_bytes () -. allocated_before in
              let peak_bytes = 8 * (!peak - baseline) in
              Printf.printf
-               "receipt history rows=100000 peak_live_growth_bytes=%d\n%!"
-               peak_bytes;
+               "receipt history rows=100000 peak_live_growth_bytes=%d allocated_bytes=%.0f\n%!"
+               peak_bytes
+               allocated_bytes;
+             T.require
+               (allocated_bytes < 16. *. 1024. *. 1024.)
+               "opening decoded historical receipt payloads";
              T.require
                (peak_bytes < 4 * 1024 * 1024)
                "opening retained unbounded receipt history";
@@ -3319,17 +3409,31 @@ let receipt_history_open_is_bounded () =
                     (Sqlite3.exec
                        sqlite
                        ("UPDATE " ^ table ^ " SET receipt = '{}' WHERE rowid = 25000"));
-                  (match
-                     Database.open_
-                       ~sw
-                       dependencies
-                       (inspect_mirror support behavior)
-                       ~graph_name:"invalid-receipt"
-                   with
-                   | Error _ -> ()
-                   | Ok opened ->
-                     ignore (Database.close opened);
-                     Alcotest.fail "invalid receipt accepted");
+                  let opened =
+                    Database.open_
+                      ~sw
+                      dependencies
+                      (inspect_mirror support behavior)
+                      ~graph_name:"invalid-receipt"
+                    |> T.require_ok ~behavior
+                  in
+                  Fun.protect
+                    ~finally:(fun () -> Database.close opened |> T.require_ok ~behavior)
+                    (fun () ->
+                       if table = "overlay_mutation_receipts"
+                       then
+                         match
+                           Database.inspect_local_mutation
+                             opened
+                             (Save_block
+                                { mutation_id = T.uuid "10000000-0000-4000-8000-000000025000"
+                                ; block = T.authoritative_block_uuid
+                                ; title = "Must not replay a corrupt receipt"
+                                })
+                         with
+                         | Error (Local_commit_persistence_failed _) -> ()
+                         | Error _ -> Alcotest.fail "receipt lookup lost the storage cause"
+                         | Ok _ -> Alcotest.fail "corrupt receipt was treated as missing");
                   (match Database.collect_garbage (inspect_mirror support behavior) with
                    | Error _ -> ()
                    | Ok _ -> Alcotest.fail "garbage collection accepted invalid receipt");
@@ -3348,6 +3452,26 @@ let receipt_history_open_is_bounded () =
                        sqlite
                        ("DELETE FROM " ^ table ^ " WHERE rowid = 25000")))
                [ "overlay_mutation_receipts"; "overlay_terminal_batch_receipts" ]))))
+;;
+
+let receipt_lookup_schema_errors_are_results () =
+  let module Store = Logseq_db_storage.Mutation_receipt_store in
+  let check_lookup table key_column read =
+    let sqlite = Sqlite3.db_open ":memory:" in
+    Fun.protect
+      ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+      (fun () ->
+         Sqlite3.Rc.check
+           (Sqlite3.exec sqlite ("CREATE TABLE " ^ table ^ " (" ^ key_column ^ " TEXT PRIMARY KEY)"));
+         match read sqlite (String.make 64 'a') with
+         | Error message ->
+           Alcotest.(check string) "missing receipt column cause is preserved"
+             "Sqlite3.Error(\"Sqlite3.prepare: no such column: receipt\")"
+             message
+         | Ok _ -> Alcotest.fail "malformed receipt table was treated as an absent key")
+  in
+  check_lookup "overlay_mutation_receipts" "receipt_key" Store.read_mutation;
+  check_lookup "overlay_terminal_batch_receipts" "batch_key" Store.read_terminal_batch
 ;;
 
 let sqlite_full_int64_checkpoint () =
@@ -3615,7 +3739,11 @@ let () =
             pre_uuid_status_outbox_preserves_identity
         ] )
     ; ( "receipt history"
-      , [ Alcotest.test_case "bounded opening and fail-closed validation" `Quick receipt_history_open_is_bounded ] )
+      , [ Alcotest.test_case "bounded opening and fail-closed validation" `Quick receipt_history_open_is_bounded
+        ; Alcotest.test_case "writer schema failure is atomic" `Quick receipt_writer_schema_failure_is_atomic
+        ; Alcotest.test_case "writer schema errors are results" `Quick receipt_writer_schema_errors_are_results
+        ; Alcotest.test_case "lookup schema errors are results" `Quick receipt_lookup_schema_errors_are_results
+        ] )
     ; ( "cursor checkpoint"
       , [ Alcotest.test_case
             "submit interval overflow is rejected"
