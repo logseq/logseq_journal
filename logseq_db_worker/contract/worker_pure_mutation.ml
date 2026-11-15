@@ -210,6 +210,7 @@ type commit =
   ; after : string
   }
 type outcome = Committed of commit | Rejected of Error.t | Unknown
+  | Unknown_with_cause of Logseq_db_types.Failure_diagnostic.t
 type recovery_item={intent:durable_intent;outcome:outcome}
 type recovery_page={items:recovery_item Rrbvec.t;next:int64 option}
 type original_point={generation:string;before:string;after:string}
@@ -221,6 +222,7 @@ let commit_bytes value=String.length(Yojson.Safe.to_string(commit_json value))
 let maximum_recovery_bytes=2*Data.maximum_request_bytes + Data.maximum_response_bytes + 4096
 let recovery_page_bytes page=
   let outcome=function Unknown->`List[`String "Unknown"]
+    |Unknown_with_cause cause->`List[`String "Unknown_with_cause";`String(Logseq_db_types.Failure_diagnostic.encode cause)]
     |Committed proof->`List[`String "Committed";commit_json proof]
     |Rejected error->`List[`String "Rejected";Error.to_yojson error]in
   let item row=`Assoc["intent",`String(encode row.intent);"outcome",outcome row.outcome]in

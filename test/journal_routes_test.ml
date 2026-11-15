@@ -5594,6 +5594,26 @@ let test_insertion_delayed_recovery_tokens () =
 ;;
 let ()=test_insertion_delayed_recovery_tokens()
 
+let test_unknown_cause_remains_bound_to_child_stage () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let module D=Logseq_db_types.Failure_diagnostic in
+  let fixture=F.make() in
+  let bound,index,round,_=F.bind fixture fixture.initial fixture.action in
+  let detail=D.of_source ~operation:"commitLocal" ~reason:"persistenceFailed"
+    "SQLITE_CONSTRAINT_TRIGGER (1811)" in
+  let unknown=F.W.Outcome_unknown_with_cause detail in
+  let unchanged,ignored=C.receive bound ~index ~round:(Int64.succ round) unknown in
+  require (unchanged==bound && ignored=C.Ignore) "another round published a private failure cause";
+  let state,action=C.receive bound ~index ~round unknown in
+  let bound,index,round,_=F.bind fixture state action in
+  let state,wait=C.receive bound ~index ~round F.W.Outcome_unknown in
+  let carrier=match wait with C.Wait message->message | _->failwith "unknown stage did not retain its waiting state" in
+  require (Option.map D.source_class (D.decode carrier)=Some "sqlite-constraint-trigger-1811")
+    "generic recovery erased the request-bound structured cause";
+  require (C.failure state=None) "unknown cause fabricated a known rejection"
+;;
+let ()=test_unknown_cause_remains_bound_to_child_stage()
+
 let test_pending_capture_buffer_traces () =
   let module R=Root_state in
   let run actions =

@@ -28,7 +28,7 @@ let owners session presentation =
     "write_phases_and_interruption": """
 let phase = function
   | W.Rejected _ -> 0
-  | W.Outcome_unknown -> 1
+  | W.Outcome_unknown | W.Outcome_unknown_with_cause _ -> 1
   | W.Committed_pending_presentation _ -> 2
   | W.Confirmed _ -> 3
 let reply = function
@@ -336,7 +336,7 @@ POSITIVE.update({
     "operation_specific_mutation_outcomes": """
 let submitted (reply:W.submission_outcome W.reply) = match reply with
  |W.Answered(Ok(W.Submission_committed receipt))->Some receipt
- |W.Answered(Ok(W.Submission_rejected _ | W.Submission_unknown))
+ |W.Answered(Ok(W.Submission_rejected _ | W.Submission_unknown | W.Submission_unknown_with_cause _))
  |W.Answered(Error _) |W.Interrupted _ |W.Not_admitted _ -> None
 let confirmed (reply:W.confirmation W.reply) = match reply with
  |W.Answered(Ok proof)->Some(W.confirmation_receipt proof)

@@ -1,5 +1,8 @@
 let rc_result db rc =
-  if Sqlite3.Rc.is_success rc then Ok () else Error (Sqlite3.errmsg db)
+  if Sqlite3.Rc.is_success rc then Ok ()
+  else if Sqlite3.extended_errcode_int db = 1811
+  then Error "SQLITE_CONSTRAINT_TRIGGER (1811)"
+  else Error (Sqlite3.errmsg db)
 ;;
 
 type row =

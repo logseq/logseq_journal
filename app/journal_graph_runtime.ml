@@ -284,6 +284,7 @@ type durable_operation =
   ; confirm_readback : bool
   ; root_request : Graph.Uuid.t
   ; submission_recovered : bool
+  ; waiting_cause : Logseq_db_types.Failure_diagnostic.t option
   ; acknowledgement_recovered : Worker.presentation option
   ; acknowledgement_in_flight : bool
   }
@@ -2786,8 +2787,10 @@ let receive_delivery_body t ~origin ~request_id result =
         | Mutation_failed _ when not durable.confirm_readback ->true | _ -> false)output.responses in
       let responses=List.map(fun response->match response.payload with
         | Mutation_failed{mutation_id;block_id;failure;_} when durable.confirm_readback ->
-          {payload=Mutation_waiting{mutation_id;block_id;message=(match failure with
-            | Projection_failure message->message|Worker_failure value->Error.message value.error)}}
+          {payload=Mutation_waiting{mutation_id;block_id;message=(match durable.waiting_cause with
+            | Some cause->Logseq_db_types.Failure_diagnostic.encode cause
+            | None->match failure with
+              | Projection_failure message->message|Worker_failure value->Error.message value.error)}}
         | Delete_conflict{block;timeline_entry_update} when settled && durable.confirm_readback ->
           {payload=Mutation_settled(durable.intent,durable.presentation,Delete_reappeared{block;timeline_entry_update})}
         | (Block_updated _ | Block_removed _ | Update_conflict _ | Mutation_failed _ | Delete_conflict _ | Subtree_deleted _) as payload when settled ->
@@ -3031,7 +3034,7 @@ let bind_mutation t request ~presentation ~intent =
     let durable=match pending.durable with
       | Some durable -> {durable with intent;presentation;confirm_readback=true}
       | None -> {intent;presentation;confirm_readback=true;root_request=request;
-          submission_recovered=false;acknowledgement_recovered=None;acknowledgement_in_flight=false} in
+          submission_recovered=false;waiting_cause=None;acknowledgement_recovered=None;acknowledgement_in_flight=false} in
     let source_epoch=t.next_request in
     t.next_request<-Int64.succ t.next_request;
     Hashtbl.replace t.pending key {pending with durable=Some durable;source_epoch;planned=Stage};Ok ()
@@ -3085,6 +3088,14 @@ let claim_mutation_ack_recovery t intent ~presentation =
 ;;
 
 let mutation_waiting_unissued t (request:Graph.Uuid.t) message =
+  let message=match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request) with
+    | Some ({durable=Some durable;_} as pending) ->
+      let module D=Logseq_db_types.Failure_diagnostic in
+      let cause=match D.decode message with Some cause->Some cause|None->durable.waiting_cause in
+      Hashtbl.replace t.pending(Graph.Uuid.to_string request)
+        {pending with durable=Some{durable with waiting_cause=cause}};
+      Option.fold ~none:message ~some:D.encode cause
+    | _->message in
   match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request) with
   | Some {operation=(Child_chain _|Capture_chain _);_} ->
     child_step t request(fun chain->Child.interrupted chain ~index:0 ~round:1L message)
@@ -3167,6 +3178,8 @@ let receive_mutation t (request:Graph.Uuid.t) progress =
          Option.iter(fun pending->Hashtbl.replace t.pending key {pending with durable=Some durable})
            (Hashtbl.find_opt t.pending key))output.requests;
        {output with responses=List.map(fun value->{payload=Mutation_settled(durable.intent,durable.presentation,value.payload)})output.responses}
+     | Outcome_unknown_with_cause cause ->
+       mutation_waiting t request (Logseq_db_types.Failure_diagnostic.encode cause)
      | Confirmed _ | Outcome_unknown | Committed_pending_presentation _ ->
        mutation_waiting t request "The change is awaiting confirmation.")
   | _->empty

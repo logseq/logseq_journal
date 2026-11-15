@@ -109,6 +109,29 @@ let restart_and_identity () =
         (ok (S.read db ~namespace ~mutation_id:(uuid 1)) |> Option.get).evidence))
 ;;
 
+let outbox_trigger_retains_safe_sqlite_cause () =
+  let module Outbox = Logseq_db_storage.Sync_outbox_store in
+  let module Diagnostic = Logseq_db_types.Failure_diagnostic in
+  fixture (fun path ->
+    let db = Sqlite3.db_open path in
+    Fun.protect ~finally:(fun () -> ignore (Sqlite3.db_close db)) (fun () ->
+      ok (Outbox.initialize_database db);
+      Sqlite3.Rc.check (Sqlite3.exec db
+        "CREATE TRIGGER synthetic_rejection BEFORE INSERT ON sync_outbox BEGIN SELECT RAISE(ABORT,'MAIN acceptance physical outbox rejection private-title secret-key'); END");
+      let source = match Outbox.replace_database db ["synthetic record"] with
+        | Error source -> source
+        | Ok () -> Alcotest.fail "physical trigger did not reject outbox insert" in
+      let detail = Diagnostic.of_source ~operation:"commitLocal" ~reason:"persistenceFailed" source in
+      Alcotest.(check string) "SQLite extended trigger cause survives producer"
+        "sqlite-constraint-trigger-1811" (Diagnostic.source_class detail);
+      Alcotest.(check bool) "bounded safe carrier" true
+        (String.length (Diagnostic.encode detail) <= 1024);
+      Sqlite3.Rc.check (Sqlite3.exec db "DROP TRIGGER synthetic_rejection");
+      ok (Outbox.replace_database db ["synthetic record"]);
+      Alcotest.(check (list string)) "storage works after removing physical fault"
+        ["synthetic record"] (ok (Outbox.read_database db))))
+;;
+
 let atomic_outbox_transaction () =
   fixture (fun path ->
     with_db path (fun db ->
@@ -232,6 +255,7 @@ let () =
     [ ( "storage"
       , [ Alcotest.test_case "fresh reads are empty without schema writes" `Quick fresh_store_reads_are_empty_and_readonly
         ; Alcotest.test_case "restart and exact identity" `Quick restart_and_identity
+        ; Alcotest.test_case "SQLite trigger safe extended cause" `Quick outbox_trigger_retains_safe_sqlite_cause
         ; Alcotest.test_case "atomic outbox transaction" `Quick atomic_outbox_transaction
         ; Alcotest.test_case "bounded scoped recovery" `Quick paging_and_bounds
         ; Alcotest.test_case

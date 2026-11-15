@@ -325,7 +325,14 @@
     {ul
     {- [Submission_committed receipt] proves local durability, not current UI
        presentation or server acceptance.}
-    {- [Submission_unknown] retains the original immutable intent for recovery.}
+    {- [Submission_unknown] retains the original immutable intent for recovery.
+       [Submission_unknown_with_cause cause] and [Outcome_unknown_with_cause cause]
+       additionally retain an allowlisted, at-most-1024-byte diagnostic from that
+       exact request. The same owner/generation checks apply; a global latest
+       diagnostic must not supply another graph's cause. This remains unknown,
+       never rejection or rollback, and adds no local retry. Error info renders
+       the safe classification without raw exception text, journal fields, UUIDs
+       or credentials. Generic recovery must not erase a retained specific cause.}
     {- [Submission_rejected error] requires evidence that the intent did not apply.}}
 
     [Not_admitted] concerns this attempt only. After an earlier admitted attempt,

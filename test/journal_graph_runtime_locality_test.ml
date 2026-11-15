@@ -1451,6 +1451,7 @@ module Target_fixture = struct
     |Ok(W.Answered(Ok submission))->intent,(match submission with
       |W.Submission_rejected error->W.Rejected error
       |Submission_unknown->W.Outcome_unknown
+      |Submission_unknown_with_cause cause->W.Outcome_unknown_with_cause cause
       |Submission_committed receipt->W.Committed_pending_presentation receipt)
     |_->failwith "Original typed mutation proof was rejected"
 
@@ -6274,6 +6275,32 @@ let test_unknown_mutation_recovery_issues_original () =
       (Result.is_ok (Runtime.bind_mutation runtime resumed ~presentation ~intent:(W.Mutation_intent intent)))
 ;;
 
+let test_mutation_recovery_retains_cause () =
+  let module D=Logseq_db_types.Failure_diagnostic in
+  List.iter (fun (kind,continuation) ->
+    let runtime,_,request=prepare_unbound_mutation ~ordinary:(kind=Delete_conflict) kind in
+    let presentation=Option.get(W.selected Worker_producer.projection) in
+    let intent=Runtime.worker_intent runtime request Worker_producer.session |> Result.get_ok in
+    Runtime.bind_mutation runtime request ~presentation ~intent |> Result.get_ok;
+    let cause=D.create ~operation:"commitLocal" ~reason:"persistenceFailed"
+      ~source:"SQLITE_CONSTRAINT_TRIGGER (1811)" () in
+    let output=Runtime.receive_mutation runtime request (W.Outcome_unknown_with_cause cause) in
+    Alcotest.(check bool) "one original continuation" true (output.requests=[request]);
+    Runtime.bind_mutation runtime request ~presentation ~intent |> Result.get_ok;
+    let output=match continuation with
+      | `Legacy -> Runtime.receive_mutation runtime request W.Outcome_unknown
+      | `Interrupted -> Production_runtime.fail_request runtime request ~message:"The request was interrupted."
+      | `Coordination -> Production_runtime.fail_request runtime request ~message:"The coordinator is unavailable." in
+    Alcotest.(check int) "generic completion cannot add another retry" 0 (List.length output.requests);
+    match output.responses with
+    | [{Runtime.payload=Mutation_waiting{message;_}}] ->
+      Alcotest.(check (option string)) "request-bound cause survives generic recovery"
+        (Some(D.encode cause)) (Option.map D.encode (D.decode message))
+    | _ -> Alcotest.fail "ordinary mutation must retain its waiting outcome")
+    (List.concat_map (fun kind->List.map (fun continuation->kind,continuation)
+      [`Legacy;`Interrupted;`Coordination]) [Task_change;Delete_conflict])
+;;
+
 let child_identity_runtime () =
   let runtime=Runtime.create () in seed_children_interest runtime;set_calendar runtime;runtime
 ;;
@@ -9704,6 +9731,8 @@ let () =
             test_child_failure_retains_admitted_child
         ; Alcotest.test_case "Unknown mutation issues original continuation" `Quick
             test_unknown_mutation_recovery_issues_original
+        ; Alcotest.test_case "ordinary mutation recovery retains cause" `Quick
+            test_mutation_recovery_retains_cause
         ] )
     ; ( "mutation conversion"
       , [ Alcotest.test_case

@@ -454,12 +454,17 @@ module Pure_insertion = struct
          if current.creation
          then {next with failure=Some error;phase=Applying},Present t.round
          else {next with failure=Some error;phase=Canonical(index,false)},Read_child t.round
-       | Some _,(Worker.Outcome_unknown|Committed_pending_presentation _) ->
-         let outcome=match current.outcome with
-           | Some(Worker.Confirmed _|Committed_pending_presentation _) as known->known
+       | Some _,(Worker.Outcome_unknown|Outcome_unknown_with_cause _|Committed_pending_presentation _) ->
+         let outcome=match current.outcome,progress with
+           | (Some(Worker.Confirmed _|Committed_pending_presentation _) as known),_->known
+           | (Some(Worker.Outcome_unknown_with_cause _) as known),Worker.Outcome_unknown->known
            | _->Some progress in
          let next=replace_stage t index {current with outcome} in
-         recover next "The save could not be confirmed."
+         let message=match outcome with
+           | Some(Worker.Outcome_unknown_with_cause cause) ->
+             Logseq_db_types.Failure_diagnostic.encode cause
+           | _ -> "The save could not be confirmed." in
+         recover next message
        | _->t,Wait "The child confirmation does not match its bound operation.")
     | _->t,Ignore
   let read_child t ~round summary =
@@ -517,7 +522,11 @@ module Pure_insertion = struct
 
   let resolved_status t = t.desired.resolved
   let interrupted t ~index ~round message = match t.phase with
-    | Writing expected | Acknowledging expected when expected=index && t.round=round -> recover t message
+    | Writing expected | Acknowledging expected when expected=index && t.round=round ->
+      let message=match (stage t index).outcome with
+        | Some(Worker.Outcome_unknown_with_cause cause)->Logseq_db_types.Failure_diagnostic.encode cause
+        | _->message in
+      recover t message
     | _ -> t,Ignore
   let read_failed t ~round message =
     if t.round=round && (match t.phase with Parent|Canonical _|Writing _->true|_->false)
