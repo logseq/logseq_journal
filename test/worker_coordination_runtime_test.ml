@@ -4685,7 +4685,44 @@ let test_retired_query_has_correlated_response () =
       |Error(W.Protocol_mismatch _)->true|_->false) "revoked local issuer bypassed exact proof correlation")
 ;;
 
+let test_physical_outbox_failure_carries_unknown_reason () =
+  let module Wire = Logseq_db_worker_contract.Worker_pure_mutation in
+  let module Diagnostic = Logseq_db_types.Failure_diagnostic in
+  let path = ref "" in
+  let reject enabled = Test_support.set_physical_outbox_rejection !path ~enabled in
+  let prepare support =
+    path := Filename.concat support ("logseq-db-worker/synced-graphs/"
+      ^ W.Uuid.to_string Test_support.graph_uuid ^ "/db.sqlite") in
+  with_observation_service ~prepare (fun client ~call ~send:_ ~wait:_ ~replies:_ ~notices:_ ~baseline ~owner ~registration ->
+    reject true;
+    let request_id = uuid "9c000000-0000-4000-8000-000000006001" in
+    let revision = match call (query_request client !baseline owner registration request_id
+      (Read.Outline_block {uuid=Test_support.authoritative_block_uuid;revision=None})) with
+      | Mailbox.Completed (Service.Coordination_queried {answer=Read.Query_answer (_,Read.Outline_block _,Ok (Worker_pure_data.V2_present_block {revision;_}));_}) -> revision
+      | _ -> failwith "physical failure source read failed" in
+    let request = mutation_request client !baseline owner registration
+      ~request_id:(uuid "9c000000-0000-4000-8000-000000006002")
+      ~mutation_id:(uuid "9c000000-0000-4000-8000-000000006003")
+      (W.Save_block {block=Test_support.authoritative_block_uuid;title="Private synthetic title";
+        preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) in
+    (match call request with
+     | Mailbox.Completed (Service.Coordination_mutation_result {outcome=Wire.Unknown_with_cause detail;_}) ->
+       require (Diagnostic.source_class detail="sqlite-constraint-trigger-1811")
+         "physical SQLite trigger lost extended classification across actual worker";
+       let encoded=Diagnostic.encode detail in
+       require (String.length encoded<=1024) "unknown cause exceeded bound";
+       require (not (String.contains encoded '\n')) "unknown cause is not a bounded canonical carrier"
+     | _ -> failwith "physical failure must remain Unknown with its concrete safe cause");
+    reject false;
+    require (match call request with
+      | Mailbox.Completed (Service.Coordination_mutation_result {outcome=Wire.Committed _;_}) -> true
+      | _ -> false) "same immutable intent did not recover after physical fault removal")
+;;
+
 let () =
+  if Array.mem "--physical-outbox-cause-only" Sys.argv then (
+    test_physical_outbox_failure_carries_unknown_reason (); exit 0);
+  test_physical_outbox_failure_carries_unknown_reason ();
   if Array.mem "--typed-read-only" Sys.argv then (
     test_client_to_typed_read ();
     print_endline "Worker coordination real typed client/read passed (1 test)"; exit 0);

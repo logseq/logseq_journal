@@ -1,3 +1,23 @@
+(** {1 TLDR}
+
+    Define immutable, owner-bound mutation intents and their durable outcomes.
+    Constructors validate payloads; this module performs no I/O. Commitment is
+    distinct from presentation, and an unknown outcome proves neither rejection
+    nor rollback. [Unknown_with_cause] carries only a bounded allowlisted
+    diagnostic from the same operation, never arbitrary exception text.
+
+    {1 Minimal usage example}
+
+    The caller supplies its logical owner, stable [mutation_id] and [command].
+    It retains the constructed bytes across uncertain execution:
+    {[
+      match create_mutation ~origin ~user ~graph ~mutation_id command with
+      | Error message -> Error message
+      | Ok mutation -> Ok (encode (Mutation_intent mutation))
+    ]}
+
+    {1 Construction and validation} *)
+
 module Uuid = Graph_types.Uuid
 module Data = Worker_pure_data
 
@@ -66,6 +86,7 @@ val restore : origin:Uri.t -> user:string -> graph:Uuid.t -> string -> (durable_
 type commit=private
   {mutation_id:Uuid.t;status:Data.local_status;generation:string;before:string;after:string}
 type outcome=Committed of commit|Rejected of Error.t|Unknown
+  |Unknown_with_cause of Logseq_db_types.Failure_diagnostic.t
 type recovery_item={intent:durable_intent;outcome:outcome}
 type recovery_page={items:recovery_item Rrbvec.t;next:int64 option}
 type original_point=private{generation:string;before:string;after:string}

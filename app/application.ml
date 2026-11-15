@@ -1076,6 +1076,24 @@ let report_view_decode_error state source =
       "Native event shape is invalid"
 ;;
 
+let report_unknown_outcome state ~operation ~message =
+  let module D=Logseq_db_types.Failure_diagnostic in
+  let module E=Logseq_db_worker.Error in
+  match D.decode message with
+  | None -> report_ui_error state ~operation ~phase:"confirmation" ~message
+      ~recovery:"The original submission and attachments are retained."
+  | Some detail ->
+    let summary="The save could not be confirmed. " ^ D.message detail in
+    let origin=E.create_cause_or_fallback ~component:Storage
+      ~operation:(D.operation detail) ~code:(Some(D.source_class detail))
+      ~message:(D.message detail) ~fallback_message:"The local mutation outcome is unknown." in
+    let error=E.create_with_origin ~code:Storage_busy ~message:summary
+      ~details:[E.{name=D.detail_name;value=Detail_string(D.encode detail)}] ~origin
+      |> Result.get_ok in
+    record_worker_error state ~operation ~phase:"confirmation"
+      ~recovery:"The original submission and attachments are retained." error
+;;
+
 let graph_lifecycle_owns_publication error =
   let trace = Logseq_db_worker.Error.trace error in
   not (String.equal trace.origin.operation "terminalStorageFailure")
@@ -1212,8 +1230,7 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
       capture_error=Some(Local_capture_failure message);capture_error_owner=Some Timeline_composer}
   | Capture_waiting{command;message}->
     if not(owns_capture state command) then state else
-    let state=report_ui_error state ~operation:"appendJournal" ~phase:"confirmation" ~message
-      ~recovery:"The original submission and attachments are retained."in
+    let state=report_unknown_outcome state ~operation:"appendJournal" ~message in
     {state with direct_capture=Option.map Journal_capture.await_confirmation state.direct_capture;
       capture_error=None;capture_error_owner=None}
   | Capture_projection_settled{command;result;failure;insert_rejected;_}->
@@ -1245,8 +1262,7 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
     {state with routes=Journal_routes.release_rejected_child state.routes ~command ~message}
   | Child_waiting{command;message}->
     if Journal_routes.has_child_request state.routes command then
-      let state=report_ui_error state ~operation:"insertChild" ~phase:"confirmation" ~message
-        ~recovery:"The original submission and attachments are retained."in
+      let state=report_unknown_outcome state ~operation:"insertChild" ~message in
       {state with routes=Journal_routes.await_child_confirmation state.routes ~block_id:command.block_id}
     else state
   | Child_projection_settled{command;result;failure;insert_rejected;_}->
@@ -1275,9 +1291,17 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
   | Mutation_waiting{mutation_id;block_id;message}->
     (match state.pending_status with
      | Some pending when pending.mutation_id=mutation_id && pending.block_id=block_id ->
+       let state=report_unknown_outcome state ~operation:"setTaskStatus" ~message in
+       let message=Option.fold ~none:message
+         ~some:(fun detail->"The change could not be confirmed. " ^ Logseq_db_types.Failure_diagnostic.message detail)
+         (Logseq_db_types.Failure_diagnostic.decode message) in
        {state with timeline_notice=Some(Status_pending message)}
      | _->(match state.pending_delete with
        | Some pending when pending.mutation_id=mutation_id && pending.block_id=block_id ->
+         let state=report_unknown_outcome state ~operation:"deleteSubtree" ~message in
+         let message=Option.fold ~none:message
+           ~some:(fun detail->"The change could not be confirmed. " ^ Logseq_db_types.Failure_diagnostic.message detail)
+           (Logseq_db_types.Failure_diagnostic.decode message) in
          {state with timeline_notice=Some(Delete_pending message)}
        | _->state))
   | Projection_changes _ | Projection_resync -> state
@@ -4267,6 +4291,7 @@ let start
       Coordination_host.watch host ticket ~f:(fun reply->f(map_reply(function
         |Wc.Submission_rejected error->Wc.Rejected error
         |Submission_unknown->Wc.Outcome_unknown
+        |Submission_unknown_with_cause cause->Wc.Outcome_unknown_with_cause cause
         |Submission_committed receipt->Wc.Committed_pending_presentation receipt)reply))
     |Confirmation_ticket ticket->
       Coordination_host.watch host ticket ~f:(fun reply->f(map_reply(fun confirmation->Wc.Confirmed confirmation)reply))
