@@ -324,7 +324,7 @@ let fail t ~message =
       phase = Failed message
     ; retry_identity_locked = true
     }
-  | None when t.submitted_source<>None->{t with phase=Failed message;retry_identity_locked=true}
+  | None when t.submitted_source<>None || t.retry_identity_locked->{t with phase=Failed message;retry_identity_locked=true}
   | None -> t
 ;;
 

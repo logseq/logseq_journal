@@ -390,7 +390,7 @@ let view_impl
          and sync_error = presentation.sync_error in
          V.column
            ~spacing:4.
-           [ (if sync_phase = Some Graph_service.Connecting
+           [ (if context = Context.Favorites && sync_phase = Some Graph_service.Connecting
               then
                 V.loading ~message:"Connecting" ()
                 |> test_id "journal-header-sync-progress"
@@ -405,11 +405,8 @@ let view_impl
          |> V.padding ~insets:(Ui.Layout.Edge_insets.all 8.))
   in
   let body =
-    match context with
-    | Context.Journals -> body
-    | Favorites ->
       let visible presentation =
-        presentation.sync_phase = Some Graph_service.Connecting
+        (context = Context.Favorites && presentation.sync_phase = Some Graph_service.Connecting)
         || Option.is_some presentation.sync_error
       in
       let wrap ?visible_signal () =
@@ -432,6 +429,7 @@ let view_impl
       ~key
       ~props_for:(fun presentation ->
         props ~mode:"page" ?title:(match context with Journals -> None | Favorites -> Some "Favorites")
+          ?message:presentation.sync_error
           ~connecting:(sync_active presentation.sync_phase)
           ~controls:(controls presentation) ()) (* Keep absent slots mounted so the native child indexes stay stable. *)
       ~children:

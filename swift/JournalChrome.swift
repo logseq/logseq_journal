@@ -804,7 +804,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .toolbarBackground(.hidden, for: .navigationBar)
           #endif
           .overlay(alignment: .topTrailing) {
-            if properties.title == nil {
+            if properties.title == nil && properties.message == nil {
               controls.padding(.trailing, 16)
             }
           }
@@ -828,6 +828,12 @@ struct JournalSheetDismissButton: SwiftUI.View {
               .padding(.horizontal, 16)
               // The native bar participates in the soft scroll edge, keeping
               // content visible beneath the title without another material.
+            } else if properties.message != nil {
+              HStack {
+                Spacer(minLength: 0)
+                controls
+              }
+              .padding(.horizontal, 16)
             }
           }
       }

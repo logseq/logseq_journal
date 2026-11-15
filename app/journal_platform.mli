@@ -1,3 +1,19 @@
+(** {1 TLDR}
+    Typed native platform envelopes and account-scoped restart draft storage.
+    Platform replies are validated before use; draft storage never restores
+    execution sessions or mutation authority.
+
+    {1 Minimal usage example}
+    Caller-provided [directory] is the configured application support directory:
+    {[
+      let store = Draft_store.create ~directory ~binding in
+      match Draft_store.load store with
+      | Ok drafts -> install_drafts drafts
+      | Error cause -> report_draft_failure cause
+    ]}
+
+    {1 Platform capabilities} *)
+
 type network_lifecycle =
   | Backgrounded of { generation : int64 }
   | Foreground_resumed of { generation : int64 }
@@ -48,3 +64,58 @@ val scoped_online_cancelled_request : Logseq_db_worker_lui.Logseq_db_worker_lui_
 val scoped_timeline_presented_request : Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope -> bytes
 val decode_online_event : bytes -> (bool * Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope, string) result
 val decode_authenticated_scope : bytes -> (Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope, string) result
+
+(** {1 Restart draft lifecycle}
+    At most 128 drafts, 256 attachments, 256 KiB per text, 2 MiB metadata and 128 MiB media
+    per account. Media is copied into private owned storage (32 MiB per file).
+    Before manifest rename, failed saves preserve the last complete snapshot.
+    Rename publishes the replacement; directory synchronization confirms its
+    restart durability. A synchronization error after publication is explicitly
+    reported as an unknown durable outcome, not a rollback, and must prevent
+    mutation dispatch. Old media is retained in that case. After confirmed
+    publication, orphan cleanup is best-effort and cannot turn success into an
+    error; a later save retries cleanup. Save/discard replace the snapshot;
+    [clear] removes only this account's owned files. Caller serializes operations
+    and reports errors. Recovered interrupted saves remain locked. *)
+module Draft_store : sig
+  type t
+  type draft = { graph : string; parent : string option; capture : Journal_capture.t }
+  val create : directory:string -> binding:local_account_binding -> t
+  (** A successful manifest commit remains [Ok ()] if orphan cleanup fails.
+      [on_cleanup_warning] receives the cleanup cause, independently of commit
+      success; by default it is written to stderr. The writer retries outstanding
+      cleanup once per later snapshot, including unchanged snapshots. *)
+  val save : ?on_cleanup_warning:(string -> unit) -> t -> draft list -> (unit, string) result
+  val load : t -> (draft list, string) result
+  val clear : t -> (unit, string) result
+
+  (** Fault injection at the manifest directory-sync syscall boundary; all
+      publication, media ownership and error handling remain production code. *)
+  module For_testing : sig
+    val with_directory_sync : t -> (string -> unit) -> t
+  end
+
+  (** {2 Serial asynchronous snapshots}
+      A single application-thread producer owns each writer. It retains at most
+      one running snapshot, one latest pending snapshot and one last-successful
+      snapshot for unchanged-owner comparison; replacing pending work never
+      loses the latest revision. Snapshot thunks run on the writer
+      thread and must only read immutable retained state. They must not touch UI
+      signals. Keep attachment sources alive until [flush] or [close] completes.
+      Never call [save], [load], or [clear] concurrently with a writer for the
+      same store. [on_complete] runs on the writer thread.
+
+      [flush] waits for all snapshots enqueued before the call and reports the
+      latest saved revision's result. A submission must enqueue its locked
+      snapshot and successfully flush before dispatching any mutation. [close]
+      flushes and joins the thread even on failure; only then may account cleanup
+      run or staging sources be released. Closing is idempotent. *)
+  module Writer : sig
+    type store = t
+    type t
+    val create : ?on_complete:((unit, string) result -> unit) -> ?on_cleanup_warning:(string -> unit) -> store -> t
+    val enqueue : t -> (unit -> draft list) -> (unit, string) result
+    val flush : t -> (unit, string) result
+    val close : t -> (unit, string) result
+  end
+end

@@ -214,6 +214,25 @@ type retained_drafts =
   ; next_rank : int64
   }
 
+let recovery_captures retained =
+  Drafts.fold(fun _ draft latest->
+    match Drafts.find_opt draft.block_id latest with
+    |Some previous when previous.rank>=draft.rank->latest
+    |None|Some _->Drafts.add draft.block_id draft latest)retained.composers Drafts.empty
+  |> Drafts.bindings |> List.map(fun (block_id,draft)->
+    block_id,Journal_detail.retained_capture draft.composer)
+;;
+
+let recover_captures captures =
+  let composers=List.mapi(fun index (block_id,capture)->
+    let rank=Int64.of_int(index+1) in
+    "recovered-" ^ Int64.to_string rank,
+    {block_id;request_generation=0L;rank;composer=Journal_detail.recover_composer ~parent:block_id capture})captures
+    |> List.to_seq |> Drafts.of_seq in
+  {composers;next_editor_session=Int64.of_int(List.length captures+1);
+    next_rank=Int64.of_int(List.length captures+1)}
+;;
+
 let retained_attachments retained =
   Drafts.fold
     (fun _ draft items ->

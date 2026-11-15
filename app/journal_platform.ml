@@ -259,3 +259,282 @@ let decode_copy_text_response bytes =
   let* wire = decode_json "clipboard response" Json.copied_of_yojson payload in
   if wire.copied then Ok () else Error "Clipboard write was not acknowledged."
 ;;
+
+module Draft_store = struct
+  type t = { directory : string; binding : local_account_binding
+    ; directory_sync : (string -> unit) option
+    ; cleanup_pending : string list option ref }
+  type draft = { graph : string; parent : string option; capture : Journal_capture.t }
+
+  module Wire = struct
+    type asset = { name : string; title : string; kind : string } [@@deriving yojson]
+    type draft =
+      { graph : string; parent : string option; source : string; task : string option
+      ; interrupted : bool; assets : asset list }
+    [@@deriving yojson]
+    type snapshot = { version : int; origin : string; user : string; drafts : draft list }
+    [@@deriving yojson]
+  end
+
+  let create ~directory ~binding = {directory;binding;directory_sync=None;cleanup_pending=ref None}
+  module For_testing = struct
+    let with_directory_sync t synchronize = {t with directory_sync=Some synchronize}
+  end
+  let maximum_metadata = 2 * 1024 * 1024
+  let maximum_media = 128 * 1024 * 1024
+  let maximum_file = 32 * 1024 * 1024
+  let fail cause = invalid_arg cause
+  let protect operation =
+    try Ok(operation ()) with
+    | Invalid_argument cause -> Error cause
+    | Unix.Unix_error(cause,_,_) -> Error("Draft storage: " ^ Unix.error_message cause)
+    | Sys_error _ -> Error "Draft storage file access failed."
+    | Yojson.Json_error _ -> Error "Draft recovery metadata is malformed."
+    | End_of_file -> Error "Draft recovery file is truncated."
+
+  let parent t = Filename.concat t.directory "JournalDrafts-v1"
+  let directory t = Filename.concat (parent t)
+    (Digest.to_hex(Digest.string(t.binding.managed_sync_origin ^ "\000" ^ t.binding.user_id)))
+  let exists path = try ignore(Unix.lstat path);true with
+    | Unix.Unix_error(Unix.ENOENT,_,_) -> false
+  let private_directory path =
+    if not(exists path) then Unix.mkdir path 0o700;
+    let stat=Unix.lstat path in
+    if stat.st_kind<>Unix.S_DIR || stat.st_uid<>Unix.getuid() || stat.st_perm land 0o077<>0
+    then fail "Draft storage directory is not private."
+  let prepare t = private_directory(parent t);private_directory(directory t)
+  let regular path limit =
+    let stat=Unix.lstat path in
+    if stat.st_kind<>Unix.S_REG || stat.st_uid<>Unix.getuid() || stat.st_size>limit
+    then fail "Draft recovery file is unsafe or exceeds its size limit.";
+    stat.st_size
+  let media_name name =
+    String.length name=38 && String.ends_with ~suffix:".media" name
+    && String.for_all(fun character->match character with '0'..'9'|'a'..'f'->true|_->false)
+      (String.sub name 0 32)
+  let owned name = name="state.json" || media_name name
+    || String.starts_with ~prefix:"pending-" name
+  let sync_directory path =
+    let descriptor=Unix.openfile path [Unix.O_RDONLY] 0 in
+    Fun.protect ~finally:(fun()->Unix.close descriptor)(fun()->Unix.fsync descriptor)
+  let atomic ?(committed=fun()->()) ?(synchronize=sync_directory) path write =
+    let temporary,channel=Filename.open_temp_file ~temp_dir:(Filename.dirname path)
+      ~mode:[Open_binary] "pending-" ".tmp" in
+    Fun.protect ~finally:(fun()->close_out_noerr channel;
+      if exists temporary then Unix.unlink temporary) (fun()->
+      Unix.chmod temporary 0o600;
+      write channel;
+      flush channel;Unix.fsync(Unix.descr_of_out_channel channel);close_out channel;
+      Unix.rename temporary path;committed();synchronize(Filename.dirname path))
+  let read path limit =
+    let size=regular path limit in
+    let channel=open_in_bin path in
+    Fun.protect ~finally:(fun()->close_in_noerr channel)(fun()->
+      if (Unix.fstat(Unix.descr_of_in_channel channel)).st_size<>size
+      then fail "Draft recovery file changed while reading.";
+      really_input_string channel size)
+  let copy source destination =
+    ignore(regular source maximum_file);
+    let channel=open_in_bin source in
+    Fun.protect ~finally:(fun()->close_in_noerr channel)(fun()->
+      atomic destination (fun output->
+        let buffer=Bytes.create 65536 in
+        let rec loop total =
+          let count=input channel buffer 0 (Bytes.length buffer) in
+          if total+count>maximum_file then fail "Draft attachment exceeds 32 MiB.";
+          if count>0 then (output_bytes output (Bytes.sub buffer 0 count);loop(total+count)) in
+        loop 0))
+  let uuid text = Result.is_ok(Logseq_db_types.Graph_types.Uuid.of_string text)
+  let validate drafts =
+    if List.length drafts>128 then fail "Draft recovery exceeds 128 drafts.";
+    let keys=Hashtbl.create 128 in
+    let media_count=ref 0 in
+    List.iter(fun (draft:Wire.draft)->
+      if not(uuid draft.graph) || not(Option.fold ~none:true ~some:uuid draft.parent)
+      then fail "Draft recovery graph or parent identity is invalid.";
+      media_count:= !media_count+List.length draft.assets;
+      if !media_count>256 then fail "Draft recovery exceeds 256 attachments.";
+      let key=draft.graph,draft.parent in
+      if Hashtbl.mem keys key then fail "Draft recovery contains duplicate owners.";
+      Hashtbl.add keys key ();
+      if String.length draft.source>256*1024 || List.length draft.assets>Journal_capture.attachment_limit
+      then fail "Draft text or attachment count exceeds its recovery limit.";
+      Option.iter(fun task->if task<>"default" && not(uuid task)
+        then fail "Draft task identity is invalid.")draft.task;
+      List.iter(fun(asset:Wire.asset)->
+        if not(media_name asset.name) || String.length asset.title>4096 || String.length asset.kind>256
+        then fail "Draft attachment metadata is invalid.")draft.assets)drafts
+  let snapshot t drafts = Wire.{version=1;origin=t.binding.managed_sync_origin;user=t.binding.user_id;drafts}
+  let read_snapshot t =
+    let path=Filename.concat(directory t)"state.json" in
+    if not(exists path) then [] else
+    let json=read path maximum_metadata |> Yojson.Safe.from_string in
+    let wire=match Logseq_db_types.Json_codec.decode Wire.snapshot_of_yojson json with
+      | Ok value->value | Error _->fail "Draft recovery metadata is invalid." in
+    if wire.version<>1 then fail "Draft recovery version is unsupported.";
+    if wire.origin<>t.binding.managed_sync_origin || wire.user<>t.binding.user_id
+    then fail "Draft recovery account binding does not match.";
+    validate wire.drafts;wire.drafts
+  let entries path =
+    let handle=Unix.opendir path in
+    Fun.protect ~finally:(fun()->Unix.closedir handle)(fun()->
+      let rec loop count names =
+        match Unix.readdir handle with
+        |"."|".."->loop count names
+        |name->if count>=768 then fail "Draft storage exceeds its file count limit.";
+          loop(count+1)(name::names)
+        |exception End_of_file->names in
+      loop 0 [])
+  let sweep t keep =
+    List.iter(fun name->
+      if not(owned name) then fail "Draft storage contains an unexpected file.";
+      if name<>"state.json" && not(List.mem name keep) then (
+        let path=Filename.concat(directory t)name in
+        ignore(regular path maximum_file);Unix.unlink path)) (entries(directory t))
+  let clear t = protect(fun()->
+    if exists(directory t) then (
+      private_directory(parent t);private_directory(directory t);
+      let names=entries(directory t) in
+      List.iter(fun name->if not(owned name) then fail "Draft storage contains an unexpected file.";
+        ignore(regular(Filename.concat(directory t)name)(max maximum_file maximum_metadata)))names;
+      List.iter(fun name->Unix.unlink(Filename.concat(directory t)name))names;
+      Unix.rmdir(directory t);sync_directory(parent t)))
+  let report_cleanup_warning cause =
+    Printf.eprintf "journal: draft committed; cleanup pending: %s\n%!" cause
+  let retry_cleanup t on_cleanup_warning =
+    match !(t.cleanup_pending) with
+    |None->()
+    |Some keep->
+      (match protect(fun()->sweep t keep) with
+      |Ok()->t.cleanup_pending:=None
+      |Error cause->
+        let warning="Draft saved, but cleanup is pending: " ^ cause in
+        (try on_cleanup_warning warning with _->report_cleanup_warning warning))
+  let save ?(on_cleanup_warning=report_cleanup_warning) t drafts = protect(fun()->
+    prepare t;
+    let copies=ref [] in
+    let wire=List.map(fun (draft:draft)->
+      let capture=draft.capture in
+      let assets=List.map(fun staged->
+        let name=Digest.to_hex(Digest.string(Journal_asset_import.staged_token staged)) ^ ".media" in
+        copies:=(Journal_asset_import.staged_path staged,name)::!copies;
+        Wire.{name;title=Journal_asset_import.staged_title staged;kind=Journal_asset_import.staged_type staged})
+        (Journal_capture.pending_attachments capture) in
+      let task=match Journal_capture.task_state capture with
+        |Journal_model.No_status->None |Default_status->Some "default"
+        |Status id->Some id |Invalid_status _->fail "Draft task status is invalid." in
+      Wire.{graph=draft.graph;parent=draft.parent;source=Journal_capture.source capture;task;
+        interrupted=Journal_capture.retry_identity_locked capture || Journal_capture.phase capture=Saving;assets})drafts in
+    validate wire;
+    let encoded=Yojson.Safe.to_string(Wire.snapshot_to_yojson(snapshot t wire)) in
+    if String.length encoded>maximum_metadata then fail "Draft metadata exceeds 2 MiB.";
+    let copies=List.sort_uniq(fun (_,left) (_,right)->String.compare left right)!copies in
+    let total=List.fold_left(fun total (source,name)->
+      let destination=Filename.concat(directory t)name in
+      let size=regular (if exists destination then destination else source) maximum_file in
+      if total+size>maximum_media then fail "Draft attachments exceed 128 MiB.";total+size)0 copies in
+    ignore total;
+    let created=ref [] in
+    let published=ref false in
+    (try
+      List.iter(fun(source,name)->let destination=Filename.concat(directory t)name in
+        if not(exists destination) then (created:=destination::!created;copy source destination))copies;
+      atomic ~committed:(fun()->published:=true)
+        ~synchronize:(Option.value t.directory_sync ~default:sync_directory)
+        (Filename.concat(directory t)"state.json")
+        (fun channel->output_string channel encoded)
+    with error->
+      if !published then
+        fail "Draft manifest was published, but directory synchronization failed. Its restart durability is unknown; do not submit."
+      else (
+        List.iter(fun path->if exists path then Unix.unlink path)!created;
+        raise error));
+    t.cleanup_pending:=Some(List.map snd copies);
+    retry_cleanup t on_cleanup_warning)
+  let fresh_uuid () =
+    let channel=open_in_bin "/dev/urandom" in
+    let bytes=Fun.protect ~finally:(fun()->close_in_noerr channel)(fun()->really_input_string channel 16) in
+    let hex=String.concat "" (List.init 16(fun index->Printf.sprintf "%02x" (Char.code bytes.[index]))) in
+    Printf.sprintf "%s-%s-4%s-8%s-%s" (String.sub hex 0 8)(String.sub hex 8 4)
+      (String.sub hex 13 3)(String.sub hex 17 3)(String.sub hex 20 12)
+  let load t = protect(fun()->
+    if not(exists(directory t)) then [] else (
+      private_directory(parent t);private_directory(directory t);
+      let drafts=read_snapshot t in
+      let total=ref 0 in
+      List.iter(fun (draft:Wire.draft)->List.iter(fun(asset:Wire.asset)->
+        total:= !total+regular(Filename.concat(directory t)asset.name)maximum_file;
+        if !total>maximum_media then fail "Draft attachments exceed 128 MiB.")draft.assets)drafts;
+      let staged_files=ref [] in
+      try List.mapi(fun index (draft:Wire.draft)->
+        let capture=Journal_capture.create ~session_number:(Int64.of_int(index+1)) ~source:draft.source in
+        let task=match draft.task with None->Journal_model.No_status
+          |Some "default"->Default_status |Some id->Status id in
+        let capture=Journal_capture.with_task_state capture task in
+        let capture=List.fold_left(fun capture(asset:Wire.asset)->
+          let temporary=Filename.temp_file "journal-import-recovered-" ".tmp" in
+          staged_files:=temporary::!staged_files;
+          copy(Filename.concat(directory t)asset.name)temporary;
+          let selection=`Assoc["operation",`String(fresh_uuid());"asset",`String(fresh_uuid());
+            "localMutation",`String(fresh_uuid());"metadataMutation",`String(fresh_uuid());
+            "path",`String temporary;"title",`String asset.title;"type",`String asset.kind] in
+          let payload=Yojson.Safe.to_string(`Assoc["action",`String "picked";"selection",selection]) in
+          match Journal_asset_import.decode_event payload with
+          |Ok(Picked(staged,_))->Journal_capture.add_attachment capture staged
+          |_->fail "Draft attachment could not be recovered.")capture draft.assets in
+        let capture=if draft.interrupted then
+          Journal_capture.fail (Journal_capture.lock_for_retry capture)
+            ~message:"The previous save could not be confirmed. Check the graph before discarding this draft."
+          else capture in
+        {graph=draft.graph;parent=draft.parent;capture})drafts
+      with error->List.iter(fun path->if exists path then Unix.unlink path)!staged_files;raise error))
+
+  module Writer = struct
+    type store = t
+    type job = { revision : int; snapshot : unit -> draft list }
+    type t =
+      { pending : job option Atomic.t
+      ; completed : (int * (unit, string) result) Atomic.t
+      ; running : bool Atomic.t
+      ; mutable revision : int
+      ; mutable thread : Thread.t option
+      }
+    let create ?(on_complete=fun _->()) ?(on_cleanup_warning=report_cleanup_warning) store =
+      let writer={pending=Atomic.make None;completed=Atomic.make(0,Ok());
+        running=Atomic.make true;revision=0;thread=None} in
+      let last_saved = ref None in
+      let same_snapshot left right =
+        List.length left=List.length right && List.for_all2(fun left right->
+          left.graph=right.graph && left.parent=right.parent && left.capture==right.capture)left right in
+      let rec work () =
+        match Atomic.exchange writer.pending None with
+        |Some job->
+          let result=try
+            let drafts=job.snapshot () in
+            if Option.fold ~none:false ~some:(same_snapshot drafts) !last_saved then (
+              retry_cleanup store on_cleanup_warning;Ok()) else
+            let result=save ~on_cleanup_warning store drafts in
+            (match result with Ok()->last_saved:=Some drafts|Error _->last_saved:=None);result
+          with _->last_saved:=None;Error "Draft storage worker failed; restart recovery is unavailable." in
+          Atomic.set writer.completed (job.revision,result);
+          (try on_complete result with _->());work ()
+        |None when Atomic.get writer.running->Unix.sleepf 0.005;work ()
+        |None->() in
+      writer.thread<-Some(Thread.create work ());writer
+    let enqueue writer snapshot =
+      if not(Atomic.get writer.running) then Error "Draft storage writer is closed."
+      else (
+        writer.revision<-writer.revision+1;
+        Atomic.set writer.pending (Some{revision=writer.revision;snapshot});Ok())
+    let flush writer =
+      let target=writer.revision in
+      let rec wait () =
+        let revision,result=Atomic.get writer.completed in
+        if revision>=target then result else (Unix.sleepf 0.001;wait ()) in
+      wait ()
+    let close writer =
+      let result=flush writer in
+      Atomic.set writer.running false;
+      Option.iter Thread.join writer.thread;writer.thread<-None;result
+  end
+end
