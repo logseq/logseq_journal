@@ -13,52 +13,67 @@ type ('after, 'value) outcome =
   | Failed of context * Dsl.error
 type ('after, 'value) running
 
-type completion_status = Applied | Duplicate | Obsolete | Foreign
-type resource_handoff =
-  | Producer_retains
-  | Runtime_owns of Dsl.resource_reference Rrbvec.t
-type completion_ack =
-  { status : completion_status; resources : resource_handoff }
-(** Applied ACKs queued terminal admission, not interpretation/commit/join.
-    Duplicate never replays; Obsolete cannot resume; Foreign transfers nothing.
-    Runtime_owns lists exactly validated cleanup references, including duplicates;
-    all unlisted references, Producer_retains and Error remain producer-owned.
-    Duplicate/Obsolete may adopt original-owner resources only for cleanup.
-    Reserve cleanup capacity before ACK or return Error Capacity_exceeded.
-    Producer releases/retains every untransferred resource, never releases or
-    reacquires transferred ones. Resource-bearing results MUST use complete+Pending
-    even synchronously; illegal Finished retains producer cleanup and fails protocol.
-    Join fails Cleanup_failure while producer-owned resources remain unresolved. *)
-
-type 'a completion = ('a, Dsl.error) result -> (completion_ack, Dsl.error) result
-(** Per-invocation sealed callback binds runtime/operation/original owner/incarnation/
-    context version. Concurrent calls only enqueue, never interpret/reenter inline.
-    Terminal selection/insertion is atomic; reserve capacity before dispatch so
-    no terminal/cleanup is dropped. Stage callback-before-return until Pending
-    installs its job; complete then Finished is Protocol_failure, retaining both
-    cleanup obligations and draining if producers remain. Validate identity and
-    resource producer: stale/duplicate cannot replay or release twice, foreign
-    remains with producer. Keep original owner/callback through delivery and join;
-    successful join promises no future calls. Later misuse is classified without
-    reactivation; retain only bounded classification metadata, not growing jobs. *)
-
-type job =
-  { cancel : unit -> (unit, Dsl.error) result
-  ; join : unit -> (unit, Dsl.error) result }
-(** cancel requests only; join proves operation and all resource/callback producers
-    stopped calling complete. Failure retains job/cause; maximum_pending bounds jobs. *)
-
-type 'a admission = Finished of ('a, Dsl.error) result | Pending of job
-(** Finished has no resources or remaining producer. Pending owes one terminal
-    complete (also on cancellation) and physical join. Uncertain external admission
-    returns Outcome_unknown, never claims no effect. *)
-
 type effect_scope
+(** Fresh per invocation; sealed to runtime, owner, incarnation and context version. *)
+
+val handoff : effect_scope -> Dsl.resource_reference Rrbvec.t
+  -> (unit, Dsl.error) result
+(** Non-suspending, cancellation-masked atomic transfer into Execute's cleanup
+    ledger, reserved before acquisition. Validate exact invocation/original owner,
+    kind and immutable metadata. Success owns every reference; failure transfers
+    no new references.
+    Earlier successful transfers are never undone by a later rejection.
+    Repeated transfer of the same registered references is idempotent; foreign
+    references never transfer. Revoked scopes may accept original resources for
+    cleanup only, never resume work. Charges survive return, cancellation and scope
+    exit until physical release; received consumer leases have independent lives.
+    Resource-owned services (e.g. socket reader) transfer with the reference into
+    the retained original owner's ledger, not detached invocation fibers. Effect
+    join ends acquisition; resource release/retirement joins those services.
+    Install original-owner cleanup before any suspending acquisition; that owner
+    records acquired resources even if acquisition raises/cancels before delivery.
+    Protect only bounded registration/handoff, not acquisition I/O. On rejection/
+    exception, finally resolves untransferred resources or retains cleanup failure.
+    ACK forbids producer use/release of transferred references. Returning a resource
+    requires successful handoff first; cancellation before return cannot leak it. *)
+
+module Callback_bridge : sig
+  type 'a producer =
+    { start : deliver:(('a, Dsl.error) result -> (unit, Dsl.error) result)
+        -> (unit, Dsl.error) result
+    ; stop : unit -> (unit, Dsl.error) result
+    ; await_stopped : deadline:float -> (unit, Dsl.error) result }
+  val run : scope:effect_scope -> resources:('a -> Dsl.resource_reference Rrbvec.t)
+    -> 'a producer -> ('a, Dsl.error) result
+  (** Only for external callbacks/non-interruptible producers. Register producer
+      and bounded terminal/cleanup capacity before start, including failed/raising
+      start. deliver is thread-safe, non-suspending and never interprets inline;
+      atomically select one terminal and hand off validated resources before ACK.
+      Error ACK transfers no new references; earlier transfers remain owned.
+      Producer cleans every untransferred reference.
+      Duplicate/late original resources transfer for cleanup only; foreign remain
+      producer-owned. No replay or double release; bounded identity watermarks.
+      Callback-before-start-return is legal. start/stop must return promptly;
+      await_stopped may suspend but must respect its absolute monotonic deadline.
+      Execute derives deadlines from its clock and cleanup_seconds.
+      resources is pure, total and lists every result-owned reference; no secrets.
+      Before returning or propagating cancellation, stop as needed and confirm
+      all callbacks/native work stopped and untransferred resources resolved.
+      Never mask an unbounded wait.
+      Failed/timed-out join retains producer, original owner and charges in the
+      scope ledger, returns Cleanup_failure with primary/cleanup causes and forces
+      actual draining; retirement/reopen cannot bypass it. Retained cleanup is
+      retried explicitly by retirement, without a background dispatch loop.
+      Cancellation is neither physical stop nor database rollback; uncertain writes
+      retain durable identifiers and Outcome_unknown. Successful join forbids further
+      callbacks; later misuse cannot reactivate a scope or abandon owner cleanup. *)
+end
+
 val check_current : effect_scope -> (unit, Dsl.error) result
 val admit_network : effect_scope -> (unit, Dsl.error) result
 (** Check current scope immediately before irreversible database/crypto/asset work.
     admit_network atomically rechecks gate/cancel/actual epoch and registers each
-    actual remote attempt (also delayed jobs); success is not a reusable permit.
+    actual remote attempt (also after suspension); success is not a reusable permit.
     Admitted outcomes still reconcile after revocation. Original-owner cleanup
     bypasses current authority checks, never original resource validation. *)
 
@@ -66,16 +81,25 @@ type database_owner
 
 type dispatch =
   { database : 'a. owner:database_owner -> scope:effect_scope -> identity:Dsl.identity
-      -> complete:'a completion -> 'a Dsl.database -> 'a admission
+      -> 'a Dsl.database -> ('a, Dsl.error) result
   ; transport : 'a. scope:effect_scope -> identity:Dsl.identity
-      -> complete:'a completion -> 'a Dsl.transport -> 'a admission
+      -> 'a Dsl.transport -> ('a, Dsl.error) result
   ; crypto : 'a. scope:effect_scope -> identity:Dsl.identity
-      -> complete:'a completion -> 'a Dsl.crypto -> 'a admission
+      -> 'a Dsl.crypto -> ('a, Dsl.error) result
   ; assets : 'a. scope:effect_scope -> identity:Dsl.identity
-      -> complete:'a completion -> 'a Dsl.assets -> 'a admission }
-(** Database delegates only sync operations to the shared owner, preserving complete
-    through commit/deferral. Never fabricate Activated/Applied before commit;
-    domain Deferred differs from execution Pending and neither proves join.
+      -> 'a Dsl.assets -> ('a, Dsl.error) result }
+(** Execute forks effects in its Eio task/scope tree and joins on every exit.
+    Functions may suspend; return means owned subfibers and producers are stopped,
+    except retained Cleanup_failure obligations. Use finally/protect for cleanup;
+    short masked handoffs/commit bookkeeping only, never unlimited masked I/O.
+    Cleanup uses cleanup_seconds; failure retains original owner/handles/charges,
+    reports Cleanup_failure and forces draining even for direct effects.
+    Resource results use handoff; Execute installs return values without suspension
+    before checking cancellation, preserving cleanup even if no continuation runs.
+    External work uses Callback_bridge, not detached fibers or a second lifecycle.
+    Database delegates only sync operations to the shared owner through commit/
+    deferral. Never fabricate Activated/Applied before commit; Deferred is domain
+    data, not unfinished execution. Cancellation cannot erase durable outcomes.
     Lost commit response is Outcome_unknown with durable identity, not fresh replay.
     Composite preparation uses the same scoped crypto owner; match optional request,
     IDs/counts/generation exactly. Snapshot unprotection streams bounded batches,
@@ -108,7 +132,7 @@ type network_deadlines =
     headers and complete body cumulatively across redirects/one refresh. Download
     covers entire transfer/setup/refresh/redirects; progress never resets deadlines.
     Liveness is separate. Expiry cancels/joins I/O/staging/callbacks; failed cleanup
-    retains jobs/resources and reports Cleanup_failure. Unknown writes report
+    retains producers/resources and reports Cleanup_failure. Unknown writes report
     Outcome_unknown; ordinary setup/read expiry Network_failure with bounded stage.
     Certificate failure remains Authentication_failure, malformed data Protocol_failure;
     neither becomes retryable timeout. No rollback or unchanged security retry. *)
@@ -118,13 +142,14 @@ type capabilities =
   ; validate_limits : Dsl.limits -> (unit, Dsl.error) result
   ; websocket_liveness : websocket_liveness
   ; network_deadlines : network_deadlines
+  ; cleanup_seconds : float
   ; acquire : Dsl.identity -> (unit, Dsl.error) result
   ; fence_network : Dsl.identity -> (unit, Dsl.error) result
   ; close_network : Dsl.identity -> (unit, Dsl.error) result
   ; authorize_network : Dsl.identity -> epoch:int64 -> (unit, Dsl.error) result
   ; validate_resource : Dsl.resource_reference -> (unit, Dsl.error) result
   ; restore : scope:effect_scope -> Dsl.identity
-      -> complete:Dsl.restore_report completion -> Dsl.restore_report admission
+      -> (Dsl.restore_report, Dsl.error) result
   ; dispatch : dispatch
   ; observe : Dsl.identity -> (Dsl.observation, Dsl.error) result
   ; fence : Dsl.identity -> (unit, Dsl.error) result
@@ -132,7 +157,8 @@ type capabilities =
   ; release_file : Dsl.identity -> Dsl.asset_file -> (unit, Dsl.error) result
   ; release_lease : Dsl.identity -> Dsl.asset_lease -> (unit, Dsl.error) result
   ; release_snapshot : Dsl.identity -> Dsl.snapshot -> (unit, Dsl.error) result }
-(** validate_identity checks actual origin/account/graph/generations on admissions/
+(** Restore follows the dispatch ownership/cancellation contract, using local I/O.
+    validate_identity checks actual origin/account/graph/generations on admissions/
     completions; caller serializes generation changes with fencing. acquire reserves
     exclusive graph writer atomically; failure leaves none, retire releases it.
     Validate configuration BEFORE acquire/allocation/enumeration: actual outbox
@@ -141,13 +167,13 @@ type capabilities =
     Chunks/batches/frames must fit small-memory limits; never substitute asset limits
     or a smaller artifact cap. Validation reads immutable configuration only;
     mismatch is Invalid_input. Restore incrementally accounts disk recovery.
-    Validate liveness/deadlines before acquire and install exact policy before
-    Connect succeeds. Authenticate each actual HTTP/socket admission with current
-    credentials; only one checked refresh, then explicit correction, no hidden loop.
+    Validate finite positive cleanup_seconds and liveness/deadlines before acquire;
+    install exact policy before Connect succeeds. Authenticate each actual HTTP/
+    socket admission with current credentials; only one checked refresh, then explicit correction, no hidden loop.
     Limits stay immutable while acquired. fence_network is nonblocking admission
     fence/cancel, callable from control fiber; runtime closes its gate first even
     on error. close_network physically joins idle sockets and callback producers
-    as well as jobs; failed cleanup keeps Closed, reopening waits for old join.
+    as well as effect fibers; failed cleanup keeps Closed, reopening waits for old join.
     authorize_network checks actual caller epoch at open and every execution.
     validate_resource checks original ledger/identity/kind/immutable metadata even
     for post-revocation cleanup; descriptors alone grant no access. observe is
@@ -183,8 +209,9 @@ val create : sw:Eio.Switch.t -> clock:'clock Eio.Time.Mono.t
 (** Validate actual identity/configuration locally before exclusive acquire; failed
     create leaves no registration/resource. One runtime per graph incarnation.
     Eio switches own runtime/program/task scopes and control/retirement fibers;
-    start forks, await suspends its caller only. Pending producers still require
-    explicit join after fiber cancel; parent cancellation fences/joins all owners.
+    start forks, await suspends its caller only. Fiber cancellation joins structured
+    children; external producers additionally require bridge physical join. Parent
+    cancellation fences all owners; bounded cleanup failure retains actual draining.
     Finish checked retirement before releasing database/scheduling owners.
     Execute privately creates Dsl.Producer.owner; allocate typed task promises
     after capacity reservation, binding child poll to the exact task. Task_join
@@ -193,12 +220,12 @@ val create : sw:Eio.Switch.t -> clock:'clock Eio.Time.Mono.t
     outbox, channels and outputs reserve/register operation ledgers before delivery;
     Producer checks never replace current revision/authority/resource validation.
     Client-created equal-identity owners are foreign: reject before callbacks/use.
-    Context/version, running, effect_scope/completion, database binding, network
+    Context/version, running, effect_scope, database binding, network
     retirement and observation revisions are runtime-created process-local values;
     reads/repeated await return the same registered values, never fresh authority.
     Bounded queues are runtime mechanics; sync/retry/scheduling remain pure EDSL. *)
 
-val start : t -> 'before graph_context -> ('before, 'after, 'a) Dsl.t
+val start : t -> 'before graph_context -> ('before, 'after, 'a) Dsl.program
   -> (('after, 'a) running, Dsl.error) result
 val await : ('after, 'a) running -> ('after, 'a) outcome
 (** One admitted program per runtime. start atomically checks actual identity/phase,
@@ -208,7 +235,7 @@ val await : ('after, 'a) running -> ('after, 'a) outcome
     Network gate/actual epoch checked at dispatch AND execution; local restore/
     inspect never contacts server. Close fences immediately, indexed Close or
     await_network_retirement joins without rollback. Drain/retire failure stays
-    draining. await is repeatable after admitted jobs deliver/join or cleanup
+    draining. await is repeatable after admitted effect fibers return/join or cleanup
     failure is retained. Unjoined producers bypass indexed failure continuations:
     fence and return actual draining context with Cleanup_failure/all causes.
     Only joined ordinary failure enters its declared branch; durable unknown
@@ -312,5 +339,5 @@ type version
 val version : 's graph_context -> version
 val equal_version : version -> version -> bool
 (** Metadata never refreshes authority; fresh process-local versions do not wrap or
-    serialize. Contexts/completions/jobs/resources survive no restart. Observation
+    serialize. Contexts/scopes/bridge producers/resources survive no restart. Observation
     is neither database user query nor presentation ACK. *)
