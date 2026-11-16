@@ -91,6 +91,17 @@ type ('after, 'value) running
             Pending (schedule_head ~scope ~identity connection ~complete)
           | _ -> Finished (Error (Dsl.Protocol_failure "unsupported transport"))
 
+      let pull_transport
+          (read_pull : scope:effect_scope -> identity:Dsl.identity
+            -> Dsl.connection -> Dsl.Overlay.Types.server_cursor
+            -> (Dsl.pull_result, Dsl.error) result)
+          (type a) ~scope ~identity
+          ~complete:(_ : a completion) (operation : a Dsl.transport) : a admission =
+          match operation with
+          | Dsl.On_connection (connection, Dsl.Pull since) ->
+            Finished (read_pull ~scope ~identity connection since)
+          | _ -> Finished (Error (Dsl.Protocol_failure "unsupported transport"))
+
       let connect ~sw ~clock ~database_owner owners schedule_head identity limits =
         let dispatch =
           { owners.dispatch with
@@ -226,7 +237,24 @@ type dispatch =
     Domain Deferred is a completed call whose business barrier remains pending;
     Pending is an unfinished execution. Neither means physical join.
 
-    Transport owns authenticated bounded framing and socket retirement. Crypto
+    Transport owns authenticated bounded framing and socket retirement. Pull's
+    completion is Dsl.pull_result, never an authoritative_batch-only callback.
+    The single connection reader matches pull/ok (including txs=[]) to the pending
+    Pull's exact connection generation and issued baseline, validating remote
+    cursor >= baseline and wire rows before delivering Pulled or No_progress.
+    No_progress.since comes from that request ledger, not a fabricated wire field.
+    Empty/replayed pages complete once without advancing the local checkpoint or
+    invoking database Apply_authoritative. Submitted recovery priority, retained
+    remote target, settled waiting and positive delayed re-pull are expressed by
+    the pure task (see Dsl's next_sync example), never an adapter business loop.
+    Fetch_snapshot streams and verifies declared/actual total bytes against
+    snapshot_maximum_artifact_bytes, charging aggregate staging before writes.
+    Verification and Activate_snapshot also charge independent scratch before
+    decryption/activation intermediates; both original and scratch remain charged
+    through cancellation and failed cleanup. They stream full checksum/row-count
+    checks with maximum_bytes/maximum_items per in-memory decryption batch; bounded
+    metadata/descriptors retain small-message limits. Artifact budgets authorize
+    disk totals, never artifact-sized buffers or larger messages. Crypto
     owns checked envelopes and scoped secret handles, never plaintext fallback.
     Assets own staging, durable publication/recovery and original resource cleanup.
     All adapters reject foreign identities and resources, preserve typed domain
@@ -269,6 +297,17 @@ type capabilities =
     maximum-file and pending-staging byte limits must equal the actual configured
     asset store values, not just descriptor/count budgets. validate_limits compares
     immutable configuration only; restore/recovery performs incremental disk work.
+    It must also compare snapshot_maximum_artifact_bytes to the actual downloader's
+    total-artifact ceiling, and snapshot_staging_budget_bytes/snapshot_scratch_budget_bytes
+    to the real staging and activation/crypto scratch owners' aggregate budgets.
+    Require exact configuration agreement, including streaming chunk/decryption
+    batch and metadata/frame bounds fitting maximum_bytes/maximum_message_bytes;
+    an adapter may not silently substitute its own smaller artifact limit or
+    reuse asset_maximum_file_bytes. Reject mismatch with Invalid_input before
+    acquire, allocation or enumeration. The independent snapshot ceilings admit
+    32 MiB and the existing 1 GiB product artifact configuration without increasing
+    the 16 MiB small-memory limits. Positive numeric validation is the limits
+    constructor's contract; signature compilation cannot prove it executes.
     create validates websocket_liveness and the transport must install that exact
     physical liveness policy before Connect success. Authentication is checked at
     each HTTP/socket admission with the current injected credential; only the real

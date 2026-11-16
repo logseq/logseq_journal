@@ -104,17 +104,39 @@ type limits = private
   ; foreground_reserve : int
   ; foreground_demand_reserve : int; foreground_descriptor_reserve_bytes : int
   ; asset_cache_budget_bytes : int64; asset_maximum_file_bytes : int
-  ; asset_pending_budget_bytes : int64 }
+  ; asset_pending_budget_bytes : int64
+  ; snapshot_maximum_artifact_bytes : int64
+  ; snapshot_staging_budget_bytes : int64; snapshot_scratch_budget_bytes : int64 }
 val limits : maximum_items:int -> maximum_bytes:int -> maximum_pending:int
   -> maximum_resources:int -> steps_per_turn:int -> maximum_tasks:int
   -> maximum_messages:int -> maximum_message_bytes:int -> maximum_demands:int
   -> maximum_active_assets:int -> foreground_reserve:int
   -> foreground_demand_reserve:int -> foreground_descriptor_reserve_bytes:int
   -> asset_cache_budget_bytes:int64 -> asset_maximum_file_bytes:int
-  -> asset_pending_budget_bytes:int64 -> (limits, error) result
+  -> asset_pending_budget_bytes:int64 -> snapshot_maximum_artifact_bytes:int64
+  -> snapshot_staging_budget_bytes:int64 -> snapshot_scratch_budget_bytes:int64
+  -> (limits, error) result
 (** Positive bounds: items <= 4096, bytes <= 16777216, pending <= 4096,
     resources <= 1024, steps_per_turn <= 65536, tasks <= 256, messages <= 4096,
     message_bytes <= 16777216, demands <= 4096, active_assets <= pending.
+    Snapshot artifact, aggregate staging and aggregate scratch budgets are separate
+    strictly positive int64 byte limits; no 16 MiB artifact ceiling is imposed.
+    A 1 GiB artifact limit is legal with sufficient staging/scratch configuration.
+    Zero/negative snapshot budgets return Invalid_input. Reservation arithmetic is
+    overflow-checked, including concurrent and cancelled-but-unreleased resources.
+    Staging includes downloaded encrypted/plain artifacts; scratch includes
+    decrypted staging and activation intermediates. Charge both when both exist;
+    reserve before writing, retain charges until physical cleanup, and report
+    Capacity_exceeded before crossing either independent disk budget. Smaller
+    staging/scratch budgets may reject a particular artifact, not enlarge memory.
+    Download, checksum/metadata verification and activation stream the artifact;
+    maximum_bytes still bounds each in-memory chunk and single decryption batch,
+    and maximum_items bounds batch rows. Metadata/descriptor/frame bounds remain
+    maximum_bytes/maximum_message_bytes, both at most 16 MiB. Never materialize a
+    whole artifact or allocate from its declared total size. Snapshot budgets do
+    not alter asset_maximum_file_bytes, asset cache/pending budgets or message
+    reservations. Configuration validation reads no files; recovery accounts
+    retained staging/scratch incrementally before new admissions.
     Foreground reserve is in [1..maximum_active_assets]. Background admissions
     cannot consume that reserve. Active and pending demands both count against
     maximum_demands; one active transfer per exact asset version is shared.
@@ -171,6 +193,52 @@ val limits : maximum_items:int -> maximum_bytes:int -> maximum_pending:int
     slot. Completed jobs are pruned using monotonic ticket watermarks, not an
     unbounded set of tombstones. Queued notifications coalesce to resampling;
     terminal delivery is never dropped. Validation performs no graph scan. *)
+
+(** {2 Independent snapshot budget example}
+
+    [base] is an already valid limits value. Reconstruct through validation, never
+    update the private record. This changes only snapshot disk budgets, not the
+    16 MiB ceilings for small messages, descriptors or decryption batches:
+    {[
+      let snapshot_budgets (base : limits) ~artifact ~staging ~scratch =
+        limits ~maximum_items:base.maximum_items ~maximum_bytes:base.maximum_bytes
+          ~maximum_pending:base.maximum_pending
+          ~maximum_resources:base.maximum_resources ~steps_per_turn:base.steps_per_turn
+          ~maximum_tasks:base.maximum_tasks ~maximum_messages:base.maximum_messages
+          ~maximum_message_bytes:base.maximum_message_bytes
+          ~maximum_demands:base.maximum_demands
+          ~maximum_active_assets:base.maximum_active_assets
+          ~foreground_reserve:base.foreground_reserve
+          ~foreground_demand_reserve:base.foreground_demand_reserve
+          ~foreground_descriptor_reserve_bytes:base.foreground_descriptor_reserve_bytes
+          ~asset_cache_budget_bytes:base.asset_cache_budget_bytes
+          ~asset_maximum_file_bytes:base.asset_maximum_file_bytes
+          ~asset_pending_budget_bytes:base.asset_pending_budget_bytes
+          ~snapshot_maximum_artifact_bytes:artifact
+          ~snapshot_staging_budget_bytes:staging ~snapshot_scratch_budget_bytes:scratch
+
+      let snapshot_32_mib base =
+        snapshot_budgets base ~artifact:33554432L ~staging:67108864L ~scratch:67108864L
+
+      let snapshot_1_gib base =
+        snapshot_budgets base ~artifact:1073741824L
+          ~staging:2147483648L ~scratch:2147483648L
+
+      let invalid_snapshot_budgets base =
+        [ snapshot_budgets base ~artifact:0L ~staging:1L ~scratch:1L;
+          snapshot_budgets base ~artifact:1L ~staging:(-1L) ~scratch:1L;
+          snapshot_budgets base ~artifact:1L ~staging:1L ~scratch:0L ]
+    ]}
+    The first two functions must return Ok for a valid base; this pure constructor
+    does not consult an actual store. Execute construction additionally requires
+    alignment with the actual configured owners. Each invalid example must return
+    Error (Invalid_input _); staging < artifact is instead a valid configuration
+    whose oversized transfer fails Capacity_exceeded before writing beyond budget.
+    The signature can type-check these calls and their result handling, but cannot
+    execute or prove numeric validation. Implementation acceptance must run those
+    cases, reject maximum_bytes or maximum_message_bytes = 16777217 independently
+    of snapshot budgets, and verify that 32 MiB/1 GiB totals stream without raising
+    either small-memory ceiling. No runtime evidence is implied by compilation. *)
 
 type retry_policy = private
   { initial_seconds : float; maximum_seconds : float
@@ -247,6 +315,28 @@ type _ database =
 
 type remote_head =
   { through : Overlay.Types.server_cursor; snapshot_available : bool }
+type pull_result =
+  | Pulled of Overlay.Types.authoritative_batch
+  | No_progress of
+      { since : Overlay.Types.server_cursor; through : Overlay.Types.server_cursor }
+(** Pulled contains a validated nonempty authoritative batch advancing the request
+    baseline. No_progress is a successful empty/effectively empty page (including
+    already-applied transactions), not an empty authoritative_batch or an error.
+    Its since is the matched request baseline, not a new wire field; through is
+    the validated remote response cursor, which must be >= since. The transport
+    checks connection generation, pending Pull ownership, baseline and every wire
+    cursor before classifying either result; malformed/foreign/regressing replies
+    remain Protocol_failure. Filtering replayed rows cannot bypass validation.
+    Neither result itself advances a local checkpoint: only Apply_authoritative
+    commits Pulled. No_progress never calls Apply_authoritative, acknowledges
+    submissions or proves an accepted barrier was locally reached. It preserves
+    the greatest known remote target even when through is lower than that target.
+    The pure task policy re-inspects local state, gives durable Submitted recovery
+    priority, then either settles an already caught-up graph or sleeps for a
+    finite positive no-progress delay before pulling a still-ahead target. This
+    successful-page pacing is not retry of a protocol/storage/auth failure.
+    No hidden adapter loop, immediate re-pull or checkpoint fabrication is allowed. *)
+
 type submission_reply =
   | Accepted of Overlay.Types.acceptance_barrier
   | Rejected of Overlay.Types.rejection_resolution
@@ -282,7 +372,7 @@ type _ transport =
   | On_connection : connection * 'a transport -> 'a transport
   | Head : remote_head transport
   | Fetch_snapshot : Overlay.Types.server_cursor -> snapshot transport
-  | Pull : Overlay.Types.server_cursor -> Overlay.Types.authoritative_batch transport
+  | Pull : Overlay.Types.server_cursor -> pull_result transport
   | Push : Overlay.Types.submission_batch -> submission_reply transport
 
 (** Wire framing, authentication, cursor ordering, bounds and encryption envelopes
@@ -299,7 +389,11 @@ type _ transport =
     The real hello/pull/tx-batch protocol has no generic request-ID multiplexer:
     allow at most one unresolved request per response family, including one Push,
     and validate frozen mutation tx-id, baseline and acceptance barrier. Ambiguous
-    replies fail the connection and retain Submitted, never guess an owner. Head
+    replies fail the connection and retain Submitted, never guess an owner. A
+    pull/ok with txs=[] completes that pending Pull with No_progress, still checking
+    response cursor against its issued baseline; it is not an unsolicited hint,
+    dropped completion or authoritative_batch construction failure. No request ID
+    or new empty-page wire field is introduced. Head
     reads the validated hello/head state; no new server endpoint is implied.
     Receive suspends and completes once with one message, including connection
     identity. Repeat Receive in the EDSL to subscribe continuously. Only one
@@ -848,6 +942,66 @@ val task_view : 'a task -> 'a task_node
     never racing multiple Receive readers. Demand updates remain consumable
     while transfers run as children. No child has lifecycle authority. *)
 
+(** {2 Pull completion and no-progress example}
+
+    [next_sync] is a caller's pure task builder, not an adapter or an exported DSL
+    function. [settled] waits for an external change; [resume] retains its target
+    and re-inspects before another Pull. [recover] consumes the exact Retry_group
+    commit's frozen batch as in the recovery contract above; it never fresh-sends.
+    [on_applied] retains the original batch and updated target and handles both
+    Applied and Deferred without discarding either.
+    The caller supplies a finite positive [delay] for successful no-progress pacing.
+    {[
+      let farther left right =
+        if Overlay.Types.Server_cursor.compare left right >= 0 then left else right
+
+      let next_sync ~connection ~target ~delay ~recover ~resume ~settled
+          ~on_applied since =
+        task_perform (Task_transport (On_connection (connection, Pull since)))
+          ~failure:task_fail ~success:(fun reply ->
+            task_perform (Task_database Inspect) ~failure:task_fail
+              ~success:(fun view ->
+                let token = Overlay.Types.sync_view_token view in
+                let checkpoint = Overlay.Types.sync_view_checkpoint view in
+                match reply with
+                | Pulled batch ->
+                  let target = farther target
+                    (Overlay.Types.authoritative_batch_through batch) in
+                  task_perform (Task_database (Apply_authoritative (token, batch)))
+                    ~failure:task_fail ~success:(on_applied target batch)
+                | No_progress {since = baseline; through} ->
+                  let target = farther target through in
+                  if not (Overlay.Types.Server_cursor.equal baseline since) then
+                    task_fail (Protocol_failure "unmatched Pull baseline")
+                  else
+                    let submitted = List.find_map
+                      (fun (item : Overlay.Types.submission_descriptor) ->
+                        match item.state with
+                        | Overlay.Types.Submitted batch_id -> Some batch_id
+                        | _ -> None)
+                      (Overlay.Types.sync_view_submissions view) in
+                    match submitted with
+                    | Some batch_id ->
+                      task_perform (Task_database (Prepare_submission
+                        (token, Overlay.Types.Retry_group batch_id)))
+                        ~failure:task_fail ~success:(recover target)
+                    | None ->
+                      if Overlay.Types.Server_cursor.compare checkpoint target >= 0
+                      then settled target
+                      else task_perform (Sleep delay) ~failure:task_fail
+                        ~success:(fun () -> resume target)))
+    ]}
+    With checkpoint = target and no Submitted, the empty page chooses settled
+    without a database write. With checkpoint < target it preserves that target
+    across Sleep even if through = since. With Submitted it chooses Retry_group
+    first, including when checkpoint = target; the original frozen identity/wires
+    survive. Recovery must return to this policy (with the retained target and
+    no-progress pacing before another unchanged Pull), not loop fresh submissions.
+    Deferred application preserves its original batch and recovery priority.
+    A concurrent database/token conflict escapes exactly, requiring re-inspection;
+    it is never hidden by transport. These are type-checked branch examples, not
+    runtime proof of scheduling or cursor validation by an unimplemented signature. *)
+
 (** {2 Outbox inspection and upload example}
 
     This complete single-member planner uses only public types. The caller supplies
@@ -951,10 +1105,19 @@ val task_view : 'a task -> 'a task_node
     Fetch_snapshot verifies bounded metadata/declared cursor and actual artifact;
     the producer ledger also binds parsed expected row count required by Overlay
     activation. Activation validates that count, checksum and real encryption mode
-    before publishing. Snapshot resource bytes have their own maximum_bytes bound
-    and cannot bypass maximum_resources; encrypted staging/decryption scratch is
-    accounted before allocation. These snapshot bounds are independent of asset
-    cache budgets. Failed release remains owed in the runtime cleanup ledger. *)
+    before publishing. Declared and actual total artifact bytes are bounded by
+    snapshot_maximum_artifact_bytes, not maximum_bytes. Enforce that ceiling during
+    streamed download even for absent/false size metadata, before each write.
+    Reserve aggregate snapshot_staging_budget_bytes and snapshot_scratch_budget_bytes
+    independently before download/decryption/activation allocations; encrypted
+    originals and plaintext scratch coexist and remain charged until released.
+    Checksum and row-count verification cover the complete streamed artifact;
+    each chunk/decryption batch remains within maximum_bytes and maximum_items,
+    including activation. No full-file read or artifact-sized plaintext buffer is
+    permitted. Metadata/descriptors retain the small-message bounds; all staged
+    resources still count toward maximum_resources. These limits are independent
+    of asset maximum-file/cache/pending budgets. Failed release remains owed with
+    its bytes charged in the runtime cleanup ledger. *)
 
 type (_, _, _, _) operation =
   | Run_task : 'a task -> (ready, ready, ready, 'a) operation
