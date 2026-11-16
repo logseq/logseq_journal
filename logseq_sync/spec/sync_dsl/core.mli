@@ -1,33 +1,5 @@
-(** {1 TLDR}
-
-    Pure, typed programs and synchronization policy for one graph incarnation.
-    Programs describe effects; they neither perform I/O nor own database handles.
-    [Execute] interprets them, owns versioned graph contexts and injects capabilities.
-    This module does not depend on that interpreter. Account selection, access
-    authorization, database user reads/writes and destructive local-copy permission
-    belong to callers. The outer indexed [t] alone owns graph lifecycle; inner
-    ['a task] describes bounded structured concurrency, waits and restricted
-    effects, exposed to Execute through [task_view]. [run_task] embeds a service
-    in Ready without granting child tasks graph retirement authority. Independent
-    Execute control/demand ingress remains live while the service is suspended.
-    The external database owner invalidates outbox inspection independently of
-    asset queues; Await_outbox_changed/Inspect/checked ACK preserve concurrent
-    commits. Tasks explicitly publish revision-bound demand states and policy
-    status; Execute exposes these without waiting for service termination.
-    Foreground ingress/work and disk bytes have separately validated reservations.
-    This proposal is not yet registered in the build.
-
-    Primary entry points (declared below):
-    {[
-      val return : 'a -> ('s, 's, 'a) t
-      val perform : ('before, 'after, 'failed, 'a) operation
-        -> success:('a -> ('after, 'final, 'b) t)
-        -> failure:(error -> ('failed, 'final, 'b) t)
-        -> ('before, 'final, 'b) t
-      val run_task : 'a task -> (ready, ready, ready, 'a) operation
-    ]}
-    State indices constrain ordinary continuations, not identity, linearity,
-    cancellation or rollback. Failures retain their actual post-effect context. *)
+(** Pure programs; only the outer indexed program changes graph lifecycle.
+    Indices prove neither runtime authority, linearity nor rollback. *)
 
 type cold
 type ready
@@ -67,34 +39,15 @@ type error =
 
 type ('before, 'after, 'value) t
 
-(** Programs remain abstract; {!view} exposes one pure interpreter step. *)
 val return : 'a -> ('s, 's, 'a) t
 val abort : error -> ('s, 'final, 'a) t
 val bind : ('before, 'middle, 'a) t -> ('a -> ('middle, 'after, 'b) t)
   -> ('before, 'after, 'b) t
 
-(** {1 Minimal usage example}
-
-    The caller supplies [on_restored], a pure continuation producing a ready-to-ready
-    program, and later submits [program] with a cold context to the interpreter:
-    {[
-      let program =
-        perform restore
-          ~success:on_restored
-          ~failure:(fun cause -> abort cause)
-    ]}
-    Restoration is local-only, including encrypted offline recovery. An explicit
-    network gate and available graph keys are separate prerequisites for remote
-    work. [abort] stops interpretation without pretending the expected final
-    phase was reached; the interpreter returns the actual context existentially. *)
-
-(** {1 Construction and validation} *)
-
 val identity : origin:string -> account:string -> graph:string
   -> account_generation:int64 -> graph_generation:int64 -> (identity, error) result
 (** Require canonical HTTPS origin, nonempty account/graph and nonnegative
-    generations. Runtime authority is checked against the injected owner on every
-    effect and completion; this record alone grants no authority. *)
+    generations. Actual owner authority is rechecked on effects and completions. *)
 
 type limits = private
   { maximum_items : int; maximum_bytes : int; maximum_pending : int
@@ -117,139 +70,51 @@ val limits : maximum_items:int -> maximum_bytes:int -> maximum_pending:int
   -> snapshot_staging_budget_bytes:int64 -> snapshot_scratch_budget_bytes:int64
   -> (limits, error) result
 (** Positive bounds: items <= 4096, bytes <= 16777216, pending <= 4096,
-    resources <= 1024, steps_per_turn <= 65536, tasks <= 256, messages <= 4096,
+    resources <= 1024, steps <= 65536, tasks <= 256, messages <= 4096,
     message_bytes <= 16777216, demands <= 4096, active_assets <= pending.
-    Snapshot artifact, aggregate staging and aggregate scratch budgets are separate
-    strictly positive int64 byte limits; no 16 MiB artifact ceiling is imposed.
-    A 1 GiB artifact limit is legal with sufficient staging/scratch configuration.
-    Zero/negative snapshot budgets return Invalid_input. Reservation arithmetic is
-    overflow-checked, including concurrent and cancelled-but-unreleased resources.
-    Staging includes downloaded encrypted/plain artifacts; scratch includes
-    decrypted staging and activation intermediates. Charge both when both exist;
-    reserve before writing, retain charges until physical cleanup, and report
-    Capacity_exceeded before crossing either independent disk budget. Smaller
-    staging/scratch budgets may reject a particular artifact, not enlarge memory.
-    Download, checksum/metadata verification and activation stream the artifact;
-    maximum_bytes still bounds each in-memory chunk and single decryption batch,
-    and maximum_items bounds batch rows. Metadata/descriptor/frame bounds remain
-    maximum_bytes/maximum_message_bytes, both at most 16 MiB. Never materialize a
-    whole artifact or allocate from its declared total size. Snapshot budgets do
-    not alter asset_maximum_file_bytes, asset cache/pending budgets or message
-    reservations. Configuration validation reads no files; recovery accounts
-    retained staging/scratch incrementally before new admissions.
-    Foreground reserve is in [1..maximum_active_assets]. Background admissions
-    cannot consume that reserve. Active and pending demands both count against
-    maximum_demands; one active transfer per exact asset version is shared.
-    foreground_demand_reserve is in [1..maximum_demands]; descriptor reserve is
-    in [1..maximum_message_bytes]. Background interests may use at most
-    maximum_demands - foreground_demand_reserve entries and descriptor bytes at
-    most maximum_message_bytes - foreground_descriptor_reserve_bytes. Foreground
-    may use the total budget, not an additional pool. These reservations apply
-    before ingress, including delivered-but-active interests and obsolete values
-    still retained for cleanup. Same-ID replacement computes the net new charge
-    atomically, without charging two live interests; retained old resources still
-    count. A rejected replacement changes neither revision nor accounting. Shared
-    transfers count once as work but each demand ID counts as an interest.
-    Promotion checks total capacity; demotion also checks the background ceiling.
-    Withdraw/stop/cleanup acknowledgements need reserved control capacity and may
-    not be rejected just because background descriptors fill their permitted pool.
-    Background/ordinary ingress, notification and output values also cannot consume
-    foreground_demand_reserve message slots or reserved foreground descriptor bytes.
-    Require maximum_messages >= foreground_demand_reserve + 3; three additional
-    fixed control slots cover stop, gate and unlock notice. The outbox dirty slot
-    and latest observation slot are separate fixed runtime metadata. A foreground
-    demand can use the reserved message slots as well as its entry/byte reservation;
-    otherwise a full shared message queue would defeat the ingress guarantee.
-    A background transfer shared with a foreground interest is reclassified before
-    admission; generic asset operations cannot claim foreground reservations.
-    Release descriptor charges only when actually discarded, including task-held
-    active selections and superseded cleanup metadata; moving them from ingress to
-    a task is not reclamation. Interest charges end at Finish_demand, never merely
-    at dequeue. Capacity pressure is explicit
-    and callers retry admission only after reclaim, without spinning.
-    Asset cache/pending byte budgets are nonnegative int64; single-file bytes are
-    in [0..104857600], matching the real asset store's configuration. Zero disables
-    that storage class, not its accounting. Cache bytes include all resident files,
-    including pinned files; pending bytes include staging, cancelled work awaiting
-    cleanup and recovered pending originals. Reserve actual bytes before writing,
-    stream with a hard single-file ceiling even when advertised size is absent or
-    false, and reject with Capacity_exceeded before crossing any byte ceiling.
-    Count/resource limits do not replace these disk limits. Pruning cannot remove
-    pinned files or durable unpublished originals; inability to reclaim is explicit
-    pressure, not deletion of user intent. Recovery accounts existing durable files
-    and orphan staging before admitting new writes; over-budget stores allow only
-    bounded recovery/pruning/release until within limits. No new durable store is
-    required and validation itself never enumerates files.
-    Require tasks >= active_assets + 4 and pending >= active_assets + 4. Reserve three pending
-    slots for receive, sync database and input, plus foreground_reserve for
-    foreground assets; ordinary/background work cannot borrow these reservations.
-    Queue/ingress and active descriptor bytes share maximum_message_bytes, including
-    replaced and in-delivery values while retained by tasks/output/cleanup ledgers;
-    reject before allocation and never reclaim merely on internal ownership transfer.
-    steps_per_turn is a fair scheduling quantum, never a service lifetime limit.
-    Validate before allocation. All retained
-    files/leases/staging, including cancelled deliveries, count toward resources;
-    reserve before acquisition. Failure retains its slot; cleanup needs no new
-    slot. Completed jobs are pruned using monotonic ticket watermarks, not an
-    unbounded set of tombstones. Queued notifications coalesce to resampling;
-    terminal delivery is never dropped. Validation performs no graph scan. *)
-
-(** {2 Independent snapshot budget example}
-
-    [base] is an already valid limits value. Reconstruct through validation, never
-    update the private record. This changes only snapshot disk budgets, not the
-    16 MiB ceilings for small messages, descriptors or decryption batches:
-    {[
-      let snapshot_budgets (base : limits) ~artifact ~staging ~scratch =
-        limits ~maximum_items:base.maximum_items ~maximum_bytes:base.maximum_bytes
-          ~maximum_pending:base.maximum_pending
-          ~maximum_resources:base.maximum_resources ~steps_per_turn:base.steps_per_turn
-          ~maximum_tasks:base.maximum_tasks ~maximum_messages:base.maximum_messages
-          ~maximum_message_bytes:base.maximum_message_bytes
-          ~maximum_demands:base.maximum_demands
-          ~maximum_active_assets:base.maximum_active_assets
-          ~foreground_reserve:base.foreground_reserve
-          ~foreground_demand_reserve:base.foreground_demand_reserve
-          ~foreground_descriptor_reserve_bytes:base.foreground_descriptor_reserve_bytes
-          ~asset_cache_budget_bytes:base.asset_cache_budget_bytes
-          ~asset_maximum_file_bytes:base.asset_maximum_file_bytes
-          ~asset_pending_budget_bytes:base.asset_pending_budget_bytes
-          ~snapshot_maximum_artifact_bytes:artifact
-          ~snapshot_staging_budget_bytes:staging ~snapshot_scratch_budget_bytes:scratch
-
-      let snapshot_32_mib base =
-        snapshot_budgets base ~artifact:33554432L ~staging:67108864L ~scratch:67108864L
-
-      let snapshot_1_gib base =
-        snapshot_budgets base ~artifact:1073741824L
-          ~staging:2147483648L ~scratch:2147483648L
-
-      let invalid_snapshot_budgets base =
-        [ snapshot_budgets base ~artifact:0L ~staging:1L ~scratch:1L;
-          snapshot_budgets base ~artifact:1L ~staging:(-1L) ~scratch:1L;
-          snapshot_budgets base ~artifact:1L ~staging:1L ~scratch:0L ]
-    ]}
-    The first two functions must return Ok for a valid base; this pure constructor
-    does not consult an actual store. Execute construction additionally requires
-    alignment with the actual configured owners. Each invalid example must return
-    Error (Invalid_input _); staging < artifact is instead a valid configuration
-    whose oversized transfer fails Capacity_exceeded before writing beyond budget.
-    The signature can type-check these calls and their result handling, but cannot
-    execute or prove numeric validation. Implementation acceptance must run those
-    cases, reject maximum_bytes or maximum_message_bytes = 16777217 independently
-    of snapshot budgets, and verify that 32 MiB/1 GiB totals stream without raising
-    either small-memory ceiling. No runtime evidence is implied by compilation. *)
+    Require tasks and pending >= active_assets + 4; reserve three pending slots
+    for receive/database/input plus foreground_reserve for foreground assets.
+    Foreground reserves: work in [1..active_assets], interests in [1..demands],
+    descriptors in [1..message_bytes]; messages >= foreground_demand_reserve + 3
+    for stop/gate/unlock. Background cannot borrow reserved work, task, message,
+    interest or descriptor capacity. Foreground uses the total, not extra pools.
+    Outbox dirty and latest observation each have an independent fixed slot.
+    Active and pending interests count per ID; shared transfers count once.
+    Same-ID replacement charges net descriptors atomically; rejection changes
+    nothing. Demotion checks background capacity; withdrawal/stop/cleanup retain
+    reserved control capacity. Reclassify shared foreground work before admission.
+    Ingress, task-held, output and cleanup descriptors share message_bytes;
+    ownership transfer/dequeue reclaims nothing. Finish_demand ends the interest;
+    discard ends descriptor charges, physical cleanup ends resource/byte charges.
+    Reserve before allocation/acquisition/writes with checked arithmetic;
+    cancelled resources and failed cleanup remain charged; cleanup needs no new
+    slot. Prune completed jobs with monotonic watermarks, not growing tombstones;
+    terminal delivery cannot be dropped. steps_per_turn is a fair-turn quantum.
+    Snapshot artifact/staging/scratch budgets are independent positive int64s:
+    zero/negative is Invalid_input; staging below artifact is legal but may yield
+    Capacity_exceeded. No 16 MiB artifact cap: 32 MiB and 1 GiB are legal totals.
+    Reserve aggregate staging and scratch separately before writes/allocations;
+    encrypted originals and plaintext intermediates coexist and both stay charged
+    until cleanup. Stream complete checksum/row-count verification and activation;
+    each chunk/decryption batch <= maximum_bytes and rows <= maximum_items.
+    Metadata/frames obey small-message bounds; never buffer an entire artifact.
+    Snapshot limits do not replace asset limits. Asset cache/pending budgets are
+    nonnegative int64s, file bytes in [0..104857600]; zero disables that class.
+    Cache includes pinned files; pending includes unreleased/recovered staging.
+    Enforce actual file bytes even with false/absent size metadata. Pruning cannot
+    delete pinned bytes or durable unpublished originals. Incremental recovery
+    accounts existing files/orphans before admission; over-budget stores permit
+    only bounded recovery/prune/release. Validation reads configuration, not files
+    or graph data; exhaustion is explicit, never spinning or silent eviction. *)
 
 type retry_policy = private
   { initial_seconds : float; maximum_seconds : float
   ; multiplier : float; maximum_attempts : int }
 val retry_policy : initial_seconds:float -> maximum_seconds:float
   -> multiplier:float -> maximum_attempts:int -> (retry_policy, error) result
-(** Finite positive delays, maximum >= initial, multiplier >= 1 and attempts in
-    [0..10]. Zero disables automatic retry. Pure EDSL policy uses capped exponential
-    delays with Sleep; attempts count actual admissions, not waiting turns. Only
-    network failures are retryable; no unchanged auth/protocol/storage/crypto retry.
-    Policy is supplied to task builders, not an adapter-owned business loop. *)
+(** Finite positive delays; maximum >= initial, multiplier >= 1, attempts in
+    [0..10] (zero disables retry). EDSL uses capped exponential Sleep; count actual
+    admissions. Only network failures permit retry, never unchanged other errors. *)
 
 type network_gate = Closed | Open of { authorization_epoch : int64 }
 type key_status = Unencrypted | Key_locked | Key_available
@@ -259,10 +124,6 @@ type observation =
   ; pending_submissions : int; pending_assets : int; cleanup_pending : int
   ; last_failure : error option }
 
-(** {1 Capability details} *)
-
-(** Database effects concern synchronization only. [Overlay.Types] is the real
-    external synchronization database boundary, not a renamed execution owner. *)
 type restore_report =
   { keys : key_status; checkpoint : Overlay.Types.server_cursor option
   ; recovery_pending : bool }
@@ -275,20 +136,16 @@ type authoritative_result =
 
 type resource = private { owner : identity; token : string }
 val resource : owner:identity -> token:string -> (resource, error) result
-(** A bounded, process-local producer reference, not a path or authority. The
-    trusted adapter registers the token in its original owner's resource ledger
-    before delivery. Pure construction validates shape only; execution checks
-    actual producer ownership and resource kind, including after revocation. *)
+(** Shape-only process-local descriptor: the producer registers token/kind before
+    delivery; execution checks its real original-owner ledger even after revocation. *)
 
 type snapshot = private
   { resource : resource; through : Overlay.Types.server_cursor
   ; checksum : string; encrypted : bool }
 val snapshot : resource:resource -> through:Overlay.Types.server_cursor
   -> checksum:string -> encrypted:bool -> (snapshot, error) result
-(** Descriptor of immutable staged bytes, never proof of verification. Activation
-    validates actual producer metadata, checksum, encryption mode and baseline.
-    The producer retains bytes until checked release/retirement, including stale
-    downloads. An arbitrary descriptor cannot substitute a native path. *)
+(** Staged immutable bytes remain owed until checked release, even when stale.
+    Activation checks actual producer metadata, baseline, checksum and encryption. *)
 
 type _ database =
   | Inspect : Overlay.Types.sync_view database
@@ -299,19 +156,12 @@ type _ database =
   | Activate_snapshot : snapshot -> activation database
   | Release_snapshot : snapshot -> unit database
 
-(** Inspection is bounded metadata, not user data reads. Before enumerating any
-    descriptors, construction checks that the external database's configured
-    outbox_max_records fits maximum_items and its descriptor byte bound fits
-    maximum_bytes. Incompatible budgets are rejected without enumeration; never
-    truncate a sync_view or acknowledge an invisible submission. Submission preparation
-    atomically freezes durable wires before transmission; token conflicts require
-    a fresh view, not blind replay. Accepted transport responses do not remove
-    durable intent until authoritative reconciliation. Deferred application keeps
-    the original batch and waits for its exact submission outcome. Activation
-    verifies graph generation, baseline and pending local intent atomically;
-    deferral cannot be reported as activation. Durable commit outcomes survive
-    cancellation; uncertainty is reconciled by exact identifiers, never resubmitted
-    as a fresh mutation. No new persistent store or persistence format is implied. *)
+(** Inspect checks configured record/descriptor bounds before enumeration; never
+    truncate. Prepare freezes durable wires before send; conflicts need fresh views.
+    Acceptance retains intent until authoritative reconciliation. Deferred retains
+    its original batch and waits for its exact submission outcome. Activation
+    atomically checks generation/baseline/local intent; deferral is not activation.
+    Cancellation preserves commits; reconcile uncertainty by original identifiers. *)
 
 type remote_head =
   { through : Overlay.Types.server_cursor; snapshot_available : bool }
@@ -319,37 +169,24 @@ type pull_result =
   | Pulled of Overlay.Types.authoritative_batch
   | No_progress of
       { since : Overlay.Types.server_cursor; through : Overlay.Types.server_cursor }
-(** Pulled contains a validated nonempty authoritative batch advancing the request
-    baseline. No_progress is a successful empty/effectively empty page (including
-    already-applied transactions), not an empty authoritative_batch or an error.
-    Its since is the matched request baseline, not a new wire field; through is
-    the validated remote response cursor, which must be >= since. The transport
-    checks connection generation, pending Pull ownership, baseline and every wire
-    cursor before classifying either result; malformed/foreign/regressing replies
-    remain Protocol_failure. Filtering replayed rows cannot bypass validation.
-    Neither result itself advances a local checkpoint: only Apply_authoritative
-    commits Pulled. No_progress never calls Apply_authoritative, acknowledges
-    submissions or proves an accepted barrier was locally reached. It preserves
-    the greatest known remote target even when through is lower than that target.
-    The pure task policy re-inspects local state, gives durable Submitted recovery
-    priority, then either settles an already caught-up graph or sleeps for a
-    finite positive no-progress delay before pulling a still-ahead target. This
-    successful-page pacing is not retry of a protocol/storage/auth failure.
-    No hidden adapter loop, immediate re-pull or checkpoint fabrication is allowed. *)
+(** Validate connection generation, pending Pull baseline and every wire cursor
+    before filtering replays. Pulled is nonempty and advances that baseline;
+    No_progress covers empty/replayed pages with matched since and through >= since.
+    Neither advances local checkpoint; only Apply_authoritative commits Pulled.
+    No_progress never applies/ACKs barriers: retain greatest remote target,
+    re-inspect, prioritize Submitted recovery, then settle if caught up or Sleep
+    a finite positive delay before re-pull. No hidden adapter loop or forged cursor. *)
 
 type submission_reply =
   | Accepted of Overlay.Types.acceptance_barrier
   | Rejected of Overlay.Types.rejection_resolution
 
 type connection
-(** Process-local authenticated connection identity including a fresh, non-reused
-    connection generation. Created by Connect, validated on every use; never
-    serializable. Retirement invalidates it without retiring the graph. *)
+(** Connect produces a registered, fresh process-local token/generation; shape
+    validation grants no authority. Every use checks its original producer;
+    connection retirement invalidates it without retiring the graph. *)
 val connection : owner:identity -> token:string -> generation:int64
   -> (connection, error) result
-(** Trusted producer registers a fresh token/generation before constructing its
-    descriptor. Construction checks bounded shape, not authority; Execute validates
-    the actual original producer and immutable generation on Connect completion. *)
 
 type connection_end =
   | Remote_closed
@@ -375,95 +212,54 @@ type _ transport =
   | Pull : Overlay.Types.server_cursor -> pull_result transport
   | Push : Overlay.Types.submission_batch -> submission_reply transport
 
-(** Wire framing, authentication, cursor ordering, bounds and encryption envelopes
-    are validated before typed responses are delivered. Empty/incomplete pages
-    cannot advance a checkpoint. Remote head and snapshot download are not local
-    activation. Push uncertainty retains the frozen batch; only network failures
-    are eligible for timed retry. Rejection/authentication/protocol/crypto/storage
-    failures need explicit correction, not an unchanged automatic retry.
-    Head/Fetch_snapshot/Pull/Push must be wrapped exactly once in On_connection;
-    nested wrappers and wrappers around connection-management operations fail.
-    The adapter owns exactly one physical socket reader per connection. It matches
-    responses to bounded pending requests and routes unsolicited changes to the
-    bounded Receive source; request tasks never read the socket themselves.
-    The real hello/pull/tx-batch protocol has no generic request-ID multiplexer:
-    allow at most one unresolved request per response family, including one Push,
-    and validate frozen mutation tx-id, baseline and acceptance barrier. Ambiguous
-    replies fail the connection and retain Submitted, never guess an owner. A
-    pull/ok with txs=[] completes that pending Pull with No_progress, still checking
-    response cursor against its issued baseline; it is not an unsolicited hint,
-    dropped completion or authoritative_batch construction failure. No request ID
-    or new empty-page wire field is introduced. Head
-    reads the validated hello/head state; no new server endpoint is implied.
-    Receive suspends and completes once with one message, including connection
-    identity. Repeat Receive in the EDSL to subscribe continuously. Only one
-    Receive may be pending per connection. Overflow backpressures the reader;
-    only Remote_changed hints may coalesce by resampling head, never responses,
-    terminal messages or authoritative batches. Count and byte bounds apply before
-    frame allocation; oversized frames fail the connection, not silently drop data.
-    Retire_connection cancels and joins reader, writer, matching requests and
-    callback producers before success. Connect rejects while an earlier connection
-    is unretired. Remote_closed/Network_lost permit EDSL timed backoff; access and
-    protocol failures require explicit correction. Local close is not a retry cause.
-
-    Restart recovery reads Submitted IDs from Inspect and performs
-    Prepare_submission (fresh_token, Retry_group original_id). The real Overlay
-    commit returns the original submission_batch, including ID, t_before and exact
-    protected wires; None or changed bytes is a protocol error, never fresh-send
-    permission. Push uses the existing tx-batch wire with original t-before,
-    mutation tx-id, protected tx and outliner-op; the local batch ID does not imply
-    a server batch-status endpoint or batch-ID deduplication guarantee. Accepted/Stale responses feed
-    Accept_group/Reject_group and authoritative Pull; Stale alone does not prove
-    earlier non-execution. No old-process failure witness is required for this
-    recovery path. New submissions use Submit_group, never reconstructed retries.
-
-    Normalize wire rejection against the exact frozen submitted member order:
-    success_tx_ids must be an ordered prefix, failed_tx_id must be its next
-    member, and unexecuted_suffix is exactly the remaining suffix. Only when the
-    accepted prefix is empty may an omitted failed ID denote the first member,
-    as in the existing wire contract. A nonempty accepted prefix requires both
-    validated cursor and checksum acceptance_barrier; an empty prefix has None.
-    Reject duplicates, foreign IDs, reordered prefixes, missing barriers and
-    impossible partitions as Protocol_failure, retaining the frozen submission.
-    Empty_tx_data/Invalid_tx/Invalid_t_before map to Overlay.Invalid_request;
-    Db_transact_failed with missing_block_uuids maps to Missing_dependencies;
-    other Db_transact_failed and Snapshot_upload_in_progress map to
-    Operational_failure. Preserve bounded missing IDs and diagnostic detail.
-    Stale requires its advancing cursor and yields Overlay.Stale, never a
-    fabricated definitive partition or proof of a previous attempt's outcome.
-    Preserve Overlay's Permission_denied when a real source supplies it, but do
-    not invent a wire reason. Rejected resolutions flow through Reject_group;
-    its durable commit and subsequent authoritative pull decide reconciliation.
-
-    Remote_error carries the real server Error message, scoped to its connection,
-    and must be handled by the connection/sync policy as a non-retryable protocol
-    error, retaining uncertain submissions. It cannot be discarded as a hint or
-    arbitrarily attached to an unmatched Push. Presence/online-users are not sync
-    inputs. Ping/pong is physical connection liveness, not an outbox wake or commit.
-    Authentication acquisition/one checked refresh belong to injected transport;
-    exhaustion returns Authentication_failure/Access_revoked, never timed reconnect
-    with the unchanged rejected credential. No account/key-package API is added. *)
+(** Validate framing/authentication/cursors/bounds/envelopes before delivery.
+    Wrap Head/Fetch_snapshot/Pull/Push exactly once in On_connection, never
+    connection management. One socket reader matches responses to bounded pending
+    requests; no request-ID multiplexer: at most one unresolved response-family
+    request (including Push). Match generation, baseline, frozen tx-id/barrier;
+    ambiguity fails the connection and retains Submitted. pull/ok with txs=[]
+    completes its Pull with No_progress, not Receive or a new wire field.
+    Head uses existing hello/head state. One pending Receive per connection;
+    overflow backpressures. Only Remote_changed hints coalesce by resampling,
+    never responses/terminal messages/batches. Bound frames before allocation.
+    Retire joins reader/writer/requests/callbacks; Connect rejects until old join.
+    Only Remote_closed/Network_lost permit EDSL backoff, not local close or
+    unchanged auth/protocol/crypto/storage rejection. Authentication uses injected
+    credentials and one checked refresh; exhaustion waits for corrected authority.
+    Recovery uses Inspect Submitted IDs then Retry_group with a fresh token;
+    require the original batch ID, t_before and exact protected wires, not None.
+    Push uses existing tx-batch t-before/tx-id/protected tx/outliner-op: no batch
+    status endpoint or server batch-ID deduplication is implied. Stale is not
+    proof of prior non-execution; Accept_group/Reject_group then Pull reconcile.
+    New work uses Submit_group, never reconstruction of uncertain submissions.
+    Rejection partitions frozen member order: success_tx_ids is an ordered prefix,
+    failed_tx_id the next member, unexecuted_suffix the exact remainder. Omitted
+    failed ID means first member only for an empty prefix. Nonempty prefix needs
+    validated cursor/checksum barrier; empty prefix has None. Invalid partitions,
+    duplicates/foreign IDs/missing barriers fail Protocol_failure, retaining wires.
+    Empty_tx_data/Invalid_tx/Invalid_t_before -> Overlay.Invalid_request;
+    Db_transact_failed with missing_block_uuids -> Missing_dependencies;
+    other Db_transact_failed/Snapshot_upload_in_progress -> Operational_failure.
+    Preserve bounded missing IDs/diagnostics. Stale needs an advancing cursor and
+    maps to Overlay.Stale, never a definitive partition. Preserve real
+    Permission_denied without inventing a wire reason. Remote_error is a scoped
+    non-retryable protocol error, never an unmatched Push result or dropped hint;
+    retain uncertain submissions. Presence is not sync; ping/pong is only liveness. *)
 
 type unlock_input
 val unlock_input : wrapped_graph_key:string -> (unlock_input, error) result
 val wrapped_graph_key : unlock_input -> string
-(** Validated wrapped material, never a raw key. Secret acquisition and account
-    key-package coordination are caller responsibilities. The accessor exposes
-    only the supplied wrapped envelope, never a raw key. Unlock succeeds only
-    after verifying and installing the key for this exact graph; a still-locked
-    result is Error Locked, not successful key access. Never log key material. *)
+(** Wrapped material only; never log keys. Unlock verifies/installs this graph's
+    key; still locked means Error Locked. Callers own key acquisition/coordination. *)
 type _ crypto = Unlock : unlock_input -> key_status crypto
 
-(** Assets are explicit bounded demands, not a graph-wide discovery service. *)
 type asset = Logseq_db_types.Asset_descriptor.t
-(** Shared validated graph metadata retains source, checksum, file type and remote
-    version. External URLs are not managed-sync downloads. *)
+
 type asset_file = private { file : resource; asset : asset }
 type asset_lease = private { lease : resource; source : asset_file }
 val asset_file : resource -> asset -> (asset_file, error) result
 val asset_lease : resource -> asset_file -> (asset_lease, error) result
-(** Adapter-created descriptors validated against its real registered resources;
-    pure constructors neither retain bytes nor confer native access. *)
+
 type resource_reference = Snapshot_reference of snapshot
   | Connection_reference of connection
   | File_reference of asset_file | Lease_reference of asset_lease
@@ -472,8 +268,7 @@ type asset_result = Available of asset_file | Waiting_remote | Missing_local
 type cache_report =
   { resident_bytes : int64; pending_bytes : int64; retained_bytes : int64
   ; cleanup_pending : int; over_budget : bool }
-(** Bounded totals, not an inventory; retained bytes are pinned/unpublished bytes
-    already included in resident/pending totals, not a third additive pool. *)
+(** retained_bytes is already included in resident/pending, not an additive pool. *)
 
 type _ assets =
   | Prune_cache : cache_report assets
@@ -484,60 +279,27 @@ type _ assets =
   | Release_file : asset_file -> unit assets
   | Release_lease : asset_lease -> unit assets
 
-(** Files and leases are process-local, minted by the original asset owner and
-    runtime-checked against exact graph generation. Upload uses an existing durable
-    publication intent; success means verified remote publication, not a user
-    database edit. Downloads verify envelope/checksum before publication; malformed
-    encryption never falls back to plaintext. Locked assets wait for unlock and
-    missing remote versions remain waiting, not empty successful downloads.
-    Lookup is local-only and recreates a registered handle for matching cached
-    bytes after restart; None is absence of those exact bytes, not remote absence.
-    For Managed (Some remote B) with current_checksum A, Lookup first checks the
-    local original A, then cached B on a miss; it may return either only with
-    validated actual content identity. This also works with Closed network or locked
-    keys when verified local plaintext is already available. Managed None with A
-    checks A offline; its miss means Waiting_remote, not permission to invent a
-    file type/version or GET A. Managed None without A waits for publication.
-    External sources never enter managed Download/Upload. Download uses only the
-    explicit Managed remote version B after a local miss; it never substitutes A
-    as a remote version. Result asset_file.asset describes the original selection
-    descriptor, while its registered file metadata records the actual chosen bytes;
-    Retain and Publish validate that relationship, not equality of A and B.
-    Lookup completion is fenced by incarnation and the full selection (UUID,
-    current_checksum, optional remote checksum/file_type). A demand-bound child
-    created by spawn_asset additionally binds its exact receipt; replacement
-    invalidates that child interest and cleans stale results. Generic Lookup has
-    no implicit demand binding: it may return an old selection to its original
-    task, but Publish_demand must reject it against a changed receipt and the task
-    releases it through the original owner. Neither path can publish stale bytes.
-    Local lookup sharing uses that full selection; remote transfers deduplicate
-    by incarnation, UUID, remote checksum and file_type, never checksum alone or
-    demand ID. Distinct local interests may share B's download, but each must
-    revalidate its own current selection before publishing a separately retained
-    lease. A remote-version publication is an explicit replacement Demand, not a
-    network-change heuristic that fabricates new graph metadata.
-    Local source staging, durable import recovery, publication and pruning are
-    owned by the injected asset capability under existing persistence rules.
-    Restore performs bounded/incremental accounting and recovery of existing cache
-    and staging metadata before asset admission, without remote work. Prune_cache
-    is a cancellable local incremental sweep using bounded batches and yielding to
-    foreground work; it removes only unpinned cache and proven orphan staging.
-    It reports actual remaining bytes/pressure, never claims durable originals were
-    uploaded merely to reclaim space. Cleanup failures retain paths under their
-    original owner and return their concrete error. The EDSL may request pruning
-    after Capacity_exceeded, then wait for release/correction when retained bytes
-    prevent progress; it must not loop retrying a storage failure. Database import
-    remains the external owner's user API, not a DSL operation.
-    Retain creates a separately bounded native lease; release failure retains
-    the original resource. Duplicate successful release is idempotent. Leases
-    cannot be abandoned by claiming physical release. *)
+(** Original-owner registered files/leases are process-local and generation-checked.
+    Upload uses durable publication intent; success is verified remote publication,
+    not a user edit. Download verifies encryption/checksum, never plaintext fallback.
+    Lookup is offline: for Managed remote B/current A try original A then cached B;
+    Managed None/current A checks A, whose miss is Waiting_remote (never GET A).
+    Managed None without A waits for publication. Download only explicit remote B;
+    External never enters managed transfers. Result asset preserves selection;
+    registered metadata identifies actual bytes; Retain/Publish validate both.
+    Lookup sharing binds full incarnation/UUID/current/remote checksum/file_type;
+    transfer dedup binds incarnation/UUID/remote checksum/file_type, not demand ID.
+    Each interest revalidates selection and retains its own lease before publish.
+    spawn_asset binds revision: replacement cancels its obsolete interest; generic
+    Lookup may return old selection but cannot publish to a changed receipt.
+    Remote-version changes require explicit replacement Demand. Locked/missing
+    versions wait, never fabricate successful bytes. Restore incrementally accounts
+    existing staging/cache offline. Prune yields bounded batches, removing only
+    unpinned cache/proven orphan staging; durable unpublished originals stay.
+    Pressure waits for release/correction, never retries storage failures in a loop.
+    Retain creates a separate bounded lease; release is idempotent only after
+    success. Failed cleanup retains exact handles/paths/charges and concrete error. *)
 
-(** {2 Structured business tasks}
-
-    The outer indexed program alone changes graph lifecycle. Inner tasks are pure
-    descriptions with restricted capabilities, not host closures executing I/O.
-    Long-lived policy is ordinary recursive task construction, waits, timers and
-    continuation-local state. There is no controller step or hidden adapter policy. *)
 type 'a task
 type scope
 type !'a child
@@ -551,21 +313,17 @@ type demand_change =
   | Withdraw of demand_id
 
 type demand_receipt
-(** Process-local exact demand revision, minted by ingress; invalid after a newer
-    revision or scope exit. It is not an asset file or lifecycle authority. *)
+(** Ingress-minted exact revision; replacement or scope exit invalidates it. *)
 type unlock_receipt
-(** Runtime-minted, single-use wrapped-input revision bound to this graph
-    incarnation and service scope. Replacement, expiry or scope exit invalidates
-    it. It contains no printable material and survives no restart. *)
+(** Single-use graph/scope-bound wrapped revision; replacement, expiry or scope
+    exit invalidates it. No restart persistence or printable key material. *)
 type service_input =
   | Unlock_requested of unlock_receipt
   | Demand_changed of demand_receipt * demand_change
   | Network_changed of network_gate
   | Stop_requested
-(** Inputs are supplied through Execute's independent bounded ingress. Demand IDs
-    are bounded nonempty strings (<= 256 bytes). Updating an ID replaces its exact
-    asset version and priority; withdrawing cancels its interest, not other users'
-    shared download. The EDSL owns scheduling policy and resource release. *)
+(** Demand IDs are nonempty <= 256 bytes. Replacement changes exact selection and
+    priority; withdrawal cancels only that interest, not other shared users. *)
 
 type asset_failure_reason =
   | Asset_network of string
@@ -584,11 +342,9 @@ type asset_failure_reason =
 
 type demand_transfer =
   { result : (asset_result, asset_failure_reason) result; attempts : int }
-(** Joined Download_demand result with the actual admitted remote-attempt count
-    for this invocation (zero if none). The interpreter reports facts from its
-    scoped network admission ledger, not a guessed count of scheduled tasks.
-    Business transfer failure is data; stale receipts, invalid usage and unjoined
-    cleanup remain task-effect errors. No automatic retry occurs in this effect. *)
+(** Joined result; attempts counts this invocation's actual scoped remote
+    admissions (zero if none), never scheduled tasks. No implicit retry. Business
+    failures are data; stale usage/unjoined cleanup remain task-effect errors. *)
 
 type demand_availability =
   | Demand_queued
@@ -603,31 +359,21 @@ type demand_availability =
   | Demand_revoked
 
 type demand_delivery
-(** Runtime-minted publication identity, bound to one original owner, graph
-    incarnation, demand revision and scope. Not constructible from a demand ID.
-    A received delivery retains its original cleanup binding until release ACK. *)
+(** Runtime-minted owner/incarnation/revision/scope binding; received delivery
+    retains original cleanup obligation through revocation until release ACK. *)
 type demand_output = private
   { delivery : demand_delivery
   ; id : demand_id
   ; demand : demand_receipt
   ; availability : demand_availability }
-(** The bounded external result of explicit Publish_demand, not an adapter
-    callback or program termination. Demand_available must pair an exact asset
-    file with its validated lease; publication never manufactures a lease. *)
 
-(** Every state uses the same revision/delivery/release protocol, including states
-    with no resources. attempts is the number of admitted remote attempts, >= 0;
-    retry_scheduled is true only while a bounded network retry timer actually exists.
-    Not-found, checksum, authentication, locked, storage and invalid-content causes
-    are not automatic retry permission. Locked/network-closed become waiting states;
-    correction or a new demand revision triggers a fresh local Lookup. Expected
-    transfer failures are published for the affected interest and handled locally,
-    not escalated to stop unrelated sync/connection tasks. Retrying never changes
-    the identity of an uncertain durable publication. Diagnostics remain bounded. *)
+(** All availability states use delivery/release, even without resources.
+    attempts >= 0; retry_scheduled requires an actual bounded network retry timer.
+    Only network failures permit retry; locked/closed wait for correction, then
+    fresh Lookup. Publish expected failures per interest without stopping unrelated
+    sync work. Never change uncertain durable publication identity. *)
 
 type outbox_check
-(** Opaque scope-owned inspection epoch for this exact runtime/incarnation. Created
-    by Await_outbox_changed before Inspect; not a database token or durable receipt. *)
 
 type 'a wake = Input of service_input | Child_ready of 'a child
 
@@ -637,8 +383,6 @@ type notification =
   | Connected of connection
   | Remote_received of received
   | Connection_retired of connection
-(** A bounded scope-owned channel carries connection identity and remote hints
-    from the sole receiver to sync/asset policy. It owns no socket or graph. *)
 
 type service_status =
   | Service_idle
@@ -648,8 +392,6 @@ type service_status =
   | Service_waiting_unlock
   | Service_backoff of { attempt : int; seconds : float; cause : error }
   | Service_blocked of error
-(** Pure policy status, not authority or proof of durable synchronization. Concrete
-    causes are retained; transient failures need not terminate the service. *)
 
 type _ task_effect =
   | Notifications : scope -> notifications task_effect
@@ -674,107 +416,46 @@ type _ task_effect =
   | Await_input_or_child : 'a child Rrbvec.t -> 'a wake task_effect
   | Sleep : float -> unit task_effect
   | Yield : unit task_effect
-(** Await_outbox_changed is an independent level-triggered bounded invalidation,
-    not a Next_input/asset notification. Exactly one task per service owns the
-    inspection reservation, held from await through acknowledgement; competing
-    consumers fail Invalid_input rather than stealing a wake. No waiter is needed
-    for notification retention. Runtime starts dirty; restoration, successful
-    unlock/activation and every successful reopen also request a check. Connection
-    policy requests a reconnect check with Resample_outbox after Connected.
-    Resample_outbox explicitly marks dirty (for example after Connected); it does
-    not inspect or send anything. Await captures the dirty epoch before Inspect.
-    Acknowledge_outbox_check clears only that captured epoch, after successful
-    inspection and installation of its bounded plan. A newer commit during Inspect
-    stays dirty and makes the next await immediately ready. Implement by a checked
-    epoch or equivalent two-bit dirty/in-flight protocol without counter wrap loss.
-    Abandon_outbox_check releases the reservation without acknowledging dirty work;
-    use it after failed inspection/planning before waiting for correction. Task
-    termination/cancellation also abandons it. The next consumer inspects afresh.
-    A failed Inspect itself does not implicitly clear or consume the check.
-    Old/foreign/duplicate checks
-    fail Stale_context. Scope exit invalidates checks without discarding dirtiness.
-    Closed network still permits Inspect and local planning; it never authorizes
-    Push. Keep the plan while waiting for Open, then inspect again before preparing
-    a submission against a fresh sync token. Network reopen cannot depend solely
-    on a commit arriving after the waiter was installed. Inspect failure on absent
-    mirror waits for activation; it must not spin or erase pending local intent.
-    Task_observe is the local checked Observe capability usable during Run_task.
-    Publish_status replaces one bounded policy-status slot observed independently
-    through Execute.observe_runtime/await_observation; it neither queues unbounded
-    history nor transfers resources. The service designates one status publisher
-    (siblings forward causes through bounded Notifications rather than racing).
-    Runtime gate/counts and actual retained cleanup override optimistic policy;
-    Service_online is not acknowledgement of an outbox commit.
-
-    Sleep uses finite nonnegative monotonic seconds and is cancellable. All
-    effects may suspend without blocking siblings, ingress or control. Database
-    mutations still serialize at the single external database owner.
-    Wait_network_open is a cancellable wait for an authorized Open gate with old
-    network retirement complete, not a timer retry or a reusable permit; each
-    subsequent actual admission must recheck. It does not consume Next_input.
-    Consume_unlock atomically checks/consumes the exact live receipt and executes
-    the ordinary Unlock capability locally, even with Closed network admission.
-    Expired/replaced/foreign receipts fail without invoking crypto; failure after
-    consumption exposes the original crypto error and requires fresh input.
-    Its wrapped payload is discarded after consumption and joined crypto work;
-    neither receipt diagnostics nor observations/logs contain key material.
-
-    Publish_demand checks the exact current revision, asset and original resource
-    ledger atomically before enqueueing. Success transfers the supplied file and
-    lease references from the task to the runtime output ledger, not to a consumer;
-    the task must not release or republish them. Failure transfers nothing, so the
-    task retains both references for explicit release. Output count and bytes share
-    maximum_messages/maximum_message_bytes; resources share maximum_resources.
-    Capacity_exceeded is immediate and recoverable in the task, not silent loss.
-    Available is legal only for a live Demand, Revoked only for its live Withdraw;
-    waiting/missing results carry no resources. Duplicate publication of transferred
-    references is rejected without minting another delivery or lease. Reservations
-    include superseded cleanup until physical release succeeds; failed cleanup is
-    retained with its original cause, never hidden by replacement success.
-    One unreceived publication per revision may be replaced atomically; superseded
-    unreceived resources are released by their original owner before reclaiming
-    their slots. Replacement/withdrawal invalidates queued old availability and
-    schedules its original-owner cleanup. Received resources are never silently
-    released under a consumer: their delivery becomes revoked and remains owed
-    until Execute.release_demand ACK. Demand_revoked is an explicit task publication
-    for a live withdrawal receipt; it carries no resources. Late publication fails
-    Stale_context and leaves task ownership intact. Scope exit cancels receivers,
-    cleans unreceived output and retains received deliveries and failed cleanup
-    in the runtime ledger; retirement cannot succeed while any remain.
-    Finish_demand cannot erase outstanding output/cleanup or a newer revision.
-    No shared mutable callback or notification side channel publishes availability.
-
-    Download_demand resolves the exact current asset/priority from its receipt and
-    uses the ordinary Download adapter once, reporting its joined result and actual
-    scoped admission count as demand_transfer. It neither performs local Lookup
-    nor silently retries; the EDSL must Lookup first, publish queued/waiting states
-    and choose whether to download. A withdrawn/stale revision cannot start.
-    No-version Download returns Waiting_remote without network admission. Closed
-    and Locked reject remote admission and report Asset_network_closed/Asset_locked with
-    zero attempts, allowing policy to publish waiting states; concrete network
-    failure after admission preserves its diagnostic and nonzero attempt count.
-    Active assets are bounded by maximum_active_assets, background admissions by
-    maximum_active_assets - foreground_reserve, including generic Download/Upload.
-    Capacity failure is explicit; EDSL waits/yields and selects the next demand.
-    Updates cancel obsolete interest and reclassify shared work before further
-    admissions; physical cancellation/join still consumes the active slot.
-    Finish_demand releases that revision's interest only after its children joined
-    and resources were transferred or released; stale receipts cannot erase newer
-    demand. Transfer deduplication is by exact asset version, not demand ID.
-    Notifications reserves a channel slot from maximum_resources; all channels
-    share maximum_messages/maximum_message_bytes. Notify suspends under pressure;
-    only adjacent Remote_changed hints for the same connection may coalesce.
-    Connection transitions never coalesce. Next_notification is single-consumer;
-    fan-out requires separate bounded channels and explicit Notify in the EDSL.
-    Scope exit cancels waiters and releases queues after all children join.
-    Await_input_or_child suspends on ingress and the supplied live children using
-    Eio readiness, not polling. The vector is bounded by maximum_tasks, contains
-    no duplicates and belongs to the current scope. Selection atomically consumes
-    only a winning input; Child_ready does not consume its join. Cancellation
-    consumes neither input nor child result. Stop has priority; otherwise choose
-    fairly between input and ready children, so finished transfers are joined and
-    slots reclaimed even if no new demand arrives. It shares Next_input's single
-    consumer reservation, not another unbounded queue. *)
+(** Outbox is independent level-triggered dirtiness, retained without a waiter.
+    One task owns await-to-ACK reservation; competitors fail Invalid_input.
+    Start/restore/unlock/activation/reopen mark dirty; Connected calls Resample.
+    Await captures epoch before Inspect; ACK clears only that epoch after installing
+    a successful bounded plan. Commits during Inspect stay dirty; no wrap loss.
+    Abandon/failure/cancel/scope exit releases reservation, never dirtiness;
+    old/foreign/duplicate checks fail Stale_context. Inspect may run Closed;
+    after waiting for Open re-inspect before preparing fresh wires. Absent mirror
+    waits for activation, never spins. Resample marks dirty without I/O.
+    Task_observe is local metadata; one publisher replaces latest status, bounded
+    sibling Notifications forward causes. Actual gate/counts/cleanup override policy.
+    Sleep is finite nonnegative monotonic/cancellable. Effects may suspend without
+    blocking siblings, ingress or control. Database mutations share the external owner.
+    Wait_network_open waits for authorized Open and old network join, not a permit;
+    each admission rechecks. Consume_unlock atomically consumes live receipt before
+    local crypto; stale/expired fails without crypto. Crypto failure needs fresh
+    input; discard payload after joined crypto, never expose key diagnostics.
+    Publish validates revision/selection/resources/capacity atomically: success
+    transfers file+lease to runtime (task must not release/republish), failure
+    transfers nothing. Available requires live Demand, Revoked live Withdraw;
+    waiting/missing carry no resources. Reject duplicate transferred references.
+    One unreceived publication per revision may be replaced; release superseded
+    resources before reclaiming slots. Changed revisions invalidate queued output;
+    received resources are only revoked, never reclaimed before release_demand ACK.
+    Scope exit cleans unreceived output, retains received/failed cleanup and blocks
+    retirement. Finish_demand cannot erase output/cleanup or newer revisions.
+    Download_demand uses ordinary Download once after EDSL Lookup; no-version waits
+    without remote admission; Closed/Locked report waiting causes with zero attempts.
+    Count active work through physical join, including generic Download/Upload;
+    background cannot borrow foreground reserve. Replacement reclassifies shared
+    work before admission. Finish_demand follows joined children and transferred/
+    released resources; stale revisions cannot finish newer interests.
+    Notifications reserves a resource slot; queues share message count/bytes.
+    Notify backpressures; only adjacent same-connection Remote_changed coalesce,
+    never transitions. One consumer per channel; fan-out uses explicit channels.
+    Scope exit joins children before queue release. Await_input_or_child uses
+    readiness, not polling: unique live same-scope children <= maximum_tasks.
+    Atomically consume winning input only; Child_ready is not join, cancellation
+    consumes neither. Stop first, otherwise fair input/ready-child choice; shares
+    Next_input's sole consumer reservation. *)
 
 val task_return : 'a -> 'a task
 val task_bind : 'a task -> ('a -> 'b task) -> 'b task
@@ -784,32 +465,20 @@ val task_perform : 'a task_effect -> success:('a -> 'b task)
 val with_scope : (scope -> 'a task) -> 'a task
 val spawn : scope -> 'a task -> ('a child, error) result task
 val spawn_asset : scope -> demand_receipt -> 'a task -> ('a child, error) result task
-(** Like spawn, but binds the child to a current demand's priority for admission.
-    Ordinary/background children cannot consume foreground_reserve task slots;
-    spawn_asset for a live foreground receipt can. Replacement reclassifies shared
-    interest before new admissions; cancellation/join still holds its slot. Require
-    maximum_tasks >= maximum_active_assets + 4 so coordination and the foreground
-    task reservation coexist. A stale receipt starts no task. The EDSL chooses
-    runnable demands fairly, with bounded foreground bursts and eventual background
-    turns when resources/network allow; foreground reservation is not starvation
-    permission. No busy polling for capacity: await/join a live child or wait input. *)
+(** spawn_asset binds current revision/priority; ordinary children cannot borrow
+    foreground task slots. Replacement reclassifies before admission; cancellation
+    holds slots through join. Schedule fair bounded foreground bursts with eventual
+    background turns; wait on input/children for capacity, never busy-poll. *)
 val equal_child : 'a child -> 'a child -> bool
 val join : 'a child -> ('a, error) result task
 val cancel_child : 'a child -> unit task
 
-(** Every scope owns all spawned children. Normal return, failure and cancellation
-    cancel then join remaining children and their operation producers before exit.
-    Completed children retain their bounded slot until join; join consumes it once.
-    Foreign/expired scopes and reused child joins fail explicitly at runtime.
-    Cancellation of a child affects only its subtree, not siblings or graph phase.
-    Failure is observed by join, not silently lost; scope exit reports unobserved
-    child failures as well. Expected Cancelled caused solely by that scope's own
-    shutdown is not a new primary failure; cleanup failures and unknown durable
-    outcomes always propagate and retain original owners. Spawn reserves task,
-    terminal and queue capacity before starting; exhaustion returns
-    Capacity_exceeded without starting a producer.
-    Tasks cannot invoke Restore, Set_network, Begin_drain or Finish_retirement.
-    Network_closed is a joined ordinary task failure, not whole-graph cancellation. *)
+(** Scope exit cancels then joins children and producers on every path; completed
+    children keep slots until one join consumes them. Foreign/expired/reused joins
+    fail. Child cancel affects its subtree only. Report unobserved child failures;
+    scope-caused Cancelled is not a new primary, but cleanup/unknown outcomes stay.
+    Reserve task/terminal/queue capacity before spawn. Network_closed is an ordinary
+    joined failure, not graph cancellation. *)
 
 type _ task_node =
   | Task_return : 'a -> 'a task_node
@@ -824,51 +493,25 @@ type _ task_node =
   | Task_cancel : 'a child -> unit task_node
   | Task_bind : 'a task * ('a -> 'b task) -> 'b task_node
 val task_view : 'a task -> 'a task_node
-(** Total pure one-node projection for Execute. Scope/child handles are minted by
-    the interpreter, never manufactured by the program. Execute uses Eio switches,
-    fibers, promises and cancellation contexts; this view is not a second general
-    fiber scheduler. Runnable continuations yield after steps_per_turn reductions;
-    fair turns include queued completions and input, with no cumulative step cap.
-    Every continuation must terminate; arbitrary nonterminating OCaml cannot be
-    preempted by this contract. Retained tasks, waiters and ready queues are bounded
-    by maximum_tasks/maximum_pending; terminal capacity is reserved at admission. *)
+(** Pure total projection. Continuations must terminate without I/O; yield after
+    steps_per_turn, fairly including completions/input, with no lifetime step cap.
+    Bound retained tasks/waiters/ready queues and reserve terminal capacity. *)
 
-(** {2 Interpreter production protocol}
-
-    The program representation above stays abstract. This support module is the
-    sole producer of opaque task/ingress/output handles; it performs no I/O and
-    implements no scheduling or business policy. Each Execute.create privately
-    creates one owner and never exposes it to programs, adapters or consumers.
-    Public creation is not authorization: a client can create another owner, but
-    its handles are foreign even for an identical identity. Owner identity uses
-    fresh process-local allocation, never caller strings or structural equality.
-    No handle survives restart. Foreign/closed-scope production or validation
-    returns Error Stale_context without allocating a handle or invoking callbacks;
-    original-owner delivery cleanup validation remains legal after scope close.
-    Execute registers every returned handle in its
-    bounded operation ledger before delivery; successful construction alone does
-    not prove admission, revision currency, resource validity or cleanup ACK.
-
-    Production audit: phase/drainable witnesses and ordinary records/variants are
-    public data; t/task are constructed only by the pure combinators. identity,
-    limits, retry_policy, resource, snapshot, connection, unlock_input, asset_file,
-    asset_lease and demand_id use their named validated constructors. Overlay and
-    asset descriptor values come from their real public owner interfaces, not
-    from this support module. The remaining opaque scope, child, demand_receipt,
-    unlock_receipt, outbox_check, notifications, demand_delivery and private
-    demand_output are produced below. Execute's own opaque values are local to
-    Execute, so do not require a cross-module constructor. *)
+(** Interpreter-only handle production, no I/O/policy. Execute keeps one private
+    freshly allocated owner, never passes it to adapters/programs. Equal identity
+    is not equal ownership. No handle survives restart. Foreign/closed checks fail
+    Stale_context before allocation/callback; original cleanup remains legal.
+    Execute reserves/registers bounded handles and checks current operation ledgers;
+    construction proves neither admission, authority, revision nor resource ACK. *)
 module Producer : sig
   type owner
   val create : identity -> owner
   val scope : owner -> scope
   val check_scope : owner -> scope -> (unit, error) result
   val close_scope : owner -> scope -> (unit, error) result
-  (** Checks exact owner and live scope. Close is idempotent for its original
-      owner, invalidates associated handles, and drops retained child callbacks
-      only after Execute has cancelled/joined their producers. It neither cancels
-      nor joins anything itself; Execute must perform physical cleanup first.
-      Received deliveries keep their original cleanup binding after scope close. *)
+  (** Check exact live owner/scope. Original-owner close is idempotent, only after
+      Execute cancels/joins producers; close itself does neither. Received delivery
+      cleanup survives close. *)
 
   val child : owner -> scope -> 'a task
     -> poll:(unit -> ('a, error) result option) -> ('a child, error) result
@@ -876,24 +519,13 @@ module Producer : sig
   val child_result : owner -> scope -> 'a child
     -> (('a, error) result option, error) result
   val forget_child : owner -> scope -> 'a child -> (unit, error) result
-  (** Execute reserves a bounded task slot, allocates a typed promise for the
-      very task passed here, and supplies its nonblocking poll. The child retains
-      that exact typed callback; child_result checks owner/scope before calling it.
-      None means unfinished, Some is a repeatable terminal result, not a join ACK.
-      No existential cast, caller-selected result type or untyped ticket lookup
-      is needed. Execute alone resolves the promise by interpreting that task.
-      Producer cannot prove the callback's business honesty: possession of its
-      private owner and actual registration are required at every Task_join,
-      Task_cancel and Await_input_or_child. Forget follows physical join, consumes
-      the join slot and drops the callback; subsequent uses fail Stale_context.
-      Repeated forget succeeds idempotently for the original owner after pruning;
-      child_result/check_child still reject the consumed child. Foreign, closed
-      or consumed handles fail Stale_context without calling poll. Execute bounds
-      all live handles and retained callbacks by limits, including scope creation;
-      Producer does not maintain a second unbounded registry. Retained handle
-      objects carry their original owner and validity cell after ledger pruning.
-      Foreign checks never call poll. No helper authorizes an arbitrary OCaml
-      callback to execute inside a program; this callback is interpreter-only. *)
+  (** Execute reserves a slot and binds poll to the exact task's typed promise.
+      Check owner/live scope/unconsumed registration before poll; None is unfinished,
+      Some repeatable terminal data, not join. Foreign checks never invoke poll.
+      forget follows physical join, drops callback/slot; repeated original forget
+      is idempotent but consumed check/result fails Stale_context. Bound handles/
+      callbacks without a second registry or growing tombstones; handles retain
+      owner/validity after pruning. Producer cannot prove callback honesty. *)
 
   val demand_receipt : owner -> scope -> (demand_receipt, error) result
   val unlock_receipt : owner -> scope -> (unlock_receipt, error) result
@@ -903,330 +535,19 @@ module Producer : sig
   val check_unlock_receipt : owner -> scope -> unlock_receipt -> (unit, error) result
   val check_outbox_check : owner -> scope -> outbox_check -> (unit, error) result
   val check_notifications : owner -> scope -> notifications -> (unit, error) result
-  (** Fresh non-reused identities, created after reservation and registered before
-      delivery. Execute binds demand to exact ID/revision/selection/priority,
-      unlock to its single-use envelope/expiry, outbox to its captured dirty epoch
-      and channel to its bounded queue. Checks here establish owner/live scope
-      only; Execute additionally checks that immutable registration and current
-      revision/consumption state atomically on every use. Revoked registrations
-      cannot be restored by minting a new handle. No user-supplied token can alias
-      an earlier identity; pruning must not introduce reuse or unbounded tombstones. *)
+  (** Fresh identities after reservation, registered before delivery. Execute binds
+      demand selection/revision/priority, unlock envelope/expiry, outbox epoch and
+      channel queue, checking currency/consumption atomically in addition to owner/
+      live scope. No identity reuse, registration resurrection or growing tombstones. *)
 
   val demand_output : owner -> scope -> demand_receipt -> id:demand_id
     -> demand_availability -> (demand_output, error) result
   val check_delivery : owner -> demand_delivery -> (unit, error) result
-  (** Allocates one fresh delivery and its private output after checking the
-      receipt's exact owner and scope. Execute first validates the live receipt's
-      registered ID/selection, publication legality, resources and capacity, then
-      atomically registers output before enqueue. Producer does not validate a
-      lease, transfer ownership or publish. check_delivery checks original owner
-      even after scope close; Execute still checks delivery ledger and release
-      watermarks before use/cleanup. Received deliveries retain cleanup authority,
-      not current availability authority, after revocation. *)
+  (** Execute checks live receipt ID/selection, publication legality/resources/
+      capacity before atomic registration/enqueue. Producer only creates output,
+      never validates leases or transfers ownership. check_delivery checks original
+      owner after scope close; Execute still checks ledger/release watermarks. *)
 end
-
-(** Interpreter-only construction example. The caller supplies private [owner],
-    active [scope], a reserved typed task promise [poll], and already validated
-    publication inputs. All production uses public DSL declarations:
-    {[
-      let admit_child owner scope task poll =
-        Producer.child owner scope task ~poll
-
-      let inspect_child owner scope child =
-        Producer.child_result owner scope child
-
-      let make_output owner scope receipt id availability =
-        Producer.demand_output owner scope receipt ~id availability
-    ]}
-    These are not business APIs. Execute must apply the registration and physical
-    join rules above; a successfully minted foreign owner's handle is rejected
-    before any callback, publication, network admission or original-owner release. *)
-
-(** A service can run connection, sync and assets independently. Caller-supplied
-    [connection_loop], [sync_loop] and [asset_loop] are pure task builders; the
-    connection loop repeats Receive and retires before timed reconnect, the sync
-    loop inspects/commits exact tokens, and the asset loop consumes Next_input and
-    spawns bounded transfers rather than awaiting Download inline. For example:
-    {[
-      let admit scope task continue =
-        task_bind (spawn scope task) (function
-          | Error cause -> task_fail cause
-          | Ok child -> continue child)
-
-      let service connection_loop sync_loop asset_loop =
-        with_scope (fun scope ->
-          task_perform (Notifications scope) ~failure:task_fail
-            ~success:(fun notices ->
-              admit scope (connection_loop notices) (fun _connection ->
-              admit scope (sync_loop notices) (fun _sync ->
-              admit scope (asset_loop scope) (fun assets ->
-              task_bind (join assets) (function
-                | Error cause -> task_fail cause
-                | Ok () -> task_return ()))))))
-
-      let spawn_after_reclaim scope work running on_pressure =
-        task_bind (spawn scope work) (function
-          | Ok child -> task_return child
-          | Error (Capacity_exceeded _ as cause) ->
-            task_bind (on_pressure cause) (fun () ->
-              task_bind (join running) (function
-                | Error cause -> task_fail cause
-                | Ok () ->
-                  task_bind (spawn scope work) (function
-                    | Ok child -> task_return child
-                    | Error cause -> task_fail cause)))
-          | Error cause -> task_fail cause)
-
-      let rec unlock_service on_unlock_error () =
-        task_perform Next_input ~failure:task_fail ~success:(function
-          | Unlock_requested receipt ->
-            task_perform (Consume_unlock receipt)
-              ~failure:(fun cause ->
-                task_bind (on_unlock_error cause)
-                  (fun () -> unlock_service on_unlock_error ()))
-              ~success:(fun _keys -> unlock_service on_unlock_error ())
-          | Stop_requested -> task_return ()
-          | _ -> unlock_service on_unlock_error ())
-
-      let publish_available receipt file =
-        task_perform (Task_assets (Retain file)) ~failure:task_fail
-          ~success:(fun lease ->
-            task_perform (Publish_demand (receipt, Demand_available (file, lease)))
-              ~success:(fun () -> task_return ())
-              ~failure:(fun primary ->
-                task_perform (Task_assets (Release_lease lease))
-                  ~failure:(fun cleanup -> task_fail
-                    (Cleanup_failure { primary = Some primary;
-                      failures = Rrbvec.singleton cleanup }))
-                  ~success:(fun () ->
-                    task_perform (Task_assets (Release_file file))
-                      ~success:(fun () -> task_fail primary)
-                      ~failure:(fun cleanup -> task_fail
-                        (Cleanup_failure { primary = Some primary;
-                          failures = Rrbvec.singleton cleanup })))))
-
-      let rec asset_service on_other =
-        task_perform Next_input ~failure:task_fail ~success:(function
-          | Demand_changed (receipt, Demand {asset; _}) ->
-            let publish state = task_perform (Publish_demand (receipt, state))
-              ~success:task_return ~failure:task_fail in
-            let downloaded report = match report.result with
-              | Ok (Available file) -> publish_available receipt file
-              | Ok Waiting_remote -> publish Demand_waiting_remote
-              | Ok Missing_local -> publish Demand_missing_local
-              | Error Asset_network_closed -> publish Demand_waiting_network
-              | Error Asset_locked -> publish Demand_waiting_unlock
-              | Error reason -> publish (Demand_failed
-                  {reason; attempts = report.attempts; retry_scheduled = false}) in
-            let lookup_failed cause = publish (Demand_failed
-              {reason = Asset_other cause; attempts = 0; retry_scheduled = false}) in
-            let work = task_bind (publish Demand_queued) (fun () ->
-              task_perform (Task_assets (Lookup asset)) ~failure:lookup_failed
-                ~success:(function
-                  | Some file -> publish_available receipt file
-                  | None ->
-                    task_bind (publish Demand_downloading) (fun () ->
-                      task_perform (Download_demand receipt)
-                        ~failure:lookup_failed ~success:downloaded))) in
-            task_bind work (fun () -> asset_service on_other)
-          | Stop_requested -> task_return ()
-          | input -> task_bind (on_other input)
-              (fun () -> asset_service on_other))
-    ]}
-    [on_unlock_error] receives the exact expiry/replacement Stale_context or crypto
-    cause as a pure task, then the locked service waits for fresh external input;
-    it never retries an expired envelope or logs its material. This dedicated
-    unlock-only example has no asset interests; the combined service dispatches
-    every input through its single consumer instead of dropping demand changes.
-    [on_pressure] is a pure task builder that exposes the capacity cause to local
-    scheduling policy before waiting for [running] to join; rejected [work] has not
-    run. [on_other] handles unlock, withdrawal and gate inputs with the same sole
-    input consumer. The small asset_service illustrates the publication path only;
-    the production asset_loop spawns transfers so ingress remains responsive.
-    Failed Retain leaves the file in the original runtime cleanup ledger; failed
-    releases retain their exact original handles and slots, including on scope exit.
-    asset_loop is the single Next_input consumer: it forwards network changes to
-    its local policy and Stop_requested returns, cancelling/joining sibling work
-    through the scope. Connection-to-sync hints use Notify/Next_notification,
-    never racing multiple Receive readers. Demand updates remain consumable
-    while transfers run as children. No child has lifecycle authority. *)
-
-(** {2 Pull completion and no-progress example}
-
-    [next_sync] is a caller's pure task builder, not an adapter or an exported DSL
-    function. [settled] waits for an external change; [resume] retains its target
-    and re-inspects before another Pull. [recover] consumes the exact Retry_group
-    commit's frozen batch as in the recovery contract above; it never fresh-sends.
-    [on_applied] retains the original batch and updated target and handles both
-    Applied and Deferred without discarding either.
-    The caller supplies a finite positive [delay] for successful no-progress pacing.
-    {[
-      let farther left right =
-        if Overlay.Types.Server_cursor.compare left right >= 0 then left else right
-
-      let next_sync ~connection ~target ~delay ~recover ~resume ~settled
-          ~on_applied since =
-        task_perform (Task_transport (On_connection (connection, Pull since)))
-          ~failure:task_fail ~success:(fun reply ->
-            task_perform (Task_database Inspect) ~failure:task_fail
-              ~success:(fun view ->
-                let token = Overlay.Types.sync_view_token view in
-                let checkpoint = Overlay.Types.sync_view_checkpoint view in
-                match reply with
-                | Pulled batch ->
-                  let target = farther target
-                    (Overlay.Types.authoritative_batch_through batch) in
-                  task_perform (Task_database (Apply_authoritative (token, batch)))
-                    ~failure:task_fail ~success:(on_applied target batch)
-                | No_progress {since = baseline; through} ->
-                  let target = farther target through in
-                  if not (Overlay.Types.Server_cursor.equal baseline since) then
-                    task_fail (Protocol_failure "unmatched Pull baseline")
-                  else
-                    let submitted = List.find_map
-                      (fun (item : Overlay.Types.submission_descriptor) ->
-                        match item.state with
-                        | Overlay.Types.Submitted batch_id -> Some batch_id
-                        | _ -> None)
-                      (Overlay.Types.sync_view_submissions view) in
-                    match submitted with
-                    | Some batch_id ->
-                      task_perform (Task_database (Prepare_submission
-                        (token, Overlay.Types.Retry_group batch_id)))
-                        ~failure:task_fail ~success:(recover target)
-                    | None ->
-                      if Overlay.Types.Server_cursor.compare checkpoint target >= 0
-                      then settled target
-                      else task_perform (Sleep delay) ~failure:task_fail
-                        ~success:(fun () -> resume target)))
-    ]}
-    With checkpoint = target and no Submitted, the empty page chooses settled
-    without a database write. With checkpoint < target it preserves that target
-    across Sleep even if through = since. With Submitted it chooses Retry_group
-    first, including when checkpoint = target; the original frozen identity/wires
-    survive. Recovery must return to this policy (with the retained target and
-    no-progress pacing before another unchanged Pull), not loop fresh submissions.
-    Deferred application preserves its original batch and recovery priority.
-    A concurrent database/token conflict escapes exactly, requiring re-inspection;
-    it is never hidden by transport. These are type-checked branch examples, not
-    runtime proof of scheduling or cursor validation by an unimplemented signature. *)
-
-(** {2 Outbox inspection and upload example}
-
-    This complete single-member planner uses only public types. The caller supplies
-    [with_connection], a pure task builder that waits for an authenticated current
-    connection, and [on_error], which exposes the exact cause and waits for explicit
-    correction for non-network errors. It does not return immediately to a failing
-    Inspect loop. Submitted recovery and authoritative Pull remain the sibling sync
-    policy described above; this example only chooses fresh eligible Queued work.
-    The inspected view itself is the installed bounded local plan; after waiting
-    for network it is discarded and inspected again before freezing any wires.
-    {[
-      let submit_one connection view mutation_id =
-        let token = Overlay.Types.sync_view_token view in
-        task_perform
-          (Task_database (Prepare_submission
-            (token, Overlay.Types.Submit_group [mutation_id])))
-          ~failure:task_fail ~success:(fun commit ->
-            match commit.Overlay.Types.submission_batch with
-            | None -> task_fail (Protocol_failure "missing frozen submission")
-            | Some batch ->
-              task_perform (Task_transport (On_connection (connection, Push batch)))
-                ~failure:task_fail ~success:(fun reply ->
-                  let batch_id = Overlay.Types.submission_batch_id batch in
-                  let transition = match reply with
-                    | Accepted barrier -> Overlay.Types.Accept_group {batch_id; barrier}
-                    | Rejected resolution ->
-                      Overlay.Types.Reject_group {batch_id; resolution} in
-                  task_perform (Task_database (Prepare_submission
-                    (commit.sync_token, transition)))
-                    ~failure:task_fail ~success:(fun _commit ->
-                      task_perform Resample_outbox
-                        ~failure:task_fail ~success:task_return)))
-
-      let queued view =
-        List.find_opt (fun (item : Overlay.Types.submission_descriptor) ->
-          item.dependency_eligible && item.state = Overlay.Types.Queued)
-          (Overlay.Types.sync_view_submissions view)
-
-      let rec outbox_service with_connection on_error =
-        let recover cause =
-          task_bind (on_error cause) (fun () ->
-            outbox_service with_connection on_error) in
-        task_perform Await_outbox_changed ~failure:recover ~success:(fun check ->
-          let abandon primary =
-            task_perform (Abandon_outbox_check check)
-              ~success:(fun () -> recover primary)
-              ~failure:(fun cleanup -> task_fail (Cleanup_failure
-                { primary = Some primary; failures = Rrbvec.singleton cleanup })) in
-          task_perform (Task_database Inspect) ~failure:abandon ~success:(fun view ->
-            let candidate = queued view in
-            task_perform (Acknowledge_outbox_check check) ~failure:recover
-              ~success:(fun () -> match candidate with
-                | None -> outbox_service with_connection on_error
-                | Some _ ->
-                  task_perform Wait_network_open ~failure:recover ~success:(fun () ->
-                    task_bind (with_connection ()) (fun connection ->
-                      task_perform (Task_database Inspect) ~failure:recover
-                        ~success:(fun fresh ->
-                          let work = match queued fresh with
-                            | None -> task_return ()
-                            | Some item -> submit_one connection fresh item.mutation_id in
-                          let joined = with_scope (fun scope ->
-                            task_bind (spawn scope work) (function
-                              | Error cause -> task_return (Error cause)
-                              | Ok child -> join child)) in
-                          task_bind joined (function
-                            | Error cause -> recover cause
-                            | Ok () -> outbox_service with_connection on_error)))))))
-    ]}
-    The external owner calls Execute.notify_outbox_changed after its durable
-    commit. A notification arriving before await or between Inspect and ACK remains
-    observable. Only this loop owns the check reservation. Stop is delivered to
-    the service's single input owner, whose return cancels/joins this sibling.
-    A Push or follow-up database conflict cannot be repaired by rebuilding a fresh
-    batch; the parent re-inspects original durable Submitted/accepted state. *)
-
-(** {2 Snapshot acquisition and cleanup example}
-
-    With an authenticated [connection] and advertised [through], fetch stages
-    bytes, activation delegates bounded decryption to the graph's scoped crypto
-    owner, and every result releases the original staged resource. The graph may
-    remain Ready with no mirror when activation is deferred; callers expose that
-    reason and await the relevant local correction, never claim activation.
-    {[
-      let acquire_snapshot connection through =
-        task_perform
-          (Task_transport (On_connection (connection, Fetch_snapshot through)))
-          ~failure:task_fail ~success:(fun snapshot ->
-            let release result =
-              task_perform (Task_database (Release_snapshot snapshot))
-                ~success:(fun () -> match result with
-                  | Ok activation -> task_return activation
-                  | Error cause -> task_fail cause)
-                ~failure:(fun cleanup -> task_fail (Cleanup_failure
-                  { primary = (match result with Ok _ -> None | Error e -> Some e);
-                    failures = Rrbvec.singleton cleanup })) in
-            task_perform (Task_database (Activate_snapshot snapshot))
-              ~success:(fun activation -> release (Ok activation))
-              ~failure:(fun cause -> release (Error cause)))
-    ]}
-    Fetch_snapshot verifies bounded metadata/declared cursor and actual artifact;
-    the producer ledger also binds parsed expected row count required by Overlay
-    activation. Activation validates that count, checksum and real encryption mode
-    before publishing. Declared and actual total artifact bytes are bounded by
-    snapshot_maximum_artifact_bytes, not maximum_bytes. Enforce that ceiling during
-    streamed download even for absent/false size metadata, before each write.
-    Reserve aggregate snapshot_staging_budget_bytes and snapshot_scratch_budget_bytes
-    independently before download/decryption/activation allocations; encrypted
-    originals and plaintext scratch coexist and remain charged until released.
-    Checksum and row-count verification cover the complete streamed artifact;
-    each chunk/decryption batch remains within maximum_bytes and maximum_items,
-    including activation. No full-file read or artifact-sized plaintext buffer is
-    permitted. Metadata/descriptors retain the small-message bounds; all staged
-    resources still count toward maximum_resources. These limits are independent
-    of asset maximum-file/cache/pending budgets. Failed release remains owed with
-    its bytes charged in the runtime cleanup ledger. *)
 
 type (_, _, _, _) operation =
   | Run_task : 'a task -> (ready, ready, ready, 'a) operation
@@ -1256,10 +577,8 @@ type (_, _, _) node =
       * (error -> ('failed, 'final, 'b) t)
       -> ('before, 'final, 'b) node
 val view : ('before, 'after, 'a) t -> ('before, 'after, 'a) node
-(** A total one-step pure projection, including normalization of [bind]. Branch
-    callbacks must terminate without I/O or yielding. Interpretation bounds the
-    reductions per fair turn, not total service lifetime; a callback exception
-    fails with the actual current phase. *)
+(** Total pure projection including bind normalization; callbacks terminate without
+    I/O/yield. Exceptions report actual phase, not the requested final phase. *)
 
 val run_task : 'a task -> (ready, ready, ready, 'a) operation
 
@@ -1270,45 +589,26 @@ val transport : 'a transport -> (ready, ready, ready, 'a) operation
 val crypto : 'a crypto -> (ready, ready, ready, 'a) operation
 val assets : 'a assets -> (ready, ready, ready, 'a) operation
 val observe : ('s, 's, 's, observation) operation
-(** Ready means a bound graph workspace, not necessarily an activated mirror or
-    unlocked keys. A missing local base is a successful restore with checkpoint
-    None; Inspect then fails explicitly until activation. Locked encrypted bases
-    restore metadata without plaintext access. Restoration uses only durable
-    local metadata/mirror/wrapped keys and leaves the gate Closed. Partial failed
-    restoration remains cold with retained cleanup
-    obligations; it may be drained. Opening the gate rechecks authorization epoch.
-    Closing fences new network admissions and waits for admitted transport work;
-    an unknown prior outcome remains durable and visible, not rolled back.
-    Transport, Download and Upload require Open at admission and execution;
-    Inspect, local reconciliation, unlock and resource release do not. Locked keys
-    reject protected work before sending bytes, but do not block metadata restore.
-    Ordinary effect failures leave ready, with durable outcomes and retained
-    resources reflected by observation rather than hidden by the phase index. *)
-
-(** {1 Lifecycle and recovery} *)
+(** Ready need not mean activated/unlocked. Restore is local-only and leaves Closed;
+    missing mirror succeeds with checkpoint None (Inspect fails until activation).
+    Locked bases restore metadata without plaintext. Partial restore failure stays
+    cold with cleanup owed. Open checks actual epoch; Close fences then joins,
+    never rolls back unknown/committed work. Transport/Download/Upload check Open
+    at admission and execution; local inspect/reconcile/unlock/release do not.
+    Locked rejects protected work before bytes; ordinary failures retain ready
+    with durable outcomes/resources visible in observation. *)
 
 val begin_drain : 's drainable -> ('s, draining, draining, unit) operation
 val finish_retirement : (draining, retired, draining, unit) operation
 val release_file : asset_file -> ('s, 's, 's, unit) operation
 val release_lease : asset_lease -> ('s, 's, 's, unit) operation
 val release_snapshot : snapshot -> ('s, 's, 's, unit) operation
-(** Drain irreversibly fences ordinary work, including cancelled setup, before
-    requesting cancellation. Its failure is still draining. Physical retirement
-    requires joined transport/crypto/snapshot/asset work, callback producers,
-    database delegations and all retained resources; cleanup failure stays draining.
-    Merely cancelling fibers or closing the gate proves none of these joins.
-    Original owners remain addressable after account/graph replacement for checked
-    release. Retired is terminal except idempotent release/cached observation;
-    retirement does not authorize database deletion or account replacement.
-    Cancellation may interrupt any program: the interpreter reports its actual
-    state and error, never fabricating the program's desired final phase. *)
-
-(** {1 Observation and helpers} *)
+(** Drain irreversibly fences before cancel; failure stays draining. Retirement
+    requires physical joins of all work/callbacks/delegations and resource cleanup;
+    cancel or gate close is insufficient. Retain original owners after replacement.
+    Retired permits only idempotent release/cached observation, never deletion or
+    account replacement. Cancellation returns actual phase and concrete error. *)
 
 val error_message : error -> string
-(** Observations contain bounded synchronization metadata only. Caller-owned
-    UI/query subscriptions, delivery windows and presentation acknowledgements
-    are not synchronization completion. External database deferral and physical
-    completion are described by the interpreter protocol, not polling a boolean.
-    After restart obtain a new incarnation and restore from existing durable
-    checkpoint/outbox/key/asset records. No context or resource token survives. *)
+(** Bounded sync metadata, not user queries, presentation ACK or physical completion.
+    Restart uses a fresh incarnation and existing durable recovery records only. *)
