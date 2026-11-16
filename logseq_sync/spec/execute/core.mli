@@ -268,10 +268,32 @@ type websocket_liveness =
     single socket owner, with timeout reported as Network_lost, never fake Changed.
     Peer_close_only deliberately provides no silent-peer timeout guarantee. *)
 
+type network_deadlines =
+  { setup_seconds : float; tls_handshake_seconds : float
+  ; http_response_seconds : float; download_seconds : float }
+(** All fields are finite strictly positive monotonic durations. Setup bounds DNS
+    and TCP across all attempted addresses; each TLS handshake is separately
+    bounded, including websocket setup. HTTP response bounds request write,
+    headers and complete body, not merely first byte. Download bounds the entire
+    streamed snapshot/asset transfer, including setup, authentication refresh and
+    redirects; progress never resets it. HTTP response budget is cumulative across
+    redirects/one authentication refresh, not renewed for each attempt. Existing
+    transport uses bounded DNS/TCP, TLS and cumulative HTTP response budgets;
+    websocket liveness is separate and cannot replace these finite deadlines.
+    Expiry cancels and joins socket I/O, readers/writers, staging and callbacks
+    before delivering a joined failure. Unknown remote write outcome is
+    Outcome_unknown, ordinary setup/read expiry is Network_failure with a bounded
+    stage diagnostic. Certificate/peer verification failure remains
+    Authentication_failure, malformed data Protocol_failure, never a retryable
+    timeout. Failed join/release retains its job/resources and reports
+    Cleanup_failure under the ordinary draining rules, not successful timeout
+    cleanup. No deadline authorizes rollback or unchanged security-failure retry. *)
+
 type capabilities =
   { validate_identity : Dsl.identity -> (unit, Dsl.error) result
   ; validate_limits : Dsl.limits -> (unit, Dsl.error) result
   ; websocket_liveness : websocket_liveness
+  ; network_deadlines : network_deadlines
   ; acquire : Dsl.identity -> (unit, Dsl.error) result
   ; fence_network : Dsl.identity -> (unit, Dsl.error) result
   ; close_network : Dsl.identity -> (unit, Dsl.error) result
@@ -308,7 +330,8 @@ type capabilities =
     32 MiB and the existing 1 GiB product artifact configuration without increasing
     the 16 MiB small-memory limits. Positive numeric validation is the limits
     constructor's contract; signature compilation cannot prove it executes.
-    create validates websocket_liveness and the transport must install that exact
+    create validates websocket_liveness and every network_deadlines field before
+    acquire; the transport must install those exact immutable deadlines and
     physical liveness policy before Connect success. Authentication is checked at
     each HTTP/socket admission with the current injected credential; only the real
     authenticated transport's single refresh-on-rejection is permitted. Exhausted
@@ -390,7 +413,43 @@ val create : sw:Eio.Switch.t -> clock:'clock Eio.Time.Mono.t
     fences and joins all these owners; cleanup errors remain explicit, not proof
     of retirement. Callers must finish checked retirement before releasing the
     database owner. Bounded completion, control and ingress queues are runtime
-    mechanisms only; connection retry, sync and asset scheduling remain EDSL. *)
+    mechanisms only; connection retry, sync and asset scheduling remain EDSL.
+
+    Execute owns a private Dsl.Producer.owner allocated once at create. Task_scope
+    allocates Producer.scope under its Eio switch. Task_spawn/Task_spawn_asset
+    reserve capacity then allocate a typed Eio promise for that exact task and
+    use Producer.child with its nonblocking promise peek; the interpreter resolves
+    it with the same task's typed result. Task_join checks private owner, current
+    scope and registered child before reading Producer.child_result, suspends on
+    the actual Eio promise when unfinished, then physically joins and calls
+    forget_child. No cast or existential result table is needed. Scope exit joins
+    first, then closes the support scope; a failed join retains the scope and
+    cleanup binding instead of dropping callbacks.
+
+    Accepted ingress uses Producer.demand_receipt/unlock_receipt and registers
+    revision/selection or wrapped envelope/expiry before queuing service_input.
+    Await_outbox_changed and Notifications use the corresponding producers after
+    reserving their epoch/channel ledgers. Publish_demand validates live revision,
+    resources and capacity before Producer.demand_output and atomic registration;
+    receive_demand returns that registered private record, never constructs one
+    itself. All uses check Producer ownership and the operation-specific ledger
+    atomically. A client-created producer with equal identity is still foreign:
+    reject before invoking its child callback or touching its resources. Producer
+    checks alone do not replace current authorization, revision checks or lease
+    validation. The private owner is never passed to injected dispatch/adapters;
+    these keep using their existing validated descriptor constructors and complete.
+    No Worker reducer/runner, controller or business lane participates.
+
+    Local opaque-value production audit: create allocates t, its initial
+    graph_context and version; admitted terminal execution allocates the next
+    context/version, while current and repeated await only return that same value.
+    start allocates running; each admitted dispatch allocates effect_scope and its
+    typed completion closure. database_owner/activation_owner allocate the sole
+    database binding. close_network allocates or reuses network_retirement for
+    the exact fenced generation. Installing a changed observation allocates
+    observation_revision; observe_runtime/await_observation only expose it.
+    None is an input that another module must manufacture. All are runtime-bound,
+    process-local and checked against the actual owner/generation before use. *)
 
 (** {1 Capability details} *)
 
