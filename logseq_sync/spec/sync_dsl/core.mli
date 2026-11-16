@@ -37,12 +37,12 @@ type error =
   | Asset_failure of Logseq_db_types.Failure_diagnostic.t
   | Unexpected_failure of string
 
-type ('before, 'after, 'value) t
+type ('before, 'after, 'value) program
 
-val return : 'a -> ('s, 's, 'a) t
-val abort : error -> ('s, 'final, 'a) t
-val bind : ('before, 'middle, 'a) t -> ('a -> ('middle, 'after, 'b) t)
-  -> ('before, 'after, 'b) t
+val return : 'a -> ('s, 's, 'a) program
+val abort : error -> ('s, 'final, 'a) program
+val bind : ('before, 'middle, 'a) program -> ('a -> ('middle, 'after, 'b) program)
+  -> ('before, 'after, 'b) program
 
 val identity : origin:string -> account:string -> graph:string
   -> account_generation:int64 -> graph_generation:int64 -> (identity, error) result
@@ -88,8 +88,9 @@ val limits : maximum_items:int -> maximum_bytes:int -> maximum_pending:int
     discard ends descriptor charges, physical cleanup ends resource/byte charges.
     Reserve before allocation/acquisition/writes with checked arithmetic;
     cancelled resources and failed cleanup remain charged; cleanup needs no new
-    slot. Prune completed jobs with monotonic watermarks, not growing tombstones;
-    terminal delivery cannot be dropped. steps_per_turn is a fair-turn quantum.
+    slot. maximum_pending bounds admitted effects, bridge producers and unresolved
+    cleanup through physical join. Prune joined registrations with monotonic
+    watermarks, not growing tombstones; terminal delivery cannot be dropped. steps_per_turn is a fair-turn quantum.
     Snapshot artifact/staging/scratch budgets are independent positive int64s:
     zero/negative is Invalid_input; staging below artifact is legal but may yield
     Capacity_exceeded. No 16 MiB artifact cap: 32 MiB and 1 GiB are legal totals.
@@ -393,29 +394,29 @@ type service_status =
   | Service_backoff of { attempt : int; seconds : float; cause : error }
   | Service_blocked of error
 
-type _ task_effect =
-  | Notifications : scope -> notifications task_effect
-  | Notify : notifications * notification -> unit task_effect
-  | Next_notification : notifications -> notification task_effect
-  | Await_outbox_changed : outbox_check task_effect
-  | Acknowledge_outbox_check : outbox_check -> unit task_effect
-  | Abandon_outbox_check : outbox_check -> unit task_effect
-  | Resample_outbox : unit task_effect
-  | Task_observe : observation task_effect
-  | Publish_status : service_status -> unit task_effect
-  | Task_database : 'a database -> 'a task_effect
-  | Task_transport : 'a transport -> 'a task_effect
-  | Task_crypto : 'a crypto -> 'a task_effect
-  | Task_assets : 'a assets -> 'a task_effect
-  | Consume_unlock : unlock_receipt -> key_status task_effect
-  | Publish_demand : demand_receipt * demand_availability -> unit task_effect
-  | Download_demand : demand_receipt -> demand_transfer task_effect
-  | Finish_demand : demand_receipt -> unit task_effect
-  | Wait_network_open : unit task_effect
-  | Next_input : service_input task_effect
-  | Await_input_or_child : 'a child Rrbvec.t -> 'a wake task_effect
-  | Sleep : float -> unit task_effect
-  | Yield : unit task_effect
+type _ task_operation =
+  | Notifications : scope -> notifications task_operation
+  | Notify : notifications * notification -> unit task_operation
+  | Next_notification : notifications -> notification task_operation
+  | Await_outbox_changed : outbox_check task_operation
+  | Acknowledge_outbox_check : outbox_check -> unit task_operation
+  | Abandon_outbox_check : outbox_check -> unit task_operation
+  | Resample_outbox : unit task_operation
+  | Task_observe : observation task_operation
+  | Publish_status : service_status -> unit task_operation
+  | Task_database : 'a database -> 'a task_operation
+  | Task_transport : 'a transport -> 'a task_operation
+  | Task_crypto : 'a crypto -> 'a task_operation
+  | Task_assets : 'a assets -> 'a task_operation
+  | Consume_unlock : unlock_receipt -> key_status task_operation
+  | Publish_demand : demand_receipt * demand_availability -> unit task_operation
+  | Download_demand : demand_receipt -> demand_transfer task_operation
+  | Finish_demand : demand_receipt -> unit task_operation
+  | Wait_network_open : unit task_operation
+  | Next_input : service_input task_operation
+  | Await_input_or_child : 'a child Rrbvec.t -> 'a wake task_operation
+  | Sleep : float -> unit task_operation
+  | Yield : unit task_operation
 (** Outbox is independent level-triggered dirtiness, retained without a waiter.
     One task owns await-to-ACK reservation; competitors fail Invalid_input.
     Start/restore/unlock/activation/reopen mark dirty; Connected calls Resample.
@@ -460,7 +461,7 @@ type _ task_effect =
 val task_return : 'a -> 'a task
 val task_bind : 'a task -> ('a -> 'b task) -> 'b task
 val task_fail : error -> 'a task
-val task_perform : 'a task_effect -> success:('a -> 'b task)
+val task_perform : 'a task_operation -> success:('a -> 'b task)
   -> failure:(error -> 'b task) -> 'b task
 val with_scope : (scope -> 'a task) -> 'a task
 val spawn : scope -> 'a task -> ('a child, error) result task
@@ -483,7 +484,7 @@ val cancel_child : 'a child -> unit task
 type _ task_node =
   | Task_return : 'a -> 'a task_node
   | Task_fail : error -> 'a task_node
-  | Task_perform : 'a task_effect * ('a -> 'b task)
+  | Task_perform : 'a task_operation * ('a -> 'b task)
       * (error -> 'b task) -> 'b task_node
   | Task_scope : (scope -> 'a task) -> 'a task_node
   | Task_spawn : scope * 'a task -> ('a child, error) result task_node
@@ -565,18 +566,18 @@ type (_, _, _, _) operation =
   | Release_snapshot : snapshot -> ('s, 's, 's, unit) operation
 
 val perform : ('before, 'after, 'failed, 'a) operation
-  -> success:('a -> ('after, 'final, 'b) t)
-  -> failure:(error -> ('failed, 'final, 'b) t)
-  -> ('before, 'final, 'b) t
+  -> success:('a -> ('after, 'final, 'b) program)
+  -> failure:(error -> ('failed, 'final, 'b) program)
+  -> ('before, 'final, 'b) program
 
 type (_, _, _) node =
   | Return : 'a -> ('s, 's, 'a) node
   | Abort : error -> ('s, 'final, 'a) node
   | Perform : ('before, 'after, 'failed, 'a) operation
-      * ('a -> ('after, 'final, 'b) t)
-      * (error -> ('failed, 'final, 'b) t)
+      * ('a -> ('after, 'final, 'b) program)
+      * (error -> ('failed, 'final, 'b) program)
       -> ('before, 'final, 'b) node
-val view : ('before, 'after, 'a) t -> ('before, 'after, 'a) node
+val view : ('before, 'after, 'a) program -> ('before, 'after, 'a) node
 (** Total pure projection including bind normalization; callbacks terminate without
     I/O/yield. Exceptions report actual phase, not the requested final phase. *)
 
