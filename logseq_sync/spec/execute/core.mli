@@ -4,6 +4,10 @@
     own process-local execution, versioned contexts and checked physical retirement.
     The dependency points from this module to the pure program protocol, never
     back. The caller owns authorization, account coordination and database lifetime.
+    notify_outbox_changed accepts only actual owner/incarnation invalidations after
+    durable commit; receive_demand and observe_runtime expose bounded outputs while
+    a long-lived service runs. The single graph database owner is shared with user
+    writes; concurrent network/assets never create a second transaction queue.
     No implementation or build registration is supplied by this proposal.
 
     Primary entry points (declared below):
@@ -229,9 +233,17 @@ type dispatch =
     results, and retain original failure diagnostics without secrets. Injection
     changes the execution mechanism, not the pure synchronization decisions. *)
 
+type websocket_liveness =
+  | Peer_close_only
+  | Ping_pong of { interval_seconds : float; timeout_seconds : float }
+(** Finite positive monotonic intervals/timeouts. Ping/pong is handled by the
+    single socket owner, with timeout reported as Network_lost, never fake Changed.
+    Peer_close_only deliberately provides no silent-peer timeout guarantee. *)
+
 type capabilities =
   { validate_identity : Dsl.identity -> (unit, Dsl.error) result
   ; validate_limits : Dsl.limits -> (unit, Dsl.error) result
+  ; websocket_liveness : websocket_liveness
   ; acquire : Dsl.identity -> (unit, Dsl.error) result
   ; fence_network : Dsl.identity -> (unit, Dsl.error) result
   ; close_network : Dsl.identity -> (unit, Dsl.error) result
@@ -253,7 +265,16 @@ type capabilities =
     successful retirement releases it. Construction validates everything else
     first, including validate_limits against actual database/asset configuration
     without enumerating data. Outbox record and descriptor budgets must fit the
-    DSL budgets before Inspect may allocate; no silent truncation. Limits remain
+    DSL budgets before Inspect may allocate; no silent truncation. Asset cache,
+    maximum-file and pending-staging byte limits must equal the actual configured
+    asset store values, not just descriptor/count budgets. validate_limits compares
+    immutable configuration only; restore/recovery performs incremental disk work.
+    create validates websocket_liveness and the transport must install that exact
+    physical liveness policy before Connect success. Authentication is checked at
+    each HTTP/socket admission with the current injected credential; only the real
+    authenticated transport's single refresh-on-rejection is permitted. Exhausted
+    refresh preserves Authentication_failure and waits for explicit corrected
+    authorization, never a hidden reconnect loop or caller password API. Limits remain
     immutable while acquired. fence_network is an atomic nonblocking adapter
     admission fence/cancel request, independently callable from the control fiber;
     it must not wait for a program, network result or physical join. The runtime
@@ -285,7 +306,20 @@ type capabilities =
     graph selection, local-copy deletion and explicit destructive confirmation. *)
 
 val database_owner : Dsl.Overlay.Database.t -> database_owner
-val database : database_owner -> Dsl.Overlay.Database.t
+val activation_owner : dependencies:Dsl.Overlay.Database.dependencies
+  -> inspection:Dsl.Overlay.Database.mirror_inspection -> graph_name:string
+  -> (database_owner, Dsl.error) result
+val database : database_owner -> (Dsl.Overlay.Database.t, Dsl.error) result
+(** activation_owner binds a caller-inspected absent mirror to the same sole
+    external owner queue used after activation. It validates bounded metadata,
+    never opens a second writer or contacts the server. Restore reports checkpoint
+    None; database returns Storage_failure until successful activation installs the
+    actual opened Overlay database. Activate_snapshot delegates the real prepare/
+    streamed-unprotection/commit protocol against that absent inspection, then opens
+    and installs the committed mirror before returning Activated. Interrupted open
+    retains the committed inspection for local recovery, never re-downloads or
+    overwrites an already activated mirror. The caller still owns eventual close.
+    An already available mirror uses database_owner, not activation_owner. *)
 (** A process-local binding to the actual external database's sole transaction
     queue, not a second database or writer. The supplied database dispatcher must
     route every same-graph sync mutation through that owner; external user edits,
@@ -377,6 +411,42 @@ val open_network : t -> authorization_epoch:int64 -> (unit, Dsl.error) result
     Set_network Open has the same checks. Close races cannot admit new bytes.
     Transport retirement and task cancellation are not graph retirement. *)
 
+val notify_outbox_changed : t -> owner:database_owner -> identity:Dsl.identity
+  -> (unit, Dsl.error) result
+(** The external database owner calls this only after a durable local commit that
+    may change upload eligibility, including user edits and durable asset metadata.
+    This is an owner-to-runtime invalidation, not a dependency on a Worker reducer
+    or runner and not permission to execute user writes in Sync. Validate the actual
+    database binding and full graph incarnation; foreign/replaced/retired owners
+    fail Stale_context/Identity_mismatch without waking a different graph.
+    Success atomically marks one independent dirty slot and wakes
+    Dsl.Await_outbox_changed; it means neither Inspect nor upload completed. Repeated
+    commits coalesce without allocating a descriptor or entering the asset queue.
+    No waiter, active Run_task or network Open gate is required. Asset/task/output
+    saturation cannot reject or block this notification. The fixed slot is reserved
+    at create, survives service scope exit until graph retirement, and supports
+    commit-during-Inspect through Dsl.outbox_check's acknowledgement protocol.
+    Do not acknowledge every later epoch after Inspect or clear dirty unconditionally.
+    Runtime initialization, successful activation and successful network reopening
+    mark dirty as well. Connection policy invokes Resample_outbox on Connected.
+    Closed gate records/inspects local work only; normal gate checks still prevent
+    remote I/O. The database owner retains/reports notification errors; durable
+    commit is never rolled back or reported uncommitted because notification failed.
+    Rebinding/restart starts dirty and reconciles existing durable outbox state. *)
+
+(** The caller supplies [commit], the actual external owner's already serialized
+    local write. Keep durable success separate from invalidation failure:
+    {[
+      let commit_and_notify runtime owner identity commit =
+        match commit () with
+        | Error cause -> Error cause
+        | Ok durable_receipt ->
+          Ok (durable_receipt,
+            notify_outbox_changed runtime ~owner ~identity)
+    ]}
+    An Error in the inner result is notification failure after durable success;
+    report/rebind that owner rather than replaying the user mutation. *)
+
 type ingress_ack = Queued | Replaced
 val submit_unlock : t -> identity:Dsl.identity -> valid_for:float
   -> Dsl.unlock_input -> (ingress_ack, Dsl.error) result
@@ -438,6 +508,19 @@ val request_stop : t -> (unit, Dsl.error) result
     Capacity_exceeded means not admitted: caller retains the update for retry.
     Pending and consumed-but-active interests share maximum_demands accounting;
     the EDSL explicitly releases an interest with Dsl.Finish_demand.
+    Admission enforces the total/background interest and descriptor-byte ceilings
+    in Dsl.limits, including foreground_demand_reserve and
+    foreground_descriptor_reserve_bytes, before enqueuing or copying descriptors.
+    Background cannot occupy foreground-reserved ingress even when no foreground
+    transfer is currently active. Same-ID replacement charges one live interest
+    with atomic net descriptor accounting; resource/cleanup charges remain until
+    ACK. Deduplication of transfers never exempts distinct demand IDs from ingress
+    budgets. Failed demotion/replacement preserves the previously admitted demand.
+    Withdrawal is always admissible for a live ID using its existing control slot;
+    unknown withdrawals are idempotent no-ops, never allocate tombstones. Reclaim
+    interest/descriptor slots only at the documented discard/Finish_demand boundary.
+    The caller can retry Capacity_exceeded after explicit completion/release; the
+    runtime does not silently evict background work or choose product priorities.
     Stop and current network status have reserved slots independent of demand
     capacity, and wake Next_input even while asset/network children are suspended.
     request_stop is idempotent graceful input, not forced cancel or graph drain.
@@ -505,6 +588,26 @@ val current : t -> (context, Dsl.error) result
 
 (** {1 Observation and helpers} *)
 
+type observation_revision
+type runtime_observation =
+  { revision : observation_revision; state : Dsl.observation
+  ; status : Dsl.service_status }
+val observe_runtime : t -> (runtime_observation, Dsl.error) result
+val await_observation : t -> after:observation_revision
+  -> (runtime_observation, Dsl.error) result
+(** Independent running-time observation, requiring no idle graph_context or await.
+    One bounded latest-value snapshot is installed on Publish_status, gate/key/
+    checkpoint/count/cleanup change and terminal scope change. observe_runtime reads
+    it atomically; await_observation registers and compares revision atomically,
+    returning immediately if changed, so subscribe-after-read loses no invalidation.
+    Only one observation waiter is allowed; cancellation consumes nothing. Revisions
+    are non-reused process-local runtime-bound values; foreign revisions fail.
+    Multiple changes may coalesce to the current snapshot, never an unbounded log.
+    Reads are metadata-only and local; no hidden Inspect, network call or graph
+    scan. Runtime metadata and retained errors must not be overwritten by an
+    optimistic policy status. Retired snapshots remain readable; an unchanged
+    retired await returns Stale_context rather than suspending forever. *)
+
 val identity : 's graph_context -> Dsl.identity
 val phase : 's graph_context -> 's Dsl.phase
 type version
@@ -514,5 +617,5 @@ val equal_version : version -> version -> bool
     tokens, not wrapping machine counters or serializable authority. Contexts,
     completion bindings, internal tickets, jobs, cancellation handles and retained
     files are process-local.
-    Observation is through Dsl.observe on a checked context, with bounded
-    invalidations managed by callers; no database user query API is provided. *)
+    Idle indexed observation uses Dsl.observe; running services use observe_runtime
+    and await_observation. Neither is a database user query or presentation ACK. *)
