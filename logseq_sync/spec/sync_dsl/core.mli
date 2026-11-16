@@ -833,6 +833,115 @@ val task_view : 'a task -> 'a task_node
     preempted by this contract. Retained tasks, waiters and ready queues are bounded
     by maximum_tasks/maximum_pending; terminal capacity is reserved at admission. *)
 
+(** {2 Interpreter production protocol}
+
+    The program representation above stays abstract. This support module is the
+    sole producer of opaque task/ingress/output handles; it performs no I/O and
+    implements no scheduling or business policy. Each Execute.create privately
+    creates one owner and never exposes it to programs, adapters or consumers.
+    Public creation is not authorization: a client can create another owner, but
+    its handles are foreign even for an identical identity. Owner identity uses
+    fresh process-local allocation, never caller strings or structural equality.
+    No handle survives restart. Foreign/closed-scope production or validation
+    returns Error Stale_context without allocating a handle or invoking callbacks;
+    original-owner delivery cleanup validation remains legal after scope close.
+    Execute registers every returned handle in its
+    bounded operation ledger before delivery; successful construction alone does
+    not prove admission, revision currency, resource validity or cleanup ACK.
+
+    Production audit: phase/drainable witnesses and ordinary records/variants are
+    public data; t/task are constructed only by the pure combinators. identity,
+    limits, retry_policy, resource, snapshot, connection, unlock_input, asset_file,
+    asset_lease and demand_id use their named validated constructors. Overlay and
+    asset descriptor values come from their real public owner interfaces, not
+    from this support module. The remaining opaque scope, child, demand_receipt,
+    unlock_receipt, outbox_check, notifications, demand_delivery and private
+    demand_output are produced below. Execute's own opaque values are local to
+    Execute, so do not require a cross-module constructor. *)
+module Producer : sig
+  type owner
+  val create : identity -> owner
+  val scope : owner -> scope
+  val check_scope : owner -> scope -> (unit, error) result
+  val close_scope : owner -> scope -> (unit, error) result
+  (** Checks exact owner and live scope. Close is idempotent for its original
+      owner, invalidates associated handles, and drops retained child callbacks
+      only after Execute has cancelled/joined their producers. It neither cancels
+      nor joins anything itself; Execute must perform physical cleanup first.
+      Received deliveries keep their original cleanup binding after scope close. *)
+
+  val child : owner -> scope -> 'a task
+    -> poll:(unit -> ('a, error) result option) -> ('a child, error) result
+  val check_child : owner -> scope -> 'a child -> (unit, error) result
+  val child_result : owner -> scope -> 'a child
+    -> (('a, error) result option, error) result
+  val forget_child : owner -> scope -> 'a child -> (unit, error) result
+  (** Execute reserves a bounded task slot, allocates a typed promise for the
+      very task passed here, and supplies its nonblocking poll. The child retains
+      that exact typed callback; child_result checks owner/scope before calling it.
+      None means unfinished, Some is a repeatable terminal result, not a join ACK.
+      No existential cast, caller-selected result type or untyped ticket lookup
+      is needed. Execute alone resolves the promise by interpreting that task.
+      Producer cannot prove the callback's business honesty: possession of its
+      private owner and actual registration are required at every Task_join,
+      Task_cancel and Await_input_or_child. Forget follows physical join, consumes
+      the join slot and drops the callback; subsequent uses fail Stale_context.
+      Repeated forget succeeds idempotently for the original owner after pruning;
+      child_result/check_child still reject the consumed child. Foreign, closed
+      or consumed handles fail Stale_context without calling poll. Execute bounds
+      all live handles and retained callbacks by limits, including scope creation;
+      Producer does not maintain a second unbounded registry. Retained handle
+      objects carry their original owner and validity cell after ledger pruning.
+      Foreign checks never call poll. No helper authorizes an arbitrary OCaml
+      callback to execute inside a program; this callback is interpreter-only. *)
+
+  val demand_receipt : owner -> scope -> (demand_receipt, error) result
+  val unlock_receipt : owner -> scope -> (unlock_receipt, error) result
+  val outbox_check : owner -> scope -> (outbox_check, error) result
+  val notifications : owner -> scope -> (notifications, error) result
+  val check_demand_receipt : owner -> scope -> demand_receipt -> (unit, error) result
+  val check_unlock_receipt : owner -> scope -> unlock_receipt -> (unit, error) result
+  val check_outbox_check : owner -> scope -> outbox_check -> (unit, error) result
+  val check_notifications : owner -> scope -> notifications -> (unit, error) result
+  (** Fresh non-reused identities, created after reservation and registered before
+      delivery. Execute binds demand to exact ID/revision/selection/priority,
+      unlock to its single-use envelope/expiry, outbox to its captured dirty epoch
+      and channel to its bounded queue. Checks here establish owner/live scope
+      only; Execute additionally checks that immutable registration and current
+      revision/consumption state atomically on every use. Revoked registrations
+      cannot be restored by minting a new handle. No user-supplied token can alias
+      an earlier identity; pruning must not introduce reuse or unbounded tombstones. *)
+
+  val demand_output : owner -> scope -> demand_receipt -> id:demand_id
+    -> demand_availability -> (demand_output, error) result
+  val check_delivery : owner -> demand_delivery -> (unit, error) result
+  (** Allocates one fresh delivery and its private output after checking the
+      receipt's exact owner and scope. Execute first validates the live receipt's
+      registered ID/selection, publication legality, resources and capacity, then
+      atomically registers output before enqueue. Producer does not validate a
+      lease, transfer ownership or publish. check_delivery checks original owner
+      even after scope close; Execute still checks delivery ledger and release
+      watermarks before use/cleanup. Received deliveries retain cleanup authority,
+      not current availability authority, after revocation. *)
+end
+
+(** Interpreter-only construction example. The caller supplies private [owner],
+    active [scope], a reserved typed task promise [poll], and already validated
+    publication inputs. All production uses public DSL declarations:
+    {[
+      let admit_child owner scope task poll =
+        Producer.child owner scope task ~poll
+
+      let inspect_child owner scope child =
+        Producer.child_result owner scope child
+
+      let make_output owner scope receipt id availability =
+        Producer.demand_output owner scope receipt ~id availability
+    ]}
+    These are not business APIs. Execute must apply the registration and physical
+    join rules above; a successfully minted foreign owner's handle is rejected
+    before any callback, publication, network admission or original-owner release. *)
+
 (** A service can run connection, sync and assets independently. Caller-supplied
     [connection_loop], [sync_loop] and [asset_loop] are pure task builders; the
     connection loop repeats Receive and retires before timed reconnect, the sync
