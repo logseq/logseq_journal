@@ -1,0 +1,6 @@
+(library
+ (name logseq_sync_sync_service)
+ (public_name logseq_sync.sync_service)
+ (modules core)
+ (virtual_modules core)
+ (libraries eio sync_dsl))
