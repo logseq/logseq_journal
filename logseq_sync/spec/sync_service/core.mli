@@ -27,8 +27,7 @@ type 'clock dependencies =
   ; bind_ingress : ingress -> unit }
 (** Caller keeps database/Worker owners alive through retirement and owns account coordination. *)
 
-type error = Sync_error of Dsl.error
-
+type error = Dsl.error
 
 exception Reentrant_close
 exception Close_already_called
