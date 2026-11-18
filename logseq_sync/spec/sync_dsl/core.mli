@@ -1,5 +1,4 @@
-(** Pure programs; only the outer indexed program changes graph lifecycle.
-    Indices prove neither runtime authority, linearity nor rollback. *)
+(** Indices express lifecycle, not runtime authority, linearity or rollback. *)
 
 type cold
 type ready
@@ -46,8 +45,7 @@ val bind : ('before, 'middle, 'a) program -> ('a -> ('middle, 'after, 'b) progra
 
 val identity : origin:string -> account:string -> graph:string
   -> account_generation:int64 -> graph_generation:int64 -> (identity, error) result
-(** Require canonical HTTPS origin, nonempty account/graph and nonnegative
-    generations. Actual owner authority is rechecked on effects and completions. *)
+(** Canonical HTTPS origin, nonempty account/graph, nonnegative generations; effects recheck actual authority. *)
 
 type limits = private
   { maximum_items : int; maximum_bytes : int; maximum_pending : int
@@ -69,53 +67,29 @@ val limits : maximum_items:int -> maximum_bytes:int -> maximum_pending:int
   -> asset_pending_budget_bytes:int64 -> snapshot_maximum_artifact_bytes:int64
   -> snapshot_staging_budget_bytes:int64 -> snapshot_scratch_budget_bytes:int64
   -> (limits, error) result
-(** Positive bounds: items <= 4096, bytes <= 16777216, pending <= 4096,
-    resources <= 1024, steps <= 65536, tasks <= 256, messages <= 4096,
-    message_bytes <= 16777216, demands <= 4096, active_assets <= pending.
-    Require tasks and pending >= active_assets + 4; reserve three pending slots
-    for receive/database/input plus foreground_reserve for foreground assets.
-    Foreground reserves: work in [1..active_assets], interests in [1..demands],
-    descriptors in [1..message_bytes]; messages >= foreground_demand_reserve + 3
-    for stop/gate/unlock. Background cannot borrow reserved work, task, message,
-    interest or descriptor capacity. Foreground uses the total, not extra pools.
-    Outbox dirty and latest observation each have an independent fixed slot.
-    Active and pending interests count per ID; shared transfers count once.
-    Same-ID replacement charges net descriptors atomically; rejection changes
-    nothing. Demotion checks background capacity; withdrawal/stop/cleanup retain
-    reserved control capacity. Reclassify shared foreground work before admission.
-    Ingress, task-held, output and cleanup descriptors share message_bytes;
-    ownership transfer/dequeue reclaims nothing. Finish_demand ends the interest;
-    discard ends descriptor charges, physical cleanup ends resource/byte charges.
-    Reserve before allocation/acquisition/writes with checked arithmetic;
-    cancelled resources and failed cleanup remain charged; cleanup needs no new
-    slot. maximum_pending bounds admitted effects, bridge producers and unresolved
-    cleanup through physical join. Prune joined registrations with monotonic
-    watermarks, not growing tombstones; terminal delivery cannot be dropped. steps_per_turn is a fair-turn quantum.
-    Snapshot artifact/staging/scratch budgets are independent positive int64s:
-    zero/negative is Invalid_input; staging below artifact is legal but may yield
-    Capacity_exceeded. No 16 MiB artifact cap: 32 MiB and 1 GiB are legal totals.
-    Reserve aggregate staging and scratch separately before writes/allocations;
-    encrypted originals and plaintext intermediates coexist and both stay charged
-    until cleanup. Stream complete checksum/row-count verification and activation;
-    each chunk/decryption batch <= maximum_bytes and rows <= maximum_items.
-    Metadata/frames obey small-message bounds; never buffer an entire artifact.
-    Snapshot limits do not replace asset limits. Asset cache/pending budgets are
-    nonnegative int64s, file bytes in [0..104857600]; zero disables that class.
-    Cache includes pinned files; pending includes unreleased/recovered staging.
-    Enforce actual file bytes even with false/absent size metadata. Pruning cannot
-    delete pinned bytes or durable unpublished originals. Incremental recovery
-    accounts existing files/orphans before admission; over-budget stores permit
-    only bounded recovery/prune/release. Validation reads configuration, not files
-    or graph data; exhaustion is explicit, never spinning or silent eviction. *)
+(** Positive bounds: items/pending/messages/demands <= 4096, bytes/message_bytes <= 16777216,
+    resources <= 1024, steps <= 65536, tasks <= 256; active_assets <= pending.
+    Tasks/pending >= active_assets + 4; reserve three pending control slots plus foreground work.
+    Foreground reserves: work [1..active_assets], interests [1..demands], descriptors [1..message_bytes];
+    messages >= foreground_demand_reserve + 3. Background cannot borrow reserves.
+    Charge interests per ID, shared transfers once; replacement uses atomic net descriptors.
+    Dequeue reclaims nothing; cancelled/failed cleanup remains charged through physical join.
+    Reserve before acquisition; control/release need no new slot. Exhaustion never evicts accepted work.
+    Snapshot artifact/staging/scratch budgets are independent positive int64s, without a 16 MiB artifact cap;
+    staging below artifact is legal. Charge encrypted/plaintext coexistence until cleanup;
+    stream verification/activation within maximum_bytes/items.
+    Asset cache/pending budgets are nonnegative; file bytes [0..104857600]; zero disables that class.
+    Count pinned/recovered files and actual sizes before admission; over-budget permits only recovery/prune/release.
+    Never prune pinned bytes or durable unpublished originals. Validation reads configuration only. *)
 
 type retry_policy = private
   { initial_seconds : float; maximum_seconds : float
   ; multiplier : float; maximum_attempts : int }
 val retry_policy : initial_seconds:float -> maximum_seconds:float
   -> multiplier:float -> maximum_attempts:int -> (retry_policy, error) result
-(** Finite positive delays; maximum >= initial, multiplier >= 1, attempts in
-    [0..10] (zero disables retry). EDSL uses capped exponential Sleep; count actual
-    admissions. Only network failures permit retry, never unchanged other errors. *)
+(** Finite positive delays, maximum >= initial, multiplier >= 1, attempts [0..10].
+    maximum_attempts counts actual retry admissions after the initial attempt; zero disables retry.
+    Only network failures retry, using capped exponential monotonic Sleep. *)
 
 type network_gate = Closed | Open of { authorization_epoch : int64 }
 type key_status = Unencrypted | Key_locked | Key_available
@@ -137,16 +111,14 @@ type authoritative_result =
 
 type resource = private { owner : identity; token : string }
 val resource : owner:identity -> token:string -> (resource, error) result
-(** Shape-only process-local descriptor: the producer registers token/kind before
-    delivery; execution checks its real original-owner ledger even after revocation. *)
+(** Shape-only process-local descriptor; use/release checks the registered original-owner ledger, even after revocation. *)
 
 type snapshot = private
   { resource : resource; through : Overlay.Types.server_cursor
   ; checksum : string; encrypted : bool }
 val snapshot : resource:resource -> through:Overlay.Types.server_cursor
   -> checksum:string -> encrypted:bool -> (snapshot, error) result
-(** Staged immutable bytes remain owed until checked release, even when stale.
-    Activation checks actual producer metadata, baseline, checksum and encryption. *)
+(** Staged bytes remain owed until checked release; activation verifies producer metadata, baseline, checksum and encryption. *)
 
 type _ database =
   | Inspect : Overlay.Types.sync_view database
@@ -157,12 +129,9 @@ type _ database =
   | Activate_snapshot : snapshot -> activation database
   | Release_snapshot : snapshot -> unit database
 
-(** Inspect checks configured record/descriptor bounds before enumeration; never
-    truncate. Prepare freezes durable wires before send; conflicts need fresh views.
-    Acceptance retains intent until authoritative reconciliation. Deferred retains
-    its original batch and waits for its exact submission outcome. Activation
-    atomically checks generation/baseline/local intent; deferral is not activation.
-    Cancellation preserves commits; reconcile uncertainty by original identifiers. *)
+(** Inspect rejects oversized views, never truncates. Prepare durably freezes wires before send;
+    conflicts need fresh tokens. Deferred retains the original batch and exact submission outcome.
+    Activation checks generation/baseline/local intent atomically; cancellation preserves commits. *)
 
 type remote_head =
   { through : Overlay.Types.server_cursor; snapshot_available : bool }
@@ -170,22 +139,16 @@ type pull_result =
   | Pulled of Overlay.Types.authoritative_batch
   | No_progress of
       { since : Overlay.Types.server_cursor; through : Overlay.Types.server_cursor }
-(** Validate connection generation, pending Pull baseline and every wire cursor
-    before filtering replays. Pulled is nonempty and advances that baseline;
-    No_progress covers empty/replayed pages with matched since and through >= since.
-    Neither advances local checkpoint; only Apply_authoritative commits Pulled.
-    No_progress never applies/ACKs barriers: retain greatest remote target,
-    re-inspect, prioritize Submitted recovery, then settle if caught up or Sleep
-    a finite positive delay before re-pull. No hidden adapter loop or forged cursor. *)
+(** Validate generation, issued baseline and all cursors before filtering; Pulled advances baseline.
+    No_progress matches since with through >= since; neither result advances checkpoint without apply.
+    Retain greatest target, recover Submitted, then settle or delay before re-pull; never ACK a barrier. *)
 
 type submission_reply =
   | Accepted of Overlay.Types.acceptance_barrier
   | Rejected of Overlay.Types.rejection_resolution
 
 type connection
-(** Connect produces a registered, fresh process-local token/generation; shape
-    validation grants no authority. Every use checks its original producer;
-    connection retirement invalidates it without retiring the graph. *)
+(** Fresh registered connection generation; every use checks its original producer. Retirement invalidates the connection, not the graph. *)
 val connection : owner:identity -> token:string -> generation:int64
   -> (connection, error) result
 
@@ -213,45 +176,22 @@ type _ transport =
   | Pull : Overlay.Types.server_cursor -> pull_result transport
   | Push : Overlay.Types.submission_batch -> submission_reply transport
 
-(** Validate framing/authentication/cursors/bounds/envelopes before delivery.
-    Wrap Head/Fetch_snapshot/Pull/Push exactly once in On_connection, never
-    connection management. One socket reader matches responses to bounded pending
-    requests; no request-ID multiplexer: at most one unresolved response-family
-    request (including Push). Match generation, baseline, frozen tx-id/barrier;
-    ambiguity fails the connection and retains Submitted. pull/ok with txs=[]
-    completes its Pull with No_progress, not Receive or a new wire field.
-    Head uses existing hello/head state. One pending Receive per connection;
-    overflow backpressures. Only Remote_changed hints coalesce by resampling,
-    never responses/terminal messages/batches. Bound frames before allocation.
-    Retire joins reader/writer/requests/callbacks; Connect rejects until old join.
-    Only Remote_closed/Network_lost permit EDSL backoff, not local close or
-    unchanged auth/protocol/crypto/storage rejection. Authentication uses injected
-    credentials and one checked refresh; exhaustion waits for corrected authority.
-    Recovery uses Inspect Submitted IDs then Retry_group with a fresh token;
-    require the original batch ID, t_before and exact protected wires, not None.
-    Push uses existing tx-batch t-before/tx-id/protected tx/outliner-op: no batch
-    status endpoint or server batch-ID deduplication is implied. Stale is not
-    proof of prior non-execution; Accept_group/Reject_group then Pull reconcile.
-    New work uses Submit_group, never reconstruction of uncertain submissions.
-    Rejection partitions frozen member order: success_tx_ids is an ordered prefix,
-    failed_tx_id the next member, unexecuted_suffix the exact remainder. Omitted
-    failed ID means first member only for an empty prefix. Nonempty prefix needs
-    validated cursor/checksum barrier; empty prefix has None. Invalid partitions,
-    duplicates/foreign IDs/missing barriers fail Protocol_failure, retaining wires.
-    Empty_tx_data/Invalid_tx/Invalid_t_before -> Overlay.Invalid_request;
-    Db_transact_failed with missing_block_uuids -> Missing_dependencies;
-    other Db_transact_failed/Snapshot_upload_in_progress -> Operational_failure.
-    Preserve bounded missing IDs/diagnostics. Stale needs an advancing cursor and
-    maps to Overlay.Stale, never a definitive partition. Preserve real
-    Permission_denied without inventing a wire reason. Remote_error is a scoped
-    non-retryable protocol error, never an unmatched Push result or dropped hint;
-    retain uncertain submissions. Presence is not sync; ping/pong is only liveness. *)
+(** Validate framing/authentication/cursors/bounds before delivery. Wrap only Head/Fetch_snapshot/Pull/Push
+    once in On_connection; one unresolved response-family request and one Receive per connection.
+    Match generation/baseline/frozen IDs/barriers; ambiguity fails the connection, retaining Submitted.
+    Empty/replayed Pull returns No_progress. Only Remote_changed hints coalesce; overflow backpressures.
+    Retire physically joins readers/writers/requests/callbacks before reconnect. Only remote network loss retries.
+    Authentication allows one checked refresh, then requires corrected authority.
+    Retry_group uses original batch ID, t_before and exact durable wires with a fresh Inspect token;
+    unknown sends never become fresh submissions. Accept/Reject then Pull reconcile uncertain execution.
+    Rejection validates exact ordered prefix/failed member/suffix and prefix barrier; invalid partitions retain wires.
+    Omitted failed ID requires empty prefix; Stale needs advancing cursor, never proves non-execution.
+    Preserve typed rejection causes/bounded diagnostics; Remote_error is non-retryable and retains uncertainty. *)
 
 type unlock_input
 val unlock_input : wrapped_graph_key:string -> (unlock_input, error) result
 val wrapped_graph_key : unlock_input -> string
-(** Wrapped material only; never log keys. Unlock verifies/installs this graph's
-    key; still locked means Error Locked. Callers own key acquisition/coordination. *)
+(** Wrapped material only; never log keys. Still-locked Unlock returns Locked; caller owns key acquisition. *)
 type _ crypto =
   | Unlock : unlock_input -> key_status crypto
   | Encrypt_values : string Rrbvec.t -> (string * string) Rrbvec.t crypto
@@ -260,11 +200,8 @@ type _ crypto =
       -> (Overlay.Types.crypto_item_id * string) list crypto
   | Unprotect : Overlay.Database.unprotection_request
       -> (Overlay.Types.crypto_item_id * string) list crypto
-(** The bound graph key never leaves its owner. Encrypt_values preserves order
-    and returns IV/ciphertext pairs; Decrypt_value validates the Transit envelope.
-    Protect/Unprotect preserve exact request IDs and cardinality. Bound plaintext,
-    ciphertext and results by item/byte limits; malformed envelopes never fall back
-    to plaintext. Worker operations use the same owner, not reducer tickets. *)
+(** Graph keys stay with their owner. Encrypt_values preserves order; Decrypt_value validates Transit.
+    Protect/Unprotect preserve exact IDs/cardinality; bound all bytes/items, never plaintext fallback. *)
 
 type asset = Logseq_db_types.Asset_descriptor.t
 
@@ -281,7 +218,7 @@ type asset_result = Available of asset_file | Waiting_remote | Missing_local
 type cache_report =
   { resident_bytes : int64; pending_bytes : int64; retained_bytes : int64
   ; cleanup_pending : int; over_budget : bool }
-(** retained_bytes is already included in resident/pending, not an additive pool. *)
+(** retained_bytes is included in resident/pending, not additive. *)
 
 type _ assets =
   | Prune_cache : cache_report assets
@@ -292,26 +229,15 @@ type _ assets =
   | Release_file : asset_file -> unit assets
   | Release_lease : asset_lease -> unit assets
 
-(** Original-owner registered files/leases are process-local and generation-checked.
-    Upload uses durable publication intent; success is verified remote publication,
-    not a user edit. Download verifies encryption/checksum, never plaintext fallback.
-    Lookup is offline: for Managed remote B/current A try original A then cached B;
-    Managed None/current A checks A, whose miss is Waiting_remote (never GET A).
-    Managed None without A waits for publication. Download only explicit remote B;
-    External never enters managed transfers. Result asset preserves selection;
-    registered metadata identifies actual bytes; Retain/Publish validate both.
-    Lookup sharing binds full incarnation/UUID/current/remote checksum/file_type;
-    transfer dedup binds incarnation/UUID/remote checksum/file_type, not demand ID.
-    Each interest revalidates selection and retains its own lease before publish.
-    spawn_asset binds revision: replacement cancels its obsolete interest; generic
-    Lookup may return old selection but cannot publish to a changed receipt.
-    Remote-version changes require explicit replacement Demand. Locked/missing
-    versions wait, never fabricate successful bytes. Restore incrementally accounts
-    existing staging/cache offline. Prune yields bounded batches, removing only
-    unpinned cache/proven orphan staging; durable unpublished originals stay.
-    Pressure waits for release/correction, never retries storage failures in a loop.
-    Retain creates a separate bounded lease; release is idempotent only after
-    success. Failed cleanup retains exact handles/paths/charges and concrete error. *)
+(** Registered files/leases are process-local and original-owner checked. Upload ACK means verified publication.
+    Lookup is offline: Managed remote B/current A tries original A then cached B;
+    Managed None/current A checks A, then waits (never GET A); External never transfers.
+    Download requires explicit remote version and verifies encryption/checksum, without plaintext fallback.
+    Results preserve selection; Retain/Publish check actual byte metadata. Sharing includes incarnation,
+    UUID/checksums/file_type; transfer dedup omits demand ID, but each interest needs its own lease.
+    Replacement invalidates old publication rights. Locked/missing versions wait for correction.
+    Prune only unpinned cache/proven orphan staging; unpublished originals survive.
+    Release is idempotent only after success; failed cleanup retains handles/paths/charges/causes. *)
 
 type 'a task
 type scope
@@ -326,17 +252,15 @@ type demand_change =
   | Withdraw of demand_id
 
 type demand_receipt
-(** Ingress-minted exact revision; replacement or scope exit invalidates it. *)
+(** Exact ingress revision; replacement/scope exit invalidates it. *)
 type unlock_receipt
-(** Single-use graph/scope-bound wrapped revision; replacement, expiry or scope
-    exit invalidates it. No restart persistence or printable key material. *)
+(** Single-use wrapped revision; replacement/expiry/scope exit invalidates it. Never persists or prints keys. *)
 type service_input =
   | Unlock_requested of unlock_receipt
   | Demand_changed of demand_receipt * demand_change
   | Network_changed of network_gate
   | Stop_requested
-(** Demand IDs are nonempty <= 256 bytes. Replacement changes exact selection and
-    priority; withdrawal cancels only that interest, not other shared users. *)
+(** IDs are nonempty, <= 256 bytes; withdrawal cancels only its interest, not shared users. *)
 
 type asset_failure_reason =
   | Asset_network of string
@@ -355,9 +279,7 @@ type asset_failure_reason =
 
 type demand_transfer =
   { result : (asset_result, asset_failure_reason) result; attempts : int }
-(** Joined result; attempts counts this invocation's actual scoped remote
-    admissions (zero if none), never scheduled tasks. No implicit retry. Business
-    failures are data; stale usage/unjoined cleanup remain task-effect errors. *)
+(** Joined result; attempts counts actual scoped remote admissions, not tasks. No implicit retry; unjoined cleanup remains an effect error. *)
 
 type demand_availability =
   | Demand_queued
@@ -372,23 +294,18 @@ type demand_availability =
   | Demand_revoked
 
 type demand_delivery
-(** Runtime-minted owner/incarnation/revision/scope binding; received delivery
-    retains original cleanup obligation through revocation until release ACK. *)
+(** Received delivery retains original cleanup obligation through revocation until release ACK. *)
 type demand_output = private
   { delivery : demand_delivery
   ; id : demand_id
   ; demand : demand_receipt
   ; availability : demand_availability }
 
-(** All availability states use delivery/release, even without resources.
-    attempts >= 0; retry_scheduled requires an actual bounded network retry timer.
-    Only network failures permit retry; locked/closed wait for correction, then
-    fresh Lookup. Publish expected failures per interest without stopping unrelated
-    sync work. Never change uncertain durable publication identity. *)
+(** Every state requires delivery release; retry_scheduled requires a bounded network timer. Locked/Closed wait, then fresh Lookup. *)
 
 type outbox_check
 type capacity_revision
-(** Runtime-bound revision of task/message/resource capacity. *)
+(** Runtime-bound capacity revision. *)
 
 type 'a wake = Input of service_input | Child_ready of 'a child
 
@@ -433,52 +350,26 @@ type _ task_operation =
   | Await_input_or_child : 'a child Rrbvec.t -> 'a wake task_operation
   | Sleep : float -> unit task_operation
   | Yield : unit task_operation
-(** Capture capacity revision before admission; after Capacity_exceeded wait for
-    change or join owned children, then recheck. Compare-and-wait is atomic;
-    release/join/discard wakes waiters. Foreign revisions fail Stale_context.
-    Waits reserve no work slot, are bounded by tasks, and cancel with the scope.
-    No capacity event grants admission or permits dropping admitted work.
-
-    Outbox is independent level-triggered dirtiness, retained without a waiter.
-    One task owns await-to-ACK reservation; competitors fail Invalid_input.
-    Start/restore/unlock/activation/reopen mark dirty; Connected calls Resample.
-    Await captures epoch before Inspect; ACK clears only that epoch after installing
-    a successful bounded plan. Commits during Inspect stay dirty; no wrap loss.
-    Abandon/failure/cancel/scope exit releases reservation, never dirtiness;
-    old/foreign/duplicate checks fail Stale_context. Inspect may run Closed;
-    after waiting for Open re-inspect before preparing fresh wires. Absent mirror
-    waits for activation, never spins. Resample marks dirty without I/O.
-    Task_observe is local metadata; one publisher replaces latest status, bounded
-    sibling Notifications forward causes. Actual gate/counts/cleanup override policy.
-    Sleep is finite nonnegative monotonic/cancellable. Effects may suspend without
-    blocking siblings, ingress or control. Database mutations share the external owner.
-    Wait_network_open waits for authorized Open and old network join, not a permit;
-    each admission rechecks. Consume_unlock atomically consumes live receipt before
-    local crypto; stale/expired fails without crypto. Crypto failure needs fresh
-    input; discard payload after joined crypto, never expose key diagnostics.
-    Publish validates revision/selection/resources/capacity atomically: success
-    transfers file+lease to runtime (task must not release/republish), failure
-    transfers nothing. Available requires live Demand, Revoked live Withdraw;
-    waiting/missing carry no resources. Reject duplicate transferred references.
-    One unreceived publication per revision may be replaced; release superseded
-    resources before reclaiming slots. Changed revisions invalidate queued output;
-    received resources are only revoked, never reclaimed before release_demand ACK.
-    Scope exit cleans unreceived output, retains received/failed cleanup and blocks
-    retirement. Finish_demand cannot erase output/cleanup or newer revisions.
-    Download_demand uses ordinary Download once after EDSL Lookup; no-version waits
-    without remote admission; Closed/Locked report waiting causes with zero attempts.
-    Count active work through physical join, including generic Download/Upload;
-    background cannot borrow foreground reserve. Replacement reclassifies shared
-    work before admission. Finish_demand follows joined children and transferred/
-    released resources; stale revisions cannot finish newer interests.
-    Notifications reserves a resource slot; queues share message count/bytes.
-    Notify backpressures; only adjacent same-connection Remote_changed coalesce,
-    never transitions. One consumer per channel; fan-out uses explicit channels.
-    Scope exit joins children before queue release. Await_input_or_child uses
-    readiness, not polling: unique live same-scope children <= maximum_tasks.
-    Atomically consume winning input only; Child_ready is not join, cancellation
-    consumes neither. Stop first, otherwise fair input/ready-child choice; shares
-    Next_input's sole consumer reservation. *)
+(** Capture capacity revision before admission; atomically wait for change or join owned children, then recheck.
+    Waiters cancel with scope; wakeup grants no capacity and cannot discard accepted work.
+    Outbox dirtiness survives without waiters. One await-to-ACK owner captures epoch before Inspect;
+    ACK only after bounded plan installation; concurrent commits stay dirty. Abandon/cancel releases reservation only.
+    Start/restore/unlock/activation/reopen mark dirty; Connected resamples. Re-inspect after waiting for Open.
+    Sleep is finite nonnegative, monotonic/cancellable; effects may suspend without blocking control.
+    Wait_network_open also waits for old join but grants no permit; admission rechecks authority.
+    Consume_unlock consumes live receipt before crypto; stale/expired performs no crypto. Failure needs fresh input.
+    Publish atomically validates revision/selection/resources/capacity: success transfers file+lease,
+    failure transfers nothing. Never release/republish transferred resources. Available needs live Demand;
+    Revoked needs live Withdraw; waiting/missing carry none. Reject duplicate references.
+    Replace unreceived output only after cleanup; received bytes remain until consumer release ACK.
+    Scope exit retains received/failed cleanup, blocking retirement; Finish cannot erase it or newer revisions.
+    Download_demand performs one Download after Lookup; Closed/Locked/no-version admits no remote attempt.
+    Active work stays charged through join; replacement reclassifies shared priority before admission.
+    Notifications share message budgets; Notify backpressures, coalescing only adjacent same-connection hints.
+    One consumer per channel; exit joins children before queue release.
+    Await_input_or_child requires unique live same-scope children; shares Next_input's sole consumer.
+    Atomically consume only winning input; readiness is not join, cancellation consumes nothing.
+    Stop wins, otherwise choice is fair. *)
 
 val task_return : 'a -> 'a task
 val task_bind : 'a task -> ('a -> 'b task) -> 'b task
@@ -488,20 +379,14 @@ val task_perform : 'a task_operation -> success:('a -> 'b task)
 val with_scope : (scope -> 'a task) -> 'a task
 val spawn : scope -> 'a task -> ('a child, error) result task
 val spawn_asset : scope -> demand_receipt -> 'a task -> ('a child, error) result task
-(** spawn_asset binds current revision/priority; ordinary children cannot borrow
-    foreground task slots. Replacement reclassifies before admission; cancellation
-    holds slots through join. Schedule fair bounded foreground bursts with eventual
-    background turns; wait on input/children for capacity, never busy-poll. *)
+(** spawn_asset binds revision/priority; replacement reclassifies before admission. Slots remain charged through join; background eventually runs. *)
 val equal_child : 'a child -> 'a child -> bool
 val join : 'a child -> ('a, error) result task
 val cancel_child : 'a child -> unit task
 
-(** Scope exit cancels then joins children and producers on every path; completed
-    children keep slots until one join consumes them. Foreign/expired/reused joins
-    fail. Child cancel affects its subtree only. Report unobserved child failures;
-    scope-caused Cancelled is not a new primary, but cleanup/unknown outcomes stay.
-    Reserve task/terminal/queue capacity before spawn. Network_closed is an ordinary
-    joined failure, not graph cancellation. *)
+(** Scope exit cancels/joins all children/producers. One join consumes a completed child's slot;
+    foreign/expired/reused joins fail. Report unobserved failures, retaining cleanup/unknown outcomes.
+    Child cancellation affects only its subtree; Network_closed is not graph cancellation. *)
 
 type _ task_node =
   | Task_return : 'a -> 'a task_node
@@ -516,25 +401,18 @@ type _ task_node =
   | Task_cancel : 'a child -> unit task_node
   | Task_bind : 'a task * ('a -> 'b task) -> 'b task_node
 val task_view : 'a task -> 'a task_node
-(** Pure total projection. Continuations must terminate without I/O; yield after
-    steps_per_turn, fairly including completions/input, with no lifetime step cap.
-    Bound retained tasks/waiters/ready queues and reserve terminal capacity. *)
+(** Pure total projection; continuations terminate without I/O. Yield after steps_per_turn, fairly including input/completions. *)
 
-(** Interpreter-only handle production, no I/O/policy. Execute keeps one private
-    freshly allocated owner, never passes it to adapters/programs. Equal identity
-    is not equal ownership. No handle survives restart. Foreign/closed checks fail
-    Stale_context before allocation/callback; original cleanup remains legal.
-    Execute reserves/registers bounded handles and checks current operation ledgers;
-    construction proves neither admission, authority, revision nor resource ACK. *)
+(** Interpreter-only process-local handles, not authority or resource ACKs; equal identity is not equal ownership.
+    Execute keeps its fresh owner private, reserves/registers before delivery and validates current ledgers.
+    Foreign/closed checks fail before callbacks; original cleanup remains legal. *)
 module Producer : sig
   type owner
   val create : identity -> owner
   val scope : owner -> scope
   val check_scope : owner -> scope -> (unit, error) result
   val close_scope : owner -> scope -> (unit, error) result
-  (** Check exact live owner/scope. Original-owner close is idempotent, only after
-      Execute cancels/joins producers; close itself does neither. Received delivery
-      cleanup survives close. *)
+  (** Exact live owner/scope; close is idempotent only after Execute joins producers. Received-delivery cleanup survives close. *)
 
   val child : owner -> scope -> 'a task
     -> poll:(unit -> ('a, error) result option) -> ('a child, error) result
@@ -542,13 +420,9 @@ module Producer : sig
   val child_result : owner -> scope -> 'a child
     -> (('a, error) result option, error) result
   val forget_child : owner -> scope -> 'a child -> (unit, error) result
-  (** Execute reserves a slot and binds poll to the exact task's typed promise.
-      Check owner/live scope/unconsumed registration before poll; None is unfinished,
-      Some repeatable terminal data, not join. Foreign checks never invoke poll.
-      forget follows physical join, drops callback/slot; repeated original forget
-      is idempotent but consumed check/result fails Stale_context. Bound handles/
-      callbacks without a second registry or growing tombstones; handles retain
-      owner/validity after pruning. Producer cannot prove callback honesty. *)
+  (** Bind poll to the exact typed task after reservation; check owner/live scope/unconsumed registration before polling.
+      None is unfinished; repeatable Some is not join. Forget only after physical join;
+      repeated original forget succeeds, consumed check/result fails. Prune callbacks without growing tombstones. *)
 
   val demand_receipt : owner -> scope -> (demand_receipt, error) result
   val unlock_receipt : owner -> scope -> (unlock_receipt, error) result
@@ -558,26 +432,17 @@ module Producer : sig
     -> (capacity_revision, error) result
   val capacity_sequence : owner -> scope -> capacity_revision
     -> (int64, error) result
-  (** Checked projection of the captured nonnegative, nonwrapping sequence; validates
-      exact owner/live scope, not equality with the latest sequence. Execute compares
-      with its current sequence and registers the waiter atomically, without yield.
-      No growing revision registry; old same-scope captures remain valid baselines. *)
+  (** Validate owner/live scope, not latest-sequence equality; old captures remain valid atomic-wait baselines without a revision registry. *)
   val check_demand_receipt : owner -> scope -> demand_receipt -> (unit, error) result
   val check_unlock_receipt : owner -> scope -> unlock_receipt -> (unit, error) result
   val check_outbox_check : owner -> scope -> outbox_check -> (unit, error) result
   val check_notifications : owner -> scope -> notifications -> (unit, error) result
-  (** Fresh identities after reservation, registered before delivery. Execute binds
-      demand selection/revision/priority, unlock envelope/expiry, outbox epoch and
-      channel queue, checking currency/consumption atomically in addition to owner/
-      live scope. No identity reuse, registration resurrection or growing tombstones. *)
+  (** Fresh registered identities; Execute atomically checks current selection/revision/expiry/epoch/queue and consumption. Never resurrect handles. *)
 
   val demand_output : owner -> scope -> demand_receipt -> id:demand_id
     -> demand_availability -> (demand_output, error) result
   val check_delivery : owner -> demand_delivery -> (unit, error) result
-  (** Execute checks live receipt ID/selection, publication legality/resources/
-      capacity before atomic registration/enqueue. Producer only creates output,
-      never validates leases or transfers ownership. check_delivery checks original
-      owner after scope close; Execute still checks ledger/release watermarks. *)
+  (** Producer constructs only; Execute validates publication/resources/capacity. Original-owner delivery checks survive scope close. *)
 end
 
 type (_, _, _, _) operation =
@@ -609,47 +474,34 @@ type (_, _, _) node =
       * (error -> ('failed, 'final, 'b) program)
       -> ('before, 'final, 'b) node
 val view : ('before, 'after, 'a) program -> ('before, 'after, 'a) node
-(** Total pure projection including bind normalization; callbacks terminate without
-    I/O/yield. Exceptions report actual phase, not the requested final phase. *)
+(** Pure total projection; callbacks terminate without I/O/yield. Exceptions report actual phase. *)
 
 val run_task : 'a task -> (ready, ready, ready, 'a) operation
 
 val restore : (cold, ready, cold, restore_report) operation
 val install_initial_network : network_gate -> (ready, ready, ready, unit) operation
-(** Atomic one-shot install only if no properly bound admitted explicit gate control
-    has occurred since runtime creation; otherwise succeeds without changing the
-    gate. Validate target runtime/owner and applicable context/version/lifecycle
-    admission first; foreign, stale, copied or revoked calls have no effects,
-    including on eligibility. An admitted install consumes eligibility even on
-    semantic failure, never queued/retried; Open shares Set_network's fail-fast
-    epoch/old-generation join checks. Admitted explicit controls invalidate
-    eligibility before those semantic checks, even if Open is rejected. *)
+(** Atomic one-shot install; admitted explicit controls supersede it, so later install is a no-op.
+    Admission rejection has zero effects, including eligibility. Admitted install/control consumes eligibility
+    before semantic Open epoch/old-generation-join checks, even on failure. Never queue or retry Open. *)
 val set_network : network_gate -> (ready, ready, ready, unit) operation
 val database : 'a database -> (ready, ready, ready, 'a) operation
 val transport : 'a transport -> (ready, ready, ready, 'a) operation
 val crypto : 'a crypto -> (ready, ready, ready, 'a) operation
 val assets : 'a assets -> (ready, ready, ready, 'a) operation
 val observe : ('s, 's, 's, observation) operation
-(** Ready need not mean activated/unlocked. Runtime starts Closed; local-only Restore
-    preserves explicit gate controls and initial-install eligibility;
-    missing mirror succeeds with checkpoint None (Inspect fails until activation).
-    Locked bases restore metadata without plaintext. Partial restore failure stays
-    cold with cleanup owed. Open checks actual epoch; Close fences then joins,
-    never rolls back unknown/committed work. Transport/Download/Upload check Open
-    at admission and execution; local inspect/reconcile/unlock/release do not.
-    Locked rejects protected work before bytes; ordinary failures retain ready
-    with durable outcomes/resources visible in observation. *)
+(** Runtime starts Closed; local Restore preserves controls/eligibility. Missing mirror yields checkpoint None;
+    Inspect waits for activation. Locked restore reads metadata only; partial failure stays cold with cleanup owed.
+    Open checks actual epoch; Closed fences/joins without rollback. Remote effects recheck permission;
+    local inspection/reconciliation/unlock/release need none. Protected work fails Locked before bytes. *)
 
 val begin_drain : 's drainable -> ('s, draining, draining, unit) operation
 val finish_retirement : (draining, retired, draining, unit) operation
 val release_file : asset_file -> ('s, 's, 's, unit) operation
 val release_lease : asset_lease -> ('s, 's, 's, unit) operation
 val release_snapshot : snapshot -> ('s, 's, 's, unit) operation
-(** Drain irreversibly fences before cancel; failure stays draining. Retirement
-    requires physical joins of all work/callbacks/delegations and resource cleanup;
-    cancel or gate close is insufficient. Retain original owners after replacement.
-    Retired permits only idempotent release/cached observation, never deletion or
-    account replacement. Cancellation returns actual phase and concrete error. *)
+(** Drain fences irreversibly; failure stays draining. Retirement requires physical joins and cleanup,
+    retaining original owners after replacement. Retired allows release/cached observation only;
+    cancellation reports actual phase/cause, never implies rollback. *)
 
 type policy_config = private
   { sync_retry : retry_policy
@@ -657,62 +509,20 @@ type policy_config = private
   ; no_progress_seconds : float }
 val policy_config : sync_retry:retry_policy -> asset_retry:retry_policy
   -> no_progress_seconds:float -> (policy_config, error) result
-(** Positive finite no-progress delay; no built-in retry counts or timing defaults. *)
+(** Positive finite no-progress delay; no default retry counts/timings. *)
 
 val sync_policy : policy_config -> initial_network:network_gate -> (cold, ready, unit) program
-(** Pure service entry: Restore locally, Install_initial_network, then Run_task.
-    Never replay initial_network through Set_network or Network_changed.
-    Stop joins children and returns Ready; retirement is the service owner's job.
-    One coordinator owns policy state, input and status; children return events,
-    never mutate its state. Receive remains live while requests/asset work wait.
-
-    Inspect on dirtiness with epoch ACK only after bounded plan installation.
-    Recover Submitted using Retry_group and exact committed wires before fresh
-    eligible Submit_group; use each fresh Inspect token. Persist preparation before
-    Push; match/commit Accept_group or Reject_group before further planning.
-    Unknown sends keep original durable identity and require Inspect/reconciliation,
-    never fresh encryption or blind replay. Token conflicts re-inspect, not retry
-    unchanged transitions. Blocked intent is not silently discarded or resubmitted.
-
-    Serialize all response-family requests per connection. Track greatest remote
-    target; Apply_authoritative alone advances checkpoint. Deferred transfers no
-    batch ownership to the database: coordinator retains that exact bounded batch
-    and Await_submission_outcome ID, pauses further Pull/fresh submissions, resolves
-    that Submitted batch, then re-inspects and reapplies the original batch with a
-    fresh token. Late responses still settle original owners. Never ACK/replace a
-    deferred batch with a hint. On scope exit discard only volatile batch bytes;
-    retained checkpoint and Submitted records ensure re-pull/recovery after restart.
-    No_progress follows its transport contract and configured delay, not busy Pull.
-    Missing mirror activates a verified snapshot, releases it on all paths and
-    inspects installed state; deferred activation waits for its actual local change.
-
-    Only Network_failure/Remote_closed/Network_lost and Asset_network admit bounded
-    retries. Close and physically join the exact connection before reconnecting;
-    each retry uses capped monotonic Sleep, cancelled by stop/gate closure. Count
-    actual remote admissions, not wakeups. maximum_attempts bounds retry admissions
-    after the initial attempt (zero disables retry), separately per operation.
-    Reconnect budget resets only after authoritative catch-up
-    with Submitted recovery settled, not merely Connect. A matched successful
-    response resets that request budget. asset_retry is per demand revision and
-    resets on available bytes from Lookup/transfer or explicit selection replacement.
-    Exhaustion publishes the retained cause and waits: a new authorized gate epoch
-    starts a network episode; corrected unlock restarts only key-blocked planning.
-    Closed/Locked wait for correction without consuming retry budget; reopen/unlock
-    re-inspects and revalidates before work. Other failures publish exact causes,
-    never schedule retries. Storage/protocol/crypto/cleanup bugs require repair;
-    unchanged hints/dirtiness cannot replay them. Rejection settlement and token
-    conflict re-planning are domain transitions, not failure retry.
-
-    Event wait selects stop, ingress, receiver notifications, outbox, timers and
-    joined child readiness through bounded scoped children/channels. Capacity
-    pressure retains admitted plans, frozen wires, deferred batch and demand
-    receipts; capture revision before admission, join completions or await capacity
-    without blocking control/release. Permanent bound mismatch fails explicitly.
-    Asset interests use Lookup/Download_demand, separate leases, Publish/Finish and
-    existing priority reservations; withdrawals cancel/join only that interest.
-    No graph enumeration, account/catalog/selection/deletion orchestration, hidden
-    interpreter policy, dropped accepted work or adapter reconnect loop. *)
+(** Restore, Install_initial_network, then Run_task; never replay the initial gate. Stop joins and returns Ready,
+    leaving retirement to the owner. Recover Submitted exact wires before fresh submissions; persist before Push.
+    Unknown outcomes reconcile original IDs. Deferred retains exact batch/outcome ID, pauses Pull/fresh sends,
+    then re-inspects/reapplies after settlement; scope exit drops only volatile bytes, preserving restart recovery.
+    No_progress uses configured delay; snapshots release on every path, deferred activation waits for change.
+    Only Network_failure/Remote_closed/Network_lost/Asset_network retry; join old connection before reconnect.
+    Retry Sleep cancels on stop/gate close. Reconnect budget resets after authoritative catch-up and Submitted
+    recovery; request budget after matched success; asset budget after available bytes or selection replacement.
+    Exhaustion retains cause until new authorized gate epoch; unlock restarts only key-blocked work.
+    Closed/Locked consume no retries; other failures require repair, not unchanged hints/dirtiness.
+    Capacity pressure retains plans/wires/batches/receipts; wait without blocking control/release.
+    Permanent bound mismatch fails. Withdrawals cancel/join only their interest; no adapter policy loops. *)
 
 val error_message : error -> string
-(** Bounded sync metadata, not user queries, presentation ACK or physical completion.
-    Restart uses a fresh incarnation and existing durable recovery records only. *)
