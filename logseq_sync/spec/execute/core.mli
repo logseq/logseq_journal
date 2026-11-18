@@ -78,42 +78,6 @@ type network_deadlines =
     Expiry cancels/joins; failed cleanup retains owners, unknown writes return Outcome_unknown.
     Read/setup expiry is Network_failure; certificate/protocol errors never become retryable timeouts. *)
 
-type publication_observation =
-  | Import_absent | Local_present | Metadata_present
-  | Publication_acknowledged | Entity_cancelled
-
-type _ worker_operation =
-  | Worker_crypto : 'a Dsl.crypto -> 'a worker_operation
-  | Prepare_import : Logseq_db_types.Asset_import.t
-      -> Logseq_db_types.Asset_upload_intent.t worker_operation
-  | Publish_import_preview : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
-  | Persist_import : Logseq_db_types.Asset_upload_intent.t * int option
-      -> unit worker_operation
-  | Inspect_import : Logseq_db_types.Asset_upload_intent.t
-      -> publication_observation worker_operation
-  | Apply_local_import : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
-  | Put_import : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
-  | Apply_import_metadata : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
-  | Await_import_publication : Logseq_db_types.Asset_upload_intent.t
-      -> unit worker_operation
-  | Cancel_import : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
-  | Release_import_staging : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
-  | Recover_import_inputs :
-      { after : int64 option; maximum_items : int; maximum_bytes : int }
-      -> Logseq_db_types.Asset_import.Recovery.page worker_operation
-  | Confirm_import_input : string
-      -> Logseq_db_types.Asset_import.Recovery.item option worker_operation
-  | Acknowledge_import_input : { input : string; prepared : string }
-      -> unit worker_operation
-(** Worker sequences durable phases; Persist checks exact prior revision (None means absent).
-    Prepare reserves original input before copying and journals Prepared proof before return;
-    exact input recovers original intent, changed input/owner rejects. Preview is not remote publication.
-    Uncertain persistence retains staging for original-proof recovery, never re-stages vanished picker paths.
-    Local/metadata writes use sole queue/original mutation IDs. Put ACKs storage, not metadata/publication;
-    inspect/wait require original proof, not matching content. Cancel preserves commits/unknown outcomes.
-    Release staging only with terminal proof and no users. Recovery is bounded/read-only; ACK matches Prepared proof.
-    Decoded intent/path/operation ID grants no authority. *)
-
 type worker_network =
   { with_admission : 'a. (unit -> ('a, Dsl.error) result) -> ('a, Dsl.error) result }
 (** Runtime-bound single attempt: register before callback, cancel on fence, join before return. No reusable permission or retry; dispatch cleanup rules apply. *)
@@ -126,7 +90,44 @@ module type WORKER_OWNER = sig
     -> (unit, Dsl.error) result
   val with_scope : identity:Dsl.identity -> operation:Logseq_db_types.Graph_types.Uuid.t
     -> (scope -> ('a, Dsl.error) result) -> ('a, Dsl.error) result
-  val perform : scope -> 'a worker_operation -> ('a, Dsl.error) result
+  val crypto : scope -> 'a Dsl.crypto -> ('a, Dsl.error) result
+  val prepare_import : scope -> Logseq_db_types.Asset_import.t
+    -> (Logseq_db_types.Asset_upload_intent.t, Dsl.error) result
+  (** Reserve original input before copying; journal Prepared proof before return.
+      Exact input recovers original intent; changed input/owner rejects. *)
+  val publish_import_preview : scope -> Logseq_db_types.Asset_upload_intent.t
+    -> (unit, Dsl.error) result
+  (** Preview is not remote publication. *)
+  val persist_import : scope -> Logseq_db_types.Asset_upload_intent.t
+    -> expected:int option -> (unit, Dsl.error) result
+  (** Exact prior revision; None means absent. Uncertainty retains original proof/staging, never re-stages picker paths. *)
+  val inspect_import : scope -> Logseq_db_types.Asset_upload_intent.t
+    -> ([ `Import_absent | `Local_present | `Metadata_present
+        | `Publication_acknowledged | `Entity_cancelled ], Dsl.error) result
+  val apply_local_import : scope -> Logseq_db_types.Asset_upload_intent.t
+    -> (unit, Dsl.error) result
+  val put_import : scope -> Logseq_db_types.Asset_upload_intent.t
+    -> (unit, Dsl.error) result
+  (** ACK means storage, not metadata/publication. *)
+  val apply_import_metadata : scope -> Logseq_db_types.Asset_upload_intent.t
+    -> (unit, Dsl.error) result
+  val await_import_publication : scope -> Logseq_db_types.Asset_upload_intent.t
+    -> (unit, Dsl.error) result
+  (** Local/metadata writes use the sole queue/original mutation IDs; inspect/wait require original proof, not matching content. *)
+  val cancel_import : scope -> Logseq_db_types.Asset_upload_intent.t
+    -> (unit, Dsl.error) result
+  (** Cancellation preserves commits/unknown outcomes. *)
+  val release_import_staging : scope -> Logseq_db_types.Asset_upload_intent.t
+    -> (unit, Dsl.error) result
+  (** Release only with terminal proof and no users. Decoded intent/path/operation ID grants no authority. *)
+  val recover_import_inputs : scope -> after:int64 option
+    -> maximum_items:int -> maximum_bytes:int
+    -> (Logseq_db_types.Asset_import.Recovery.page, Dsl.error) result
+  val confirm_import_input : scope -> string
+    -> (Logseq_db_types.Asset_import.Recovery.item option, Dsl.error) result
+  val acknowledge_import_input : scope -> input:string -> prepared:string
+    -> (unit, Dsl.error) result
+  (** Recovery is bounded/read-only; ACK matches original Prepared proof. Worker sequences durable phases. *)
   val cancel : scope -> (unit, Dsl.error) result
   val retain_imported_file : scope -> Logseq_db_types.Asset_upload_intent.t
     -> (imported_file option, Dsl.error) result
