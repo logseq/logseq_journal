@@ -1,0 +1,4 @@
+(library
+ (name logseq_sync_service_lifecycle)
+ (public_name logseq_sync.internal.service_lifecycle)
+ (modules logseq_sync_service_lifecycle))

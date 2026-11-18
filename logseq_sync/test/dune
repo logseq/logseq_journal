@@ -1,4 +1,29 @@
 (test
+ (name execute_runtime_contract)
+ (modules execute_runtime_contract)
+ (libraries datascript_ocaml.types logseq_sync_sync_service logseq_sync_sync_service_impl alcotest eio eio_main datascript-ocaml-native logseq_db_storage execute logseq_sync_execute_impl sync_dsl logseq_sync_sync_dsl_impl logseq_overlay_db logseq_db_types rrbvec melange-transit-core melange-transit-native unix))
+
+(test
+ (name execute_owner_contract)
+ (modules execute_owner_contract)
+ (libraries alcotest eio eio_main sync_dsl logseq_sync_sync_dsl_impl logseq_sync_execute_owners))
+
+(test
+ (name service_lifecycle_contract)
+ (modules service_lifecycle_contract)
+ (libraries alcotest logseq_sync_service_lifecycle))
+
+(test
+ (name sync_dsl_contract)
+ (modules sync_dsl_contract sync_dsl_interpreter sync_dsl_policy_contract)
+ (libraries alcotest sync_dsl logseq_sync_sync_dsl_impl logseq_overlay_db logseq_db_types rrbvec))
+
+(test
+ (name indexed_program_contract)
+ (modules indexed_program_contract)
+ (libraries alcotest logseq_sync_indexed_program))
+
+(test
  (name test_sync)
  (modules
   test_sync

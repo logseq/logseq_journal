@@ -1,0 +1,12 @@
+(library
+ (name logseq_sync_execute_owners)
+ (public_name logseq_sync.internal.execute_owners)
+ (modules owner_binding database_owner)
+ (libraries eio sync_dsl logseq_overlay_db))
+
+(library
+ (name logseq_sync_execute_impl)
+ (public_name logseq_sync.execute.impl)
+ (implements execute)
+ (modules core)
+ (libraries eio mtime sync_dsl logseq_sync_execute_owners logseq_overlay_db logseq_db_types rrbvec))
