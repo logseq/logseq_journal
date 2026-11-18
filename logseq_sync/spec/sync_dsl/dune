@@ -1,0 +1,7 @@
+(library
+ (name sync_dsl)
+ (public_name logseq_sync.sync_dsl)
+ (modules core)
+ (virtual_modules core)
+ (default_implementation logseq_sync_sync_dsl_impl)
+ (libraries logseq_overlay_db logseq_db_types rrbvec))

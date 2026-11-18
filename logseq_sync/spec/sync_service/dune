@@ -3,4 +3,5 @@
  (public_name logseq_sync.sync_service)
  (modules core)
  (virtual_modules core)
+ (default_implementation logseq_sync_sync_service_impl)
  (libraries eio sync_dsl execute))

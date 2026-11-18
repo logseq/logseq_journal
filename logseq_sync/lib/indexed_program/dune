@@ -1,0 +1,4 @@
+(library
+ (name logseq_sync_indexed_program)
+ (public_name logseq_sync.internal.indexed_program)
+ (modules logseq_sync_indexed_program))
