@@ -252,7 +252,19 @@ val unlock_input : wrapped_graph_key:string -> (unlock_input, error) result
 val wrapped_graph_key : unlock_input -> string
 (** Wrapped material only; never log keys. Unlock verifies/installs this graph's
     key; still locked means Error Locked. Callers own key acquisition/coordination. *)
-type _ crypto = Unlock : unlock_input -> key_status crypto
+type _ crypto =
+  | Unlock : unlock_input -> key_status crypto
+  | Encrypt_values : string Rrbvec.t -> (string * string) Rrbvec.t crypto
+  | Decrypt_value : string -> string crypto
+  | Protect : Overlay.Database.protection_request
+      -> (Overlay.Types.crypto_item_id * string) list crypto
+  | Unprotect : Overlay.Database.unprotection_request
+      -> (Overlay.Types.crypto_item_id * string) list crypto
+(** The bound graph key never leaves its owner. Encrypt_values preserves order
+    and returns IV/ciphertext pairs; Decrypt_value validates the Transit envelope.
+    Protect/Unprotect preserve exact request IDs and cardinality. Bound plaintext,
+    ciphertext and results by item/byte limits; malformed envelopes never fall back
+    to plaintext. Worker operations use the same owner, not reducer tickets. *)
 
 type asset = Logseq_db_types.Asset_descriptor.t
 
@@ -375,6 +387,8 @@ type demand_output = private
     sync work. Never change uncertain durable publication identity. *)
 
 type outbox_check
+type capacity_revision
+(** Runtime-bound revision of task/message/resource capacity. *)
 
 type 'a wake = Input of service_input | Child_ready of 'a child
 
@@ -402,6 +416,8 @@ type _ task_operation =
   | Acknowledge_outbox_check : outbox_check -> unit task_operation
   | Abandon_outbox_check : outbox_check -> unit task_operation
   | Resample_outbox : unit task_operation
+  | Capacity_revision : capacity_revision task_operation
+  | Await_capacity_changed : capacity_revision -> unit task_operation
   | Task_observe : observation task_operation
   | Publish_status : service_status -> unit task_operation
   | Task_database : 'a database -> 'a task_operation
@@ -417,7 +433,13 @@ type _ task_operation =
   | Await_input_or_child : 'a child Rrbvec.t -> 'a wake task_operation
   | Sleep : float -> unit task_operation
   | Yield : unit task_operation
-(** Outbox is independent level-triggered dirtiness, retained without a waiter.
+(** Capture capacity revision before admission; after Capacity_exceeded wait for
+    change or join owned children, then recheck. Compare-and-wait is atomic;
+    release/join/discard wakes waiters. Foreign revisions fail Stale_context.
+    Waits reserve no work slot, are bounded by tasks, and cancel with the scope.
+    No capacity event grants admission or permits dropping admitted work.
+
+    Outbox is independent level-triggered dirtiness, retained without a waiter.
     One task owns await-to-ACK reservation; competitors fail Invalid_input.
     Start/restore/unlock/activation/reopen mark dirty; Connected calls Resample.
     Await captures epoch before Inspect; ACK clears only that epoch after installing
@@ -532,6 +554,14 @@ module Producer : sig
   val unlock_receipt : owner -> scope -> (unlock_receipt, error) result
   val outbox_check : owner -> scope -> (outbox_check, error) result
   val notifications : owner -> scope -> (notifications, error) result
+  val capacity_revision : owner -> scope -> sequence:int64
+    -> (capacity_revision, error) result
+  val capacity_sequence : owner -> scope -> capacity_revision
+    -> (int64, error) result
+  (** Checked projection of the captured nonnegative, nonwrapping sequence; validates
+      exact owner/live scope, not equality with the latest sequence. Execute compares
+      with its current sequence and registers the waiter atomically, without yield.
+      No growing revision registry; old same-scope captures remain valid baselines. *)
   val check_demand_receipt : owner -> scope -> demand_receipt -> (unit, error) result
   val check_unlock_receipt : owner -> scope -> unlock_receipt -> (unit, error) result
   val check_outbox_check : owner -> scope -> outbox_check -> (unit, error) result
@@ -553,6 +583,7 @@ end
 type (_, _, _, _) operation =
   | Run_task : 'a task -> (ready, ready, ready, 'a) operation
   | Restore : (cold, ready, cold, restore_report) operation
+  | Install_initial_network : network_gate -> (ready, ready, ready, unit) operation
   | Set_network : network_gate -> (ready, ready, ready, unit) operation
   | Database : 'a database -> (ready, ready, ready, 'a) operation
   | Transport : 'a transport -> (ready, ready, ready, 'a) operation
@@ -584,13 +615,23 @@ val view : ('before, 'after, 'a) program -> ('before, 'after, 'a) node
 val run_task : 'a task -> (ready, ready, ready, 'a) operation
 
 val restore : (cold, ready, cold, restore_report) operation
+val install_initial_network : network_gate -> (ready, ready, ready, unit) operation
+(** Atomic one-shot install only if no properly bound admitted explicit gate control
+    has occurred since runtime creation; otherwise succeeds without changing the
+    gate. Validate target runtime/owner and applicable context/version/lifecycle
+    admission first; foreign, stale, copied or revoked calls have no effects,
+    including on eligibility. An admitted install consumes eligibility even on
+    semantic failure, never queued/retried; Open shares Set_network's fail-fast
+    epoch/old-generation join checks. Admitted explicit controls invalidate
+    eligibility before those semantic checks, even if Open is rejected. *)
 val set_network : network_gate -> (ready, ready, ready, unit) operation
 val database : 'a database -> (ready, ready, ready, 'a) operation
 val transport : 'a transport -> (ready, ready, ready, 'a) operation
 val crypto : 'a crypto -> (ready, ready, ready, 'a) operation
 val assets : 'a assets -> (ready, ready, ready, 'a) operation
 val observe : ('s, 's, 's, observation) operation
-(** Ready need not mean activated/unlocked. Restore is local-only and leaves Closed;
+(** Ready need not mean activated/unlocked. Runtime starts Closed; local-only Restore
+    preserves explicit gate controls and initial-install eligibility;
     missing mirror succeeds with checkpoint None (Inspect fails until activation).
     Locked bases restore metadata without plaintext. Partial restore failure stays
     cold with cleanup owed. Open checks actual epoch; Close fences then joins,
@@ -609,6 +650,68 @@ val release_snapshot : snapshot -> ('s, 's, 's, unit) operation
     cancel or gate close is insufficient. Retain original owners after replacement.
     Retired permits only idempotent release/cached observation, never deletion or
     account replacement. Cancellation returns actual phase and concrete error. *)
+
+type policy_config = private
+  { sync_retry : retry_policy
+  ; asset_retry : retry_policy
+  ; no_progress_seconds : float }
+val policy_config : sync_retry:retry_policy -> asset_retry:retry_policy
+  -> no_progress_seconds:float -> (policy_config, error) result
+(** Positive finite no-progress delay; no built-in retry counts or timing defaults. *)
+
+val sync_policy : policy_config -> initial_network:network_gate -> (cold, ready, unit) program
+(** Pure service entry: Restore locally, Install_initial_network, then Run_task.
+    Never replay initial_network through Set_network or Network_changed.
+    Stop joins children and returns Ready; retirement is the service owner's job.
+    One coordinator owns policy state, input and status; children return events,
+    never mutate its state. Receive remains live while requests/asset work wait.
+
+    Inspect on dirtiness with epoch ACK only after bounded plan installation.
+    Recover Submitted using Retry_group and exact committed wires before fresh
+    eligible Submit_group; use each fresh Inspect token. Persist preparation before
+    Push; match/commit Accept_group or Reject_group before further planning.
+    Unknown sends keep original durable identity and require Inspect/reconciliation,
+    never fresh encryption or blind replay. Token conflicts re-inspect, not retry
+    unchanged transitions. Blocked intent is not silently discarded or resubmitted.
+
+    Serialize all response-family requests per connection. Track greatest remote
+    target; Apply_authoritative alone advances checkpoint. Deferred transfers no
+    batch ownership to the database: coordinator retains that exact bounded batch
+    and Await_submission_outcome ID, pauses further Pull/fresh submissions, resolves
+    that Submitted batch, then re-inspects and reapplies the original batch with a
+    fresh token. Late responses still settle original owners. Never ACK/replace a
+    deferred batch with a hint. On scope exit discard only volatile batch bytes;
+    retained checkpoint and Submitted records ensure re-pull/recovery after restart.
+    No_progress follows its transport contract and configured delay, not busy Pull.
+    Missing mirror activates a verified snapshot, releases it on all paths and
+    inspects installed state; deferred activation waits for its actual local change.
+
+    Only Network_failure/Remote_closed/Network_lost and Asset_network admit bounded
+    retries. Close and physically join the exact connection before reconnecting;
+    each retry uses capped monotonic Sleep, cancelled by stop/gate closure. Count
+    actual remote admissions, not wakeups. maximum_attempts bounds retry admissions
+    after the initial attempt (zero disables retry), separately per operation.
+    Reconnect budget resets only after authoritative catch-up
+    with Submitted recovery settled, not merely Connect. A matched successful
+    response resets that request budget. asset_retry is per demand revision and
+    resets on available bytes from Lookup/transfer or explicit selection replacement.
+    Exhaustion publishes the retained cause and waits: a new authorized gate epoch
+    starts a network episode; corrected unlock restarts only key-blocked planning.
+    Closed/Locked wait for correction without consuming retry budget; reopen/unlock
+    re-inspects and revalidates before work. Other failures publish exact causes,
+    never schedule retries. Storage/protocol/crypto/cleanup bugs require repair;
+    unchanged hints/dirtiness cannot replay them. Rejection settlement and token
+    conflict re-planning are domain transitions, not failure retry.
+
+    Event wait selects stop, ingress, receiver notifications, outbox, timers and
+    joined child readiness through bounded scoped children/channels. Capacity
+    pressure retains admitted plans, frozen wires, deferred batch and demand
+    receipts; capture revision before admission, join completions or await capacity
+    without blocking control/release. Permanent bound mismatch fails explicitly.
+    Asset interests use Lookup/Download_demand, separate leases, Publish/Finish and
+    existing priority reservations; withdrawals cancel/join only that interest.
+    No graph enumeration, account/catalog/selection/deletion orchestration, hidden
+    interpreter policy, dropped accepted work or adapter reconnect loop. *)
 
 val error_message : error -> string
 (** Bounded sync metadata, not user queries, presentation ACK or physical completion.

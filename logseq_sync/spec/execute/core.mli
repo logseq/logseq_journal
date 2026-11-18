@@ -63,7 +63,7 @@ module Callback_bridge : sig
       Failed/timed-out join retains producer, original owner and charges in the
       scope ledger, returns Cleanup_failure with primary/cleanup causes and forces
       actual draining; retirement/reopen cannot bypass it. Retained cleanup is
-      retried explicitly by retirement, without a background dispatch loop.
+      a supervised repair obligation; retirement reports it without implicit retry.
       Cancellation is neither physical stop nor database rollback; uncertain writes
       retain durable identifiers and Outcome_unknown. Successful join forbids further
       callbacks; later misuse cannot reactivate a scope or abandon owner cleanup. *)
@@ -137,6 +137,97 @@ type network_deadlines =
     Certificate failure remains Authentication_failure, malformed data Protocol_failure;
     neither becomes retryable timeout. No rollback or unchanged security retry. *)
 
+type publication_observation =
+  | Import_absent | Local_present | Metadata_present
+  | Publication_acknowledged | Entity_cancelled
+
+type _ worker_operation =
+  | Worker_crypto : 'a Dsl.crypto -> 'a worker_operation
+  | Prepare_import : Logseq_db_types.Asset_import.t
+      -> Logseq_db_types.Asset_upload_intent.t worker_operation
+  | Publish_import_preview : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
+  | Persist_import : Logseq_db_types.Asset_upload_intent.t * int option
+      -> unit worker_operation
+  | Inspect_import : Logseq_db_types.Asset_upload_intent.t
+      -> publication_observation worker_operation
+  | Apply_local_import : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
+  | Put_import : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
+  | Apply_import_metadata : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
+  | Await_import_publication : Logseq_db_types.Asset_upload_intent.t
+      -> unit worker_operation
+  | Cancel_import : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
+  | Release_import_staging : Logseq_db_types.Asset_upload_intent.t -> unit worker_operation
+  | Recover_import_inputs :
+      { after : int64 option; maximum_items : int; maximum_bytes : int }
+      -> Logseq_db_types.Asset_import.Recovery.page worker_operation
+  | Confirm_import_input : string
+      -> Logseq_db_types.Asset_import.Recovery.item option worker_operation
+  | Acknowledge_import_input : { input : string; prepared : string }
+      -> unit worker_operation
+(** Worker, not sync policy, sequences durable import phases. Persist checks exact
+    previous revision (None means absent); original intent/IDs survive interruption.
+    Prepare reserves canonical original input before copying source bytes, then
+    atomically journals Prepared intent/input proof before returning. Repeated
+    exact input recovers its original intent; changed input/owner rejects. Preview
+    publication registers verified staged bytes in the same scoped asset owner;
+    it is not remote publication. Failed/uncertain persistence retains staging
+    until original-proof recovery; never re-stage from a vanished picker path.
+    Local/metadata writes use the sole database queue and original mutation IDs.
+    Put acknowledges verified remote storage, not metadata or publication; inspect
+    and publication wait use original proof, never merely matching current content.
+    Cancel joins actual work, preserves unknown outcomes and committed edits;
+    staging release requires durable terminal proof and no remaining users.
+    Recovery is bounded/read-only; ACK matches stored original Prepared evidence.
+    No operation grants authority from decoded intent, path or operation ID. *)
+
+type worker_network =
+  { with_admission : 'a. (unit -> ('a, Dsl.error) result) -> ('a, Dsl.error) result }
+(** Runtime-bound single-attempt gate/epoch check and structured network scope;
+    register before callback, cancel on fence, join before return. No reusable
+    permission or transport retry; callbacks obey dispatch cleanup rules. *)
+
+module type WORKER_OWNER = sig
+  type scope
+  type imported_file
+  val bind_runtime : identity:Dsl.identity -> database_owner:database_owner
+    -> limits:Dsl.limits -> cleanup_seconds:float -> network:worker_network
+    -> (unit, Dsl.error) result
+  val with_scope : identity:Dsl.identity -> operation:Logseq_db_types.Graph_types.Uuid.t
+    -> (scope -> ('a, Dsl.error) result) -> ('a, Dsl.error) result
+  val perform : scope -> 'a worker_operation -> ('a, Dsl.error) result
+  val cancel : scope -> (unit, Dsl.error) result
+  val retain_imported_file : scope -> Logseq_db_types.Asset_upload_intent.t
+    -> (imported_file option, Dsl.error) result
+  val imported_file_path : imported_file -> string
+  val release_imported_file : imported_file -> (unit, Dsl.error) result
+  val fence : identity:Dsl.identity -> (unit, Dsl.error) result
+  val await_quiescent : identity:Dsl.identity -> (unit, Dsl.error) result
+end
+(** Caller supplies one concrete owner shared by Worker and dispatch.crypto/assets/
+    database preparation. No legacy Core ticket, runner event pump or Execute.t is
+    needed. create binds the owner once after exclusive acquire, before any Worker
+    admission; failed binding leaves no registration. Until binding/after fence,
+    with_scope rejects. Cross-runtime rebinding while obligations live is rejected.
+    Use supplied network.with_admission for each actual remote attempt; local work
+    needs no permission. Binding shares limits/sole database queue and actual key/
+    staging owners; bound mismatches reject before I/O. create failure retires any
+    successful binding, retaining failed cleanup under sw. Current generation and
+    cancellation are rechecked after suspension/before commit.
+    with_scope reserves bounded operation/result/cleanup capacity before callback;
+    one live scope per operation, exact intent operation/owner checks before I/O.
+    It registers actual tasks, then cancels/joins them on every exit. Closed/foreign
+    scopes reject perform before callbacks; no implicit operation replay. Returned imported
+    files retain separate original-owner leases beyond scope exit; path grants no
+    ownership. Release is legal after fence/replacement, ACKs physical release,
+    and is idempotent only after success. Failed cleanup retains handles/causes.
+    fence stops new scopes/writes and cancels admitted tasks, never revokes bytes
+    under a consumer. await_quiescent joins tasks/callbacks and waits for leases;
+    failure retains the owner. Execute retirement includes this owner and uses its
+    cleanup deadline for physical joins, not as a forced consumer-lease timeout.
+    All remote admissions share Execute's gate/epoch and old-generation join;
+    adapters have no reconnect/retry policy. Durable input/intents/staging survive
+    cancellation and restart; prune only proven unreferenced terminal staging. *)
+
 type capabilities =
   { validate_identity : Dsl.identity -> (unit, Dsl.error) result
   ; validate_limits : Dsl.limits -> (unit, Dsl.error) result
@@ -150,6 +241,7 @@ type capabilities =
   ; validate_resource : Dsl.resource_reference -> (unit, Dsl.error) result
   ; restore : scope:effect_scope -> Dsl.identity
       -> (Dsl.restore_report, Dsl.error) result
+  ; worker_owner : (module WORKER_OWNER)
   ; dispatch : dispatch
   ; observe : Dsl.identity -> (Dsl.observation, Dsl.error) result
   ; fence : Dsl.identity -> (unit, Dsl.error) result
@@ -250,6 +342,15 @@ val open_network : t -> authorization_epoch:int64 -> (unit, Dsl.error) result
     close returns same outstanding receipt/error. await joins exact old generation,
     retaining receipt/cause on failure. Local Ready work continues; no graph drain.
     open checks actual epoch and rejects until old join, never waits hiddenly.
+    Controls work during binding/Restore, including cold. Validate target runtime/
+    owner and applicable context/version/lifecycle admission first; foreign, stale,
+    copied or revoked calls have no effects, including on initial-install eligibility.
+    Only a properly bound admitted explicit control attempt atomically disables
+    Dsl.Install_initial_network before semantic Open epoch/old-generation join
+    checks, even if those checks reject it. Restore never resets the gate or this
+    one-shot eligibility. Initial
+    install atomically checks/consumes eligibility with gate mutation; no deferred
+    Open or hidden retry after failure or supersession.
     Indexed Set_network Closed fences+joins; Open shares checks. No new bytes
     after fence; network/task cancellation is not graph retirement. *)
 
