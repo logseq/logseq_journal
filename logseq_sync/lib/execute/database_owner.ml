@@ -9,6 +9,8 @@ type activation_input =
   { snapshot : Dsl.snapshot
   ; path : string
   ; expected_rows : int
+  ; maximum_crypto_items : int
+  ; maximum_crypto_bytes : int
   ; unprotect :
       Database.unprotection_request
       -> ((Types.crypto_item_id * string) list, Dsl.error) result
@@ -16,6 +18,8 @@ type activation_input =
 
 type preparation =
   { staged : Database.prepared_snapshot_activation
+  ; maximum_crypto_items : int
+  ; maximum_crypto_bytes : int
   ; check_current : unit -> (unit, Dsl.error) result
   ; unprotect :
       Database.unprotection_request
@@ -42,7 +46,11 @@ let activation_result = function
 let rec unprotect preparation =
   let* () = preparation.check_current () in
   let* request =
-    activation_result (Database.next_snapshot_unprotection_batch preparation.staged)
+    activation_result
+      (Database.next_snapshot_unprotection_batch
+         ~maximum_items:preparation.maximum_crypto_items
+         ~maximum_bytes:preparation.maximum_crypto_bytes
+         preparation.staged)
   in
   match request with
   | None -> Ok ()
@@ -77,7 +85,9 @@ let activation_owner ~sw ~dependencies ~inspection ~graph_name =
         (fun (left, _) (right, _) ->
           left.snapshot = right.snapshot
           && left.path = right.path
-          && left.expected_rows = right.expected_rows)
+          && left.expected_rows = right.expected_rows
+          && left.maximum_crypto_items = right.maximum_crypto_items
+          && left.maximum_crypto_bytes = right.maximum_crypto_bytes)
     ; prepare =
         (fun inspection ((input : activation_input), check_current) ->
           let* () = check_current () in
@@ -96,7 +106,14 @@ let activation_owner ~sw ~dependencies ~inspection ~graph_name =
                  ~expected_checksum:(Some checksum)
                  ~expected_rows:input.expected_rows)
           in
-          let preparation = { staged; check_current; unprotect = input.unprotect } in
+          let preparation =
+            { staged
+            ; check_current
+            ; unprotect = input.unprotect
+            ; maximum_crypto_items = input.maximum_crypto_items
+            ; maximum_crypto_bytes = input.maximum_crypto_bytes
+            }
+          in
           let transferred = ref false in
           Fun.protect
             ~finally:(fun () ->

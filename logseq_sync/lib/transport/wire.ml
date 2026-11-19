@@ -46,7 +46,9 @@ let submission batch =
 ;;
 
 let head = function
-  | Protocol.Server.Hello { t; _ } -> Ok Dsl.{ through = t; snapshot_available = true }
+  | Protocol.Server.Hello { t; checksum } ->
+    let* expected_checksum = optional_checksum checksum in
+    Ok Dsl.{ through = t; snapshot_available = true; expected_checksum }
   | _ -> invalid "Expected hello response"
 ;;
 
@@ -87,7 +89,7 @@ let pull ~limits ~since = function
       let* transactions = validate None 0 [] txs in
       let* checksum = optional_checksum value in
       match transactions with
-      | [] -> Ok (Dsl.No_progress { since; through = t })
+      | [] -> Ok (Dsl.No_progress { since; through = t; expected_checksum = checksum })
       | _ ->
         let* batch =
           O.authoritative_batch

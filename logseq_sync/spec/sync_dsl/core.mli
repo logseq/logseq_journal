@@ -207,6 +207,9 @@ val snapshot
 
 type _ database =
   | Inspect : Overlay.Types.sync_view database
+  | Verify_checksum :
+      Overlay.Types.server_cursor * Overlay.Types.checksum
+      -> unit database
   | Prepare_submission :
       Overlay.Types.sync_token * Overlay.Types.outbox_transition
       -> Overlay.Types.outbox_commit database
@@ -223,6 +226,7 @@ type _ database =
 type remote_head =
   { through : Overlay.Types.server_cursor
   ; snapshot_available : bool
+  ; expected_checksum : Overlay.Types.checksum option
   }
 
 type pull_result =
@@ -230,6 +234,7 @@ type pull_result =
   | No_progress of
       { since : Overlay.Types.server_cursor
       ; through : Overlay.Types.server_cursor
+      ; expected_checksum : Overlay.Types.checksum option
       }
   (** Validate generation, issued baseline and all cursors before filtering; Pulled advances baseline.
     No_progress matches since with through >= since; neither result advances checkpoint without apply.

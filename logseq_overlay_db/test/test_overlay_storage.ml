@@ -5,11 +5,15 @@ let server_cursor_of_int value =
 module Database = Logseq_overlay_db.Database
 
 let retirement_sequence = Atomic.make 0
+
 let next_retirement () =
   Database.retirement_id_of_string
-    (Printf.sprintf "97000000-0000-4000-8000-%012d" (Atomic.fetch_and_add retirement_sequence 1))
+    (Printf.sprintf
+       "97000000-0000-4000-8000-%012d"
+       (Atomic.fetch_and_add retirement_sequence 1))
   |> Result.get_ok
 ;;
+
 module T = Test_support
 module Types = Logseq_overlay_db.Types
 open Types
@@ -34,7 +38,9 @@ let block_precondition database block behavior =
     ~finally:(fun () -> Database.release_snapshot snapshot)
     (fun () ->
        let revision =
-         match Database.get_outline_blocks snapshot [ block ] |> T.require_ok ~behavior with
+         match
+           Database.get_outline_blocks snapshot [ block ] |> T.require_ok ~behavior
+         with
          | [ Present_block { revision; _ } ] | [ Missing_block { revision; _ } ] ->
            revision
          | _ -> Alcotest.fail "block precondition returned the wrong cardinality"
@@ -135,17 +141,25 @@ let rec supply_snapshot_crypto ~behavior prepared batch_count =
     supply_snapshot_crypto ~behavior prepared (batch_count + 1)
 ;;
 
-let prepare_snapshot ?wire_batch_max_bytes ?(extend = fun _ -> ()) ~behavior root support =
+let prepare_snapshot ?wire_batch_max_bytes ?change_max_items ?(extend = fun _ -> ()) ~behavior root support =
   let path, applied_server_cursor, expected_checksum, expected_rows =
     snapshot_input_for root
   in
   extend path;
   let dependencies, location, inspection = absent_inspection ~behavior support in
   let dependencies =
-    match wire_batch_max_bytes with
-    | None -> dependencies
-    | Some wire_batch_max_bytes ->
-      let limits = { (T.limits ~behavior) with wire_batch_max_bytes } in
+    match wire_batch_max_bytes, change_max_items with
+    | None, None -> dependencies
+    | _ ->
+      let defaults = T.limits ~behavior in
+      let limits =
+        { defaults with
+          wire_batch_max_bytes =
+            Option.value wire_batch_max_bytes ~default:defaults.wire_batch_max_bytes
+        ; change_max_items =
+            Option.value change_max_items ~default:defaults.change_max_items
+        }
+      in
       Database.dependencies
         ~epoch_ms:(fun () -> 1_704_067_200_000L)
         ~monotonic_ns:(fun () -> 1_000_000L)
@@ -214,40 +228,78 @@ let snapshot_input_validation_is_fail_closed () =
 let snapshot_rejection_preserves_schema_versions () =
   let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
   let module Session = Logseq_db_storage.Storage_session in
-  List.iter (fun (major, minor) ->
-    T.with_temp_directory "overlay-old-schema-" (fun root ->
-      let source = Filename.concat root "source" in
-      Unix.mkdir source 0o700;
-      let database_path = T.seed_mirror source in
-      let connection = Storage.open_database database_path |> T.require_ok ~behavior:"open synthetic schema" in
-      let db = Storage.restore_database connection |> T.require_ok ~behavior:"restore synthetic schema" in
-      let session = Session.create ~tail:(Datascript.Storage.restore_tail_groups (Storage.datascript_storage connection))
-          ~callbacks:(Storage.connection_callbacks connection) in
-      Fun.protect ~finally:(fun () -> ignore (Session.close session)) (fun () ->
-        let staged = Session.stage_transact session ~authoritative_before:db
-            [Datascript.Add (Ident "logseq.kv/schema-version", "kv/value",
-              Map [Keyword "major", Int64 (Int64.of_int major); Keyword "minor", Int64 (Int64.of_int minor)])]
-            |> T.require_ok ~behavior:"stage old synthetic schema" in
-        Session.commit_staged session staged |> T.require_ok ~behavior:"commit old synthetic schema");
-      let path = Filename.concat root "snapshot.transit" in
-      let expected_rows = T.write_snapshot_from_database ~database_path ~snapshot_path:path in
-      let support = Filename.concat root "target" in
-      Unix.mkdir support 0o700;
-      let dependencies, _, inspection = absent_inspection ~behavior:"old schema admission" support in
-      match Database.prepare_snapshot_activation dependencies inspection ~path
-          ~applied_server_cursor:(server_cursor 0) ~expected_checksum:None ~expected_rows with
-      | Error (Snapshot_parse_error message) ->
-        Alcotest.(check string) "version evidence preserved at admission boundary"
+  List.iter
+    (fun (major, minor) ->
+       T.with_temp_directory "overlay-old-schema-" (fun root ->
+         let source = Filename.concat root "source" in
+         Unix.mkdir source 0o700;
+         let database_path = T.seed_mirror source in
+         let connection =
+           Storage.open_database database_path
+           |> T.require_ok ~behavior:"open synthetic schema"
+         in
+         let db =
+           Storage.restore_database connection
+           |> T.require_ok ~behavior:"restore synthetic schema"
+         in
+         let session =
+           Session.create
+             ~tail:
+               (Datascript.Storage.restore_tail_groups
+                  (Storage.datascript_storage connection))
+             ~callbacks:(Storage.connection_callbacks connection)
+         in
+         Fun.protect
+           ~finally:(fun () -> ignore (Session.close session))
+           (fun () ->
+              let staged =
+                Session.stage_transact
+                  session
+                  ~authoritative_before:db
+                  [ Datascript.Add
+                      ( Ident "logseq.kv/schema-version"
+                      , "kv/value"
+                      , Map
+                          [ Keyword "major", Int64 (Int64.of_int major)
+                          ; Keyword "minor", Int64 (Int64.of_int minor)
+                          ] )
+                  ]
+                |> T.require_ok ~behavior:"stage old synthetic schema"
+              in
+              Session.commit_staged session staged
+              |> T.require_ok ~behavior:"commit old synthetic schema");
+         let path = Filename.concat root "snapshot.transit" in
+         let expected_rows =
+           T.write_snapshot_from_database ~database_path ~snapshot_path:path
+         in
+         let support = Filename.concat root "target" in
+         Unix.mkdir support 0o700;
+         let dependencies, _, inspection =
+           absent_inspection ~behavior:"old schema admission" support
+         in
+         match
+           Database.prepare_snapshot_activation
+             dependencies
+             inspection
+             ~path
+             ~applied_server_cursor:(server_cursor 0)
+             ~expected_checksum:None
+             ~expected_rows
+         with
+         | Error (Snapshot_parse_error message) ->
+           Alcotest.(check string)
+             "version evidence preserved at admission boundary"
              (Printf.sprintf
                 "Graph schema %d.%d is not supported. Journal requires schema 65.33 or \
                  later."
                 major
                 minor)
-          message
-      | Error _ -> Alcotest.fail "old schema returned a different error category"
-      | Ok prepared -> Database.cancel_snapshot_activation prepared;
-        Alcotest.fail "unsupported schema was admitted"))
-    [65, 29; 64, 200]
+             message
+         | Error _ -> Alcotest.fail "old schema returned a different error category"
+         | Ok prepared ->
+           Database.cancel_snapshot_activation prepared;
+           Alcotest.fail "unsupported schema was admitted"))
+    [ 65, 29; 64, 200 ]
 ;;
 
 let with_snapshot_metadata changes f =
@@ -262,14 +314,20 @@ let with_snapshot_metadata changes f =
     let database = Storage.restore_database connection |> T.require_ok ~behavior in
     let session =
       Session.create
-        ~tail:(Datascript.Storage.restore_tail_groups (Storage.datascript_storage connection))
+        ~tail:
+          (Datascript.Storage.restore_tail_groups (Storage.datascript_storage connection))
         ~callbacks:(Storage.connection_callbacks connection)
     in
-    Fun.protect ~finally:(fun () -> ignore (Session.close session)) (fun () ->
-      if changes <> [] then (
-        let staged = Session.stage_transact session ~authoritative_before:database changes
-          |> T.require_ok ~behavior in
-        Session.commit_staged session staged |> T.require_ok ~behavior));
+    Fun.protect
+      ~finally:(fun () -> ignore (Session.close session))
+      (fun () ->
+         if changes <> []
+         then (
+           let staged =
+             Session.stage_transact session ~authoritative_before:database changes
+             |> T.require_ok ~behavior
+           in
+           Session.commit_staged session staged |> T.require_ok ~behavior));
     f root database_path)
 ;;
 
@@ -279,13 +337,22 @@ let snapshot_uuid_metadata_case changes expected_error () =
   let behavior = "optional snapshot UUID metadata" in
   with_snapshot_metadata changes (fun root database_path ->
     let path = Filename.concat root "snapshot.transit" in
-    let expected_rows = T.write_snapshot_from_database ~database_path ~snapshot_path:path in
+    let expected_rows =
+      T.write_snapshot_from_database ~database_path ~snapshot_path:path
+    in
     let support = Filename.concat root "target" in
     Unix.mkdir support 0o700;
     let dependencies, _, inspection = absent_inspection ~behavior support in
     let cursor = server_cursor 42 in
-    let result = Database.prepare_snapshot_activation dependencies inspection ~path
-      ~applied_server_cursor:cursor ~expected_checksum:None ~expected_rows in
+    let result =
+      Database.prepare_snapshot_activation
+        dependencies
+        inspection
+        ~path
+        ~applied_server_cursor:cursor
+        ~expected_checksum:None
+        ~expected_rows
+    in
     match expected_error, result with
     | Some expected, Error (Snapshot_parse_error actual) ->
       Alcotest.(check string) "metadata rejection is preserved" expected actual;
@@ -299,64 +366,122 @@ let snapshot_uuid_metadata_case changes expected_error () =
     | None, Error (Snapshot_parse_error message) -> Alcotest.fail message
     | None, Error _ -> Alcotest.fail "valid optional UUID metadata was rejected"
     | None, Ok prepared ->
-      Fun.protect ~finally:(fun () -> Database.cancel_snapshot_activation prepared) (fun () ->
-        ignore (supply_snapshot_crypto ~behavior prepared 0);
-        ignore (Database.commit_snapshot_activation prepared |> T.require_ok ~behavior));
+      Fun.protect
+        ~finally:(fun () -> Database.cancel_snapshot_activation prepared)
+        (fun () ->
+           ignore (supply_snapshot_crypto ~behavior prepared 0);
+           ignore (Database.commit_snapshot_activation prepared |> T.require_ok ~behavior));
       (* The fixture helper only exports kvs, so this checkpoint must have been
          created from the requested target and baseline, not copied from input. *)
-      let target_path = Filename.concat support
-        ("logseq-db-worker/synced-graphs/" ^ Logseq_db_types.Graph_types.Uuid.to_string T.graph_uuid ^ "/db.sqlite") in
+      let target_path =
+        Filename.concat
+          support
+          ("logseq-db-worker/synced-graphs/"
+           ^ Logseq_db_types.Graph_types.Uuid.to_string T.graph_uuid
+           ^ "/db.sqlite")
+      in
       let checkpoint = Checkpoint.read_path target_path |> T.require_ok ~behavior in
-      T.require (Logseq_db_types.Graph_types.Uuid.equal checkpoint.graph_id T.graph_uuid)
+      T.require
+        (Logseq_db_types.Graph_types.Uuid.equal checkpoint.graph_id T.graph_uuid)
         "checkpoint did not retain the download target";
-      T.require (Server_cursor.equal checkpoint.applied_server_t cursor)
+      T.require
+        (Server_cursor.equal checkpoint.applied_server_t cursor)
         "checkpoint did not retain the baseline cursor";
       let metadata_values path =
         let connection = Storage.open_database path |> T.require_ok ~behavior in
-        Fun.protect ~finally:(fun () -> ignore (Storage.close (Storage.connection_callbacks connection))) (fun () ->
-          let database = Storage.restore_database connection |> T.require_ok ~behavior in
-          List.map (fun ident ->
-            Datascript.datoms database Datascript.Avet ~a:"db/ident"
-              ~v:(Datascript.Keyword ident) ()
-            |> Seq.flat_map (fun datom ->
-              Datascript.datoms database Datascript.Eavt ~e:datom.Datascript.e
-                ~a:"kv/value" ())
-            |> Seq.map (fun datom -> datom.Datascript.v)
-            |> List.of_seq)
-            ["logseq.kv/local-graph-uuid"; "logseq.kv/graph-uuid"])
+        Fun.protect
+          ~finally:(fun () ->
+            ignore (Storage.close (Storage.connection_callbacks connection)))
+          (fun () ->
+             let database =
+               Storage.restore_database connection |> T.require_ok ~behavior
+             in
+             List.map
+               (fun ident ->
+                  Datascript.datoms
+                    database
+                    Datascript.Avet
+                    ~a:"db/ident"
+                    ~v:(Datascript.Keyword ident)
+                    ()
+                  |> Seq.flat_map (fun datom ->
+                    Datascript.datoms
+                      database
+                      Datascript.Eavt
+                      ~e:datom.Datascript.e
+                      ~a:"kv/value"
+                      ())
+                  |> Seq.map (fun datom -> datom.Datascript.v)
+                  |> List.of_seq)
+               [ "logseq.kv/local-graph-uuid"; "logseq.kv/graph-uuid" ])
       in
-      Alcotest.(check bool) "activation does not invent UUID metadata" true
+      Alcotest.(check bool)
+        "activation does not invent UUID metadata"
+        true
         (metadata_values database_path = metadata_values target_path);
-      Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
-        let database = Database.open_ ~sw dependencies (inspect_mirror support behavior)
-          ~graph_name:"optional-uuid-graph" |> T.require_ok ~behavior in
-        Fun.protect ~finally:(fun () -> ignore (Database.close database)) (fun () ->
-          let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
-          Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () ->
-            let info = Database.graph_info snapshot |> T.require_ok ~behavior in
-            T.require (Logseq_db_types.Graph_types.Uuid.equal info.graph_uuid T.graph_uuid)
-              "reopened mirror lost target identity";
-            match Database.get_outline_blocks snapshot [T.authoritative_block_uuid]
-                  |> T.require_ok ~behavior with
-            | [Present_block _] -> ()
-            | _ -> Alcotest.fail "reopened snapshot lost graph data")))))
+      Eio_main.run (fun _ ->
+        Eio.Switch.run (fun sw ->
+          let database =
+            Database.open_
+              ~sw
+              dependencies
+              (inspect_mirror support behavior)
+              ~graph_name:"optional-uuid-graph"
+            |> T.require_ok ~behavior
+          in
+          Fun.protect
+            ~finally:(fun () -> ignore (Database.close database))
+            (fun () ->
+               let snapshot =
+                 Database.current_snapshot database |> T.require_ok ~behavior
+               in
+               Fun.protect
+                 ~finally:(fun () -> Database.release_snapshot snapshot)
+                 (fun () ->
+                    let info = Database.graph_info snapshot |> T.require_ok ~behavior in
+                    T.require
+                      (Logseq_db_types.Graph_types.Uuid.equal
+                         info.graph_uuid
+                         T.graph_uuid)
+                      "reopened mirror lost target identity";
+                    match
+                      Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+                      |> T.require_ok ~behavior
+                    with
+                    | [ Present_block _ ] -> ()
+                    | _ -> Alcotest.fail "reopened snapshot lost graph data")))))
 ;;
 
 let local_admission_keeps_uuid_requirement missing () =
   let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
   let behavior = "local graph admission remains unchanged" in
-  let changes = Datascript.[RetractEntity (Ident "logseq.kv/graph-uuid");
-    Add (Ident "logseq.kv/graph-remote?", "kv/value", Bool false)]
-    @ (if missing then [Datascript.RetractEntity (Ident "logseq.kv/local-graph-uuid")] else []) in
+  let changes =
+    Datascript.
+      [ RetractEntity (Ident "logseq.kv/graph-uuid")
+      ; Add (Ident "logseq.kv/graph-remote?", "kv/value", Bool false)
+      ]
+    @
+    if missing
+    then [ Datascript.RetractEntity (Ident "logseq.kv/local-graph-uuid") ]
+    else []
+  in
   with_snapshot_metadata changes (fun _ database_path ->
     let connection = Storage.open_database database_path |> T.require_ok ~behavior in
-    Fun.protect ~finally:(fun () -> ignore (Storage.close (Storage.connection_callbacks connection))) (fun () ->
-      let database = Storage.restore_database connection |> T.require_ok ~behavior in
-      let startup = Storage.startup_metadata connection |> T.require_ok ~behavior in
-      match Logseq_db_storage.Admission.inspect ~target:Local_target ~db:database
-        ~storage_schema:startup.schema, missing with
-      | Error Corrupt_storage, true | Ok _, false -> ()
-      | _ -> Alcotest.fail "local graph UUID requirement changed"))
+    Fun.protect
+      ~finally:(fun () ->
+        ignore (Storage.close (Storage.connection_callbacks connection)))
+      (fun () ->
+         let database = Storage.restore_database connection |> T.require_ok ~behavior in
+         let startup = Storage.startup_metadata connection |> T.require_ok ~behavior in
+         match
+           ( Logseq_db_storage.Admission.inspect
+               ~target:Local_target
+               ~db:database
+               ~storage_schema:startup.schema
+           , missing )
+         with
+         | Error Corrupt_storage, true | Ok _, false -> ()
+         | _ -> Alcotest.fail "local graph UUID requirement changed"))
 ;;
 
 let snapshot_uuid_metadata_cases =
@@ -365,29 +490,48 @@ let snapshot_uuid_metadata_cases =
   let set ident value = Add (Ident ("logseq.kv/" ^ ident), "kv/value", value) in
   let corrupt = Some "The downloaded graph storage is corrupt." in
   let identity = Some "The downloaded graph has an invalid synchronization identity." in
-  List.map (fun (name, changes, expected) ->
-    Alcotest.test_case name `Quick (snapshot_uuid_metadata_case changes expected))
+  List.map
+    (fun (name, changes, expected) ->
+       Alcotest.test_case name `Quick (snapshot_uuid_metadata_case changes expected))
     [ "snapshot UUIDs present", [], None
-    ; "snapshot remote UUID absent", [remove "graph-uuid"], None
-    ; "snapshot local UUID absent", [remove "local-graph-uuid"], None
-    ; "snapshot both UUIDs absent", [remove "graph-uuid"; remove "local-graph-uuid"], None
-    ; "snapshot present remote UUID conflict", [set "graph-uuid" (Uuid "70000000-0000-4000-8000-000000000001")], identity
-    ; "snapshot absent local UUID retains remote conflict rejection", [remove "local-graph-uuid"; set "graph-uuid" (Uuid "70000000-0000-4000-8000-000000000001")], identity
-    ; "snapshot malformed remote UUID", [set "graph-uuid" (String "invalid-uuid")], corrupt
-    ; "snapshot malformed local UUID", [set "local-graph-uuid" (String "invalid-uuid")], corrupt
-    ; "snapshot remote UUID wrong type", [set "graph-uuid" (Bool false)], corrupt
-    ; "snapshot local UUID wrong type", [set "local-graph-uuid" (Bool false)], corrupt
-    ; "snapshot missing db type", [remove "db-type"], corrupt
-    ; "snapshot invalid db type", [set "db-type" (String "file")], corrupt
-    ; "snapshot missing schema version", [remove "schema-version"], corrupt
-    ; "snapshot invalid schema version", [set "schema-version" (String "65.33")], corrupt
-    ; "snapshot missing remote flag", [remove "graph-remote?"], identity
-    ; "snapshot false remote flag", [set "graph-remote?" (Bool false)], identity
-    ; "snapshot malformed remote flag", [set "graph-remote?" (String "true")], identity
+    ; "snapshot remote UUID absent", [ remove "graph-uuid" ], None
+    ; "snapshot local UUID absent", [ remove "local-graph-uuid" ], None
+    ; ( "snapshot both UUIDs absent"
+      , [ remove "graph-uuid"; remove "local-graph-uuid" ]
+      , None )
+    ; ( "snapshot present remote UUID conflict"
+      , [ set "graph-uuid" (Uuid "70000000-0000-4000-8000-000000000001") ]
+      , identity )
+    ; ( "snapshot absent local UUID retains remote conflict rejection"
+      , [ remove "local-graph-uuid"
+        ; set "graph-uuid" (Uuid "70000000-0000-4000-8000-000000000001")
+        ]
+      , identity )
+    ; ( "snapshot malformed remote UUID"
+      , [ set "graph-uuid" (String "invalid-uuid") ]
+      , corrupt )
+    ; ( "snapshot malformed local UUID"
+      , [ set "local-graph-uuid" (String "invalid-uuid") ]
+      , corrupt )
+    ; "snapshot remote UUID wrong type", [ set "graph-uuid" (Bool false) ], corrupt
+    ; "snapshot local UUID wrong type", [ set "local-graph-uuid" (Bool false) ], corrupt
+    ; "snapshot missing db type", [ remove "db-type" ], corrupt
+    ; "snapshot invalid db type", [ set "db-type" (String "file") ], corrupt
+    ; "snapshot missing schema version", [ remove "schema-version" ], corrupt
+    ; ( "snapshot invalid schema version"
+      , [ set "schema-version" (String "65.33") ]
+      , corrupt )
+    ; "snapshot missing remote flag", [ remove "graph-remote?" ], identity
+    ; "snapshot false remote flag", [ set "graph-remote?" (Bool false) ], identity
+    ; "snapshot malformed remote flag", [ set "graph-remote?" (String "true") ], identity
     ]
-  @ [ Alcotest.test_case "local admission still requires local UUID" `Quick
+  @ [ Alcotest.test_case
+        "local admission still requires local UUID"
+        `Quick
         (local_admission_keeps_uuid_requirement true)
-    ; Alcotest.test_case "local admission accepts existing local UUID" `Quick
+    ; Alcotest.test_case
+        "local admission accepts existing local UUID"
+        `Quick
         (local_admission_keeps_uuid_requirement false)
     ]
 ;;
@@ -396,23 +540,43 @@ let snapshot_import_error_does_not_disclose_payload () =
   T.with_temp_directory "overlay-invalid-payload-" (fun root ->
     let support = Filename.concat root "target" in
     Unix.mkdir support 0o700;
-    let dependencies, _, inspection = absent_inspection ~behavior:"safe import rejection" support in
+    let dependencies, _, inspection =
+      absent_inspection ~behavior:"safe import rejection" support
+    in
     let path = Filename.concat root "snapshot.transit" in
     let payload = {|{"SENSITIVE-synthetic-body":invalid}|} in
     let header = Bytes.create 4 in
     Bytes.set_int32_be header 0 (Int32.of_int (String.length payload));
     Out_channel.with_open_bin path (fun channel ->
-      output_bytes channel header; output_string channel payload);
-    match Database.prepare_snapshot_activation dependencies inspection ~path
-        ~applied_server_cursor:(server_cursor 0) ~expected_checksum:None ~expected_rows:1 with
+      output_bytes channel header;
+      output_string channel payload);
+    match
+      Database.prepare_snapshot_activation
+        dependencies
+        inspection
+        ~path
+        ~applied_server_cursor:(server_cursor 0)
+        ~expected_checksum:None
+        ~expected_rows:1
+    with
     | Error (Snapshot_parse_error message) ->
-      let module D=Logseq_db_types.Failure_diagnostic in
-      let diagnostic=match D.decode message with Some d->d | None->Alcotest.fail "snapshot parser reason was discarded" in
-      Alcotest.(check string) "safe parser category survives" "parseFailed" (D.reason diagnostic);
-      Alcotest.(check bool) "raw parser body is excluded" false
+      let module D = Logseq_db_types.Failure_diagnostic in
+      let diagnostic =
+        match D.decode message with
+        | Some d -> d
+        | None -> Alcotest.fail "snapshot parser reason was discarded"
+      in
+      Alcotest.(check string)
+        "safe parser category survives"
+        "parseFailed"
+        (D.reason diagnostic);
+      Alcotest.(check bool)
+        "raw parser body is excluded"
+        false
         (String.contains (D.message diagnostic) '{')
     | Error _ -> Alcotest.fail "malformed snapshot returned another category"
-    | Ok prepared -> Database.cancel_snapshot_activation prepared;
+    | Ok prepared ->
+      Database.cancel_snapshot_activation prepared;
       Alcotest.fail "malformed snapshot was admitted")
 ;;
 
@@ -471,6 +635,80 @@ let snapshot_activation_installs_queryable_mirror ?extend () =
           "activated mirror was not queryable")))
 ;;
 
+let snapshot_crypto_batches_respect_item_capacity () =
+  let behavior = "snapshot crypto batches respect item capacity" in
+  T.with_temp_directory "overlay-snapshot-item-bound-" (fun root ->
+    let support = Filename.concat root "target" in
+    Unix.mkdir support 0o700;
+    let _, _, prepared = prepare_snapshot ~change_max_items:1 ~behavior root support in
+    Fun.protect
+      ~finally:(fun () -> Database.cancel_snapshot_activation prepared)
+      (fun () ->
+         match
+           Database.next_snapshot_unprotection_batch prepared |> T.require_ok ~behavior
+         with
+         | None -> Alcotest.fail "protected snapshot omitted crypto"
+         | Some request ->
+           Alcotest.(check int)
+             "snapshot item limit"
+             1
+             (List.length (Database.unprotection_ciphertexts request))))
+;;
+
+let snapshot_crypto_batches_tighten_caller_bounds () =
+  let behavior = "snapshot crypto batches tighten caller bounds" in
+  T.with_temp_directory "overlay-snapshot-caller-bound-" (fun root ->
+    let support = Filename.concat root "target" in
+    Unix.mkdir support 0o700;
+    let _, _, prepared = prepare_snapshot ~behavior root support in
+    Fun.protect
+      ~finally:(fun () -> Database.cancel_snapshot_activation prepared)
+      (fun () ->
+         List.iter
+           (fun (maximum_items, maximum_bytes) ->
+              match
+                Database.next_snapshot_unprotection_batch
+                  ~maximum_items
+                  ~maximum_bytes
+                  prepared
+              with
+              | Error Snapshot_limit_exceeded -> ()
+              | _ ->
+                Alcotest.fail "invalid caller bound must reject without consuming a batch")
+           [ 0, 128; -1, 128; 2, 0; 2, -1 ];
+         let rec supply total batches =
+           match
+             Database.next_snapshot_unprotection_batch
+               ~maximum_items:2
+               ~maximum_bytes:128
+               prepared
+             |> T.require_ok ~behavior
+           with
+           | None -> total, batches
+           | Some request ->
+             let items = Database.unprotection_ciphertexts request in
+             T.require
+               (items <> [] && List.length items <= 2)
+               "caller item bound exceeded";
+             T.require
+               (List.fold_left
+                  (fun bytes (_, value) -> bytes + String.length value)
+                  0
+                  items
+                <= 128)
+               "caller byte bound exceeded";
+             Database.supply_snapshot_unprotection_batch
+               prepared
+               ~request
+               ~plaintexts:items
+             |> T.require_ok ~behavior;
+             supply (total + List.length items) (batches + 1)
+         in
+         let total, batches = supply 0 0 in
+         T.require (total > 2 && batches > 1) "fixture did not exercise multiple batches";
+         ignore (Database.commit_snapshot_activation prepared |> T.require_ok ~behavior)))
+;;
+
 let canceled_snapshot_activation_removes_temporary_artifacts () =
   let behavior = "canceled snapshot activation removes temporary artifacts" in
   T.with_temp_directory "overlay-snapshot-cancel-" (fun root ->
@@ -513,29 +751,50 @@ let snapshot_state_errors_keep_their_reason () =
     let support = Filename.concat root "target" in
     Unix.mkdir support 0o700;
     let _, _, prepared = prepare_snapshot ~behavior root support in
-    Fun.protect ~finally:(fun () -> Database.cancel_snapshot_activation prepared) (fun () ->
-      let request = Database.next_snapshot_unprotection_batch prepared
-        |> T.require_ok ~behavior |> Option.get in
-      expect Snapshot_crypto_batch_pending (Database.next_snapshot_unprotection_batch prepared);
-      expect Snapshot_persist_awaiting_crypto (Database.commit_snapshot_activation prepared);
-      let plaintexts = Database.unprotection_ciphertexts request in
-      Database.supply_snapshot_unprotection_batch prepared ~request ~plaintexts
-      |> T.require_ok ~behavior;
-      ignore (supply_snapshot_crypto ~behavior prepared 0);
-      ignore (Database.commit_snapshot_activation prepared |> T.require_ok ~behavior);
-      expect Snapshot_next_after_persist_or_commit (Database.next_snapshot_unprotection_batch prepared);
-      expect Snapshot_supply_after_persist_or_commit
-        (Database.supply_snapshot_unprotection_batch prepared ~request ~plaintexts)));
+    Fun.protect
+      ~finally:(fun () -> Database.cancel_snapshot_activation prepared)
+      (fun () ->
+         let request =
+           Database.next_snapshot_unprotection_batch prepared
+           |> T.require_ok ~behavior
+           |> Option.get
+         in
+         expect
+           Snapshot_crypto_batch_pending
+           (Database.next_snapshot_unprotection_batch prepared);
+         expect
+           Snapshot_persist_awaiting_crypto
+           (Database.commit_snapshot_activation prepared);
+         let plaintexts = Database.unprotection_ciphertexts request in
+         Database.supply_snapshot_unprotection_batch prepared ~request ~plaintexts
+         |> T.require_ok ~behavior;
+         ignore (supply_snapshot_crypto ~behavior prepared 0);
+         ignore (Database.commit_snapshot_activation prepared |> T.require_ok ~behavior);
+         expect
+           Snapshot_next_after_persist_or_commit
+           (Database.next_snapshot_unprotection_batch prepared);
+         expect
+           Snapshot_supply_after_persist_or_commit
+           (Database.supply_snapshot_unprotection_batch prepared ~request ~plaintexts)));
   T.with_temp_directory "overlay-snapshot-root-reason-" (fun root ->
     let support = Filename.concat root "target" in
     Unix.mkdir support 0o700;
     let dependencies, _, inspection = absent_inspection ~behavior support in
-    let path, applied_server_cursor, expected_checksum, expected_rows = snapshot_input_for root in
+    let path, applied_server_cursor, expected_checksum, expected_rows =
+      snapshot_input_for root
+    in
     let blocked = Filename.concat support "logseq-db-worker" in
-    let channel = open_out_bin blocked in close_out channel;
-    expect Snapshot_root_unavailable
-      (Database.prepare_snapshot_activation dependencies inspection ~path ~applied_server_cursor
-         ~expected_checksum ~expected_rows))
+    let channel = open_out_bin blocked in
+    close_out channel;
+    expect
+      Snapshot_root_unavailable
+      (Database.prepare_snapshot_activation
+         dependencies
+         inspection
+         ~path
+         ~applied_server_cursor
+         ~expected_checksum
+         ~expected_rows))
 ;;
 
 let snapshot_crypto_results_are_validated_before_staging () =
@@ -808,6 +1067,131 @@ let checksum_vectors_preserve_snapshot_semantics () =
     ]
 ;;
 
+let incremental_checksum_matches_snapshot_verification () =
+  let behavior = "incremental checksum matches snapshot verification" in
+  List.iter
+    (fun e2ee ->
+       T.with_temp_directory "overlay-checksum-delta-" (fun root ->
+         let support = Filename.concat root "live" in
+         Unix.mkdir support 0o700;
+         let database_path = T.seed_mirror support in
+         if e2ee then T.mark_snapshot_e2ee database_path;
+         let dependencies, _, inspection = location_and_inspection support behavior in
+         Eio_main.run (fun _ ->
+           Eio.Switch.run (fun sw ->
+             let database =
+               Database.open_ ~sw dependencies inspection ~graph_name:"checksum-delta"
+               |> T.require_ok ~behavior
+             in
+             let module J = Transit_core.Json in
+             let lookup uuid =
+               J.Array [ J.Keyword "block/uuid"; J.Uuid (Graph.Uuid.to_string uuid) ]
+             in
+             let block = lookup T.authoritative_block_uuid in
+             let renamed_page = T.mutation_uuid 991 in
+             let orphan = T.mutation_uuid 992 in
+             let tag = T.mutation_uuid 993 in
+             let add entity attr value =
+               J.Array [ J.Keyword "db/add"; entity; J.Keyword attr; value ]
+             in
+             let retract entity attr value =
+               J.Array [ J.Keyword "db/retract"; entity; J.Keyword attr; value ]
+             in
+             let steps =
+               [ [ add block "block/title" (J.String "checksum delta 🚀")
+                 ; add block "block/order" (J.String "a9")
+                 ]
+               ; [ add
+                     (lookup T.page_uuid)
+                     "block/uuid"
+                     (J.Uuid (Graph.Uuid.to_string renamed_page))
+                 ]
+               ; [ add (J.Int (-1)) "block/uuid" (J.Uuid (Graph.Uuid.to_string tag))
+                 ; add (J.Int (-1)) "db/ident" (J.Keyword "checksum/temporary-tag")
+                 ; add (J.Int (-2)) "block/uuid" (J.Uuid (Graph.Uuid.to_string orphan))
+                 ; add
+                     (J.Int (-2))
+                     "block/tags"
+                     (J.Array [ J.Keyword "db/ident"; J.Keyword "logseq.class/Page" ])
+                 ]
+               ; [ retract
+                     (lookup orphan)
+                     "block/tags"
+                     (J.Array [ J.Keyword "db/ident"; J.Keyword "logseq.class/Page" ])
+                 ; add (lookup tag) "db/ident" (J.Keyword "checksum/not-a-page")
+                 ]
+               ; [ add block "logseq.property/built-in?" (J.Bool true) ]
+               ; [ add block "logseq.property/built-in?" (J.Bool false) ]
+               ; [ retract block "block/order" (J.String "a9") ]
+               ; [ J.Array [ J.Keyword "db/retractEntity"; lookup orphan ] ]
+               ; [ J.Array [ J.Keyword "db/retractEntity"; block ] ]
+               ]
+             in
+             let verify cursor =
+               let target = Filename.concat root (Printf.sprintf "verified-%d" cursor) in
+               Unix.mkdir target 0o700;
+               let path = Filename.concat target "snapshot.transit" in
+               let expected_rows =
+                 T.write_snapshot_from_database ~database_path ~snapshot_path:path
+               in
+               let dependencies, _, inspection = absent_inspection ~behavior target in
+               let prepared =
+                 Database.prepare_snapshot_activation
+                   dependencies
+                   inspection
+                   ~path
+                   ~applied_server_cursor:(server_cursor cursor)
+                   ~expected_checksum:None
+                   ~expected_rows
+                 |> T.require_ok ~behavior
+               in
+               ignore (supply_snapshot_crypto ~behavior prepared 0);
+               Database.commit_snapshot_activation prepared
+               |> T.require_ok ~behavior
+               |> ignore;
+               let expected =
+                 match Database.mirror_presence (inspect_mirror target behavior) with
+                 | Available { checksum = Some checksum; _ } -> checksum
+                 | _ -> Alcotest.fail "snapshot verification omitted computed digest"
+               in
+               T.require
+                 (Database.check_checkpoint_checksum
+                    database
+                    ~through:(server_cursor cursor)
+                    ~expected
+                  |> T.require_ok ~behavior
+                  = Some true)
+                 "incremental digest differs from full snapshot verification";
+               expected
+             in
+             ignore (verify 0);
+             let expected = ref None in
+             List.iteri
+               (fun index operations ->
+                  T.apply_test_transaction database ~cursor:(index + 1) operations;
+                  expected := Some (verify (index + 1)))
+               steps;
+             Database.close database |> T.require_ok ~behavior;
+             let reopened =
+               Database.open_
+                 ~sw
+                 dependencies
+                 (inspect_mirror support behavior)
+                 ~graph_name:"checksum-delta"
+               |> T.require_ok ~behavior
+             in
+             T.require
+               (Database.check_checkpoint_checksum
+                  reopened
+                  ~through:(server_cursor (List.length steps))
+                  ~expected:(Option.get !expected)
+                |> T.require_ok ~behavior
+                = Some true)
+               "restored digest differs from committed incremental digest";
+             Database.close reopened |> T.require_ok ~behavior))))
+    [ false; true ]
+;;
+
 let unused_preparation_checksum_defers_invalid_utf8_without_publication () =
   let behavior = "unused preparation checksum defers invalid UTF-8" in
   T.with_temp_directory "overlay-checksum-late-failure-" (fun root ->
@@ -956,15 +1340,25 @@ let stale_delete_cannot_remove_replacement () =
   T.with_temp_directory "overlay-stale-delete-" (fun support ->
     let database_path = T.seed_mirror support in
     let directory = Filename.dirname database_path in
-    let prepared, _ = Database.prepare_mirror_deletion ~application_support_directory:support
-      ~graph_id:T.graph_uuid ~retirement:(next_retirement ()) |> T.require_ok ~behavior in
-    Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion prepared) (fun () ->
-      Unix.rename directory (Filename.concat support "captured-original");
-      ignore (T.seed_mirror support);
-      (match Database.commit_mirror_deletion prepared with
-       | Error Mirror_delete_stale -> ()
-       | _ -> Alcotest.fail "a prepared deletion removed its replacement");
-      Alcotest.(check bool) "replacement remains present" true (Sys.file_exists database_path)))
+    let prepared, _ =
+      Database.prepare_mirror_deletion
+        ~application_support_directory:support
+        ~graph_id:T.graph_uuid
+        ~retirement:(next_retirement ())
+      |> T.require_ok ~behavior
+    in
+    Fun.protect
+      ~finally:(fun () -> Database.cancel_mirror_deletion prepared)
+      (fun () ->
+         Unix.rename directory (Filename.concat support "captured-original");
+         ignore (T.seed_mirror support);
+         (match Database.commit_mirror_deletion prepared with
+          | Error Mirror_delete_stale -> ()
+          | _ -> Alcotest.fail "a prepared deletion removed its replacement");
+         Alcotest.(check bool)
+           "replacement remains present"
+           true
+           (Sys.file_exists database_path)))
 ;;
 
 (* No pure reducer owns the filesystem rename, purge, or stderr capability.
@@ -976,43 +1370,82 @@ let retired_cleanup_retries_without_touching_a_new_mirror ?(closed_stderr = fals
     let blocked_name = "synthetic-cleanup-blocked" in
     let blocked = Filename.concat (Filename.dirname database_path) blocked_name in
     Unix.mkdir blocked 0o700;
-    Out_channel.with_open_bin (Filename.concat blocked "pending") (fun out -> output_string out "synthetic");
+    Out_channel.with_open_bin (Filename.concat blocked "pending") (fun out ->
+      output_string out "synthetic");
     let rec blocked_paths path =
       match Unix.lstat path with
       | { Unix.st_kind = Unix.S_DIR; _ } ->
-        let children = Sys.readdir path |> Array.to_list
-          |> List.concat_map (fun name -> blocked_paths (Filename.concat path name)) in
+        let children =
+          Sys.readdir path
+          |> Array.to_list
+          |> List.concat_map (fun name -> blocked_paths (Filename.concat path name))
+        in
         if Filename.basename path = blocked_name then path :: children else children
       | _ -> []
-      | exception Unix.Unix_error (Unix.ENOENT, _, _) -> [] in
-    let unblock () = List.iter (fun path -> Unix.chmod path 0o700) (blocked_paths support) in
+      | exception Unix.Unix_error (Unix.ENOENT, _, _) -> []
+    in
+    let unblock () =
+      List.iter (fun path -> Unix.chmod path 0o700) (blocked_paths support)
+    in
     Fun.protect ~finally:unblock (fun () ->
       let dependencies = T.dependencies ~behavior in
       Unix.chmod blocked 0o500;
       let commit () =
-        match Database.prepare_mirror_deletion ~application_support_directory:support ~graph_id:T.graph_uuid ~retirement:(next_retirement ()) with
+        match
+          Database.prepare_mirror_deletion
+            ~application_support_directory:support
+            ~graph_id:T.graph_uuid
+            ~retirement:(next_retirement ())
+        with
         | Error _ as error -> error
-        | Ok (preparation, _) -> Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion preparation)
-            (fun () -> Database.commit_mirror_deletion preparation) in
-      let result = if not closed_stderr then commit () else (
-        flush stderr;
-        let saved = Unix.dup Unix.stderr in
-        let unreadable = Unix.openfile "/dev/null" [Unix.O_RDONLY] 0 in
-        Fun.protect ~finally:(fun () ->
-          Unix.dup2 saved Unix.stderr; Unix.close saved; Unix.close unreadable)
-          (fun () -> Unix.dup2 unreadable Unix.stderr; commit ())) in
+        | Ok (preparation, _) ->
+          Fun.protect
+            ~finally:(fun () -> Database.cancel_mirror_deletion preparation)
+            (fun () -> Database.commit_mirror_deletion preparation)
+      in
+      let result =
+        if not closed_stderr
+        then commit ()
+        else (
+          flush stderr;
+          let saved = Unix.dup Unix.stderr in
+          let unreadable = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0 in
+          Fun.protect
+            ~finally:(fun () ->
+              Unix.dup2 saved Unix.stderr;
+              Unix.close saved;
+              Unix.close unreadable)
+            (fun () ->
+               Unix.dup2 unreadable Unix.stderr;
+               commit ()))
+      in
       ignore (result |> T.require_ok ~behavior);
-      Alcotest.(check bool) "canonical copy was committed absent" false (Sys.file_exists database_path);
-      Alcotest.(check bool) "failed purge remains durably retryable" true (blocked_paths support <> []);
+      Alcotest.(check bool)
+        "canonical copy was committed absent"
+        false
+        (Sys.file_exists database_path);
+      Alcotest.(check bool)
+        "failed purge remains durably retryable"
+        true
+        (blocked_paths support <> []);
       ignore (T.seed_mirror support);
       unblock ();
       let fresh = inspect_mirror support behavior in
-      Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
-        let database = Database.open_ ~sw dependencies fresh ~graph_name:"New synthetic copy"
-            |> T.require_ok ~behavior in
-        ignore (Database.close database |> T.require_ok ~behavior)));
-      Alcotest.(check bool) "new live copy survives retired cleanup" true (Sys.file_exists database_path);
-      Alcotest.(check bool) "ordinary producer lifecycle retries retired purge" true (blocked_paths support = [])))
+      Eio_main.run (fun _ ->
+        Eio.Switch.run (fun sw ->
+          let database =
+            Database.open_ ~sw dependencies fresh ~graph_name:"New synthetic copy"
+            |> T.require_ok ~behavior
+          in
+          ignore (Database.close database |> T.require_ok ~behavior)));
+      Alcotest.(check bool)
+        "new live copy survives retired cleanup"
+        true
+        (Sys.file_exists database_path);
+      Alcotest.(check bool)
+        "ordinary producer lifecycle retries retired purge"
+        true
+        (blocked_paths support = [])))
 ;;
 
 let mirror_preparation_cancel_and_commit_replay () =
@@ -1021,39 +1454,78 @@ let mirror_preparation_cancel_and_commit_replay () =
     let database_path = T.seed_mirror support in
     let dependencies, _, inspection = location_and_inspection support behavior in
     let retirement = next_retirement () in
-    let prepared, _ = Database.prepare_mirror_deletion ~application_support_directory:support ~graph_id:T.graph_uuid ~retirement |> T.require_ok ~behavior in
-    Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
-      match Database.open_ ~sw dependencies inspection ~graph_name:"Busy synthetic mirror" with
-      | Error Ownership_conflict -> ()
-      | _ -> Alcotest.fail "preparation did not hold exclusive ownership"));
-    ignore(Database.cancel_mirror_deletion_checked prepared |> T.require_ok ~behavior);
-    ignore(Database.cancel_mirror_deletion_checked prepared |> T.require_ok ~behavior);
-    Alcotest.(check bool) "cancel retains canonical mirror" true (Sys.file_exists database_path);
-    Alcotest.(check bool) "cancelled preparation cannot commit" true
+    let prepared, _ =
+      Database.prepare_mirror_deletion
+        ~application_support_directory:support
+        ~graph_id:T.graph_uuid
+        ~retirement
+      |> T.require_ok ~behavior
+    in
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        match
+          Database.open_ ~sw dependencies inspection ~graph_name:"Busy synthetic mirror"
+        with
+        | Error Ownership_conflict -> ()
+        | _ -> Alcotest.fail "preparation did not hold exclusive ownership"));
+    ignore (Database.cancel_mirror_deletion_checked prepared |> T.require_ok ~behavior);
+    ignore (Database.cancel_mirror_deletion_checked prepared |> T.require_ok ~behavior);
+    Alcotest.(check bool)
+      "cancel retains canonical mirror"
+      true
+      (Sys.file_exists database_path);
+    Alcotest.(check bool)
+      "cancelled preparation cannot commit"
+      true
       (Result.is_error (Database.commit_mirror_deletion prepared));
     let committed_retirement = next_retirement () in
-    let prepared, _ = Database.prepare_mirror_deletion ~application_support_directory:support ~graph_id:T.graph_uuid ~retirement:committed_retirement |> T.require_ok ~behavior in
+    let prepared, _ =
+      Database.prepare_mirror_deletion
+        ~application_support_directory:support
+        ~graph_id:T.graph_uuid
+        ~retirement:committed_retirement
+      |> T.require_ok ~behavior
+    in
     let committed_id = prepared in
     ignore (Database.commit_mirror_deletion prepared |> T.require_ok ~behavior);
     Database.cancel_mirror_deletion prepared;
-    Alcotest.(check bool) "commit has durable evidence" true (Database.mirror_deletion_committed prepared);
+    Alcotest.(check bool)
+      "commit has durable evidence"
+      true
+      (Database.mirror_deletion_committed prepared);
     ignore (T.seed_mirror support);
-    let replay, _ = Database.prepare_mirror_deletion ~application_support_directory:support ~graph_id:T.graph_uuid ~retirement:committed_retirement |> T.require_ok ~behavior in
-    Alcotest.(check bool) "fresh handle recovers durable commit" true (Database.mirror_deletion_committed replay);
+    let replay, _ =
+      Database.prepare_mirror_deletion
+        ~application_support_directory:support
+        ~graph_id:T.graph_uuid
+        ~retirement:committed_retirement
+      |> T.require_ok ~behavior
+    in
+    Alcotest.(check bool)
+      "fresh handle recovers durable commit"
+      true
+      (Database.mirror_deletion_committed replay);
     ignore (Database.commit_mirror_deletion replay |> T.require_ok ~behavior);
     Database.cancel_mirror_deletion replay;
     ignore (Database.commit_mirror_deletion committed_id |> T.require_ok ~behavior);
     Database.cancel_mirror_deletion committed_id;
-    Alcotest.(check bool) "late commit/cancel preserves new canonical mirror" true (Sys.file_exists database_path))
+    Alcotest.(check bool)
+      "late commit/cancel preserves new canonical mirror"
+      true
+      (Sys.file_exists database_path))
 ;;
 
 let deletion_does_not_follow_external_paths kind () =
   let behavior = "local deletion stays inside the selected physical graph" in
   T.with_temp_directory "overlay-delete-paths-" (fun root ->
-    let support = Filename.concat root "selected" and outside = Filename.concat root "outside" in
-    Unix.mkdir support 0o700; Unix.mkdir outside 0o700;
-    let database_path = T.seed_mirror support and external_database = T.seed_mirror outside in
-    let directory = Filename.dirname database_path and external_directory = Filename.dirname external_database in
+    let support = Filename.concat root "selected"
+    and outside = Filename.concat root "outside" in
+    Unix.mkdir support 0o700;
+    Unix.mkdir outside 0o700;
+    let database_path = T.seed_mirror support
+    and external_database = T.seed_mirror outside in
+    let directory = Filename.dirname database_path
+    and external_directory = Filename.dirname external_database in
     let mirrors = Filename.dirname directory in
     (match kind with
      | `Graph ->
@@ -1063,20 +1535,46 @@ let deletion_does_not_follow_external_paths kind () =
        Unix.rename mirrors (Filename.concat root "original-mirrors");
        Unix.symlink (Filename.dirname external_directory) mirrors
      | `Retirement -> Unix.symlink outside (Filename.concat mirrors ".mirror-deletions")
-     | `Lease -> Unix.symlink external_database (Filename.concat directory ".logseq-overlay-owner.sqlite")
-     | `Contained -> Unix.symlink external_directory (Filename.concat directory "attachment-link"));
-    let prepared = Database.prepare_mirror_deletion ~application_support_directory:support ~graph_id:T.graph_uuid ~retirement:(next_retirement ()) in
-    if kind = `Contained then (
+     | `Lease ->
+       Unix.symlink
+         external_database
+         (Filename.concat directory ".logseq-overlay-owner.sqlite")
+     | `Contained ->
+       Unix.symlink external_directory (Filename.concat directory "attachment-link"));
+    let prepared =
+      Database.prepare_mirror_deletion
+        ~application_support_directory:support
+        ~graph_id:T.graph_uuid
+        ~retirement:(next_retirement ())
+    in
+    if kind = `Contained
+    then (
       let prepared, _ = prepared |> T.require_ok ~behavior in
-      Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion prepared) (fun () ->
-        ignore (Database.commit_mirror_deletion prepared |> T.require_ok ~behavior));
-      Alcotest.(check bool) "selected directory was removed" false (Sys.file_exists directory))
+      Fun.protect
+        ~finally:(fun () -> Database.cancel_mirror_deletion prepared)
+        (fun () ->
+           ignore (Database.commit_mirror_deletion prepared |> T.require_ok ~behavior));
+      Alcotest.(check bool)
+        "selected directory was removed"
+        false
+        (Sys.file_exists directory))
     else (
-      Option.iter (fun (preparation, _) -> Database.cancel_mirror_deletion preparation) (Result.to_option prepared);
-      Alcotest.(check bool) "unsafe path is rejected before mutation" true (Result.is_error prepared));
-    Alcotest.(check bool) "external target database survives" true (Sys.file_exists external_database);
-    Alcotest.(check bool) "external target was never leased" false
-      (Sys.file_exists (Filename.concat external_directory ".logseq-overlay-owner.sqlite")))
+      Option.iter
+        (fun (preparation, _) -> Database.cancel_mirror_deletion preparation)
+        (Result.to_option prepared);
+      Alcotest.(check bool)
+        "unsafe path is rejected before mutation"
+        true
+        (Result.is_error prepared));
+    Alcotest.(check bool)
+      "external target database survives"
+      true
+      (Sys.file_exists external_database);
+    Alcotest.(check bool)
+      "external target was never leased"
+      false
+      (Sys.file_exists
+         (Filename.concat external_directory ".logseq-overlay-owner.sqlite")))
 ;;
 
 let legacy_retirement_replays_without_content_load mode () =
@@ -1084,66 +1582,129 @@ let legacy_retirement_replays_without_content_load mode () =
   T.with_temp_directory "overlay-legacy-retirement-" (fun support ->
     let database_path = T.seed_mirror support in
     let directory = Filename.dirname database_path in
-    let fixture = Yojson.Safe.from_file (Filename.concat T.root
-      "logseq_overlay_db/test/fixtures/legacy-retirement-v1.json") in
+    let fixture =
+      Yojson.Safe.from_file
+        (Filename.concat
+           T.root
+           "logseq_overlay_db/test/fixtures/legacy-retirement-v1.json")
+    in
     let open Yojson.Safe.Util in
     let receipt = fixture |> member "receipt" in
     let id = receipt |> member "retirement" |> to_string in
     let retirement = Database.retirement_id_of_string id |> T.require_ok ~behavior in
-    let previous = receipt |> member "previous" |> to_string
-      |> Mirror_generation.of_string |> T.require_ok ~behavior in
-    let root = Filename.concat (Filename.dirname directory) (".mirror-deletions/" ^ Graph.Uuid.to_string T.graph_uuid) in
-    List.iter (fun path -> Unix.mkdir path 0o700)
-      [Filename.dirname root; root; Filename.concat root "states"; Filename.concat root "pending"];
+    let previous =
+      receipt
+      |> member "previous"
+      |> to_string
+      |> Mirror_generation.of_string
+      |> T.require_ok ~behavior
+    in
+    let root =
+      Filename.concat
+        (Filename.dirname directory)
+        (".mirror-deletions/" ^ Graph.Uuid.to_string T.graph_uuid)
+    in
+    List.iter
+      (fun path -> Unix.mkdir path 0o700)
+      [ Filename.dirname root
+      ; root
+      ; Filename.concat root "states"
+      ; Filename.concat root "pending"
+      ];
     let receipt_path = Filename.concat root ("states/" ^ id ^ ".json") in
-    Out_channel.with_open_bin receipt_path (fun output -> output_string output (Yojson.Safe.to_string receipt));
+    Out_channel.with_open_bin receipt_path (fun output ->
+      output_string output (Yojson.Safe.to_string receipt));
     (* This is captured v1 wire data from the actual pre-upgrade public producer,
        not a reimplementation of its former generation algorithm. *)
     let dependencies = T.dependencies ~behavior in
-    Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
-      let inspection = inspect_mirror support behavior in
-      let database = Database.open_ ~sw dependencies inspection ~graph_name:"Synthetic legacy lease"
-        |> T.require_ok ~behavior in
-      if mode = `Before then (
-        let busy = Database.prepare_mirror_deletion ~application_support_directory:support
-          ~graph_id:T.graph_uuid ~retirement in
-        Alcotest.(check bool) "legacy cancellation waits for live ownership" true
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let inspection = inspect_mirror support behavior in
+        let database =
+          Database.open_ ~sw dependencies inspection ~graph_name:"Synthetic legacy lease"
+          |> T.require_ok ~behavior
+        in
+        if mode = `Before
+        then (
+          let busy =
+            Database.prepare_mirror_deletion
+              ~application_support_directory:support
+              ~graph_id:T.graph_uuid
+              ~retirement
+          in
+          Alcotest.(check bool)
+            "legacy cancellation waits for live ownership"
+            true
             (match busy with
              | Error Mirror_delete_busy -> true
              | _ -> false));
-      ignore (Database.close database |> T.require_ok ~behavior)));
+        ignore (Database.close database |> T.require_ok ~behavior)));
     let data = Filename.concat root ("pending/" ^ id ^ ".data") in
-    if mode = `Missing then Unix.rename directory (Filename.concat support "preserved-before-missing");
-    if mode = `After || mode = `Linked then (
+    if mode = `Missing
+    then Unix.rename directory (Filename.concat support "preserved-before-missing");
+    if mode = `After || mode = `Linked
+    then (
       Unix.rename directory data;
-      Out_channel.with_open_bin (Filename.concat data "db.sqlite")
-        (fun output -> output_string output "synthetic corrupted legacy retired contents");
+      Out_channel.with_open_bin (Filename.concat data "db.sqlite") (fun output ->
+        output_string output "synthetic corrupted legacy retired contents");
       ignore (T.seed_mirror support);
-      if mode = `Linked then (
+      if mode = `Linked
+      then (
         let external_directory = Filename.concat support "captured-external" in
-        Unix.rename data external_directory; Unix.symlink (Filename.concat external_directory "missing") data));
-    let observed = Database.prepare_mirror_deletion ~application_support_directory:support
-      ~graph_id:T.graph_uuid ~retirement in
-    if mode = `Linked then (
-      Option.iter (fun (prepared, _) -> Database.cancel_mirror_deletion prepared) (Result.to_option observed);
-      Alcotest.(check bool) "legacy dangling pending symlink is rejected" true (Result.is_error observed);
-      Alcotest.(check bool) "captured external contents survive" true
+        Unix.rename data external_directory;
+        Unix.symlink (Filename.concat external_directory "missing") data));
+    let observed =
+      Database.prepare_mirror_deletion
+        ~application_support_directory:support
+        ~graph_id:T.graph_uuid
+        ~retirement
+    in
+    if mode = `Linked
+    then (
+      Option.iter
+        (fun (prepared, _) -> Database.cancel_mirror_deletion prepared)
+        (Result.to_option observed);
+      Alcotest.(check bool)
+        "legacy dangling pending symlink is rejected"
+        true
+        (Result.is_error observed);
+      Alcotest.(check bool)
+        "captured external contents survive"
+        true
         (Sys.file_exists (Filename.concat support "captured-external/db.sqlite")))
     else (
       let prepared, generation = observed |> T.require_ok ~behavior in
-      Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion prepared) (fun () ->
-        Alcotest.(check bool) "legacy generation remains an opaque journal identity" true
-          (Mirror_generation.equal generation previous);
-        if mode = `Before || mode = `Missing then (
-          Alcotest.(check bool) "uncommitted legacy preparation is canceled" false (Database.mirror_deletion_committed prepared);
-          Alcotest.(check bool) "old preparation cannot rename a live replacement" true
-            (Result.is_error (Database.commit_mirror_deletion prepared)))
-        else (
-          Alcotest.(check bool) "legacy retired namespace yields durable commit evidence" true
-            (Database.mirror_deletion_committed prepared);
-          ignore (Database.commit_mirror_deletion prepared |> T.require_ok ~behavior);
-          Alcotest.(check bool) "legacy retired contents are collected" false (Sys.file_exists data))));
-    Alcotest.(check bool) "canonical is preserved without manufacturing a missing copy" (mode <> `Missing) (Sys.file_exists database_path))
+      Fun.protect
+        ~finally:(fun () -> Database.cancel_mirror_deletion prepared)
+        (fun () ->
+           Alcotest.(check bool)
+             "legacy generation remains an opaque journal identity"
+             true
+             (Mirror_generation.equal generation previous);
+           if mode = `Before || mode = `Missing
+           then (
+             Alcotest.(check bool)
+               "uncommitted legacy preparation is canceled"
+               false
+               (Database.mirror_deletion_committed prepared);
+             Alcotest.(check bool)
+               "old preparation cannot rename a live replacement"
+               true
+               (Result.is_error (Database.commit_mirror_deletion prepared)))
+           else (
+             Alcotest.(check bool)
+               "legacy retired namespace yields durable commit evidence"
+               true
+               (Database.mirror_deletion_committed prepared);
+             ignore (Database.commit_mirror_deletion prepared |> T.require_ok ~behavior);
+             Alcotest.(check bool)
+               "legacy retired contents are collected"
+               false
+               (Sys.file_exists data))));
+    Alcotest.(check bool)
+      "canonical is preserved without manufacturing a missing copy"
+      (mode <> `Missing)
+      (Sys.file_exists database_path))
 ;;
 
 let current_retirement_rejects_replaced_pending_data () =
@@ -1152,27 +1713,59 @@ let current_retirement_rejects_replaced_pending_data () =
     let database_path = T.seed_mirror support in
     let directory = Filename.dirname database_path in
     let retirement = next_retirement () in
-    let prepared, _ = Database.prepare_mirror_deletion ~application_support_directory:support
-      ~graph_id:T.graph_uuid ~retirement |> T.require_ok ~behavior in
-    let root = Filename.concat (Filename.dirname directory) (".mirror-deletions/" ^ Graph.Uuid.to_string T.graph_uuid) in
+    let prepared, _ =
+      Database.prepare_mirror_deletion
+        ~application_support_directory:support
+        ~graph_id:T.graph_uuid
+        ~retirement
+      |> T.require_ok ~behavior
+    in
+    let root =
+      Filename.concat
+        (Filename.dirname directory)
+        (".mirror-deletions/" ^ Graph.Uuid.to_string T.graph_uuid)
+    in
     let states = Filename.concat root "states" in
     Unix.chmod states 0o500;
-    Fun.protect ~finally:(fun () -> Unix.chmod states 0o700; Database.cancel_mirror_deletion prepared)
-      (fun () -> ignore (Database.commit_mirror_deletion prepared |> T.require_ok ~behavior));
-    let data = Filename.concat root ("pending/" ^ Database.retirement_id_to_string retirement ^ ".data") in
+    Fun.protect
+      ~finally:(fun () ->
+        Unix.chmod states 0o700;
+        Database.cancel_mirror_deletion prepared)
+      (fun () ->
+         ignore (Database.commit_mirror_deletion prepared |> T.require_ok ~behavior));
+    let data =
+      Filename.concat
+        root
+        ("pending/" ^ Database.retirement_id_to_string retirement ^ ".data")
+    in
     Unix.rename data (Filename.concat support "captured-old");
     ignore (T.seed_mirror support);
     let dependencies, _, inspection = location_and_inspection support behavior in
-    Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
-      let database = Database.open_ ~sw dependencies inspection ~graph_name:"Synthetic replacement"
-        |> T.require_ok ~behavior in
-      ignore (Database.close database |> T.require_ok ~behavior)));
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let database =
+          Database.open_ ~sw dependencies inspection ~graph_name:"Synthetic replacement"
+          |> T.require_ok ~behavior
+        in
+        ignore (Database.close database |> T.require_ok ~behavior)));
     Unix.rename directory data;
-    let replay = Database.prepare_mirror_deletion ~application_support_directory:support
-      ~graph_id:T.graph_uuid ~retirement in
-    Option.iter (fun (p, _) -> Database.cancel_mirror_deletion p) (Result.to_option replay);
-    Alcotest.(check bool) "replacement pending namespace is rejected" true (Result.is_error replay);
-    Alcotest.(check bool) "replacement pending contents survive" true (Sys.file_exists (Filename.concat data "db.sqlite")))
+    let replay =
+      Database.prepare_mirror_deletion
+        ~application_support_directory:support
+        ~graph_id:T.graph_uuid
+        ~retirement
+    in
+    Option.iter
+      (fun (p, _) -> Database.cancel_mirror_deletion p)
+      (Result.to_option replay);
+    Alcotest.(check bool)
+      "replacement pending namespace is rejected"
+      true
+      (Result.is_error replay);
+    Alcotest.(check bool)
+      "replacement pending contents survive"
+      true
+      (Sys.file_exists (Filename.concat data "db.sqlite")))
 ;;
 
 let corrupt_outbox_fails_closed () =
@@ -1410,7 +2003,9 @@ let require_generated_mutation_receipt database_path outcome expected_keys =
       | `List [ `String _tag; `Assoc fields ] as json ->
         (match List.assoc_opt "status" fields with
          | Some (`List [ `String actual ])
-           when String.equal actual (if outcome = "noChange" then "No_change" else "Applied") ->
+           when String.equal
+                  actual
+                  (if outcome = "noChange" then "No_change" else "Applied") ->
            Some (source, json, fields)
          | _ -> None)
       | _ -> None)
@@ -1451,7 +2046,8 @@ let duplicate_outbox_member_fails_closed () =
         Database.close database |> T.require_ok ~behavior;
         let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database_path in
         let records =
-          Logseq_db_storage.Sync_outbox_store.read_database sqlite |> T.require_ok ~behavior
+          Logseq_db_storage.Sync_outbox_store.read_database sqlite
+          |> T.require_ok ~behavior
         in
         Sqlite3.Rc.check
           (Sqlite3.exec
@@ -1475,8 +2071,10 @@ let duplicate_outbox_member_fails_closed () =
 
 let corrupt_single_outbox_record sqlite record =
   let statement = Sqlite3.prepare sqlite "UPDATE sync_outbox SET record=?" in
-  Fun.protect ~finally:(fun () -> ignore (Sqlite3.finalize statement)) (fun () ->
-    Sqlite3.Rc.check (Sqlite3.bind_text statement 1 record);
+  Fun.protect
+    ~finally:(fun () -> ignore (Sqlite3.finalize statement))
+    (fun () ->
+       Sqlite3.Rc.check (Sqlite3.bind_text statement 1 record);
        Sqlite3.Rc.check (Sqlite3.step statement))
 ;;
 
@@ -1556,7 +2154,7 @@ let pre_uuid_status_outbox_preserves_identity () =
       "opening legacy outbox changed operation fingerprints")
 ;;
 
-let noncanonical_outbox_payload_fails_closed ?(payload="tampered") () =
+let noncanonical_outbox_payload_fails_closed ?(payload = "tampered") () =
   let behavior = "noncanonical durable outbox payload fails closed" in
   T.with_temp_directory "overlay-noncanonical-outbox-" (fun support ->
     let database_path = T.seed_mirror support in
@@ -1973,10 +2571,30 @@ let no_change_receipt_survives_reopen () =
         Database.close second |> T.require_ok ~behavior)))
 ;;
 
-let authoritative_checkpoint_and_root_survive_reopen () =
+let authoritative_checkpoint_and_root_survive_reopen ?(mismatch = false) () =
   let behavior = "authoritative checkpoint and root survive reopen" in
   T.with_temp_directory "overlay-authoritative-reopen-" (fun support ->
-    ignore (T.seed_mirror support);
+    let database_path = T.seed_mirror support in
+    let durable_state () =
+      let sqlite = Sqlite3.db_open ~mode:`READONLY database_path in
+      Fun.protect
+        ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+        (fun () ->
+           List.map
+             (fun table ->
+                let rows = ref [] in
+                Sqlite3.Rc.check
+                  (Sqlite3.exec
+                     sqlite
+                     ~cb:(fun row _ -> rows := Array.to_list row :: !rows)
+                     ("SELECT * FROM " ^ table ^ " ORDER BY rowid"));
+                table, List.rev !rows)
+             [ "sync_meta"
+             ; "sync_outbox"
+             ; "overlay_mutation_receipts"
+             ; "overlay_terminal_batch_receipts"
+             ])
+    in
     let dependencies, location, inspection = location_and_inspection support behavior in
     let opening_inspection = inspection in
     Eio_main.run (fun _environment ->
@@ -2007,7 +2625,8 @@ let authoritative_checkpoint_and_root_survive_reopen () =
         in
         let cursor =
           Server_cursor.of_int64 1L
-          |> Result.map_error (fun `Negative_cursor -> "negative cursor") |> T.require_ok ~behavior
+          |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+          |> T.require_ok ~behavior
         in
         let batch =
           authoritative_batch
@@ -2015,9 +2634,46 @@ let authoritative_checkpoint_and_root_survive_reopen () =
             ~maximum_bytes:4_096
             ~transactions:[ authoritative_transaction ~cursor ~transaction:wire ]
             ~through:cursor
-            ~checksum:None
+            ~checksum:(if mismatch then Some (checksum "ffffffffffffffff") else None)
           |> T.require_ok ~behavior
         in
+        if mismatch
+        then (
+          Database.commit_local
+            first
+            ~expected:(T.insert_precondition first ~parent:T.page_uuid ~behavior)
+            (T.insert_blocks ~ordinal:980 ())
+          |> T.require_ok ~behavior
+          |> ignore;
+          let snapshot = Database.current_snapshot first |> T.require_ok ~behavior in
+          let title =
+            match
+              Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+              |> T.require_ok ~behavior
+            with
+            | [ Present_block { value; _ } ] -> value.block.title
+            | _ -> Alcotest.fail "missing checksum fixture block"
+          in
+          Database.release_snapshot snapshot;
+          Database.commit_local
+            first
+            ~expected:(block_precondition first T.authoritative_block_uuid behavior)
+            (Save_block
+               { mutation_id = T.mutation_uuid 981
+               ; block = T.authoritative_block_uuid
+               ; title
+               })
+          |> T.require_ok ~behavior
+          |> ignore);
+        T.require
+          (Database.check_checkpoint_checksum
+             first
+             ~through:(server_cursor 0)
+             ~expected:(checksum "0000000000000000")
+           |> T.require_ok ~behavior
+           = Some false)
+          "restoration trusted the seed's server-claimed checksum";
+        let durable_before = durable_state () in
         let sync = Database.inspect_sync first |> T.require_ok ~behavior in
         let prepared, request =
           Database.begin_authoritative first ~expected:(sync_view_token sync) batch
@@ -2026,21 +2682,38 @@ let authoritative_checkpoint_and_root_survive_reopen () =
         T.require
           (Option.is_none request)
           "plaintext authoritative fixture requested crypto";
-        let application =
-          match
-            Database.apply_authoritative first prepared ~decrypted:None
-            |> T.require_ok ~behavior
-          with
-          | Authoritative_applied commit -> commit
-          | Authoritative_deferred _ -> Alcotest.fail "authoritative fixture was deferred"
+        let snapshot = Database.current_snapshot first |> T.require_ok ~behavior in
+        let before =
+          Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+          |> T.require_ok ~behavior
         in
-        ignore application;
+        Database.release_snapshot snapshot;
+        let result = Database.apply_authoritative first prepared ~decrypted:None in
+        if mismatch
+        then (
+          T.require
+            (durable_state () = durable_before)
+            "checksum mismatch changed durable checkpoint, outbox or receipts";
+          (match result with
+           | Error Authoritative_checksum_mismatch -> ()
+           | Error _ -> Alcotest.fail "checksum mismatch returned the wrong error"
+           | Ok _ -> Alcotest.fail "checksum mismatch was committed");
+          let after = Database.inspect_sync first |> T.require_ok ~behavior in
+          T.require
+            (sync_token_equal (sync_view_token sync) (sync_view_token after))
+            "checksum rejection changed sync state")
+        else (
+          match T.require_ok ~behavior result with
+          | Authoritative_applied _ -> ()
+          | Authoritative_deferred _ -> Alcotest.fail "authoritative fixture was deferred");
         Database.close first |> T.require_ok ~behavior;
         let refreshed = inspect_mirror location behavior in
         (match Database.mirror_presence refreshed with
          | Available { checkpoint; _ } ->
            T.require
-             (Server_cursor.equal checkpoint cursor)
+             (Server_cursor.equal
+                checkpoint
+                (if mismatch then sync_view_checkpoint sync else cursor))
              "reopen inspection lost authoritative checkpoint"
          | Absent _ -> Alcotest.fail "authoritative commit removed the mirror");
         let opening_inspection = refreshed in
@@ -2049,15 +2722,36 @@ let authoritative_checkpoint_and_root_survive_reopen () =
           |> T.require_ok ~behavior
         in
         let snapshot = Database.current_snapshot second |> T.require_ok ~behavior in
-        (match
-           Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
-           |> T.require_ok ~behavior
-         with
-         | [ Present_block { value; _ } ] ->
-           T.require
-             (value.block.updated_at_ms = 1_704_067_200_456L)
-             "reopen lost authoritative block update"
-         | _ -> Alcotest.fail "reopen lost authoritative block");
+        let after =
+          Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+          |> T.require_ok ~behavior
+        in
+        if mismatch
+        then (
+          let values blocks =
+            List.filter_map
+              (function
+                | Present_block { value; _ } -> Some value
+                | _ -> None)
+              blocks
+          in
+          T.require
+            (values after = values before)
+            "rejected checksum changed durable graph";
+          T.require
+            (durable_state () = durable_before)
+            "reopen changed rejected checkpoint, outbox or receipts";
+          let reopened = Database.inspect_sync second |> T.require_ok ~behavior in
+          T.require
+            (sync_view_submissions reopened = sync_view_submissions sync)
+            "reopen changed rejected outbox")
+        else (
+          match after with
+          | [ Present_block { value; _ } ] ->
+            T.require
+              (value.block.updated_at_ms = 1_704_067_200_456L)
+              "reopen lost authoritative block update"
+          | _ -> Alcotest.fail "reopen lost authoritative block");
         Database.release_snapshot snapshot;
         Database.close second |> T.require_ok ~behavior)))
 ;;
@@ -2098,7 +2792,9 @@ let outbox_persistence_failure_is_atomic () =
              before_version.projection_revision
              after_version.projection_revision)
           "failed outbox commit advanced projection revision";
-        (match Database.get_outline_blocks after [ T.block_uuid ] |> T.require_ok ~behavior with
+        (match
+           Database.get_outline_blocks after [ T.block_uuid ] |> T.require_ok ~behavior
+         with
          | [ Missing_block _ ] -> ()
          | _ -> Alcotest.fail "failed outbox commit exposed the pending block");
         Database.release_snapshot after;
@@ -2117,13 +2813,17 @@ let receipt_writer_schema_failure_is_atomic () =
     Fun.protect
       ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
       (fun () ->
-         Sqlite3.Rc.check (Sqlite3.exec sqlite
-           "CREATE TABLE overlay_terminal_batch_receipts (batch_key TEXT PRIMARY KEY)"));
+         Sqlite3.Rc.check
+           (Sqlite3.exec
+              sqlite
+              "CREATE TABLE overlay_terminal_batch_receipts (batch_key TEXT PRIMARY KEY)"));
     let dependencies, _location, inspection = location_and_inspection support behavior in
     Eio_main.run (fun _environment ->
       Eio.Switch.run (fun sw ->
-        let database = Database.open_ ~sw dependencies inspection ~graph_name:"oracle-graph"
-          |> T.require_ok ~behavior in
+        let database =
+          Database.open_ ~sw dependencies inspection ~graph_name:"oracle-graph"
+          |> T.require_ok ~behavior
+        in
         Fun.protect
           ~finally:(fun () -> ignore (Database.close database))
           (fun () ->
@@ -2131,62 +2831,90 @@ let receipt_writer_schema_failure_is_atomic () =
              let before_version = Database.snapshot_version before in
              Database.release_snapshot before;
              let before_sync = Database.inspect_sync database |> T.require_ok ~behavior in
-             let expected = T.insert_precondition database ~parent:T.page_uuid ~behavior in
+             let expected =
+               T.insert_precondition database ~parent:T.page_uuid ~behavior
+             in
              let mutation = T.insert_blocks ~ordinal:411 () in
              (match Database.commit_local database ~expected mutation with
               | Error (Local_commit_persistence_failed message) ->
-                Alcotest.(check string) "receipt writer preserves the storage cause"
-                  "Sqlite3.Error(\"Sqlite3.prepare: table overlay_terminal_batch_receipts has no column named receipt\")"
+                Alcotest.(check string)
+                  "receipt writer preserves the storage cause"
+                  "Sqlite3.Error(\"Sqlite3.prepare: table \
+                   overlay_terminal_batch_receipts has no column named receipt\")"
                   message
               | Error _ -> Alcotest.fail "receipt writer returned the wrong commit error"
               | Ok _ -> Alcotest.fail "receipt writer exposed a successful commit");
              let after = Database.current_snapshot database |> T.require_ok ~behavior in
-             T.require (Projection_revision.equal before_version.projection_revision
-               (Database.snapshot_version after).projection_revision)
+             T.require
+               (Projection_revision.equal
+                  before_version.projection_revision
+                  (Database.snapshot_version after).projection_revision)
                "receipt writer failure advanced projection revision";
-             (match Database.get_outline_blocks after [ T.block_uuid ] |> T.require_ok ~behavior with
+             (match
+                Database.get_outline_blocks after [ T.block_uuid ]
+                |> T.require_ok ~behavior
+              with
               | [ Missing_block _ ] -> ()
               | _ -> Alcotest.fail "receipt writer failure exposed the pending block");
              Database.release_snapshot after;
              let after_sync = Database.inspect_sync database |> T.require_ok ~behavior in
-             T.require (sync_token_equal (sync_view_token before_sync) (sync_view_token after_sync))
+             T.require
+               (sync_token_equal
+                  (sync_view_token before_sync)
+                  (sync_view_token after_sync))
                "receipt writer failure advanced sync token";
-             T.require (sync_view_submissions after_sync = [])
+             T.require
+               (sync_view_submissions after_sync = [])
                "receipt writer failure exposed a submission";
              let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database_path in
              Fun.protect
                ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
                (fun () ->
-                  Alcotest.(check int) "durable outbox rolled back" 0
-                    (List.length (Logseq_db_storage.Sync_outbox_store.read_database sqlite
-                      |> T.require_ok ~behavior));
-                  Alcotest.(check int) "durable mutation receipt rolled back" 0
-                    (List.length (Logseq_db_storage.Mutation_receipt_store.read_database sqlite
-                      |> T.require_ok ~behavior));
-                  Sqlite3.Rc.check (Sqlite3.exec sqlite "DROP TABLE overlay_terminal_batch_receipts");
+                  Alcotest.(check int)
+                    "durable outbox rolled back"
+                    0
+                    (List.length
+                       (Logseq_db_storage.Sync_outbox_store.read_database sqlite
+                        |> T.require_ok ~behavior));
+                  Alcotest.(check int)
+                    "durable mutation receipt rolled back"
+                    0
+                    (List.length
+                       (Logseq_db_storage.Mutation_receipt_store.read_database sqlite
+                        |> T.require_ok ~behavior));
+                  Sqlite3.Rc.check
+                    (Sqlite3.exec sqlite "DROP TABLE overlay_terminal_batch_receipts");
                   Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite
                   |> T.require_ok ~behavior);
-             (match Database.commit_local database ~expected mutation |> T.require_ok ~behavior with
-              | Local_committed _ -> ()
-              | _ -> Alcotest.fail "same mutation retry retained a failed receipt")))))
+             match
+               Database.commit_local database ~expected mutation |> T.require_ok ~behavior
+             with
+             | Local_committed _ -> ()
+             | _ -> Alcotest.fail "same mutation retry retained a failed receipt"))))
 ;;
 
 let receipt_writer_schema_errors_are_results () =
   let module Store = Logseq_db_storage.Mutation_receipt_store in
   let check_writer table key_column write =
-    List.iter (fun receipts ->
-      let sqlite = Sqlite3.db_open ":memory:" in
-      Fun.protect
-        ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
-        (fun () ->
-           Sqlite3.Rc.check (Sqlite3.exec sqlite
-             ("CREATE TABLE " ^ table ^ " (" ^ key_column ^ " TEXT PRIMARY KEY)"));
-           match write sqlite receipts with
-           | Error message ->
-             Alcotest.(check string) "receipt writer preserves the prepare cause"
-               ("Sqlite3.Error(\"Sqlite3.prepare: table " ^ table ^ " has no column named receipt\")")
-               message
-           | Ok () -> Alcotest.fail "malformed receipt writer reported success"))
+    List.iter
+      (fun receipts ->
+         let sqlite = Sqlite3.db_open ":memory:" in
+         Fun.protect
+           ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+           (fun () ->
+              Sqlite3.Rc.check
+                (Sqlite3.exec
+                   sqlite
+                   ("CREATE TABLE " ^ table ^ " (" ^ key_column ^ " TEXT PRIMARY KEY)"));
+              match write sqlite receipts with
+              | Error message ->
+                Alcotest.(check string)
+                  "receipt writer preserves the prepare cause"
+                  ("Sqlite3.Error(\"Sqlite3.prepare: table "
+                   ^ table
+                   ^ " has no column named receipt\")")
+                  message
+              | Ok () -> Alcotest.fail "malformed receipt writer reported success"))
       [ []; [ String.make 64 'a', "{}" ] ]
   in
   check_writer "overlay_mutation_receipts" "receipt_key" Store.upsert_mutations;
@@ -2261,38 +2989,71 @@ let submit_persistence_failure_restores_queued_state () =
            -> ()
          | _ -> Alcotest.fail "failed submit did not restore Queued state");
         let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database_path in
-        Fun.protect ~finally:(fun () -> ignore (Sqlite3.db_close sqlite)) (fun () ->
-          Alcotest.(check (list string)) "failed submit rolls back durable mutable record"
-            durable_before (Store.read_database sqlite |> T.require_ok ~behavior);
-          T.require (Store.read_revision sqlite |> T.require_ok ~behavior = revision_before)
-            "failed submit rolls back metadata revision";
-          Sqlite3.Rc.check (Sqlite3.exec sqlite "DROP TRIGGER fail_overlay_submit");
-          let prepared, request = Database.begin_outbox_transition database
-              ~expected:(sync_view_token after) (Submit_group [ mutation_id ])
-            |> T.require_ok ~behavior in
-          let request = Option.get request in
-          let encrypted = Database.protection_plaintexts request
-            |> List.map (fun (id, plaintext) -> id, "encrypted:" ^ plaintext) in
-          let retried = Database.apply_outbox_transition database prepared
-              ~encrypted:(Some (request, encrypted)) |> T.require_ok ~behavior in
-          T.require (Store.read_database sqlite |> T.require_ok ~behavior <> durable_before)
-            "retry after rollback failed to persist its changed frozen baseline";
-          let current_revision = Store.read_revision sqlite |> T.require_ok ~behavior |> Option.get in
-          T.require (current_revision = Option.get revision_before + 1)
-            "successful retry must advance metadata exactly once";
-          let durable_after_retry = Store.read_database sqlite |> T.require_ok ~behavior in
-          (* A second public storage writer advances only its revision. Database
+        Fun.protect
+          ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+          (fun () ->
+             Alcotest.(check (list string))
+               "failed submit rolls back durable mutable record"
+               durable_before
+               (Store.read_database sqlite |> T.require_ok ~behavior);
+             T.require
+               (Store.read_revision sqlite |> T.require_ok ~behavior = revision_before)
+               "failed submit rolls back metadata revision";
+             Sqlite3.Rc.check (Sqlite3.exec sqlite "DROP TRIGGER fail_overlay_submit");
+             let prepared, request =
+               Database.begin_outbox_transition
+                 database
+                 ~expected:(sync_view_token after)
+                 (Submit_group [ mutation_id ])
+               |> T.require_ok ~behavior
+             in
+             let request = Option.get request in
+             let encrypted =
+               Database.protection_plaintexts request
+               |> List.map (fun (id, plaintext) -> id, "encrypted:" ^ plaintext)
+             in
+             let retried =
+               Database.apply_outbox_transition
+                 database
+                 prepared
+                 ~encrypted:(Some (request, encrypted))
+               |> T.require_ok ~behavior
+             in
+             T.require
+               (Store.read_database sqlite |> T.require_ok ~behavior <> durable_before)
+               "retry after rollback failed to persist its changed frozen baseline";
+             let current_revision =
+               Store.read_revision sqlite |> T.require_ok ~behavior |> Option.get
+             in
+             T.require
+               (current_revision = Option.get revision_before + 1)
+               "successful retry must advance metadata exactly once";
+             let durable_after_retry =
+               Store.read_database sqlite |> T.require_ok ~behavior
+             in
+             (* A second public storage writer advances only its revision. Database
              owns executing the CAS and must reject its now stale durable baseline. *)
-          Sqlite3.Rc.check (Sqlite3.exec sqlite "BEGIN IMMEDIATE");
-          Store.apply_delta sqlite
-            { expected_revision = current_revision; revision = current_revision + 1
-            ; upserts = []; deletes = [] } |> T.require_ok ~behavior;
-          Sqlite3.Rc.check (Sqlite3.exec sqlite "COMMIT");
-          let submitted_view = Database.inspect_sync database |> T.require_ok ~behavior in
-          let batch = Option.get retried.submission_batch in
-          let prepared, request = Database.begin_outbox_transition database
-              ~expected:(sync_view_token submitted_view)
-              (Retry_group (submission_batch_id batch)) |> T.require_ok ~behavior in
+             Sqlite3.Rc.check (Sqlite3.exec sqlite "BEGIN IMMEDIATE");
+             Store.apply_delta
+               sqlite
+               { expected_revision = current_revision
+               ; revision = current_revision + 1
+               ; upserts = []
+               ; deletes = []
+               }
+             |> T.require_ok ~behavior;
+             Sqlite3.Rc.check (Sqlite3.exec sqlite "COMMIT");
+             let submitted_view =
+               Database.inspect_sync database |> T.require_ok ~behavior
+             in
+             let batch = Option.get retried.submission_batch in
+             let prepared, request =
+               Database.begin_outbox_transition
+                 database
+                 ~expected:(sync_view_token submitted_view)
+                 (Retry_group (submission_batch_id batch))
+               |> T.require_ok ~behavior
+             in
              let encrypted =
                Option.map
                  (fun request ->
@@ -2301,16 +3062,26 @@ let submit_persistence_failure_restores_queued_state () =
                       |> List.map (fun (id, plaintext) -> id, "encrypted:" ^ plaintext) ))
                  request
              in
-          (match Database.apply_outbox_transition database prepared ~encrypted with
-           | Error (Outbox_commit_persistence_failed _) -> ()
-           | _ -> Alcotest.fail "stale durable metadata CAS exposed a successful retry");
-          Alcotest.(check (list string)) "metadata CAS failure preserves every payload"
-            durable_after_retry (Store.read_database sqlite |> T.require_ok ~behavior);
-          T.require (Store.read_revision sqlite |> T.require_ok ~behavior = Some (current_revision + 1))
-            "metadata CAS failure overwrote the winning writer revision";
-          let after_conflict = Database.inspect_sync database |> T.require_ok ~behavior in
-          T.require (sync_token_equal (sync_view_token submitted_view) (sync_view_token after_conflict))
-            "metadata CAS failure published an in-memory revision");
+             (match Database.apply_outbox_transition database prepared ~encrypted with
+              | Error (Outbox_commit_persistence_failed _) -> ()
+              | _ -> Alcotest.fail "stale durable metadata CAS exposed a successful retry");
+             Alcotest.(check (list string))
+               "metadata CAS failure preserves every payload"
+               durable_after_retry
+               (Store.read_database sqlite |> T.require_ok ~behavior);
+             T.require
+               (Store.read_revision sqlite
+                |> T.require_ok ~behavior
+                = Some (current_revision + 1))
+               "metadata CAS failure overwrote the winning writer revision";
+             let after_conflict =
+               Database.inspect_sync database |> T.require_ok ~behavior
+             in
+             T.require
+               (sync_token_equal
+                  (sync_view_token submitted_view)
+                  (sync_view_token after_conflict))
+               "metadata CAS failure published an in-memory revision");
         ignore (Database.close database))))
 ;;
 
@@ -2747,15 +3518,17 @@ let with_outbox_write_fixture behavior f =
 let outbox_write_count sqlite =
   let count = ref 0 in
   Sqlite3.Rc.check
-    (Sqlite3.exec sqlite "SELECT count(*) FROM outbox_write_audit"
-       ~cb:(fun row _ -> count := int_of_string (Option.get row.(0))));
+    (Sqlite3.exec sqlite "SELECT count(*) FROM outbox_write_audit" ~cb:(fun row _ ->
+       count := int_of_string (Option.get row.(0))));
   !count
 ;;
 
 let outbox_payload_bytes sqlite =
   let count = ref 0 in
   Sqlite3.Rc.check
-    (Sqlite3.exec sqlite "SELECT coalesce(sum(payload_bytes),0) FROM outbox_write_audit"
+    (Sqlite3.exec
+       sqlite
+       "SELECT coalesce(sum(payload_bytes),0) FROM outbox_write_audit"
        ~cb:(fun row _ -> count := int_of_string (Option.get row.(0))));
   !count
 ;;
@@ -2778,7 +3551,8 @@ let append_outbox_save database ordinal behavior =
   in
   let commit =
     match
-      Database.commit_local database
+      Database.commit_local
+        database
         ~expected:(block_precondition database T.authoritative_block_uuid behavior)
         mutation
       |> T.require_ok ~behavior
@@ -2808,330 +3582,552 @@ let apply_outbox_event database transition behavior =
 
 let incremental_outbox_appends count () =
   let behavior = Printf.sprintf "incremental outbox appends %d" count in
-  with_outbox_write_fixture behavior
+  with_outbox_write_fixture
+    behavior
     (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
-      for ordinal = 1 to count do
-        ignore (append_outbox_save database ordinal behavior)
-      done;
-      Alcotest.(check int) "one durable row write per appended intent" count
-        (outbox_write_count sqlite);
-      let stored = persisted_outbox sqlite behavior in
-      Alcotest.(check int) "all intents recover in order" count (List.length stored);
-      let final_bytes = List.fold_left (fun total record -> total + String.length record) 0 stored in
-      Alcotest.(check int) "each appended payload is persisted exactly once" final_bytes
-        (outbox_payload_bytes sqlite);
+       for ordinal = 1 to count do
+         ignore (append_outbox_save database ordinal behavior)
+       done;
+       Alcotest.(check int)
+         "one durable row write per appended intent"
+         count
+         (outbox_write_count sqlite);
+       let stored = persisted_outbox sqlite behavior in
+       Alcotest.(check int) "all intents recover in order" count (List.length stored);
+       let final_bytes =
+         List.fold_left (fun total record -> total + String.length record) 0 stored
+       in
+       Alcotest.(check int)
+         "each appended payload is persisted exactly once"
+         final_bytes
+         (outbox_payload_bytes sqlite);
        Printf.printf
          "outbox append N=%d committed_row_changes=%d logical_payload_bytes=%d \
           final_payload_bytes=%d\n\
           %!"
-        count (outbox_write_count sqlite) (outbox_payload_bytes sqlite) final_bytes)
+         count
+         (outbox_write_count sqlite)
+         (outbox_payload_bytes sqlite)
+         final_bytes)
 ;;
 
 let incremental_outbox_preserves_unchanged_rows () =
   let behavior = "incremental outbox preserves unchanged rows" in
-  with_outbox_write_fixture behavior
+  with_outbox_write_fixture
+    behavior
     (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
-      ignore (append_outbox_save database 1 behavior);
-      let before = List.hd (persisted_outbox sqlite behavior) in
-      ignore (append_outbox_save database 2 behavior);
-      Alcotest.(check string) "unrelated revision does not reencode prior payload" before
-        (List.hd (persisted_outbox sqlite behavior)))
+       ignore (append_outbox_save database 1 behavior);
+       let before = List.hd (persisted_outbox sqlite behavior) in
+       ignore (append_outbox_save database 2 behavior);
+       Alcotest.(check string)
+         "unrelated revision does not reencode prior payload"
+         before
+         (List.hd (persisted_outbox sqlite behavior)))
 ;;
 
 let incremental_outbox_no_change_and_identity () =
   let behavior = "incremental outbox No_change and identity" in
-  with_outbox_write_fixture behavior
+  with_outbox_write_fixture
+    behavior
     (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
-      let mutation, _ = append_outbox_save database 1 behavior in
-      for ordinal = 2 to 32 do
-        ignore (append_outbox_save database ordinal behavior)
-      done;
-      reset_outbox_write_count sqlite;
-      let no_change =
-        Save_block
-          { mutation_id = T.mutation_uuid 20_001
-          ; block = T.block_uuid
-          ; title = "Missing target"
-          }
-      in
-      (match Database.commit_local database
-               ~expected:(block_precondition database T.block_uuid behavior) no_change
-             |> T.require_ok ~behavior with
-       | Local_committed { status = No_change; _ } -> ()
-       | _ -> Alcotest.fail "missing target must produce a durable No_change receipt");
-      (match Database.commit_local database ~expected:(T.empty_precondition ~behavior) mutation
-             |> T.require_ok ~behavior with
-       | Local_existing _ -> ()
-       | _ -> Alcotest.fail "same-ID replay appended another intent");
-      (match Database.commit_local database ~expected:(T.empty_precondition ~behavior)
-               (Save_block { mutation_id = T.mutation_uuid 10_001
-                           ; block = T.authoritative_block_uuid; title = "Different intent" }) with
-       | Error Mutation_identity_conflict -> ()
-       | _ -> Alcotest.fail "same-ID different intent must remain a conflict");
-      Alcotest.(check int) "receipt and identity checks do not rewrite outbox rows" 0
-        (outbox_write_count sqlite))
+       let mutation, _ = append_outbox_save database 1 behavior in
+       for ordinal = 2 to 32 do
+         ignore (append_outbox_save database ordinal behavior)
+       done;
+       reset_outbox_write_count sqlite;
+       let no_change =
+         Save_block
+           { mutation_id = T.mutation_uuid 20_001
+           ; block = T.block_uuid
+           ; title = "Missing target"
+           }
+       in
+       (match
+          Database.commit_local
+            database
+            ~expected:(block_precondition database T.block_uuid behavior)
+            no_change
+          |> T.require_ok ~behavior
+        with
+        | Local_committed { status = No_change; _ } -> ()
+        | _ -> Alcotest.fail "missing target must produce a durable No_change receipt");
+       (match
+          Database.commit_local
+            database
+            ~expected:(T.empty_precondition ~behavior)
+            mutation
+          |> T.require_ok ~behavior
+        with
+        | Local_existing _ -> ()
+        | _ -> Alcotest.fail "same-ID replay appended another intent");
+       (match
+          Database.commit_local
+            database
+            ~expected:(T.empty_precondition ~behavior)
+            (Save_block
+               { mutation_id = T.mutation_uuid 10_001
+               ; block = T.authoritative_block_uuid
+               ; title = "Different intent"
+               })
+        with
+        | Error Mutation_identity_conflict -> ()
+        | _ -> Alcotest.fail "same-ID different intent must remain a conflict");
+       Alcotest.(check int)
+         "receipt and identity checks do not rewrite outbox rows"
+         0
+         (outbox_write_count sqlite))
 ;;
 
 let incremental_outbox_batch_updates () =
   let behavior = "incremental outbox batch updates" in
-  with_outbox_write_fixture behavior
+  with_outbox_write_fixture
+    behavior
     (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
-      let commits = List.init 64 (fun n -> snd (append_outbox_save database (n + 1) behavior)) in
-      let ids = List.take 32 commits |> List.map (fun (commit : local_commit) -> commit.mutation_id) in
-      reset_outbox_write_count sqlite;
-      let submitted = apply_outbox_event database (Submit_group ids) behavior in
-      Alcotest.(check int) "submit persists its members only" 32 (outbox_write_count sqlite);
-      let batch = Option.get submitted.submission_batch in
-      reset_outbox_write_count sqlite;
-      ignore
-        (apply_outbox_event database
-           (Accept_group
-              { batch_id = submission_batch_id batch
-              ; barrier = { through = server_cursor 32; checksum = checksum "0000000000000000" }
-              }) behavior);
-      Alcotest.(check int) "accept persists its members only" 32 (outbox_write_count sqlite);
-      let stored = persisted_outbox sqlite behavior in
-      let view = Database.inspect_sync database |> T.require_ok ~behavior in
-      Alcotest.(check int) "mutable transport updates remain durable" 32
-        (List.fold_left
-           (fun count descriptor -> match descriptor.state with
-             | Accepted_pending_authoritative _ -> count + 1 | _ -> count)
-           0 (sync_view_submissions view));
-      Alcotest.(check int) "other queued rows remain present" 64 (List.length stored))
+       let commits =
+         List.init 64 (fun n -> snd (append_outbox_save database (n + 1) behavior))
+       in
+       let ids =
+         List.take 32 commits
+         |> List.map (fun (commit : local_commit) -> commit.mutation_id)
+       in
+       reset_outbox_write_count sqlite;
+       let submitted = apply_outbox_event database (Submit_group ids) behavior in
+       Alcotest.(check int)
+         "submit persists its members only"
+         32
+         (outbox_write_count sqlite);
+       let batch = Option.get submitted.submission_batch in
+       reset_outbox_write_count sqlite;
+       ignore
+         (apply_outbox_event
+            database
+            (Accept_group
+               { batch_id = submission_batch_id batch
+               ; barrier =
+                   { through = server_cursor 32; checksum = checksum "0000000000000000" }
+               })
+            behavior);
+       Alcotest.(check int)
+         "accept persists its members only"
+         32
+         (outbox_write_count sqlite);
+       let stored = persisted_outbox sqlite behavior in
+       let view = Database.inspect_sync database |> T.require_ok ~behavior in
+       Alcotest.(check int)
+         "mutable transport updates remain durable"
+         32
+         (List.fold_left
+            (fun count descriptor ->
+               match descriptor.state with
+               | Accepted_pending_authoritative _ -> count + 1
+               | _ -> count)
+            0
+            (sync_view_submissions view));
+       Alcotest.(check int) "other queued rows remain present" 64 (List.length stored))
 ;;
 
 let reject_and_discard database (commit : local_commit) behavior =
-  let submitted = apply_outbox_event database (Submit_group [ commit.mutation_id ]) behavior in
+  let submitted =
+    apply_outbox_event database (Submit_group [ commit.mutation_id ]) behavior
+  in
   let batch = Option.get submitted.submission_batch in
   ignore
-    (apply_outbox_event database
+    (apply_outbox_event
+       database
        (Reject_group
           { batch_id = submission_batch_id batch
-          ; resolution = Definitive
-              { reason = Invalid_request
-              ; partition = { accepted_prefix = []; failed_member = Some commit.mutation_id
-                            ; unexecuted_suffix = []; acceptance_barrier = None
-                            ; missing_uuids = []; diagnostics = [] }
-              }
-          }) behavior);
-  Database.discard_blocked database ~mutation_id:commit.mutation_id |> T.require_ok ~behavior |> ignore
+          ; resolution =
+              Definitive
+                { reason = Invalid_request
+                ; partition =
+                    { accepted_prefix = []
+                    ; failed_member = Some commit.mutation_id
+                    ; unexecuted_suffix = []
+                    ; acceptance_barrier = None
+                    ; missing_uuids = []
+                    ; diagnostics = []
+                    }
+                }
+          })
+       behavior);
+  Database.discard_blocked database ~mutation_id:commit.mutation_id
+  |> T.require_ok ~behavior
+  |> ignore
 ;;
 
 let incremental_outbox_middle_delete_and_empty_revision () =
   let behavior = "incremental outbox middle delete and empty revision" in
-  with_outbox_write_fixture behavior
+  with_outbox_write_fixture
+    behavior
     (fun ~sw ~dependencies ~support ~path:_ ~sqlite database ->
-      let commits = List.init 3 (fun n -> snd (append_outbox_save database (n + 1) behavior)) in
-      let middle = List.nth commits 1 in
-      let submitted = apply_outbox_event database (Submit_group [ middle.mutation_id ]) behavior in
-      let batch = Option.get submitted.submission_batch in
-      ignore (apply_outbox_event database
-                (Reject_group { batch_id = submission_batch_id batch
-                              ; resolution = Definitive
-                                  { reason = Invalid_request
-                                  ; partition = { accepted_prefix = []; failed_member = Some middle.mutation_id
-                                                ; unexecuted_suffix = []; acceptance_barrier = None
-                                                ; missing_uuids = []; diagnostics = [] } } }) behavior);
-      let before = persisted_outbox sqlite behavior in
-      reset_outbox_write_count sqlite;
-      Database.discard_blocked database ~mutation_id:middle.mutation_id |> T.require_ok ~behavior |> ignore;
-      Alcotest.(check int) "middle discard deletes one row" 1 (outbox_write_count sqlite);
-      Alcotest.(check (list string)) "remaining sequence holes and payloads are stable"
-        [ List.nth before 0; List.nth before 2 ] (persisted_outbox sqlite behavior);
-      reject_and_discard database (List.nth commits 0) behavior;
-      reject_and_discard database (List.nth commits 2) behavior;
-      let before_reopen = Database.inspect_sync database |> T.require_ok ~behavior in
-      Database.close database |> T.require_ok ~behavior;
-      let inspection = inspect_mirror support behavior in
-      let reopened = Database.open_ ~sw dependencies inspection ~graph_name:"empty-queue"
-                     |> T.require_ok ~behavior in
-      let after_reopen = Database.inspect_sync reopened |> T.require_ok ~behavior in
-      T.require (sync_token_equal (sync_view_token before_reopen) (sync_view_token after_reopen))
-        "empty durable queue lost its independent sync revision";
-      Database.close reopened |> T.require_ok ~behavior)
+       let commits =
+         List.init 3 (fun n -> snd (append_outbox_save database (n + 1) behavior))
+       in
+       let middle = List.nth commits 1 in
+       let submitted =
+         apply_outbox_event database (Submit_group [ middle.mutation_id ]) behavior
+       in
+       let batch = Option.get submitted.submission_batch in
+       ignore
+         (apply_outbox_event
+            database
+            (Reject_group
+               { batch_id = submission_batch_id batch
+               ; resolution =
+                   Definitive
+                     { reason = Invalid_request
+                     ; partition =
+                         { accepted_prefix = []
+                         ; failed_member = Some middle.mutation_id
+                         ; unexecuted_suffix = []
+                         ; acceptance_barrier = None
+                         ; missing_uuids = []
+                         ; diagnostics = []
+                         }
+                     }
+               })
+            behavior);
+       let before = persisted_outbox sqlite behavior in
+       reset_outbox_write_count sqlite;
+       Database.discard_blocked database ~mutation_id:middle.mutation_id
+       |> T.require_ok ~behavior
+       |> ignore;
+       Alcotest.(check int) "middle discard deletes one row" 1 (outbox_write_count sqlite);
+       Alcotest.(check (list string))
+         "remaining sequence holes and payloads are stable"
+         [ List.nth before 0; List.nth before 2 ]
+         (persisted_outbox sqlite behavior);
+       reject_and_discard database (List.nth commits 0) behavior;
+       reject_and_discard database (List.nth commits 2) behavior;
+       let before_reopen = Database.inspect_sync database |> T.require_ok ~behavior in
+       Database.close database |> T.require_ok ~behavior;
+       let inspection = inspect_mirror support behavior in
+       let reopened =
+         Database.open_ ~sw dependencies inspection ~graph_name:"empty-queue"
+         |> T.require_ok ~behavior
+       in
+       let after_reopen = Database.inspect_sync reopened |> T.require_ok ~behavior in
+       T.require
+         (sync_token_equal (sync_view_token before_reopen) (sync_view_token after_reopen))
+         "empty durable queue lost its independent sync revision";
+       Database.close reopened |> T.require_ok ~behavior)
 ;;
 
 let incremental_outbox_empty_revision () =
   let behavior = "incremental outbox empty revision" in
-  with_outbox_write_fixture behavior
+  with_outbox_write_fixture
+    behavior
     (fun ~sw ~dependencies ~support ~path:_ ~sqlite:_ database ->
-      let _, commit = append_outbox_save database 1 behavior in
-      reject_and_discard database commit behavior;
-      let before = Database.inspect_sync database |> T.require_ok ~behavior in
-      Database.close database |> T.require_ok ~behavior;
-      let reopened = Database.open_ ~sw dependencies (inspect_mirror support behavior)
-                       ~graph_name:"empty-revision" |> T.require_ok ~behavior in
-      let after = Database.inspect_sync reopened |> T.require_ok ~behavior in
-      T.require (sync_token_equal (sync_view_token before) (sync_view_token after))
-        "empty queue must retain its durable sync revision";
-      Database.close reopened |> T.require_ok ~behavior)
+       let _, commit = append_outbox_save database 1 behavior in
+       reject_and_discard database commit behavior;
+       let before = Database.inspect_sync database |> T.require_ok ~behavior in
+       Database.close database |> T.require_ok ~behavior;
+       let reopened =
+         Database.open_
+           ~sw
+           dependencies
+           (inspect_mirror support behavior)
+           ~graph_name:"empty-revision"
+         |> T.require_ok ~behavior
+       in
+       let after = Database.inspect_sync reopened |> T.require_ok ~behavior in
+       T.require
+         (sync_token_equal (sync_view_token before) (sync_view_token after))
+         "empty queue must retain its durable sync revision";
+       Database.close reopened |> T.require_ok ~behavior)
 ;;
 
 let incremental_outbox_unrelated_authoritative () =
   let behavior = "incremental outbox unrelated authoritative" in
-  with_outbox_write_fixture behavior
+  with_outbox_write_fixture
+    behavior
     (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
-      let commits = List.init 32 (fun n -> snd (append_outbox_save database (n + 1) behavior)) in
-      let ids = List.map (fun (commit : local_commit) -> commit.mutation_id) commits in
-      ignore (apply_outbox_event database (Submit_group ids) behavior);
-      let before = persisted_outbox sqlite behavior in
-      reset_outbox_write_count sqlite;
-      let module Transit = Transit_core.Json in
-      let module Codec = Transit_native.Transit.Json in
-      let wire =
-        Transit.Array
-          [ Transit.Array
-              [ Transit.Keyword "db/add"
-              ; Transit.Array [ Transit.Keyword "block/uuid"
-                              ; Transit.Uuid (Logseq_db_types.Graph_types.Uuid.to_string T.page_uuid) ]
-              ; Transit.Keyword "audit/unrelated"
-              ; Transit.Int 1 ] ]
-        |> Codec.to_string ~mode:Codec.Verbose
-        |> encoded_transaction_of_string ~maximum_bytes:4096 |> T.require_ok ~behavior
-      in
-      let batch = authoritative_batch ~maximum_count:16 ~maximum_bytes:4096
-                    ~transactions:[ authoritative_transaction ~cursor:(server_cursor 1) ~transaction:wire ]
-                    ~through:(server_cursor 1) ~checksum:None |> T.require_ok ~behavior in
-      let view = Database.inspect_sync database |> T.require_ok ~behavior in
-      let prepared, request = Database.begin_authoritative database
-                                ~expected:(sync_view_token view) batch |> T.require_ok ~behavior in
-      T.require (Option.is_none request) "unrelated transaction unexpectedly needs crypto";
-      (match Database.apply_authoritative database prepared ~decrypted:None |> T.require_ok ~behavior with
-       | Authoritative_applied _ -> ()
-       | _ -> Alcotest.fail "unrelated authoritative batch was deferred");
-      Alcotest.(check int) "unrelated checkpoint does not rewrite frozen submissions" 0
-        (outbox_write_count sqlite);
-      Alcotest.(check (list string)) "frozen submission payloads survive unchanged" before
-        (persisted_outbox sqlite behavior))
+       let commits =
+         List.init 32 (fun n -> snd (append_outbox_save database (n + 1) behavior))
+       in
+       let ids = List.map (fun (commit : local_commit) -> commit.mutation_id) commits in
+       ignore (apply_outbox_event database (Submit_group ids) behavior);
+       let before = persisted_outbox sqlite behavior in
+       reset_outbox_write_count sqlite;
+       let module Transit = Transit_core.Json in
+       let module Codec = Transit_native.Transit.Json in
+       let wire =
+         Transit.Array
+           [ Transit.Array
+               [ Transit.Keyword "db/add"
+               ; Transit.Array
+                   [ Transit.Keyword "block/uuid"
+                   ; Transit.Uuid (Logseq_db_types.Graph_types.Uuid.to_string T.page_uuid)
+                   ]
+               ; Transit.Keyword "audit/unrelated"
+               ; Transit.Int 1
+               ]
+           ]
+         |> Codec.to_string ~mode:Codec.Verbose
+         |> encoded_transaction_of_string ~maximum_bytes:4096
+         |> T.require_ok ~behavior
+       in
+       let batch =
+         authoritative_batch
+           ~maximum_count:16
+           ~maximum_bytes:4096
+           ~transactions:
+             [ authoritative_transaction ~cursor:(server_cursor 1) ~transaction:wire ]
+           ~through:(server_cursor 1)
+           ~checksum:None
+         |> T.require_ok ~behavior
+       in
+       let view = Database.inspect_sync database |> T.require_ok ~behavior in
+       let prepared, request =
+         Database.begin_authoritative database ~expected:(sync_view_token view) batch
+         |> T.require_ok ~behavior
+       in
+       T.require
+         (Option.is_none request)
+         "unrelated transaction unexpectedly needs crypto";
+       (match
+          Database.apply_authoritative database prepared ~decrypted:None
+          |> T.require_ok ~behavior
+        with
+        | Authoritative_applied _ -> ()
+        | _ -> Alcotest.fail "unrelated authoritative batch was deferred");
+       Alcotest.(check int)
+         "unrelated checkpoint does not rewrite frozen submissions"
+         0
+         (outbox_write_count sqlite);
+       Alcotest.(check (list string))
+         "frozen submission payloads survive unchanged"
+         before
+         (persisted_outbox sqlite behavior))
 ;;
 
 let incremental_outbox_legacy_migration () =
   let behavior = "incremental outbox legacy migration" in
-  with_outbox_write_fixture behavior
+  with_outbox_write_fixture
+    behavior
     (fun ~sw ~dependencies ~support ~path:_ ~sqlite database ->
-      ignore (append_outbox_save database 1 behavior);
-      ignore (append_outbox_save database 2 behavior);
-      let records = persisted_outbox sqlite behavior in
-      Database.close database |> T.require_ok ~behavior;
+       ignore (append_outbox_save database 1 behavior);
+       ignore (append_outbox_save database 2 behavior);
+       let records = persisted_outbox sqlite behavior in
+       Database.close database |> T.require_ok ~behavior;
        Sqlite3.Rc.check
          (Sqlite3.exec
             sqlite
             "DROP TABLE sync_outbox; DROP TABLE IF EXISTS sync_outbox_metadata; CREATE \
              TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
-      let legacy = List.map
-        (fun record -> match Yojson.Safe.from_string record with
-          | `Assoc fields -> `Assoc (("sync_revision", `Int 57) :: List.remove_assoc "sync_revision" fields)
-                            |> Yojson.Safe.to_string
-          | _ -> Alcotest.fail "legacy fixture omitted record JSON") records in
-      Logseq_db_storage.Sync_outbox_store.replace_database sqlite legacy |> T.require_ok ~behavior;
-      let inspection = inspect_mirror support behavior in
-      let reopened = Database.open_ ~sw dependencies inspection ~graph_name:"legacy-queue"
-                     |> T.require_ok ~behavior in
-      let view = Database.inspect_sync reopened |> T.require_ok ~behavior in
-      let expected = sync_token_of_string "sync-token:v1:57" |> T.require_ok ~behavior in
-      T.require (sync_token_equal expected (sync_view_token view)) "legacy migration lost global revision";
-      ignore (append_outbox_save reopened 3 behavior);
-      Database.close reopened |> T.require_ok ~behavior;
-      let again = Database.open_ ~sw dependencies (inspect_mirror support behavior)
-                    ~graph_name:"migrated-queue" |> T.require_ok ~behavior in
-      Alcotest.(check int) "migrated and new mutations all recover" 3
-        (List.length (sync_view_submissions (Database.inspect_sync again |> T.require_ok ~behavior)));
-      T.require
-        (sync_token_equal (sync_token_of_string "sync-token:v1:58" |> T.require_ok ~behavior)
-           (sync_view_token (Database.inspect_sync again |> T.require_ok ~behavior)))
-        "migrated metadata did not advance atomically";
-      Database.close again |> T.require_ok ~behavior)
+       let legacy =
+         List.map
+           (fun record ->
+              match Yojson.Safe.from_string record with
+              | `Assoc fields ->
+                `Assoc
+                  (("sync_revision", `Int 57) :: List.remove_assoc "sync_revision" fields)
+                |> Yojson.Safe.to_string
+              | _ -> Alcotest.fail "legacy fixture omitted record JSON")
+           records
+       in
+       Logseq_db_storage.Sync_outbox_store.replace_database sqlite legacy
+       |> T.require_ok ~behavior;
+       let inspection = inspect_mirror support behavior in
+       let reopened =
+         Database.open_ ~sw dependencies inspection ~graph_name:"legacy-queue"
+         |> T.require_ok ~behavior
+       in
+       let view = Database.inspect_sync reopened |> T.require_ok ~behavior in
+       let expected = sync_token_of_string "sync-token:v1:57" |> T.require_ok ~behavior in
+       T.require
+         (sync_token_equal expected (sync_view_token view))
+         "legacy migration lost global revision";
+       ignore (append_outbox_save reopened 3 behavior);
+       Database.close reopened |> T.require_ok ~behavior;
+       let again =
+         Database.open_
+           ~sw
+           dependencies
+           (inspect_mirror support behavior)
+           ~graph_name:"migrated-queue"
+         |> T.require_ok ~behavior
+       in
+       Alcotest.(check int)
+         "migrated and new mutations all recover"
+         3
+         (List.length
+            (sync_view_submissions
+               (Database.inspect_sync again |> T.require_ok ~behavior)));
+       T.require
+         (sync_token_equal
+            (sync_token_of_string "sync-token:v1:58" |> T.require_ok ~behavior)
+            (sync_view_token (Database.inspect_sync again |> T.require_ok ~behavior)))
+         "migrated metadata did not advance atomically";
+       Database.close again |> T.require_ok ~behavior)
 ;;
 
 let incremental_outbox_migration_writer_lock () =
   let behavior = "incremental outbox migration writer lock" in
-  with_outbox_write_fixture behavior
+  with_outbox_write_fixture
+    behavior
     (fun ~sw ~dependencies ~support ~path:_ ~sqlite database ->
-      ignore (append_outbox_save database 1 behavior);
-      let legacy = persisted_outbox sqlite behavior in
-      Database.close database |> T.require_ok ~behavior;
+       ignore (append_outbox_save database 1 behavior);
+       let legacy = persisted_outbox sqlite behavior in
+       Database.close database |> T.require_ok ~behavior;
        Sqlite3.Rc.check
          (Sqlite3.exec
             sqlite
             "DROP TABLE sync_outbox; DROP TABLE IF EXISTS sync_outbox_metadata; CREATE \
              TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
-      Logseq_db_storage.Sync_outbox_store.replace_database sqlite legacy |> T.require_ok ~behavior;
-      Sqlite3.Rc.check (Sqlite3.exec sqlite "BEGIN IMMEDIATE");
-      Fun.protect ~finally:(fun () -> Sqlite3.Rc.check (Sqlite3.exec sqlite "ROLLBACK"))
-        (fun () -> match Database.open_ ~sw dependencies (inspect_mirror support behavior)
-                           ~graph_name:"locked-migration" with
-          | Error _ -> ()
-          | Ok opened -> ignore (Database.close opened);
-                         Alcotest.fail "write-required migration succeeded under another writer lock");
-      Alcotest.(check (list string)) "failed migration retains complete legacy rows" legacy
-        (persisted_outbox sqlite behavior);
-      let reopened = Database.open_ ~sw dependencies (inspect_mirror support behavior)
-                       ~graph_name:"migration-retry" |> T.require_ok ~behavior in
-      Alcotest.(check int) "migration retries without losing a row" 1
-        (List.length (sync_view_submissions (Database.inspect_sync reopened |> T.require_ok ~behavior)));
-      Database.close reopened |> T.require_ok ~behavior)
+       Logseq_db_storage.Sync_outbox_store.replace_database sqlite legacy
+       |> T.require_ok ~behavior;
+       Sqlite3.Rc.check (Sqlite3.exec sqlite "BEGIN IMMEDIATE");
+       Fun.protect
+         ~finally:(fun () -> Sqlite3.Rc.check (Sqlite3.exec sqlite "ROLLBACK"))
+         (fun () ->
+            match
+              Database.open_
+                ~sw
+                dependencies
+                (inspect_mirror support behavior)
+                ~graph_name:"locked-migration"
+            with
+            | Error _ -> ()
+            | Ok opened ->
+              ignore (Database.close opened);
+              Alcotest.fail "write-required migration succeeded under another writer lock");
+       Alcotest.(check (list string))
+         "failed migration retains complete legacy rows"
+         legacy
+         (persisted_outbox sqlite behavior);
+       let reopened =
+         Database.open_
+           ~sw
+           dependencies
+           (inspect_mirror support behavior)
+           ~graph_name:"migration-retry"
+         |> T.require_ok ~behavior
+       in
+       Alcotest.(check int)
+         "migration retries without losing a row"
+         1
+         (List.length
+            (sync_view_submissions
+               (Database.inspect_sync reopened |> T.require_ok ~behavior)));
+       Database.close reopened |> T.require_ok ~behavior)
 ;;
 
 (* Database ownership cannot interpose a writer between its read and migration
    through a pure event. Exercise the public storage migration at that boundary. *)
 let incremental_outbox_migration_rejects_stale_rows () =
   let behavior = "incremental outbox migration rejects stale rows" in
-  with_outbox_write_fixture behavior
+  with_outbox_write_fixture
+    behavior
     (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
-      ignore (append_outbox_save database 1 behavior);
-      ignore (append_outbox_save database 2 behavior);
-      let all_records = persisted_outbox sqlite behavior in
-      Database.close database |> T.require_ok ~behavior;
+       ignore (append_outbox_save database 1 behavior);
+       ignore (append_outbox_save database 2 behavior);
+       let all_records = persisted_outbox sqlite behavior in
+       Database.close database |> T.require_ok ~behavior;
        Sqlite3.Rc.check
          (Sqlite3.exec
             sqlite
             "DROP TABLE sync_outbox; DROP TABLE sync_outbox_metadata; CREATE TABLE \
              sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
-      let module Store = Logseq_db_storage.Sync_outbox_store in
-      Store.replace_database sqlite [ List.hd all_records ] |> T.require_ok ~behavior;
-      let validated = Store.read_database sqlite |> T.require_ok ~behavior in
-      let rows_of records = List.map
-          (fun record ->
-             let open Yojson.Safe.Util in
-             let json = Yojson.Safe.from_string record in
-             let mutation_id =
-               json |> member "mutation" |> to_list |> fun parts ->
-               List.nth parts 1 |> member "mutation_id" |> to_string
-             in
-             Store.{ mutation_id
-                   ; sequence = json |> member "sequence" |> to_int
-                   ; record }) records in
-      let rows = rows_of validated in
-      Store.replace_database sqlite all_records |> T.require_ok ~behavior;
-      (match Store.migrate_database sqlite ~revision:0 ~expected_records:validated rows with
-       | Error _ -> ()
-       | Ok () -> Alcotest.fail "migration discarded a row added after its validated snapshot");
-      Alcotest.(check (list string)) "stale migration preserves all later rows" all_records
-        (Store.read_database sqlite |> T.require_ok ~behavior);
-      T.require (Store.read_revision sqlite |> T.require_ok ~behavior = None)
-        "stale migration must roll back its format change";
-      Store.migrate_database sqlite ~revision:0 ~expected_records:all_records (rows_of all_records)
-      |> T.require_ok ~behavior;
-      (match Store.migrate_database sqlite ~revision:0 ~expected_records:validated rows with
-       | Error _ -> ()
-       | Ok () -> Alcotest.fail "matching revision concealed stale incremental rows");
-      Alcotest.(check (list string)) "incremental stale restore preserves all rows" all_records
-        (Store.read_database sqlite |> T.require_ok ~behavior))
+       let module Store = Logseq_db_storage.Sync_outbox_store in
+       Store.replace_database sqlite [ List.hd all_records ] |> T.require_ok ~behavior;
+       let validated = Store.read_database sqlite |> T.require_ok ~behavior in
+       let rows_of records =
+         List.map
+           (fun record ->
+              let open Yojson.Safe.Util in
+              let json = Yojson.Safe.from_string record in
+              let mutation_id =
+                json
+                |> member "mutation"
+                |> to_list
+                |> fun parts -> List.nth parts 1 |> member "mutation_id" |> to_string
+              in
+              Store.
+                { mutation_id; sequence = json |> member "sequence" |> to_int; record })
+           records
+       in
+       let rows = rows_of validated in
+       Store.replace_database sqlite all_records |> T.require_ok ~behavior;
+       (match
+          Store.migrate_database sqlite ~revision:0 ~expected_records:validated rows
+        with
+        | Error _ -> ()
+        | Ok () ->
+          Alcotest.fail "migration discarded a row added after its validated snapshot");
+       Alcotest.(check (list string))
+         "stale migration preserves all later rows"
+         all_records
+         (Store.read_database sqlite |> T.require_ok ~behavior);
+       T.require
+         (Store.read_revision sqlite |> T.require_ok ~behavior = None)
+         "stale migration must roll back its format change";
+       Store.migrate_database
+         sqlite
+         ~revision:0
+         ~expected_records:all_records
+         (rows_of all_records)
+       |> T.require_ok ~behavior;
+       (match
+          Store.migrate_database sqlite ~revision:0 ~expected_records:validated rows
+        with
+        | Error _ -> ()
+        | Ok () -> Alcotest.fail "matching revision concealed stale incremental rows");
+       Alcotest.(check (list string))
+         "incremental stale restore preserves all rows"
+         all_records
+         (Store.read_database sqlite |> T.require_ok ~behavior))
 ;;
 
 let cases =
-  [ Alcotest.test_case "incremental outbox appends 1" `Quick (incremental_outbox_appends 1)
-  ; Alcotest.test_case "incremental outbox appends 32" `Quick (incremental_outbox_appends 32)
-  ; Alcotest.test_case "incremental outbox appends 1000" `Quick (incremental_outbox_appends 1000)
-  ; Alcotest.test_case "incremental outbox unchanged rows" `Quick incremental_outbox_preserves_unchanged_rows
-  ; Alcotest.test_case "incremental outbox No_change and identity" `Quick incremental_outbox_no_change_and_identity
-  ; Alcotest.test_case "incremental outbox batch updates" `Quick incremental_outbox_batch_updates
-  ; Alcotest.test_case "incremental outbox middle delete and empty revision" `Quick incremental_outbox_middle_delete_and_empty_revision
-  ; Alcotest.test_case "incremental outbox legacy migration" `Quick incremental_outbox_legacy_migration
-  ; Alcotest.test_case "incremental outbox empty revision" `Quick incremental_outbox_empty_revision
-  ; Alcotest.test_case "incremental outbox unrelated authoritative" `Quick incremental_outbox_unrelated_authoritative
-  ; Alcotest.test_case "incremental outbox migration writer lock" `Quick incremental_outbox_migration_writer_lock
-  ; Alcotest.test_case "incremental outbox migration rejects stale rows" `Quick incremental_outbox_migration_rejects_stale_rows
+  [ Alcotest.test_case
+      "incremental outbox appends 1"
+      `Quick
+      (incremental_outbox_appends 1)
+  ; Alcotest.test_case
+      "incremental outbox appends 32"
+      `Quick
+      (incremental_outbox_appends 32)
+  ; Alcotest.test_case
+      "incremental outbox appends 1000"
+      `Quick
+      (incremental_outbox_appends 1000)
+  ; Alcotest.test_case
+      "incremental outbox unchanged rows"
+      `Quick
+      incremental_outbox_preserves_unchanged_rows
+  ; Alcotest.test_case
+      "incremental outbox No_change and identity"
+      `Quick
+      incremental_outbox_no_change_and_identity
+  ; Alcotest.test_case
+      "incremental outbox batch updates"
+      `Quick
+      incremental_outbox_batch_updates
+  ; Alcotest.test_case
+      "incremental outbox middle delete and empty revision"
+      `Quick
+      incremental_outbox_middle_delete_and_empty_revision
+  ; Alcotest.test_case
+      "incremental outbox legacy migration"
+      `Quick
+      incremental_outbox_legacy_migration
+  ; Alcotest.test_case
+      "incremental outbox empty revision"
+      `Quick
+      incremental_outbox_empty_revision
+  ; Alcotest.test_case
+      "incremental outbox unrelated authoritative"
+      `Quick
+      incremental_outbox_unrelated_authoritative
+  ; Alcotest.test_case
+      "incremental outbox migration writer lock"
+      `Quick
+      incremental_outbox_migration_writer_lock
+  ; Alcotest.test_case
+      "incremental outbox migration rejects stale rows"
+      `Quick
+      incremental_outbox_migration_rejects_stale_rows
   ; Alcotest.test_case
       "legacy storage payloads roundtrip"
       `Quick
@@ -3173,6 +4169,14 @@ let cases =
       `Quick
       (snapshot_activation_installs_queryable_mirror ~extend:extend_large_snapshot)
   ; Alcotest.test_case
+      "snapshot crypto batches respect item capacity"
+      `Quick
+      snapshot_crypto_batches_respect_item_capacity
+  ; Alcotest.test_case
+      "snapshot crypto batches tighten caller bounds"
+      `Quick
+      snapshot_crypto_batches_tighten_caller_bounds
+  ; Alcotest.test_case
       "snapshot cancellation removes temporary artifacts"
       `Quick
       canceled_snapshot_activation_removes_temporary_artifacts
@@ -3196,6 +4200,10 @@ let cases =
       "snapshot checksum independent vectors"
       `Quick
       checksum_vectors_preserve_snapshot_semantics
+  ; Alcotest.test_case
+      "incremental checksum matches snapshot verification"
+      `Quick
+      incremental_checksum_matches_snapshot_verification
   ; Alcotest.test_case
       "unused preparation checksum defers invalid UTF-8"
       `Quick
@@ -3235,9 +4243,12 @@ let cases =
       duplicate_outbox_member_fails_closed
   ; Alcotest.test_case
       "noncanonical outbox payload fails closed"
-      `Quick (noncanonical_outbox_payload_fails_closed ~payload:"tampered")
-    ; Alcotest.test_case "empty outgoing transaction stays corrupt" `Quick
-        (noncanonical_outbox_payload_fails_closed ~payload:"[]")
+      `Quick
+      (noncanonical_outbox_payload_fails_closed ~payload:"tampered")
+  ; Alcotest.test_case
+      "empty outgoing transaction stays corrupt"
+      `Quick
+      (noncanonical_outbox_payload_fails_closed ~payload:"[]")
   ; Alcotest.test_case
       "inconsistent origin evidence fails closed"
       `Quick
@@ -3266,7 +4277,11 @@ let cases =
   ; Alcotest.test_case
       "authoritative checkpoint and root survive reopen"
       `Quick
-      authoritative_checkpoint_and_root_survive_reopen
+      (authoritative_checkpoint_and_root_survive_reopen ~mismatch:false)
+  ; Alcotest.test_case
+      "checksum mismatch preserves durable authoritative state"
+      `Quick
+      (authoritative_checkpoint_and_root_survive_reopen ~mismatch:true)
   ; Alcotest.test_case
       "outbox persistence failure is atomic"
       `Quick
@@ -3348,6 +4363,21 @@ let receipt_history_open_is_bounded () =
       ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
       (fun () ->
          Store.initialize_database sqlite |> T.require_ok ~behavior;
+         let empty_receipt_open_bytes =
+           Eio_main.run (fun _ ->
+             Eio.Switch.run (fun sw ->
+               let dependencies, _, inspection =
+                 location_and_inspection support behavior
+               in
+               Gc.compact ();
+               let before = Gc.allocated_bytes () in
+               let database =
+                 Database.open_ ~sw dependencies inspection ~graph_name:"receipt-history"
+                 |> T.require_ok ~behavior
+               in
+               Database.close database |> T.require_ok ~behavior;
+               Gc.allocated_bytes () -. before))
+         in
          Sqlite3.Rc.check (Sqlite3.exec sqlite "BEGIN");
          for n = 1 to 50_000 do
            let id = Printf.sprintf "10000000-0000-4000-8000-%012d" n in
@@ -3402,11 +4432,14 @@ let receipt_history_open_is_bounded () =
              let allocated_bytes = Gc.allocated_bytes () -. allocated_before in
              let peak_bytes = 8 * (!peak - baseline) in
              Printf.printf
-               "receipt history rows=100000 peak_live_growth_bytes=%d allocated_bytes=%.0f\n%!"
+               "receipt history rows=100000 peak_live_growth_bytes=%d \
+                allocated_bytes=%.0f empty_receipt_open_bytes=%.0f\n\
+                %!"
                peak_bytes
-               allocated_bytes;
+               allocated_bytes
+               empty_receipt_open_bytes;
              T.require
-               (allocated_bytes < 16. *. 1024. *. 1024.)
+               (allocated_bytes -. empty_receipt_open_bytes < 16. *. 1024. *. 1024.)
                "opening decoded historical receipt payloads";
              T.require
                (peak_bytes < 4 * 1024 * 1024)
@@ -3441,19 +4474,21 @@ let receipt_history_open_is_bounded () =
                     ~finally:(fun () -> Database.close opened |> T.require_ok ~behavior)
                     (fun () ->
                        if table = "overlay_mutation_receipts"
-                       then
+                       then (
                          match
                            Database.inspect_local_mutation
                              opened
                              (Save_block
-                                { mutation_id = T.uuid "10000000-0000-4000-8000-000000025000"
+                                { mutation_id =
+                                    T.uuid "10000000-0000-4000-8000-000000025000"
                                 ; block = T.authoritative_block_uuid
                                 ; title = "Must not replay a corrupt receipt"
                                 })
                          with
                          | Error (Local_commit_persistence_failed _) -> ()
-                         | Error _ -> Alcotest.fail "receipt lookup lost the storage cause"
-                         | Ok _ -> Alcotest.fail "corrupt receipt was treated as missing");
+                         | Error _ ->
+                           Alcotest.fail "receipt lookup lost the storage cause"
+                         | Ok _ -> Alcotest.fail "corrupt receipt was treated as missing"));
                   (match Database.collect_garbage (inspect_mirror support behavior) with
                    | Error _ -> ()
                    | Ok _ -> Alcotest.fail "garbage collection accepted invalid receipt");
@@ -3478,23 +4513,33 @@ let receipt_open_errors_are_results () =
   let behavior = "receipt open failure is a result" in
   T.with_temp_directory "receipt-open-failure-" (fun support ->
     let path = T.seed_mirror support in
-    Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
-      let dependencies, _, inspection = location_and_inspection support behavior in
-      let database = Database.open_ ~sw dependencies inspection ~graph_name:"receipt-open"
-        |> T.require_ok ~behavior in
-      let moved = path ^ ".moved" in
-      Fun.protect
-        ~finally:(fun () ->
-          Unix.rename moved path;
-          Database.close database |> T.require_ok ~behavior)
-        (fun () ->
-          Unix.rename path moved;
-          match Database.inspect_local_mutation database
-            (Save_block {mutation_id=T.uuid "10000000-0000-4000-8000-000000099999";
-              block=T.authoritative_block_uuid;title="Must not replay"}) with
-          | Error (Local_commit_persistence_failed _) -> ()
-          | Error _ -> Alcotest.fail "receipt open failure lost persistence classification"
-          | Ok _ -> Alcotest.fail "receipt open failure became absent receipt"))))
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let dependencies, _, inspection = location_and_inspection support behavior in
+        let database =
+          Database.open_ ~sw dependencies inspection ~graph_name:"receipt-open"
+          |> T.require_ok ~behavior
+        in
+        let moved = path ^ ".moved" in
+        Fun.protect
+          ~finally:(fun () ->
+            Unix.rename moved path;
+            Database.close database |> T.require_ok ~behavior)
+          (fun () ->
+             Unix.rename path moved;
+             match
+               Database.inspect_local_mutation
+                 database
+                 (Save_block
+                    { mutation_id = T.uuid "10000000-0000-4000-8000-000000099999"
+                    ; block = T.authoritative_block_uuid
+                    ; title = "Must not replay"
+                    })
+             with
+             | Error (Local_commit_persistence_failed _) -> ()
+             | Error _ ->
+               Alcotest.fail "receipt open failure lost persistence classification"
+             | Ok _ -> Alcotest.fail "receipt open failure became absent receipt"))))
 ;;
 
 let receipt_lookup_schema_errors_are_results () =
@@ -3505,10 +4550,13 @@ let receipt_lookup_schema_errors_are_results () =
       ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
       (fun () ->
          Sqlite3.Rc.check
-           (Sqlite3.exec sqlite ("CREATE TABLE " ^ table ^ " (" ^ key_column ^ " TEXT PRIMARY KEY)"));
+           (Sqlite3.exec
+              sqlite
+              ("CREATE TABLE " ^ table ^ " (" ^ key_column ^ " TEXT PRIMARY KEY)"));
          match read sqlite (String.make 64 'a') with
          | Error message ->
-           Alcotest.(check string) "missing receipt column cause is preserved"
+           Alcotest.(check string)
+             "missing receipt column cause is preserved"
              "Sqlite3.Error(\"Sqlite3.prepare: no such column: receipt\")"
              message
          | Ok _ -> Alcotest.fail "malformed receipt table was treated as an absent key")
@@ -3553,7 +4601,6 @@ let sqlite_full_int64_checkpoint () =
          "SQLite update preserves the complete cursor")
 ;;
 
-
 let storage_corruption_after_open operation () =
   let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
   let module D = Logseq_db_types.Failure_diagnostic in
@@ -3562,19 +4609,30 @@ let storage_corruption_after_open operation () =
     T.copy_storage_fixture path;
     let connection = Storage.open_database path |> Result.get_ok in
     let callbacks = Storage.connection_callbacks connection in
-    Fun.protect ~finally:(fun () -> ignore (Storage.close callbacks)) (fun () ->
-      let sqlite = Sqlite3.db_open path in
-      Sqlite3.exec sqlite "UPDATE kvs SET content = '{invalid' WHERE addr = 0" |> Sqlite3.Rc.check;
-      T.require (Sqlite3.db_close sqlite) "close corrupting writer";
-      let result = match operation with
-        | `Startup -> Result.map (fun _ -> ()) (Storage.startup_metadata connection)
-        | `Garbage -> Result.map (fun _ -> ()) (Storage.garbage_stats callbacks) in
-      match result with
-      | Ok () -> Alcotest.fail "corruption was ignored"
-      | Error error ->
-        let diagnostic = Storage.diagnostic_error ~operation:"attachGraph" error |> D.decode |> Option.get in
-        Alcotest.(check string) "read returns concrete typed cause"
-          "codecMalformedTransit" (D.reason diagnostic)))
+    Fun.protect
+      ~finally:(fun () -> ignore (Storage.close callbacks))
+      (fun () ->
+         let sqlite = Sqlite3.db_open path in
+         Sqlite3.exec sqlite "UPDATE kvs SET content = '{invalid' WHERE addr = 0"
+         |> Sqlite3.Rc.check;
+         T.require (Sqlite3.db_close sqlite) "close corrupting writer";
+         let result =
+           match operation with
+           | `Startup -> Result.map (fun _ -> ()) (Storage.startup_metadata connection)
+           | `Garbage -> Result.map (fun _ -> ()) (Storage.garbage_stats callbacks)
+         in
+         match result with
+         | Ok () -> Alcotest.fail "corruption was ignored"
+         | Error error ->
+           let diagnostic =
+             Storage.diagnostic_error ~operation:"attachGraph" error
+             |> D.decode
+             |> Option.get
+           in
+           Alcotest.(check string)
+             "read returns concrete typed cause"
+             "codecMalformedTransit"
+             (D.reason diagnostic)))
 ;;
 
 (* Commit_batch owns the sequence of persistence stages; no reducer executes
@@ -3587,29 +4645,50 @@ let storage_commit_retains_stage stage expected_reason () =
     T.copy_storage_fixture path;
     let connection = Storage.open_database path |> Result.get_ok in
     let base = Storage.connection_callbacks connection in
-    Fun.protect ~finally:(fun () -> ignore (Storage.close base)) (fun () ->
-      let fail _ = Error "SQLITE_FULL" in
-      let callbacks = match stage with
-        | `Metadata -> { base with upsert_sync_metadata = fail }
-        | `Outbox -> { base with replace_sync_outbox = fail }
-        | `Mutation -> { base with upsert_mutation_receipts = fail }
-        | `Terminal -> { base with upsert_terminal_batch_receipts = fail } in
-      let metadata = Logseq_db_types.Sync_checkpoint.create
-          ~graph_id:T.graph_uuid ~schema:Logseq_db_types.Graph_types.{ major=1; minor=0 }
-          ~applied_server_t:(server_cursor_of_int 0) ~checksum:"0000000000000000"
-        |> Result.get_ok in
-      let batch = Storage.{ writes=[];
-        sync_metadata=(if stage=`Metadata then Some metadata else None);
-        sync_outbox=(if stage=`Outbox then Some [] else None);
-        mutation_receipts=(if stage=`Mutation then Some [] else None);
-        terminal_batch_receipts=(if stage=`Terminal then Some [] else None) } in
-      match Storage.commit_batch callbacks batch with
-      | Ok () -> Alcotest.fail "failed persistence stage was ignored"
-      | Error error ->
-        let diagnostic = Storage.diagnostic_error ~operation:"commitLocal" error
-          |> D.decode |> Option.get in
-        Alcotest.(check string) "failing commit stage" expected_reason (D.reason diagnostic);
-        Alcotest.(check string) "underlying SQLite cause" "sqlite-full" (D.source_class diagnostic)))
+    Fun.protect
+      ~finally:(fun () -> ignore (Storage.close base))
+      (fun () ->
+         let fail _ = Error "SQLITE_FULL" in
+         let callbacks =
+           match stage with
+           | `Metadata -> { base with upsert_sync_metadata = fail }
+           | `Outbox -> { base with replace_sync_outbox = fail }
+           | `Mutation -> { base with upsert_mutation_receipts = fail }
+           | `Terminal -> { base with upsert_terminal_batch_receipts = fail }
+         in
+         let metadata =
+           Logseq_db_types.Sync_checkpoint.create
+             ~graph_id:T.graph_uuid
+             ~schema:Logseq_db_types.Graph_types.{ major = 1; minor = 0 }
+             ~applied_server_t:(server_cursor_of_int 0)
+             ~checksum:"0000000000000000"
+           |> Result.get_ok
+         in
+         let batch =
+           Storage.
+             { writes = []
+             ; sync_metadata = (if stage = `Metadata then Some metadata else None)
+             ; sync_outbox = (if stage = `Outbox then Some [] else None)
+             ; mutation_receipts = (if stage = `Mutation then Some [] else None)
+             ; terminal_batch_receipts = (if stage = `Terminal then Some [] else None)
+             }
+         in
+         match Storage.commit_batch callbacks batch with
+         | Ok () -> Alcotest.fail "failed persistence stage was ignored"
+         | Error error ->
+           let diagnostic =
+             Storage.diagnostic_error ~operation:"commitLocal" error
+             |> D.decode
+             |> Option.get
+           in
+           Alcotest.(check string)
+             "failing commit stage"
+             expected_reason
+             (D.reason diagnostic);
+           Alcotest.(check string)
+             "underlying SQLite cause"
+             "sqlite-full"
+             (D.source_class diagnostic)))
 ;;
 
 let codec_preserves_structural_cause () =
@@ -3618,7 +4697,9 @@ let codec_preserves_structural_cause () =
   | Ok _ -> Alcotest.fail "unknown storage map was accepted"
   | Error error ->
     let diagnostic = Codec.diagnostic_error error |> D.decode |> Option.get in
-    Alcotest.(check string) "concrete structural cause" "storage-payload-map-shape"
+    Alcotest.(check string)
+      "concrete structural cause"
+      "storage-payload-map-shape"
       (D.source_class diagnostic)
 ;;
 
@@ -3630,39 +4711,92 @@ let storage_rollback_retains_primary () =
     T.copy_storage_fixture path;
     let connection = Storage.open_database path |> Result.get_ok in
     let base = Storage.connection_callbacks connection in
-    Fun.protect ~finally:(fun () -> ignore (Storage.close base)) (fun () ->
-      let callbacks = { base with
-        upsert = (fun _ -> Error "SQLITE_FULL");
-        rollback = (fun () -> base.rollback (); failwith "SQLITE_BUSY") } in
-      let batch = Storage.{ writes=[{address="0";payload="";addresses=[]}];
-        sync_metadata=None;sync_outbox=None;mutation_receipts=None;terminal_batch_receipts=None } in
-      match Storage.commit_batch callbacks batch with
-      | Error (Storage.Write_failed _ as error) ->
-        let diagnostic = Storage.diagnostic_error ~operation:"commitLocal" error |> D.decode |> Option.get in
-        Alcotest.(check string) "primary write cause" "sqlite-full" (D.source_class diagnostic);
-        let secondary = D.related diagnostic |> Option.get in
-        Alcotest.(check string) "rollback stage" "storageRollbackFailed" (D.reason secondary);
-        Alcotest.(check string) "rollback cause" "sqlite-locked" (D.source_class secondary)
-      | _ -> Alcotest.fail "rollback replaced the primary typed write error"))
+    Fun.protect
+      ~finally:(fun () -> ignore (Storage.close base))
+      (fun () ->
+         let callbacks =
+           { base with
+             upsert = (fun _ -> Error "SQLITE_FULL")
+           ; rollback =
+               (fun () ->
+                 base.rollback ();
+                 failwith "SQLITE_BUSY")
+           }
+         in
+         let batch =
+           Storage.
+             { writes = [ { address = "0"; payload = ""; addresses = [] } ]
+             ; sync_metadata = None
+             ; sync_outbox = None
+             ; mutation_receipts = None
+             ; terminal_batch_receipts = None
+             }
+         in
+         match Storage.commit_batch callbacks batch with
+         | Error (Storage.Write_failed _ as error) ->
+           let diagnostic =
+             Storage.diagnostic_error ~operation:"commitLocal" error
+             |> D.decode
+             |> Option.get
+           in
+           Alcotest.(check string)
+             "primary write cause"
+             "sqlite-full"
+             (D.source_class diagnostic);
+           let secondary = D.related diagnostic |> Option.get in
+           Alcotest.(check string)
+             "rollback stage"
+             "storageRollbackFailed"
+             (D.reason secondary);
+           Alcotest.(check string)
+             "rollback cause"
+             "sqlite-locked"
+             (D.source_class secondary)
+         | _ -> Alcotest.fail "rollback replaced the primary typed write error"))
 ;;
 
 let related_diagnostic_validation () =
   let module D = Logseq_db_types.Failure_diagnostic in
-  let primary = D.create ~operation:"closeDatabase" ~reason:"storageCheckpointFailed"
-      ~source:"SQLITE_FULL" ~cursor:Int64.max_int ~http_status:599 () in
-  let secondary = D.create ~operation:"closeDatabase" ~reason:"storageCloseFailed"
-      ~source:"SQLITE_BUSY" ~cursor:Int64.max_int ~http_status:599 () in
+  let primary =
+    D.create
+      ~operation:"closeDatabase"
+      ~reason:"storageCheckpointFailed"
+      ~source:"SQLITE_FULL"
+      ~cursor:Int64.max_int
+      ~http_status:599
+      ()
+  in
+  let secondary =
+    D.create
+      ~operation:"closeDatabase"
+      ~reason:"storageCloseFailed"
+      ~source:"SQLITE_BUSY"
+      ~cursor:Int64.max_int
+      ~http_status:599
+      ()
+  in
   let encoded = D.with_related primary secondary |> D.encode in
   T.require (String.length encoded <= 1024) "dual diagnostic exceeds wire budget";
-  T.require (String.length (D.message (D.with_related primary secondary)) <= 512)
+  T.require
+    (String.length (D.message (D.with_related primary secondary)) <= 512)
     "dual diagnostic exceeds display budget";
   let prefix = "journal-failure:v1:" in
-  let fields = match Yojson.Safe.from_string
-      (String.sub encoded (String.length prefix) (String.length encoded - String.length prefix)) with
-    | `Assoc fields -> fields | _ -> assert false in
+  let fields =
+    match
+      Yojson.Safe.from_string
+        (String.sub
+           encoded
+           (String.length prefix)
+           (String.length encoded - String.length prefix))
+    with
+    | `Assoc fields -> fields
+    | _ -> assert false
+  in
   let reject fields =
-    T.require (D.decode (prefix ^ Yojson.Safe.to_string (`Assoc fields)) = None)
-      "unsafe related diagnostic was accepted" in
+    T.require
+      (D.decode (prefix ^ Yojson.Safe.to_string (`Assoc fields)) = None)
+      "unsafe related diagnostic was accepted"
+  in
   reject (("related", `String (D.encode secondary)) :: fields);
   reject (("unexpected", `String "SECRET") :: fields);
   reject (("related", `String "SECRET") :: List.remove_assoc "related" fields);
@@ -3671,8 +4805,12 @@ let related_diagnostic_validation () =
 
 let diagnostic_unix_cause error expected () =
   let module D = Logseq_db_types.Failure_diagnostic in
-  let source = Printexc.to_string (Unix.Unix_error (error, "SECRET-operation", "SECRET-path")) in
-  let diagnostic = D.of_source ~operation:"workerOperation" ~reason:"persistenceFailed" source in
+  let source =
+    Printexc.to_string (Unix.Unix_error (error, "SECRET-operation", "SECRET-path"))
+  in
+  let diagnostic =
+    D.of_source ~operation:"workerOperation" ~reason:"persistenceFailed" source
+  in
   Alcotest.(check string) "concrete errno" expected (D.source_class diagnostic);
   let encoded = D.encode diagnostic in
   Alcotest.(check bool) "no exception argument" false (String.contains encoded 'S')
@@ -3689,28 +4827,48 @@ let storage_close_retains_both_causes ~checkpoint_raises () =
     T.copy_storage_fixture path;
     let connection = Storage.open_database path |> Result.get_ok in
     let base = Storage.connection_callbacks connection in
-    let callbacks = { base with
-      checkpoint = (fun () -> if checkpoint_raises then failwith "SQLITE_FULL" else Error "SQLITE_FULL");
-      close = (fun () -> ignore (Storage.close base); Error "SQLITE_BUSY") } in
+    let callbacks =
+      { base with
+        checkpoint =
+          (fun () ->
+            if checkpoint_raises then failwith "SQLITE_FULL" else Error "SQLITE_FULL")
+      ; close =
+          (fun () ->
+            ignore (Storage.close base);
+            Error "SQLITE_BUSY")
+      }
+    in
     let session = Session.create ~tail:[] ~callbacks in
     match Session.close session with
     | Error (Session.Persistence_failed encoded) ->
-      let diagnostic = match D.decode encoded with
+      let diagnostic =
+        match D.decode encoded with
         | Some value -> value
-        | None -> Alcotest.fail "dual failure destroyed the structured carrier" in
-      Alcotest.(check string) "checkpoint stage" "storageCheckpointFailed" (D.reason diagnostic);
+        | None -> Alcotest.fail "dual failure destroyed the structured carrier"
+      in
+      Alcotest.(check string)
+        "checkpoint stage"
+        "storageCheckpointFailed"
+        (D.reason diagnostic);
       Alcotest.(check string) "checkpoint cause" "sqlite-full" (D.source_class diagnostic);
       let secondary = D.related diagnostic |> Option.get in
       Alcotest.(check string) "close stage" "storageCloseFailed" (D.reason secondary);
       Alcotest.(check string) "close cause" "sqlite-locked" (D.source_class secondary);
-      let wrapped = D.of_source ~operation:"attachGraph" ~reason:"resourceFailed" encoded in
-      Alcotest.(check string) "upper wrapper retains secondary" "storageCloseFailed"
+      let wrapped =
+        D.of_source ~operation:"attachGraph" ~reason:"resourceFailed" encoded
+      in
+      Alcotest.(check string)
+        "upper wrapper retains secondary"
+        "storageCloseFailed"
         (D.reason (D.related wrapped |> Option.get));
       let message = D.message diagnostic in
       let contains text =
-        let rec loop n = n + String.length text <= String.length message
-          && (String.sub message n (String.length text) = text || loop (n + 1)) in
-        loop 0 in
+        let rec loop n =
+          n + String.length text <= String.length message
+          && (String.sub message n (String.length text) = text || loop (n + 1))
+        in
+        loop 0
+      in
       T.require (contains "close" && contains "locked") "close cause was discarded"
     | _ -> Alcotest.fail "close errors were lost")
 ;;
@@ -3736,44 +4894,85 @@ let storage_open_preserves_codec_cause content expected_reason () =
     | Error error ->
       let encoded = Storage.diagnostic_error ~operation:"attachGraph" error in
       let diagnostic = D.decode encoded |> Option.get in
-      Alcotest.(check string) "concrete codec cause survives storage boundary"
-        expected_reason (D.reason diagnostic);
+      Alcotest.(check string)
+        "concrete codec cause survives storage boundary"
+        expected_reason
+        (D.reason diagnostic);
       let rec contains_secret offset =
         offset + 6 <= String.length encoded
         && (String.sub encoded offset 6 = "SECRET" || contains_secret (offset + 1))
       in
-      T.require (not (contains_secret 0))
-        "diagnostic must not include synthetic secret")
+      T.require (not (contains_secret 0)) "diagnostic must not include synthetic secret")
 ;;
 
 let () =
   Alcotest.run
     "logseq_overlay_db storage"
     [ ( "storage error causes"
-      , [ Alcotest.test_case "codec structural cause" `Quick codec_preserves_structural_cause
-        ; Alcotest.test_case "rollback retains primary cause" `Quick storage_rollback_retains_primary
-        ; Alcotest.test_case "related diagnostic validates and bounds input" `Quick related_diagnostic_validation
-        ; Alcotest.test_case "startup corruption returns result" `Quick
+      , [ Alcotest.test_case
+            "codec structural cause"
+            `Quick
+            codec_preserves_structural_cause
+        ; Alcotest.test_case
+            "rollback retains primary cause"
+            `Quick
+            storage_rollback_retains_primary
+        ; Alcotest.test_case
+            "related diagnostic validates and bounds input"
+            `Quick
+            related_diagnostic_validation
+        ; Alcotest.test_case
+            "startup corruption returns result"
+            `Quick
             (storage_corruption_after_open `Startup)
-        ; Alcotest.test_case "garbage traversal corruption returns result" `Quick
+        ; Alcotest.test_case
+            "garbage traversal corruption returns result"
+            `Quick
             (storage_corruption_after_open `Garbage)
-        ; Alcotest.test_case "metadata commit stage" `Quick
+        ; Alcotest.test_case
+            "metadata commit stage"
+            `Quick
             (storage_commit_retains_stage `Metadata "storageMetadataFailed")
-        ; Alcotest.test_case "outbox commit stage" `Quick
+        ; Alcotest.test_case
+            "outbox commit stage"
+            `Quick
             (storage_commit_retains_stage `Outbox "storageOutboxFailed")
-        ; Alcotest.test_case "mutation receipt commit stage" `Quick
+        ; Alcotest.test_case
+            "mutation receipt commit stage"
+            `Quick
             (storage_commit_retains_stage `Mutation "storageMutationReceiptFailed")
-        ; Alcotest.test_case "terminal receipt commit stage" `Quick
+        ; Alcotest.test_case
+            "terminal receipt commit stage"
+            `Quick
             (storage_commit_retains_stage `Terminal "storageTerminalReceiptFailed")
-        ; Alcotest.test_case "Unix I/O failure" `Quick (diagnostic_unix_cause Unix.EIO "io-error")
-        ; Alcotest.test_case "Unix connection reset" `Quick (diagnostic_unix_cause Unix.ECONNRESET "network-reset")
-        ; Alcotest.test_case "close retains both failures" `Quick (storage_close_retains_both_causes ~checkpoint_raises:false)
-        ; Alcotest.test_case "throwing checkpoint still closes" `Quick
+        ; Alcotest.test_case
+            "Unix I/O failure"
+            `Quick
+            (diagnostic_unix_cause Unix.EIO "io-error")
+        ; Alcotest.test_case
+            "Unix connection reset"
+            `Quick
+            (diagnostic_unix_cause Unix.ECONNRESET "network-reset")
+        ; Alcotest.test_case
+            "close retains both failures"
+            `Quick
+            (storage_close_retains_both_causes ~checkpoint_raises:false)
+        ; Alcotest.test_case
+            "throwing checkpoint still closes"
+            `Quick
             (storage_close_retains_both_causes ~checkpoint_raises:true)
-        ; Alcotest.test_case "malformed Transit survives open" `Quick
-            (storage_open_preserves_codec_cause "{SECRET-synthetic-invalid" "codecMalformedTransit")
-        ; Alcotest.test_case "unsupported tag survives open" `Quick
-            (storage_open_preserves_codec_cause {|["~#SECRET-synthetic-tag","SECRET"]|} "codecUnsupportedTag")
+        ; Alcotest.test_case
+            "malformed Transit survives open"
+            `Quick
+            (storage_open_preserves_codec_cause
+               "{SECRET-synthetic-invalid"
+               "codecMalformedTransit")
+        ; Alcotest.test_case
+            "unsupported tag survives open"
+            `Quick
+            (storage_open_preserves_codec_cause
+               {|["~#SECRET-synthetic-tag","SECRET"]|}
+               "codecUnsupportedTag")
         ] )
     ; ( "legacy status compatibility"
       , [ Alcotest.test_case
@@ -3782,11 +4981,26 @@ let () =
             pre_uuid_status_outbox_preserves_identity
         ] )
     ; ( "receipt history"
-      , [ Alcotest.test_case "bounded opening and fail-closed validation" `Quick receipt_history_open_is_bounded
-        ; Alcotest.test_case "writer schema failure is atomic" `Quick receipt_writer_schema_failure_is_atomic
-        ; Alcotest.test_case "writer schema errors are results" `Quick receipt_writer_schema_errors_are_results
-        ; Alcotest.test_case "lookup schema errors are results" `Quick receipt_lookup_schema_errors_are_results
-        ; Alcotest.test_case "open errors are results" `Quick receipt_open_errors_are_results
+      , [ Alcotest.test_case
+            "bounded opening and fail-closed validation"
+            `Quick
+            receipt_history_open_is_bounded
+        ; Alcotest.test_case
+            "writer schema failure is atomic"
+            `Quick
+            receipt_writer_schema_failure_is_atomic
+        ; Alcotest.test_case
+            "writer schema errors are results"
+            `Quick
+            receipt_writer_schema_errors_are_results
+        ; Alcotest.test_case
+            "lookup schema errors are results"
+            `Quick
+            receipt_lookup_schema_errors_are_results
+        ; Alcotest.test_case
+            "open errors are results"
+            `Quick
+            receipt_open_errors_are_results
         ] )
     ; ( "cursor checkpoint"
       , [ Alcotest.test_case
@@ -3801,8 +5015,10 @@ let () =
     ; "snapshot UUID metadata", snapshot_uuid_metadata_cases
     ; ( "mirror and durability"
       , cases
-        @ [ Alcotest.test_case "committed deletion survives unavailable warning output" `Quick
-                (retired_cleanup_retries_without_touching_a_new_mirror ~closed_stderr:true)
+        @ [ Alcotest.test_case
+              "committed deletion survives unavailable warning output"
+              `Quick
+              (retired_cleanup_retries_without_touching_a_new_mirror ~closed_stderr:true)
           ; Alcotest.test_case
               "legacy post-rename retirement replays"
               `Quick
