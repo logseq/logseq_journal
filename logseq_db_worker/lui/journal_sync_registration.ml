@@ -21,6 +21,7 @@ type entry =
   { scope : Sync.graph_scope
   ; core : Lifecycle.t
   ; mutable opened : Pure.database_opened option
+  ; mutable attachment_error : Dsl.error option
   ; mutable status : Lifecycle.Service.status option
   ; mutable local_key_attempted : bool
   ; mutable retiring : bool
@@ -146,7 +147,7 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
   in
   let publish () =
     match !worker, !baseline, !controller with
-    | Some worker, Some initial, Some account ->
+    | Some worker, Some (initial : Sync.state), Some account ->
       let entries = ref (List.filter (fun entry -> not entry.retiring) !entries) in
       List.iter restore_key !entries;
       List.iter
@@ -154,15 +155,30 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
            match entry.opened with
            | Some _ -> ()
            | None ->
-             (match
-                Worker.attach_database_owner
-                  worker
-                  ~scope:entry.scope
-                  (Lifecycle.database_owner entry.core)
-              with
-              | Ok opened -> entry.opened <- Some opened
-              | Error _ -> ()))
+             let owner = Lifecycle.database_owner entry.core in
+             let attached =
+               let* database = Execute.Core.database_if_open owner in
+               match database with
+               | None -> Ok None
+               | Some _ when entry.retiring -> Ok None
+               | Some _ ->
+                 Worker.attach_database_owner worker ~scope:entry.scope owner
+                 |> Result.map Option.some
+                 |> Result.map_error storage_error
+             in
+             (match attached with
+              | Ok (Some _) when entry.retiring || !stopped ->
+                (match Worker.detach_database_owner worker ~scope:entry.scope with
+                 | Ok () -> ()
+                 | Error message ->
+                   failure := Some (storage_error message);
+                   notify ())
+              | Ok opened ->
+                entry.opened <- opened;
+                entry.attachment_error <- None
+              | Error error -> entry.attachment_error <- Some error))
         !entries;
+      entries := List.filter (fun entry -> (not entry.retiring) && not !stopped) !entries;
       let selected_id = Account.selected account in
       let selected =
         List.find_opt (fun entry -> Some entry.scope.graph_id = selected_id) !entries
@@ -178,10 +194,10 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
             | _ -> observed.state.last_failure)
         in
         let last_error =
-          match last_error, !failure with
-          | Some _, _ -> last_error
-          | None, Some message -> Some (Dsl.Crypto_failure message)
-          | None, None -> None
+          match entry.attachment_error, last_error, !failure with
+          | Some error, _, _ -> Some error
+          | None, Some _, _ -> last_error
+          | None, None, failure -> failure
         in
         let phase =
           match observed with
@@ -197,9 +213,13 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
              | Service_online ->
                if observed.state.pending_submissions > 0 then Submitting else Pulling)
         in
+        let phase =
+          if Option.is_some entry.attachment_error || Option.is_some !failure
+          then Sync.Failed
+          else phase
+        in
         let startup =
-          { initial.Sync.snapshot.startup with
-            authenticated = !authenticated
+          { Sync.authenticated = !authenticated
           ; account_generation = entry.scope.account.account_generation
           ; graph_generation = entry.scope.graph_generation
           ; presentation_generation = !presentation
@@ -209,7 +229,12 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
           ; catalog_loading = false
           ; awaiting_selection = false
           ; restoring_local = false
-          ; bootstrapping = Option.is_none entry.opened
+          ; bootstrapping =
+              Option.is_none entry.opened && Option.is_none entry.attachment_error
+          ; failure =
+              (if Option.is_some entry.attachment_error
+               then Some Sync.During_bootstrap
+               else initial.snapshot.startup.failure)
           ; awaiting_e2ee_password =
               Option.fold
                 ~none:false
@@ -217,8 +242,18 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
                 observed
           }
         in
-        { initial with
-          snapshot =
+        { Sync.diagnostics =
+            (match entry.attachment_error with
+             | None -> initial.diagnostics
+             | Some error ->
+               { groups =
+                   initial.diagnostics.groups
+                   @ [ { Sync.title = "Worker errors"
+                       ; entries = [ "attachDatabaseOwner", error_message error ]
+                       }
+                     ]
+               })
+        ; snapshot =
             { initial.snapshot with
               sync_phase = phase
             ; catalog = Account.catalog account
@@ -258,7 +293,7 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
                   ; presentation_generation = !presentation
                   ; awaiting_selection = !user <> None
                   }
-              ; last_error = !failure
+              ; last_error = Option.map error_message !failure
               ; last_error_attention =
                   Option.map (fun _ -> Sync.Requires_attention) !failure
               }
@@ -408,13 +443,14 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
                 on_change status;
                 notify ())
               ~on_error:(fun error ->
-                failure := Some (error_message error);
+                failure := Some error;
                 notify ())
           in
           let entry =
             { scope
             ; core
             ; opened = None
+            ; attachment_error = None
             ; status = !pending
             ; local_key_attempted = false
             ; retiring = false
@@ -580,7 +616,7 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
          failure := None;
          notify ()
        | Error error ->
-         failure := Some (error_message error);
+         failure := Some error;
          notify ());
       result)
   in
@@ -1020,7 +1056,7 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
        | Sync_intent value -> ignore (event (Pure.Sync_event value))
        | Foreground_intent foreground -> ignore (event (Pure.Set_foreground foreground))
        | Stop_intent -> shutdown ());
-      publish ();
+      notify ();
       if not !stopped then loop ()
     in
     loop ());
@@ -1029,7 +1065,7 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
     then
       if Eio.Stream.length intents >= 256
       then (
-        failure := Some "The account command queue is full.";
+        failure := Some (Dsl.Capacity_exceeded "The account command queue is full.");
         notify ())
       else Eio.Stream.add intents intent
   in

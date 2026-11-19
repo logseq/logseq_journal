@@ -830,6 +830,8 @@ let native_service_bootstrap ?(checksum_mode = `Valid) () =
                 }
               in
               let errors = ref [] in
+              let observed_checkpoint = ref None in
+              let returned = ref false in
               let service =
                 get
                   (App.start_owned_native
@@ -854,11 +856,20 @@ let native_service_bootstrap ?(checksum_mode = `Valid) () =
                      ~encrypted:false
                      ~token:(fun ~epoch:_ ~refresh:_ -> Ok "synthetic-fixture-token")
                      ~on_change:(fun status ->
-                       match status.Logseq_sync_sync_service.Core.observation.status with
+                       Alcotest.(check bool)
+                         "startup callback follows return"
+                         true
+                         !returned;
+                       let observation =
+                         status.Logseq_sync_sync_service.Core.observation
+                       in
+                       observed_checkpoint := observation.state.checkpoint;
+                       match observation.status with
                        | D.Service_blocked error -> errors := error :: !errors
                        | _ -> ())
                      ~on_error:(fun error -> errors := error :: !errors))
               in
+              returned := true;
               Fun.protect
                 ~finally:(fun () -> App.close service)
                 (fun () ->
@@ -888,8 +899,7 @@ let native_service_bootstrap ?(checksum_mode = `Valid) () =
                           :: _ -> Alcotest.fail ("Activation persistence: " ^ message)
                         | error :: _ -> Alcotest.fail (D.error_message error)
                         | [] -> ());
-                       Option.is_some
-                         (get (X.database_if_open (App.database_owner service))));
+                       Option.is_some !observed_checkpoint);
                      let database = get (X.database (App.database_owner service)) in
                      let view = Result.get_ok (Database.inspect_sync database) in
                      Alcotest.(check int64)

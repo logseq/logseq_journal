@@ -3326,7 +3326,7 @@ let test_native_registration_network_epochs () =
   let module Pure = Logseq_db_worker.Pure_reducer in
   let exception Finished in
   T.with_managed (fun fixture -> with_service_fixture (fun _ config ->
-    Eio_main.run (fun environment -> try Eio.Switch.run (fun sw ->
+    Eio_main.run (fun environment -> Eio.Time.with_timeout_exn (Eio.Stdenv.clock environment) 10. (fun () -> try Eio.Switch.run (fun sw ->
       let epochs = ref [] in
       let expected_generation = ref 1 in
       let bridge = Registration.create ~sw
@@ -3337,14 +3337,36 @@ let test_native_registration_network_epochs () =
           require (account_generation= !expected_generation) "network reopen changed token account identity";
           epochs := epoch :: !epochs;
           Error (Authentication_failure "Synthetic token rejection")) () |> Result.get_ok in
-      Fun.protect ~finally:bridge.shutdown (fun () ->
+      let module Db = Logseq_db_worker in
+      let module Runner = Db.Effect_runner in
+      let limits = Sync.limits ~maximum_response_bytes:config.response_budget_bytes
+        ~maximum_artifact_bytes:1048576 ~submission_batch_size:16 |> Result.get_ok in
+      let sync = Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io")
+        ~limits |> Result.get_ok in
+      let runtime = Runner.runtime ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
+        ~sleep:(Eio.Time.sleep (Eio.Stdenv.clock environment)) |> Result.get_ok in
+      let dependencies = Runner.dependencies ~runtime ~config ~overlay:fixture.overlay
+        ~services:bridge.services ~publish:(fun _ -> ()) |> Result.get_ok in
+      let worker = Db.create_lifecycle ~sw ~config:(Pure.config ~worker:config ~sync)
+        ~runner_dependencies:dependencies |> Result.get_ok in
+      bridge.bind worker;
+      Fun.protect ~finally:(fun () -> Db.shutdown worker) (fun () ->
         let settle () = for _ = 1 to 200 do Eio.Fiber.yield () done in
         let intent event = bridge.lifecycle (Pure.Sync_intent event); settle () in
         intent (Sync.Restore_local_account {user_id="user-1"});
+        require ((Db.graph_state worker).phase = Db.Graph_open)
+          "native registration did not hand the local mirror to Worker";
+        require (not (Db.view worker).sync.snapshot.startup.bootstrapping)
+          "native registration left an attached mirror bootstrapping";
         let scope : Sync.startup_scope = {account_generation=1;presentation_generation=1} in
         intent (Sync.Sign_in_requested scope);
         intent (Sync.Account_authenticated {user_id=Some "user-1"});
         require (!epochs<>[]) "native registration did not request a token";
+        let snapshot = (Db.view worker).sync.snapshot in
+        require (snapshot.last_error = Some "Synthetic token rejection")
+          "native registration lost the actual failure";
+        require (snapshot.sync_phase = Sync.Failed)
+          "native registration reports a failure as connecting";
         let previous = ref (List.hd !epochs) in
         let reopened label =
           epochs:=[];
@@ -3405,7 +3427,7 @@ let test_native_registration_network_epochs () =
         epochs:=[];
         intent (Sync.Catalog_refresh_requested current);
         require (!epochs<>[] && List.hd !epochs=epoch) "old account controls changed new account gate");
-      Eio.Switch.fail sw Finished) with Finished -> ())))
+      Eio.Switch.fail sw Finished) with Finished -> ()))))
 ;;
 
 let test_native_service_rejects_stale_network_commands () =
