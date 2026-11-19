@@ -1352,7 +1352,11 @@ let test_real_auth_control ~transition () =
          Atomic.set pause false;
          if transition = `Late_restore then (
            control_wait "local reset closes network permission" (fun () ->
-             drain (); !account_generation > initial_account_generation && not !authenticated);
+             drain ();
+             !account_generation > initial_account_generation
+             && Option.exists
+                  (fun startup -> startup.Service.network_phase = Service.Local_only)
+                  !current_startup);
            permit_online ();
            reconcile ());
          let retry_permitted = ref false in
