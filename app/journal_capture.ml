@@ -102,6 +102,7 @@ type t =
   ; phase : phase
   ; pending : Journal_graph_request.t option
   ; submitted_source : string option
+  ; checkpoint_suppressed : bool
   ; retry_identity_locked : bool
   ; retained_chain : Journal_graph_mutation_confirmation.Pure_insertion.t option
   ; pending_attachments : Journal_asset_import.staged list
@@ -113,6 +114,7 @@ let create ~session_number ~source =
   ; phase = Editing
   ; pending = None
   ; submitted_source = None
+  ; checkpoint_suppressed = false
   ; retry_identity_locked = false
   ; retained_chain = None
   ; pending_attachments = []
@@ -140,15 +142,17 @@ let rebind t ~session_number =
 
 let phase t = t.phase
 let retry_identity_locked t = t.retry_identity_locked
+let can_checkpoint t =
+  not t.checkpoint_suppressed && not t.retry_identity_locked && t.phase <> Saving
 let lock_for_retry t = { t with retry_identity_locked = true }
 let release_rejected_attempt t = {t with retry_identity_locked=false;pending=None;submitted_source=None;retained_chain=None;phase=Editing}
-let begin_submission t = {t with submitted_source=Some(source t);phase=Saving;retry_identity_locked=true}
+let begin_submission t = {t with submitted_source=Some(source t);checkpoint_suppressed=true;phase=Saving;retry_identity_locked=true}
 let await_confirmation t =
   if t.submitted_source=None then t else {t with phase=Saving;retry_identity_locked=true}
 let finish_submission t =
   match t.submitted_source with
   |Some submitted when submitted<>source t->
-    Some{t with submitted_source=None;phase=Editing;pending=None;retry_identity_locked=false;
+    Some{t with submitted_source=None;checkpoint_suppressed=false;phase=Editing;pending=None;retry_identity_locked=false;
       retained_chain=None;pending_attachments=[]}
   |_->None
 
@@ -225,18 +229,20 @@ let add_attachment t staged =
   if can_attach t && not duplicate
   then (
     let t = replace_attempt t in
-    { t with pending_attachments = t.pending_attachments @ [ staged ] })
+    { t with pending_attachments = t.pending_attachments @ [ staged ]; checkpoint_suppressed = false })
   else t
 ;;
 
 let remove_attachment t ~token =
   if t.submitted_source<>None then t else
-  { t with
-    pending_attachments =
-      List.filter
-        (fun staged ->
-           not (String.equal (Journal_asset_import.staged_token staged) token))
-        t.pending_attachments
+  let pending_attachments =
+    List.filter
+      (fun staged ->
+         not (String.equal (Journal_asset_import.staged_token staged) token))
+      t.pending_attachments
+  in
+  { t with pending_attachments;
+    checkpoint_suppressed = t.checkpoint_suppressed && pending_attachments = t.pending_attachments
   }
 ;;
 
@@ -246,9 +252,9 @@ let clear_attachments t =
 
 let update_source t ~source:new_source =
   if String.equal (source t) new_source then t
-  else if t.submitted_source<>None then {t with editor=Editor.replace t.editor ~source:new_source}
+  else if t.submitted_source<>None then {t with editor=Editor.replace t.editor ~source:new_source;checkpoint_suppressed=false}
   else if t.retry_identity_locked || t.phase=Saving then t
-  else let t=replace_attempt t in {t with editor=Editor.replace t.editor ~source:new_source}
+  else let t=replace_attempt t in {t with editor=Editor.replace t.editor ~source:new_source;checkpoint_suppressed=false}
 ;;
 
 let with_task_state t task_state =
@@ -273,7 +279,7 @@ let with_task_state t task_state =
     { t with task_state; pending })
   else (
     let t = replace_attempt t in
-    { t with task_state })
+    { t with task_state; checkpoint_suppressed = false })
 ;;
 
 let toggle_task_intent t =
@@ -286,9 +292,11 @@ let toggle_task_intent t =
 
 let apply_text_edit t edit =
   match Editor.apply_text_edit t.editor edit with
-  | Some editor when t.submitted_source<>None -> {t with editor}
+  | Some editor when t.submitted_source<>None ->
+    {t with editor;checkpoint_suppressed=t.checkpoint_suppressed && String.equal (source t) (Editor.source editor)}
   | Some editor when t.phase <> Saving && not t.retry_identity_locked ->
-    { t with editor; phase = Editing; pending = None }
+    { t with editor; phase = Editing; pending = None;
+      checkpoint_suppressed = t.checkpoint_suppressed && String.equal (source t) (Editor.source editor) }
   | Some _ -> t
   | None -> t
 ;;

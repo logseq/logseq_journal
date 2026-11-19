@@ -76,7 +76,8 @@ val decode_authenticated_scope : bytes -> (Logseq_db_worker_lui.Logseq_db_worker
     publication, orphan cleanup is best-effort and cannot turn success into an
     error; a later save retries cleanup. Save/discard replace the snapshot;
     [clear] removes only this account's owned files. Caller serializes operations
-    and reports errors. Recovered interrupted saves remain locked. *)
+    and reports errors. Submitted drafts are omitted; loading removes legacy
+    interrupted drafts without restoring submission authority. *)
 module Draft_store : sig
   type t
   type draft = { graph : string; parent : string option; capture : Journal_capture.t }

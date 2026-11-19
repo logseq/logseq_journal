@@ -7603,7 +7603,7 @@ let start
         {root with resident_states=Graph_drafts.add key next root.resident_states} in
       ignore(checkpoint_drafts snapshot);
       match !draft_writer with
-      |None->Error "A durable draft lock could not be created for this account."
+      |None->Error "The submitted draft could not be removed for this account."
       |Some writer when not !draft_storage_blocked->
         (match Draft_store.Writer.enqueue writer (fun()->draft_snapshot snapshot) with
         |Error cause->Error cause |Ok()->flush_drafts())

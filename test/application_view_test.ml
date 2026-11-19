@@ -1815,14 +1815,12 @@ let run_favorites_native_visibility
               let store=Drafts.create ~directory:support_directory
                 ~binding:{user_id="fixture";managed_sync_origin="https://example.invalid"} in
               let recovered=Result.get_ok(Drafts.load store) in
-              let locked=List.exists(fun(draft:Drafts.draft)->
-                draft.graph=G.Uuid.to_string scope.graph_id
-                && Journal_capture.retry_identity_locked draft.capture
-                && not(Journal_capture.can_save draft.capture))recovered in
+              let retained=List.exists(fun(draft:Drafts.draft)->
+                draft.graph=G.Uuid.to_string scope.graph_id)recovered in
               List.iter(fun(draft:Drafts.draft)->
                 List.iter Journal_asset_import.discard_staged_file
                   (Journal_capture.pending_attachments draft.capture))recovered;
-              Alcotest.(check bool) "physical Append sees a durable non-editable lock" true locked;
+              Alcotest.(check bool) "physical Append sees no submitted restart draft" false retained;
               Atomic.incr capture_append_writes;
               Alcotest.(check int) "the full attachment-only capture has one root" 0(Rrbvec.length root.children);
               let captured={page with uuid=uuid 94321;name=string_of_int journal_day;
@@ -8711,7 +8709,7 @@ let () =
           ; "status-rejected"
           ] )
     ; ( "Capture attachment imports"
-      , [ Alcotest.test_case "durable draft lock failure prevents dispatch" `Quick
+      , [ Alcotest.test_case "durable draft removal failure prevents dispatch" `Quick
             (fun () ->
               let support=Filename.temp_file "journal-draft-dispatch-" "" in
               Unix.unlink support;Unix.mkdir support 0o700;

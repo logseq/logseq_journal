@@ -36,6 +36,7 @@ val rebind : t -> session_number:int64 -> t
 
 val phase : t -> phase
 val can_save : t -> bool
+val can_checkpoint : t -> bool
 val update_source : t -> source:string -> t
 val with_task_state : t -> Journal_model.task_state -> t
 val toggle_task_intent : t -> t

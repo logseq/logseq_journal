@@ -412,6 +412,8 @@ module Draft_store = struct
         (try on_cleanup_warning warning with _->report_cleanup_warning warning))
   let save ?(on_cleanup_warning=report_cleanup_warning) t drafts = protect(fun()->
     prepare t;
+    let drafts=List.filter(fun (draft:draft)->
+      Journal_capture.can_checkpoint draft.capture)drafts in
     let copies=ref [] in
     let wire=List.map(fun (draft:draft)->
       let capture=draft.capture in
@@ -424,7 +426,7 @@ module Draft_store = struct
         |Journal_model.No_status->None |Default_status->Some "default"
         |Status id->Some id |Invalid_status _->fail "Draft task status is invalid." in
       Wire.{graph=draft.graph;parent=draft.parent;source=Journal_capture.source capture;task;
-        interrupted=Journal_capture.retry_identity_locked capture || Journal_capture.phase capture=Saving;assets})drafts in
+        interrupted=false;assets})drafts in
     validate wire;
     let encoded=Yojson.Safe.to_string(Wire.snapshot_to_yojson(snapshot t wire)) in
     if String.length encoded>maximum_metadata then fail "Draft metadata exceeds 2 MiB.";
@@ -460,13 +462,15 @@ module Draft_store = struct
   let load t = protect(fun()->
     if not(exists(directory t)) then [] else (
       private_directory(parent t);private_directory(directory t);
-      let drafts=read_snapshot t in
+      let stored=read_snapshot t in
+      let drafts=List.filter(fun (draft:Wire.draft)->not draft.interrupted)stored in
       let total=ref 0 in
       List.iter(fun (draft:Wire.draft)->List.iter(fun(asset:Wire.asset)->
         total:= !total+regular(Filename.concat(directory t)asset.name)maximum_file;
         if !total>maximum_media then fail "Draft attachments exceed 128 MiB.")draft.assets)drafts;
       let staged_files=ref [] in
-      try List.mapi(fun index (draft:Wire.draft)->
+      try
+        let recovered=List.mapi(fun index (draft:Wire.draft)->
         let capture=Journal_capture.create ~session_number:(Int64.of_int(index+1)) ~source:draft.source in
         let task=match draft.task with None->Journal_model.No_status
           |Some "default"->Default_status |Some id->Status id in
@@ -482,11 +486,10 @@ module Draft_store = struct
           match Journal_asset_import.decode_event payload with
           |Ok(Picked(staged,_))->Journal_capture.add_attachment capture staged
           |_->fail "Draft attachment could not be recovered.")capture draft.assets in
-        let capture=if draft.interrupted then
-          Journal_capture.fail (Journal_capture.lock_for_retry capture)
-            ~message:"The previous save could not be confirmed. Check the graph before discarding this draft."
-          else capture in
-        {graph=draft.graph;parent=draft.parent;capture})drafts
+        {graph=draft.graph;parent=draft.parent;capture})drafts in
+        if List.length drafts<>List.length stored then (
+          match save t recovered with Ok()->() |Error cause->fail cause);
+        recovered
       with error->List.iter(fun path->if exists path then Unix.unlink path)!staged_files;raise error))
 
   module Writer = struct
