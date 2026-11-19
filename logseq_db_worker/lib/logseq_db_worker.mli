@@ -26,13 +26,30 @@ val create
   -> runner_dependencies:Effect_runner.dependencies
   -> (t, create_error) result
 
+val create_lifecycle
+  : sw:Eio.Switch.t -> config:Pure_reducer.config
+  -> runner_dependencies:Effect_runner.dependencies -> (t, create_error) result
+val attach_database_owner : t -> scope:Logseq_sync_domain.Core.graph_scope
+  -> Execute.Core.database_owner -> (Pure_reducer.database_opened, string) result
+val detach_database_owner : t -> scope:Logseq_sync_domain.Core.graph_scope -> (unit, string) result
 val post : t -> Pure_reducer.event -> unit
+
+val database_owner
+  : t -> scope:Logseq_sync_domain.Core.graph_scope
+  -> (Execute.Core.database_owner, string) result
+
+(** Borrowed until Worker shutdown; checked Sync retirement precedes graph close. *)
+val sync_upload_store : t -> (Logseq_sync_worker_owner.Core.store, string) result
+
+val worker_owner
+  : t -> scope:Logseq_sync_domain.Core.graph_scope
+  -> (Sync_dsl.Core.identity * Logseq_sync_worker_owner.Core.t, string) result
 
 (** Diagnostic-only receipt for an exact active asset operation. Retired or
     unknown operations are ignored; the normal completion owns publication. *)
 val report_asset_diagnostic
   :  t
-  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> scope:Logseq_sync_domain.Core.graph_scope
   -> operation:string
   -> request_operation:string
   -> Logseq_db_types.Failure_diagnostic.t
@@ -54,40 +71,40 @@ val shutdown : t -> unit
 
 val retain_asset_file
   :  t
-  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> scope:Logseq_sync_domain.Core.graph_scope
   -> handle:string
   -> (string * string) option
 
 val release_asset_file
   :  t
-  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> scope:Logseq_sync_domain.Core.graph_scope
   -> handle:string
   -> unit
 
 val release_asset_file_checked
-  : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> handle:string
+  : t -> scope:Logseq_sync_domain.Core.graph_scope -> handle:string
   -> (unit, string) result
 
 (** Backend ownership of an unpublished retained resource, including retries. *)
-val abandon_asset_file : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> handle:string -> unit
+val abandon_asset_file : t -> scope:Logseq_sync_domain.Core.graph_scope -> handle:string -> unit
 val unsettled_orphan_retains : t -> int
 
 (** Typed demand registration and checked retirement on the existing serial
     Worker entry. Release joins actual retiring IO/callbacks before success. *)
 val replace_coordinated_asset_demand : t -> registration:int64
-  -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> consumer:string
-  -> priority:Logseq_sync_pure_reducer.Asset_transfer.priority
+  -> scope:Logseq_sync_domain.Core.graph_scope -> consumer:string
+  -> priority:Logseq_sync_asset_transfer.Core.priority
   -> assets:Logseq_db_types.Asset_descriptor.t list -> (unit,string) result
 val asset_demand_creator_finished : t -> registration:int64 -> consumer:string -> unit
 val finalize_coordinated_asset_demand : t -> registration:int64
-  -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> consumer:string -> (unit,string) result
+  -> scope:Logseq_sync_domain.Core.graph_scope -> consumer:string -> (unit,string) result
 val release_coordinated_asset_demand : t -> registration:int64
-  -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> consumer:string -> (unit,string) result
+  -> scope:Logseq_sync_domain.Core.graph_scope -> consumer:string -> (unit,string) result
 
 type import_receipt =
   { operation : Logseq_db_types.Graph_types.Uuid.t
   ; graph_generation : int
-  ; scope : Logseq_sync_pure_reducer.Core.graph_scope
+  ; scope : Logseq_sync_domain.Core.graph_scope
   ; target : Logseq_db_types.Graph_types.Uuid.t
   ; asset : Logseq_db_types.Asset_descriptor.t
   ; file_type : string
@@ -95,7 +112,7 @@ type import_receipt =
   }
 
 val import_asset
-  :  ?scope:Logseq_sync_pure_reducer.Core.graph_scope
+  :  ?scope:Logseq_sync_domain.Core.graph_scope
   -> ?current:(unit -> bool)
   -> t
   -> graph_generation:int
@@ -104,17 +121,17 @@ val import_asset
 
 val retain_imported_file
   :  t
-  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> scope:Logseq_sync_domain.Core.graph_scope
   -> operation:Logseq_db_types.Graph_types.Uuid.t
   -> (string * string) option
 
-val read_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+val read_for_scope : t -> scope:Logseq_sync_domain.Core.graph_scope
   -> Worker_pure_read.packed_query -> Worker_pure_read.answer
-val durable_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+val durable_mutation_for_scope : t -> scope:Logseq_sync_domain.Core.graph_scope
   -> intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent
   -> current:(unit -> bool) -> Logseq_db_worker_contract.Worker_pure_mutation.outcome
-val graph_scopes : t -> Logseq_sync_pure_reducer.Core.graph_scope list
-val graph_state_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> graph_state option
+val graph_scopes : t -> Logseq_sync_domain.Core.graph_scope list
+val graph_state_for_scope : t -> scope:Logseq_sync_domain.Core.graph_scope -> graph_state option
 
 type coordination_snapshot =
   { version : int64
@@ -134,16 +151,16 @@ val coordination_current : t -> registration:int64 -> bool
 val revoke_coordination : t -> unit
 
 val coordination_presentation_current : t -> registration:int64 -> presentation:int64
-  -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> bool
-val confirm_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> owner:Logseq_sync_domain.Core.timeline_scope -> bool
+val confirm_mutation_for_scope : t -> scope:Logseq_sync_domain.Core.graph_scope
   -> read:Worker_pure_read.packed_query -> intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent
   -> original:(string * string * string) -> current:(unit -> bool) -> Worker_pure_read.answer
 
-val recover_mutations_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+val recover_mutations_for_scope : t -> scope:Logseq_sync_domain.Core.graph_scope
   -> after:int64 option
   -> maximum_items:int -> maximum_bytes:int -> current:(unit -> bool)
   -> (Logseq_db_worker_contract.Worker_pure_mutation.recovery_page,string) result
-val acknowledge_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+val acknowledge_mutation_for_scope : t -> scope:Logseq_sync_domain.Core.graph_scope
   -> intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent -> original:(string * string * string) option
   -> current:(unit -> bool) -> (unit,string) result
 
@@ -155,7 +172,7 @@ val register_observation
   :  t
   -> registration:int64
   -> id:Logseq_db_types.Graph_types.Uuid.t
-  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> scope:Logseq_sync_domain.Core.graph_scope
   -> read:Worker_pure_read.packed_query
   -> current:(unit -> bool)
   -> notify:(epoch:int64 -> unit)
@@ -165,55 +182,55 @@ val refresh_observation
   :  t
   -> registration:int64
   -> id:Logseq_db_types.Graph_types.Uuid.t
-  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> scope:Logseq_sync_domain.Core.graph_scope
   -> (int64 * Worker_pure_read.answer, string) result
 
 val release_observation
   :  t
   -> registration:int64
   -> id:Logseq_db_types.Graph_types.Uuid.t
-  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> scope:Logseq_sync_domain.Core.graph_scope
   -> (unit, string) result
 
 (** Retire only an unknown logical observation ID; no implicit-current graph or
     invented account lifecycle. A known physical allocation must use its owner. *)
 val observation_creator_finished : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t -> unit
 val finalize_observation : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
-  -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> (unit,string) result
+  -> owner:Logseq_sync_domain.Core.timeline_scope -> (unit,string) result
 
 val release_unallocated_observation
   : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
-  -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> (unit,string) result
+  -> owner:Logseq_sync_domain.Core.timeline_scope -> (unit,string) result
 
 val observation_scope
   :  t
   -> registration:int64
   -> id:Logseq_db_types.Graph_types.Uuid.t
-  -> Logseq_sync_pure_reducer.Core.graph_scope option
+  -> Logseq_sync_domain.Core.graph_scope option
 
 (** Match the original delivered batch and release the actual physical windows. *)
-val acknowledge_change_batch : t -> registration:int64 -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+val acknowledge_change_batch : t -> registration:int64 -> scope:Logseq_sync_domain.Core.graph_scope
   -> batch:Worker_pure_read.change_batch -> current:(unit -> bool)
   -> (Worker_pure_read.change_ack,Worker_pure_read.error) result
 
 (** Writer-only actual I/O/callback barrier. No resource settlement or host permit
     is implied; the scope remains fenced until its execution incarnation retires. *)
-val quiesce_writers : t -> registration:int64 -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> (unit,string) result
+val quiesce_writers : t -> registration:int64 -> scope:Logseq_sync_domain.Core.graph_scope -> (unit,string) result
 
 (** Host plans pin the authoritative baseline and client-known execution owners.
     Physical resource scopes are captured by the backend, not by this request. *)
 type host_plan={version:int64;id:Logseq_db_types.Graph_types.Uuid.t;registration:int64;
-  owner:Logseq_sync_pure_reducer.Core.account_scope;change:Pure_reducer.Host_handoff.change;
-  expected:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t}
+  owner:Logseq_sync_domain.Core.account_scope;change:Pure_reducer.Host_handoff.change;
+  expected:Logseq_sync_domain.Core.graph_scope Rrbvec.t}
 val prepare_host_change:t -> host_plan -> (Pure_reducer.Host_handoff.receipt,string)result
 val apply_host_change:t -> Pure_reducer.Host_handoff.receipt -> (unit,string)result
 
 val confirm_host_change:t -> Pure_reducer.Host_handoff.receipt -> (bool,string)result
 
-val recover_import_inputs_for_scope:t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+val recover_import_inputs_for_scope:t -> scope:Logseq_sync_domain.Core.graph_scope
   -> after:int64 option -> maximum_items:int -> maximum_bytes:int -> current:(unit -> bool)
   -> (Logseq_db_types.Asset_import.Recovery.page,string)result
-val confirm_import_input_for_scope:t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+val confirm_import_input_for_scope:t -> scope:Logseq_sync_domain.Core.graph_scope
   -> input:string -> current:(unit -> bool) -> (Logseq_db_types.Asset_import.Recovery.item option,string)result
-val acknowledge_import_input_for_scope:t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+val acknowledge_import_input_for_scope:t -> scope:Logseq_sync_domain.Core.graph_scope
   -> input:string -> prepared:string -> current:(unit -> bool) -> (unit,string)result

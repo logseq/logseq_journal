@@ -14,7 +14,7 @@ module Worker_runtime = Logseq_db_worker_lui.Journal_worker_runtime
 module W = Journal_worker_coordination.Worker_api
 module Support = Managed_sync_e2e_support
 module Probe = Managed_sync_protocol_probe
-module Sync_protocol = Logseq_sync_pure_reducer.Sync_protocol
+module Sync_protocol = Logseq_sync_protocol.Sync_protocol
 module ID = Journal_worker_ids
 
 exception E2e_failure of string
@@ -280,7 +280,7 @@ let handle_public_state context state =
   then (
     context.password_submitted <- true;
     send_command context (Submit_e2ee_password
-      (Logseq_sync_pure_reducer.Core.unlock_challenge snapshot.unlock |> Option.get,
+      (Logseq_sync_domain.Core.unlock_challenge snapshot.unlock |> Option.get,
        context.credentials.e2ee_password)))
 ;;
 

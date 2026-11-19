@@ -1,7 +1,7 @@
 module A = Logseq_db_types.Asset_descriptor
 module M = Logseq_db_worker_contract.Worker_pure_mutation
 module Read = Worker_pure_read
-module Sync = Logseq_sync_pure_reducer.Core
+module Sync = Logseq_sync_domain.Core
 module Id = Journal_worker_ids
 
 let id="78000000-0000-4000-8000-000000000001"

@@ -22,8 +22,8 @@ type session =
   ; account : account_generation
   ; lifecycle : int64
   ; generation : graph_generation
-  ; scope : Logseq_sync_pure_reducer.Core.timeline_scope
-  ; asset_scope : Logseq_sync_pure_reducer.Core.graph_scope
+  ; scope : Logseq_sync_domain.Core.timeline_scope
+  ; asset_scope : Logseq_sync_domain.Core.graph_scope
   ; limits : Worker_pure_data.capability_limits
   }
 
@@ -362,7 +362,7 @@ let compare_session (a:session)(b:session)=
   Stdlib.compare(key a)(key b)
 ;;
 
-let matches_asset_scope (session:session) (scope:Logseq_sync_pure_reducer.Core.graph_scope)=
+let matches_asset_scope (session:session) (scope:Logseq_sync_domain.Core.graph_scope)=
   let expected=session.asset_scope in
   expected.graph_id=scope.graph_id && expected.graph_generation=scope.graph_generation
   && expected.account.user_id=scope.account.user_id
@@ -377,7 +377,7 @@ let same_logical_graph (a : session) (b : session) =
   && Uuid.equal a.graph b.graph
 ;;
 
-let matches_scope (session : session) (scope : Logseq_sync_pure_reducer.Core.timeline_scope) =
+let matches_scope (session : session) (scope : Logseq_sync_domain.Core.timeline_scope) =
   session.account = scope.startup.account_generation
   && session.generation = scope.graph_generation
   && Uuid.equal session.graph scope.graph_id

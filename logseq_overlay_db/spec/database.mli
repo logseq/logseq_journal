@@ -10,6 +10,13 @@
 
 module Graph = Logseq_db_types.Graph_types
 
+val inspect_snapshot_storage
+  :  check_current:(unit -> unit)
+  -> scratch_bytes:int64
+  -> encrypted:bool
+  -> path:string
+  -> (Types.Checksum.t, string) result
+
 type dependencies
 type mirror_inspection
 

@@ -4,14 +4,14 @@ type graph = Logseq_db_types.Managed_graph.t
 (** Narrow projection of the unlock operation; construction evidence stays with
     the sync owner. UI clients need not depend on the sync library directly. *)
 module Unlock : sig
-  type graph_scope = Logseq_sync_pure_reducer.Core.graph_scope
-  type unlock_challenge = Logseq_sync_pure_reducer.Core.unlock_challenge
-  type unlock_submission = Logseq_sync_pure_reducer.Core.unlock_submission
-  type unlock_attached = Logseq_sync_pure_reducer.Core.unlock_attached
-  type unlock_recovery = Logseq_sync_pure_reducer.Core.unlock_recovery =
+  type graph_scope = Logseq_db_types.Sync_account.graph_scope
+  type unlock_challenge = Logseq_db_types.Sync_account.unlock_challenge
+  type unlock_submission = Logseq_db_types.Sync_account.unlock_submission
+  type unlock_attached = Logseq_db_types.Sync_account.unlock_attached
+  type unlock_recovery = Logseq_db_types.Sync_account.unlock_recovery =
     | Retry_password of unlock_challenge * string
     | Retry_preparation of string
-  type unlock_phase = Logseq_sync_pure_reducer.Core.unlock_phase =
+  type unlock_phase = Logseq_db_types.Sync_account.unlock_phase =
     | Unlock_inactive
     | Unlock_challenge of unlock_challenge
     | Unlock_running of unlock_submission
@@ -44,25 +44,25 @@ type startup_failure_stage =
   | During_bootstrap
   | During_e2ee
 
-type local_unavailability = Logseq_sync_pure_reducer.Core.local_unavailability =
+type local_unavailability = Logseq_db_types.Sync_account.local_unavailability =
   | No_local_account
   | Local_catalog_unavailable
   | Local_mirror_unavailable
   | Local_key_unavailable
   | Local_restore_failed
 
-type local_access = Logseq_sync_pure_reducer.Core.local_access =
+type local_access = Logseq_db_types.Sync_account.local_access =
   | Local_pending
   | Local_available
   | Local_unavailable of local_unavailability
 
-type startup_network_phase = Logseq_sync_pure_reducer.Core.startup_network_phase =
+type startup_network_phase = Logseq_db_types.Sync_account.startup_network_phase =
   | Local_only
   | Online_after_timeline
   | Online_by_user
 
-type startup_scope = Logseq_sync_pure_reducer.Core.startup_scope
-type timeline_scope = Logseq_sync_pure_reducer.Core.timeline_scope
+type startup_scope = Logseq_db_types.Sync_account.startup_scope
+type timeline_scope = Logseq_db_types.Sync_account.timeline_scope
 
 type startup_facts =
   { authenticated : bool
@@ -79,16 +79,16 @@ type startup_facts =
   ; presentation_generation : int
   }
 
-type local_deletion_stage = Logseq_sync_pure_reducer.Core.local_deletion_stage =
+type local_deletion_stage = Logseq_db_types.Sync_account.local_deletion_stage =
   | Closing_graph
   | Deleting_mirror
   | Clearing_selection
 
-type local_deletion = Logseq_sync_pure_reducer.Core.local_deletion =
+type local_deletion = Logseq_db_types.Sync_account.local_deletion =
   | Deletion_in_progress of local_deletion_stage
   | Deletion_failed of local_deletion_stage
 
-type error_attention = Logseq_sync_pure_reducer.Core.error_attention =
+type error_attention = Logseq_db_types.Sync_account.error_attention =
   | Transient_connection
   | Requires_attention
 
@@ -149,15 +149,16 @@ type client_command =
   | Refresh_catalog of startup_scope
   | Begin_online_recovery of timeline_scope
   | Submit_e2ee_password of Unlock.unlock_challenge * string
+  | Submit_native_password of Logseq_db_types.Sync_account.graph_scope * string
   | Delete_local_cache of graph_id
   | Set_foreground of bool
 
 module Asset : sig
-  type priority = Logseq_sync_pure_reducer.Asset_transfer.priority =
+  type priority = Logseq_sync_asset_transfer.Core.priority =
     | Foreground
     | Background
 
-  type failure = Logseq_sync_pure_reducer.Asset_transfer.failure =
+  type failure = Logseq_sync_asset_transfer.Core.failure =
     | Network
     | Not_found
     | Checksum_mismatch
@@ -166,7 +167,7 @@ module Asset : sig
     | Storage_full
     | Invalid_content of string
 
-  type availability = Logseq_sync_pure_reducer.Asset_transfer.availability =
+  type availability = Logseq_sync_asset_transfer.Core.availability =
     | Queued
     | Downloading
     | Ready of string
@@ -180,15 +181,15 @@ module Asset : sig
         }
 end
 
-type account_scope = Logseq_sync_pure_reducer.Core.account_scope
-type asset_scope = Logseq_sync_pure_reducer.Core.graph_scope
+type account_scope = Logseq_db_types.Sync_account.account_scope
+type asset_scope = Logseq_db_types.Sync_account.graph_scope
 
 type asset_notice = Logseq_db_worker_pure_reducer.Core.asset_notice =
   | Asset_availability of
       { consumer : string
       ; asset : Logseq_db_types.Graph_types.Uuid.t
       ; descriptor : Logseq_db_types.Asset_descriptor.t
-      ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
+      ; availability : Logseq_sync_asset_transfer.Core.availability
       }
   | Asset_demand_accepted of string
   | Asset_backpressure of string
@@ -204,7 +205,7 @@ type asset_notice = Logseq_db_worker_pure_reducer.Core.asset_notice =
 type asset_command =
   | Replace_asset_demand of
       { consumer : string
-      ; priority : Logseq_sync_pure_reducer.Asset_transfer.priority
+      ; priority : Logseq_sync_asset_transfer.Core.priority
       ; assets : Logseq_db_types.Asset_descriptor.t list
       }
   | Release_asset_demand of string
@@ -263,7 +264,7 @@ type request =
       {registration:int64;owner:timeline_scope;observation_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_asset_demand of
       {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
-       consumer:string;priority:Logseq_sync_pure_reducer.Asset_transfer.priority;
+       consumer:string;priority:Logseq_sync_asset_transfer.Core.priority;
        assets:Logseq_db_types.Asset_descriptor.t list}
   | Coordination_release_asset_demand of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
@@ -321,15 +322,15 @@ type request =
       ; command : asset_command
       }
   | Acquire_imported_file of
-      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      { scope : Logseq_db_types.Sync_account.graph_scope
       ; operation : Logseq_db_types.Graph_types.Uuid.t
       }
   | Acquire_asset_file of
-      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      { scope : Logseq_db_types.Sync_account.graph_scope
       ; handle : string
       }
   | Release_asset_file of
-      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      { scope : Logseq_db_types.Sync_account.graph_scope
       ; handle : string
       }
 
@@ -412,7 +413,7 @@ type push =
   | Bootstrap_progress of bootstrap_progress
   | Graph_state_changed of Logseq_db_worker.graph_state
   | Asset_notice of
-      Logseq_sync_pure_reducer.Core.graph_scope
+      Logseq_db_types.Sync_account.graph_scope
       * Logseq_db_worker_pure_reducer.Core.asset_notice
 
 val invalidation_topic : Journal_worker_ids.Worker.Push_topic.t
@@ -435,9 +436,6 @@ type dependencies
 
 val dependencies
   :  overlay:Logseq_overlay_db.Database.dependencies
-  -> tls_authenticator:Logseq_sync_effect_runner.Effect_runner.tls_authenticator
-  -> secrets:Logseq_sync_effect_runner.Effect_runner.secrets
-  -> crypto:Logseq_sync_effect_runner.Effect_runner.crypto
   -> dependencies
 
 (** Pure cleanup routing for the Mailbox's exactly-once unpublished success.

@@ -2,7 +2,7 @@ module W = Journal_worker_coordination.Worker_api
 module C = Journal_worker_coordination.Worker_pure_coordinator
 module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Id = Journal_worker_ids
-module Sync = Logseq_sync_pure_reducer.Core
+module Sync = Logseq_sync_domain.Core
 
 let check condition message = if not condition then failwith message
 let uuid s = W.Uuid.of_string s |> Result.get_ok

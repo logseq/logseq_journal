@@ -1,0 +1,8 @@
+(library
+ (name logseq_sync_protocol_impl)
+ (public_name logseq_sync.protocol.impl)
+ (implements logseq_sync_protocol)
+ (modules sync_protocol)
+ (libraries logseq_db_types ppx_deriving_yojson.runtime yojson)
+ (preprocess
+  (pps ppx_deriving_yojson)))

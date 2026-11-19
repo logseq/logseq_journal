@@ -97,7 +97,7 @@ let startup_snapshot
     ; resident_graphs=[];resident_scopes=[]
     ; selected_graph = Some graph_id
     ; applied_server_t = Some (server_cursor_of_int 11)
-    ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
+    ; unlock = Logseq_sync_domain.Core.Unlock_inactive
     ; timeline_presentation_pending
     ; startup =
         { authenticated

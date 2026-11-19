@@ -149,6 +149,7 @@ module type WORKER_OWNER = sig
   val prepare_import
     :  scope
     -> Logseq_db_types.Asset_import.t
+    -> current:(unit -> bool)
     -> (Logseq_db_types.Asset_upload_intent.t, Dsl.error) result
 
   (** Preview is not remote publication. *)
@@ -290,7 +291,9 @@ val activation_owner
 
 (** The snapshot source callback validates its original acquisition ledger, including metadata.
     Absent-mirror owner shares the sole queue; database fails Storage_failure until committed activation opens/installs it. Interrupted open recovers committed inspection locally; caller owns close.
-    All writes share the external transaction queue; revalidate generation/token after suspension. Never hold transactions across network/key/task/callback waits. *)
+    All writes share the external transaction queue; revalidate generation/token after suspension. Never hold transactions across network/key/task/callback waits.
+    None means not yet activated; committed-open recovery failures remain errors. *)
+val database_if_open : database_owner -> (Dsl.Overlay.Database.t option, Dsl.error) result
 val database : database_owner -> (Dsl.Overlay.Database.t, Dsl.error) result
 
 (** Validate locally before exclusive acquire; failure leaves no registration except retained cleanup obligations.

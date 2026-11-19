@@ -421,7 +421,7 @@ class Build:
                 raise ValueError(f"producer {package} differs from locked commit")
         native_sources = dict(pre["native_source_sha256"])
         for name, digest in link["device_c_source_sha256"].items():
-            native_sources["logseq_sync/lib/effect_runner/platform/" + name] = digest
+            native_sources["logseq_sync/lib/native_crypto/" + name] = digest
         required = {name: digest for name, digest in source.items()
                     if Path(name).suffix in {".ml", ".mli", ".c", ".h"}
                     and not {"tool", "test", "apple-tests"}.intersection(Path(name).parts)}
@@ -568,11 +568,11 @@ class Build:
             add(self.forced_xmlm_files(compiler, link, xmlm))
         # The producer removed only host DNS/crypto from a local archive copy.
         command = self.ordinary_command if version == 2 else link["command"]
-        effect = next(Path(p).parent for p in command if p.endswith("/logseq_sync_effect_runner_impl.cmxa"))
-        for name in ("logseq_sync_effect_runner_impl.cmxa", "logseq_sync_effect_runner_impl.a"):
+        effect = next(Path(p).parent for p in command if p.endswith("/logseq_sync_native_crypto.cmxa"))
+        for name in ("logseq_sync_native_crypto.cmxa", "logseq_sync_native_crypto.a"):
             original_path = next(p for p in inputs if Path(p).name == name)
             add({str(effect / name): inputs[original_path]})
-        patched = effect / "liblogseq_sync_effect_runner_impl_stubs.a"
+        patched = effect / "liblogseq_sync_native_crypto_stubs.a"
         add({str(patched): link["patched_host_stub_archive_sha256"]})
         if "platform_crypto_stubs.o" in self.run("ar", "-t", patched):
             raise ValueError("producer host DNS/crypto C member was not excluded")
@@ -768,9 +768,9 @@ class Build:
                 return {"path": str(path), "sha256": sha(path)}
             def absolute(arg):
                 return Path(os.path.abspath(cwd / arg))
-            effects = [absolute(arg) for arg in original if arg.endswith("/logseq_sync_effect_runner_impl.cmxa")]
+            effects = [absolute(arg) for arg in original if arg.endswith("/logseq_sync_native_crypto.cmxa")]
             if len(effects) != 1:
-                raise ValueError("producer needs one original effect-runner archive")
+                raise ValueError("producer needs one original native-crypto archive")
             effect = effects[0].parent
             copied = directory / "host-stubs"
             copied.mkdir()
@@ -778,10 +778,10 @@ class Build:
             def record(path):
                 path = absolute(path)
                 self.bind_native_inputs(inputs, {str(path): sha(path)})
-            for name in ("logseq_sync_effect_runner_impl.cmxa", "logseq_sync_effect_runner_impl.a"):
+            for name in ("logseq_sync_native_crypto.cmxa", "logseq_sync_native_crypto.a"):
                 record(effect / name)
                 shutil.copyfile(effect / name, copied / name)
-            stub_name = "liblogseq_sync_effect_runner_impl_stubs.a"
+            stub_name = "liblogseq_sync_native_crypto_stubs.a"
             patched = copied / stub_name
             shutil.copyfile(effect / stub_name, patched)
             if self.run("ar", "-t", patched).splitlines().count("platform_crypto_stubs.o") != 1:
@@ -852,7 +852,7 @@ class Build:
                 "compiler_version": self.run(original[0], "-version"), "new_dependency_provenance": dependencies,
                 "patched_host_stub_archive_sha256": sha(patched),
                 "device_c_source_sha256": {p.name: sha(p) for p in
-                    (ROOT / "logseq_sync/lib/effect_runner/platform").glob("platform_crypto_stubs.*")}}
+                    (ROOT / "logseq_sync/lib/native_crypto").iterdir() if p.suffix in {".c", ".h"}}}
             # Reject unbound/unknown command forms before executing the current Dune-derived relink.
             self.ordinary_native_inputs(pre, link)
             link["command"] = self.ordinary_command
@@ -897,7 +897,7 @@ class Build:
             self.target_c = workspace / "platform_crypto.o"
             self.run(self.tools["clang"], "-target", self.triple, "-isysroot", self.sdk,
                      "-O2", "-fno-strict-aliasing", "-fwrapv", "-pthread", "-D_FILE_OFFSET_BITS=64", "-Wall", "-g",
-                     "-I", self.native_include, "-c", ROOT / "logseq_sync/lib/effect_runner/platform/platform_crypto_stubs.c",
+                     "-I", self.native_include, "-c", ROOT / "logseq_sync/lib/native_crypto/platform_crypto_stubs.c",
                      "-o", self.target_c)
             self.verify_target(self.target_c)
         else:

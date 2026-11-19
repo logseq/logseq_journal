@@ -1,0 +1,4 @@
+(tests
+ (names account_test worker_migration_fixture)
+ (modules account_test worker_migration_fixture)
+ (libraries datascript_ocaml.types datascript-ocaml-native logseq_journal.sync_lifecycle journal_sync_lifecycle_impl sync_dsl logseq_db_types logseq_sync.transport logseq_sync.native_transport uri unix))

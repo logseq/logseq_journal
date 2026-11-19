@@ -1,0 +1,7 @@
+(library
+ (name journal_sync_lifecycle)
+ (public_name logseq_journal.sync_lifecycle)
+ (modules core account)
+ (virtual_modules core account)
+ (default_implementation journal_sync_lifecycle_impl)
+ (libraries eio execute sync_dsl logseq_sync.sync_service logseq_sync.transport logseq_sync.worker_owner logseq_overlay_db logseq_db_types x509))

@@ -1,0 +1,8 @@
+(library
+ (name logseq_sync_native_crypto)
+ (public_name logseq_sync.native_crypto)
+ (modules platform_crypto e2ee asset_codec)
+ (libraries eio uri digestif logseq_db_types melange-transit-core melange-transit-native ppx_deriving_yojson.runtime yojson)
+ (flags (:standard -open Logseq_db_types))
+ (preprocess (pps ppx_deriving_yojson))
+ (foreign_stubs (language c) (names platform_crypto_stubs)))

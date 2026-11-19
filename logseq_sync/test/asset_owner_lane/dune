@@ -1,0 +1,4 @@
+(test
+ (name asset_owner_lane_contract)
+ (modules asset_owner_lane_contract)
+ (libraries datascript_ocaml datascript_ocaml.types alcotest logseq_sync.assets logseq_sync.worker_owner logseq_sync.crypto logseq_journal.sync_lifecycle logseq_sync_sync_service_impl logseq_sync_execute_impl logseq_sync_sync_dsl_impl x509 ptime.clock.os logseq_overlay_db.impl datascript-ocaml-native logseq_db_storage logseq_overlay_db sqlite3 eio eio_main logseq_db_types sync_dsl logseq_sync.native_crypto execute rrbvec unix))

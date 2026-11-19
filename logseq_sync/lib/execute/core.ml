@@ -108,6 +108,7 @@ module type WORKER_OWNER = sig
   val prepare_import
     :  scope
     -> Logseq_db_types.Asset_import.t
+    -> current:(unit -> bool)
     -> (Logseq_db_types.Asset_upload_intent.t, Dsl.error) result
 
   val publish_import_preview
@@ -449,6 +450,7 @@ let database_owner database =
   { binding = Owner.database_owner database; snapshot_source = None; bound = false }
 ;;
 
+let database_if_open owner = Owner.database_if_open owner.binding
 let database owner = Owner.database owner.binding
 
 let activation_owner ~sw ~snapshot_source ~dependencies ~inspection ~graph_name =

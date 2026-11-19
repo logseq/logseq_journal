@@ -2,9 +2,8 @@ module Read = Worker_pure_read
 module Db = Logseq_db_worker
 module Pure = Logseq_db_worker_pure_reducer.Core
 module Worker_runner = Logseq_db_worker_effect_runner.Effect_runner
-module Sync = Logseq_sync_pure_reducer.Core
-module Unlock = Sync
-module Sync_runner = Logseq_sync_effect_runner.Effect_runner
+module Sync = Logseq_sync_domain.Core
+module Unlock = Logseq_db_types.Sync_account
 module Overlay = Logseq_overlay_db.Database
 module ID = Journal_worker_ids
 module Authorized_graphs = Set.Make (String)
@@ -42,25 +41,25 @@ type startup_failure_stage =
   | During_bootstrap
   | During_e2ee
 
-type local_unavailability = Logseq_sync_pure_reducer.Core.local_unavailability =
+type local_unavailability = Logseq_db_types.Sync_account.local_unavailability =
   | No_local_account
   | Local_catalog_unavailable
   | Local_mirror_unavailable
   | Local_key_unavailable
   | Local_restore_failed
 
-type local_access = Logseq_sync_pure_reducer.Core.local_access =
+type local_access = Logseq_db_types.Sync_account.local_access =
   | Local_pending
   | Local_available
   | Local_unavailable of local_unavailability
 
-type startup_network_phase = Logseq_sync_pure_reducer.Core.startup_network_phase =
+type startup_network_phase = Logseq_db_types.Sync_account.startup_network_phase =
   | Local_only
   | Online_after_timeline
   | Online_by_user
 
-type startup_scope = Logseq_sync_pure_reducer.Core.startup_scope
-type timeline_scope = Logseq_sync_pure_reducer.Core.timeline_scope
+type startup_scope = Logseq_db_types.Sync_account.startup_scope
+type timeline_scope = Logseq_db_types.Sync_account.timeline_scope
 
 type startup_facts =
   { authenticated : bool
@@ -77,16 +76,16 @@ type startup_facts =
   ; presentation_generation : int
   }
 
-type local_deletion_stage = Logseq_sync_pure_reducer.Core.local_deletion_stage =
+type local_deletion_stage = Logseq_db_types.Sync_account.local_deletion_stage =
   | Closing_graph
   | Deleting_mirror
   | Clearing_selection
 
-type local_deletion = Logseq_sync_pure_reducer.Core.local_deletion =
+type local_deletion = Logseq_db_types.Sync_account.local_deletion =
   | Deletion_in_progress of local_deletion_stage
   | Deletion_failed of local_deletion_stage
 
-type error_attention = Logseq_sync_pure_reducer.Core.error_attention =
+type error_attention = Logseq_db_types.Sync_account.error_attention =
   | Transient_connection
   | Requires_attention
 
@@ -220,15 +219,16 @@ type client_command =
   | Refresh_catalog of startup_scope
   | Begin_online_recovery of timeline_scope
   | Submit_e2ee_password of Unlock.unlock_challenge * string
+  | Submit_native_password of Logseq_db_types.Sync_account.graph_scope * string
   | Delete_local_cache of Sync.graph_id
   | Set_foreground of bool
 
 module Asset = struct
-  type priority = Logseq_sync_pure_reducer.Asset_transfer.priority =
+  type priority = Logseq_sync_asset_transfer.Core.priority =
     | Foreground
     | Background
 
-  type failure = Logseq_sync_pure_reducer.Asset_transfer.failure =
+  type failure = Logseq_sync_asset_transfer.Core.failure =
     | Network
     | Not_found
     | Checksum_mismatch
@@ -237,7 +237,7 @@ module Asset = struct
     | Storage_full
     | Invalid_content of string
 
-  type availability = Logseq_sync_pure_reducer.Asset_transfer.availability =
+  type availability = Logseq_sync_asset_transfer.Core.availability =
     | Queued
     | Downloading
     | Ready of string
@@ -251,15 +251,15 @@ module Asset = struct
         }
 end
 
-type account_scope = Logseq_sync_pure_reducer.Core.account_scope
-type asset_scope = Logseq_sync_pure_reducer.Core.graph_scope
+type account_scope = Logseq_db_types.Sync_account.account_scope
+type asset_scope = Logseq_db_types.Sync_account.graph_scope
 
 type asset_notice = Logseq_db_worker_pure_reducer.Core.asset_notice =
   | Asset_availability of
       { consumer : string
       ; asset : Logseq_db_types.Graph_types.Uuid.t
       ; descriptor : Logseq_db_types.Asset_descriptor.t
-      ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
+      ; availability : Logseq_sync_asset_transfer.Core.availability
       }
   | Asset_demand_accepted of string
   | Asset_backpressure of string
@@ -275,7 +275,7 @@ type asset_notice = Logseq_db_worker_pure_reducer.Core.asset_notice =
 type asset_command =
   | Replace_asset_demand of
       { consumer : string
-      ; priority : Logseq_sync_pure_reducer.Asset_transfer.priority
+      ; priority : Logseq_sync_asset_transfer.Core.priority
       ; assets : Logseq_db_types.Asset_descriptor.t list
       }
   | Release_asset_demand of string
@@ -339,7 +339,7 @@ type request =
       {registration:int64;owner:timeline_scope;observation_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_asset_demand of
       {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
-       consumer:string;priority:Logseq_sync_pure_reducer.Asset_transfer.priority;
+       consumer:string;priority:Logseq_sync_asset_transfer.Core.priority;
        assets:Logseq_db_types.Asset_descriptor.t list}
   | Coordination_release_asset_demand of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
@@ -397,15 +397,15 @@ type request =
       ; command : asset_command
       }
   | Acquire_imported_file of
-      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      { scope : Logseq_db_types.Sync_account.graph_scope
       ; operation : Logseq_db_types.Graph_types.Uuid.t
       }
   | Acquire_asset_file of
-      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      { scope : Logseq_db_types.Sync_account.graph_scope
       ; handle : string
       }
   | Release_asset_file of
-      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      { scope : Logseq_db_types.Sync_account.graph_scope
       ; handle : string
       }
 
@@ -504,7 +504,7 @@ type push =
   | Bootstrap_progress of bootstrap_progress
   | Graph_state_changed of Db.graph_state
   | Asset_notice of
-      Logseq_sync_pure_reducer.Core.graph_scope
+      Logseq_db_types.Sync_account.graph_scope
       * Logseq_db_worker_pure_reducer.Core.asset_notice
 
 let invalidation_topic = ID.Worker.Push_topic.of_int 0
@@ -627,15 +627,9 @@ let coalesce_push ~topic previous next =
     | _ -> next)
 ;;
 
-type dependencies =
-  { overlay : Overlay.dependencies
-  ; tls_authenticator : Sync_runner.tls_authenticator
-  ; secrets : Sync_runner.secrets
-  ; crypto : Sync_runner.crypto
-  }
+type dependencies = { overlay : Overlay.dependencies }
 
-let dependencies ~overlay ~tls_authenticator ~secrets ~crypto =
-  { overlay; tls_authenticator; secrets; crypto }
+let dependencies ~overlay = { overlay }
 ;;
 
 let production_dependencies () =
@@ -657,10 +651,7 @@ let production_dependencies () =
       ~limits
     |> Result.get_ok
   in
-  let secrets = Sync_runner.apple_secrets () |> Result.get_ok in
-  let crypto = Sync_runner.apple_crypto () |> Result.get_ok in
-  let tls_authenticator = Sync_runner.system_tls_authenticator () |> Result.get_ok in
-  { overlay; tls_authenticator; secrets; crypto }
+  { overlay }
 ;;
 
 (* Diagnostic strings are internal signals, never display text. Unknown values
@@ -799,7 +790,7 @@ let diagnostic_asset_notice notice =
   match notice with
   | Asset_availability{availability=Failed{failure;retry_scheduled=false;_};_}->
     let reason,source=match failure with
-      | Logseq_sync_pure_reducer.Asset_transfer.Network -> "networkFailed",None
+      | Logseq_sync_asset_transfer.Core.Network -> "networkFailed",None
       | Not_found -> "notFound",None | Checksum_mismatch -> "checksumMismatch",None
       | Authentication -> "authenticationFailed",None | Locked -> "locked",None
       | Storage_full -> "storageFull",None | Invalid_content s -> "invalidContent",Some s in
@@ -814,7 +805,7 @@ let diagnostic_asset_notice notice =
   | _ -> None
 ;;
 
-let publish context =
+let publish ~lifecycle context =
   let latest : state option ref = ref None in
   let resident_scopes = ref [] in
   let owner = ref None in
@@ -827,8 +818,11 @@ let publish context =
     in
     { state with diagnostics =
         { groups =
-            (if !reports = [] then [] else [{title="Worker errors";entries}])
-            @ List.filter (fun (g:diagnostic_group)->g.title<>"Worker errors") state.diagnostics.groups
+            (if !reports = [] then state.diagnostics.groups
+             else {title="Worker errors";entries=entries @ List.concat_map
+               (fun (group:diagnostic_group)->if group.title="Worker errors" then group.entries else [])
+               state.diagnostics.groups}
+               :: List.filter (fun (group:diagnostic_group)->group.title<>"Worker errors") state.diagnostics.groups)
         }
     }
   in
@@ -842,6 +836,7 @@ let publish context =
     Option.iter emit !latest
   in
   function
+  | Pure.Lifecycle_intent intent -> lifecycle intent
   | Pure.Asset_notice (scope, notice) ->
     (match !latest with
      | Some current when current.snapshot.startup.account_generation=scope.account.account_generation
@@ -883,7 +878,9 @@ let publish context =
          let state={state with snapshot={state.snapshot with resident_scopes=scopes}} in
          latest:=Some state;emit state)
      | Session_state_changed (scope,state) ->
-       Journal_worker.Session_context.emit context ~topic:session_topic (Session_states [scope,client_state state])
+       let state=client_state state in
+       let state={state with snapshot={state.snapshot with resident_scopes= !resident_scopes}} in
+       Journal_worker.Session_context.emit context ~topic:session_topic (Session_states [scope,state])
      | Asset_finished _ | Protected_finished _ -> ())
   | Graph_state_changed state ->
     Journal_worker.Session_context.emit
@@ -901,45 +898,6 @@ let sync_limits config =
     ~submission_batch_size:32
 ;;
 
-let sync_dependencies dependencies context config id_token_provider =
-  let environment = Journal_worker.Session_context.environment context in
-  let clock = Eio.Stdenv.clock environment in
-  Result.bind
-    (Sync_runner.runtime
-       ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
-       ~sleep:(Eio.Time.sleep clock))
-    (fun runtime ->
-       Result.bind
-         (Sync_runner.transport
-            ~websocket_liveness:
-              (Sync_runner.Ping_pong { interval_seconds = 30.; timeout_seconds = 10. })
-            ~tls_authenticator:dependencies.tls_authenticator
-            ~network:(Eio.Stdenv.net environment)
-            ~clock)
-         (fun transport ->
-            Result.bind
-              (Sync_runner.local_store
-                 ~application_support_directory:
-                   config.Db.Config.application_support_directory
-                 ())
-              (fun local_store ->
-                 Result.bind
-                   (Sync_runner.artifact_store
-                      ~staging_directory:
-                        (Filename.concat
-                           config.application_support_directory
-                           "sync-staging"))
-                   (fun artifact_store ->
-                      Sync_runner.dependencies
-                        ~runtime
-                        ~transport
-                        ~local_store
-                        ~artifact_store
-                        ~secrets:dependencies.secrets
-                        ~crypto:dependencies.crypto
-                        ~id_token_provider))))
-;;
-
 let client_event = function
   | Restore_local_account { user_id } ->
     Pure.Sync_event (Sync.Restore_local_account { user_id })
@@ -950,6 +908,7 @@ let client_event = function
   | Request_sign_in scope -> Pure.Sync_event (Sync.Sign_in_requested scope)
   | Cancel_online scope -> Pure.Sync_event (Sync.Online_cancelled scope)
   | Local_account_unavailable (scope,reason) -> Pure.Sync_event (Sync.Local_account_unavailable (scope,reason))
+  | Submit_native_password _ -> invalid_arg "Native unlock requires the lifecycle registration"
   | Provide_token _ | Reject_token _ ->
     invalid_arg "token commands are handled by the service"
   | Configure_resident_graphs ids -> Pure.Sync_event (Sync.Resident_graphs_changed ids)
@@ -967,14 +926,6 @@ let client_event = function
 
 let error_message = function
   | Sync.Invalid_config message -> message
-;;
-
-let sync_create_error_message = function
-  | Sync_runner.Invalid_create message -> message
-;;
-
-let sync_dependency_error_message = function
-  | Sync_runner.Invalid_dependency message -> message
 ;;
 
 let worker_dependency_error_message = function
@@ -1011,6 +962,9 @@ let create ~(dependencies : dependencies) =
   let module Session = struct
     type t =
       { worker : Db.t
+      ; post_client : client_command -> unit
+      ; validate_network : Journal_sync_registration.network_control -> (unit, Sync_dsl.Core.error) result
+      ; delete_local : account_generation:int -> graph_id:graph_id -> (unit,string) result
       ; application_support_directory : string
       ; mutable catalog_source : Sync.graph list
       ; mutable authorized_graphs : Authorized_graphs.t
@@ -1114,16 +1068,8 @@ let create ~(dependencies : dependencies) =
                 ~topic:auth_topic
                 (Need_id_token { request; control }))
       in
-      let id_token_provider =
-        Sync_runner.id_token_provider
-          ~acquire:(fun (account : Sync.account_scope) ->
-            if !authenticated_user <> Some account.user_id
-            then Error "ID token request is no longer current."
-            else Worker_runner.acquire_id_token token_cache ~account)
-          ~invalidate:(fun account ~token ->
-            Worker_runner.invalidate_id_token token_cache ~account ~token)
-      in
       let (Managed_sync { base_url }) = config.Db.Config.target in
+      let registration = ref None in
       let selected =
         match sync_limits config with
         | Error error -> Error (error_message error)
@@ -1131,29 +1077,26 @@ let create ~(dependencies : dependencies) =
           (match Sync.config ~managed_sync_origin:(Uri.of_string base_url) ~limits with
            | Error error -> Error (error_message error)
            | Ok sync_config ->
-             (match sync_dependencies dependencies context config id_token_provider with
-              | Error error -> Error (sync_dependency_error_message error)
-              | Ok runner_dependencies ->
-                (match
-                   Sync_runner.create ~sw runner_dependencies
-                     ~on_asset_diagnostic:(fun ~scope ~operation ~request_operation diagnostic ->
-                       !asset_diagnostic_sink ~scope ~operation ~request_operation diagnostic)
-                     ~post:(fun event ->
-                     !event_sink (Pure.Sync_event event))
-                 with
-                 | Error error -> Error (sync_create_error_message error)
-                 | Ok runner ->
-                   Ok
-                     ( sync_config
-                     , Worker_runner.sync_runner
-                         ~retire_account:(Sync_runner.retire_account runner)
-                         ~submit:(Sync_runner.submit runner)
-                         ~shutdown:(fun () -> Sync_runner.shutdown runner)
-                         () ))))
+             let environment=Journal_worker.Session_context.environment context in
+             let tokens=Hashtbl.create 4 in
+             (match Journal_sync_registration.create ~sw ~clock:(Eio.Stdenv.mono_clock environment)
+               ~network:(Eio.Stdenv.net environment) ~authenticator:(Ca_certs_nss.authenticator () |> Result.get_ok)
+               ~config ~overlay:dependencies.overlay
+               ~token:(fun ~user ~account_generation ~epoch:_ ~refresh ->
+                 let account:Sync.account_scope={managed_sync_origin=Uri.of_string base_url;user_id=user;
+                   account_generation;presentation_generation=0;lifecycle_generation=0L} in
+                 if !authenticated_user<>Some user then Error(Sync_dsl.Core.Authentication_failure "Authentication authority changed") else (
+                   if refresh then Option.iter(fun token->Worker_runner.invalidate_id_token token_cache ~account ~token)(Hashtbl.find_opt tokens user);
+                   Worker_runner.acquire_id_token token_cache ~account
+                   |> Result.map(fun token->Hashtbl.replace tokens user token;token)
+                   |> Result.map_error(fun message->Sync_dsl.Core.Authentication_failure message))) () with
+              | Error error -> Error(Sync_dsl.Core.error_message error)
+              | Ok bridge -> registration:=Some bridge;Ok(sync_config,bridge.services))
+)
       in
       match selected with
       | Error message -> Error message
-      | Ok (sync_config, selected_sync_runner) ->
+      | Ok (sync_config, selected_services) ->
         (match
            Worker_runner.runtime
              ~sleep:
@@ -1169,14 +1112,23 @@ let create ~(dependencies : dependencies) =
                 ~runtime
                 ~config
                 ~overlay:dependencies.overlay
-                ~sync_runner:selected_sync_runner
-                ~publish:(publish context)
+                ~services:selected_services
+                ~publish:(publish ~lifecycle:selected_services.post context)
             with
             | Error error -> Error (worker_dependency_error_message error)
             | Ok runner_dependencies ->
-              (match Db.create ~sw ~config:pure_config ~runner_dependencies with
+              (match Db.create_lifecycle ~sw ~config:pure_config ~runner_dependencies with
                | Error (Db.Invalid_create message) -> Error message
                | Ok worker ->
+                 Option.iter(fun bridge->bridge.Journal_sync_registration.bind worker)!registration;
+                 let post_client command=match !registration,command with
+                   | Some bridge,Submit_native_password(scope,password)->
+                     bridge.Journal_sync_registration.unlock scope password
+                     |> Result.fold ~ok:Fun.id ~error:failwith
+                   | Some bridge,_->bridge.Journal_sync_registration.post(client_event command)
+                   | None,_->Db.post worker(client_event command) in
+                 let delete_local ~account_generation ~graph_id=
+                   Db.delete_local_copy worker ~account_generation ~graph_id in
                  event_sink := Db.post worker;
                  asset_diagnostic_sink := Db.report_asset_diagnostic worker;
                  let auth_seen = ref false in
@@ -1201,9 +1153,7 @@ let create ~(dependencies : dependencies) =
                           Eio.Condition.loop_no_mutex auth_wake (fun () -> !auth_pending)
                         in
                         auth_pending := None;
-                        Db.post
-                          worker
-                          (client_event (Reconcile_authenticated_user { user_id }));
+                        post_client (Reconcile_authenticated_user { user_id });
                         auth_enqueued_sequence := max !auth_enqueued_sequence sequence;
                         Eio.Condition.broadcast auth_wake;
                         deliver ()
@@ -1212,6 +1162,11 @@ let create ~(dependencies : dependencies) =
                  Ok
                    Session.
                      { worker
+                     ; post_client
+                     ; validate_network=(fun control -> match !registration with
+                         | Some bridge -> bridge.Journal_sync_registration.validate_control control
+                         | None -> Error Sync_dsl.Core.Stale_context)
+                     ; delete_local
                      ; application_support_directory = config.Db.Config.application_support_directory
                      ; catalog_source = []
                      ; authorized_graphs = Authorized_graphs.empty
@@ -1493,7 +1448,7 @@ let create ~(dependencies : dependencies) =
          | Some scope ->
            let event=match command with
              | Retry_upload operation -> Pure.Upload_requested_for_scope (scope,operation,Logseq_db_worker_pure_reducer.Asset_upload.Retry)
-             | Replace_asset_demand {consumer;priority;assets} -> Pure.Asset_requested_for_scope (scope,Logseq_sync_pure_reducer.Asset_transfer.Replace {consumer;priority;assets})
+             | Replace_asset_demand {consumer;priority;assets} -> Pure.Asset_requested_for_scope (scope,Logseq_sync_asset_transfer.Core.Replace {consumer;priority;assets})
              | Release_asset_demand consumer -> Pure.Asset_requested_for_scope (scope,Release consumer)
              | Retry_asset asset -> Pure.Asset_requested_for_scope (scope,Retry asset) in
            Db.post session.worker event;Ok Client_command_completed)
@@ -1501,7 +1456,7 @@ let create ~(dependencies : dependencies) =
         Eio.Condition.loop_no_mutex session.auth_wake (fun () ->
           if !(session.auth_enqueued_sequence) >= !(session.auth_sequence) then Some () else None);
         Ok (Local_copy_deleted (request,
-          Db.delete_local_copy session.worker ~account_generation:request.account_generation
+          session.Session.delete_local ~account_generation:request.account_generation
             ~graph_id:request.graph_id))
       | Inspect_local_copy request ->
         let snapshot = (Db.view session.worker).sync.snapshot in
@@ -1542,7 +1497,7 @@ let create ~(dependencies : dependencies) =
             Pure.Asset_requested
               { graph_generation
               ; event =
-                  Logseq_sync_pure_reducer.Asset_transfer.Replace
+                  Logseq_sync_asset_transfer.Core.Replace
                     { consumer; priority; assets }
               }
           | Release_asset_demand consumer ->
@@ -1569,27 +1524,40 @@ let create ~(dependencies : dependencies) =
           "host rejected request";
         Ok Client_command_completed
       | Client_command (Reconcile_authenticated_user _) ->
-        (* Latest controls may coalesce an identical user even after local startup
-           closed the network gate. An admitted fresh verification must still
-           reach Core. Reassert the latest observed SDK identity, never the
-           possibly superseded value carried by an old admitted request. *)
-        if !(session.auth_seen) then session.queue_auth !(session.authenticated_user);
         Eio.Condition.loop_no_mutex session.auth_wake (fun () ->
           if !(session.auth_enqueued_sequence) >= !(session.auth_sequence)
           then Some ()
           else None);
         Ok Client_command_completed
       | Client_command (Restore_local_account { user_id }) ->
-        Db.post session.worker (client_event (Restore_local_account { user_id }));
+        session.Session.post_client (Restore_local_account { user_id });
         (* Local restoration may arrive after the SDK authentication event.
            Reassert the observed SDK state after restoration's ordered post. *)
         if !(session.auth_seen) then session.queue_auth !(session.authenticated_user);
         Ok Client_command_completed
       | Client_command (Delete_local_cache _) ->
         Error "Local deletion requires an account-scoped request."
+      | Client_command ((Request_sign_in _ | Cancel_online _ | Refresh_catalog _ | Begin_online_recovery _) as command) ->
+        let control = match command with
+          | Request_sign_in scope -> Journal_sync_registration.Sign_in scope
+          | Cancel_online scope -> Cancel_startup scope
+          | Refresh_catalog scope -> Refresh_catalog scope
+          | Begin_online_recovery scope -> Recover_online scope
+          | _ -> assert false in
+        (match session.Session.validate_network control with
+         | Error error -> Error (Sync_dsl.Core.error_message error)
+         | Ok () ->
+           session.post_client command;
+           (match command with
+            | Request_sign_in _ when !(session.auth_seen) -> session.queue_auth !(session.authenticated_user)
+            | _ -> ());
+           Ok Client_command_completed)
       | Client_command command ->
         (match command with Submit_e2ee_password _ -> unlock_queue_log context | _ -> ());
-        Db.post session.worker (client_event command);
+        session.Session.post_client command;
+        (match command with
+         | Request_sign_in _ when !(session.auth_seen) -> session.queue_auth !(session.authenticated_user)
+         | _ -> ());
         Ok Client_command_completed
       )
     ~shutdown:(fun session ->

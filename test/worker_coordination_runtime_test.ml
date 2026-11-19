@@ -6,8 +6,7 @@ module Runtime = Logseq_db_worker_lui.Journal_worker_runtime
 module Id = Journal_worker_ids
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module T = Logseq_db_worker_test_support.Test_support
-module Sync = Logseq_sync_pure_reducer.Core
-module SR = Logseq_sync_effect_runner.Effect_runner
+module Sync = Logseq_sync_domain.Core
 
 let require condition message = if not condition then failwith message
 let uuid value = W.Uuid.of_string value |> Result.get_ok
@@ -28,7 +27,7 @@ let observation_read client baseline (owner:Service.timeline_scope) registration
   let module F=Read.For_worker in
   let baseline=Option.get baseline in
   let scope=List.find_map(fun((scope:Sync.graph_scope),_)->
-    if scope.Logseq_sync_pure_reducer.Core.graph_id=owner.graph_id
+    if scope.Logseq_sync_domain.Core.graph_id=owner.graph_id
       && scope.graph_generation=owner.graph_generation
       && scope.account.account_generation=owner.startup.account_generation then Some scope else None)
     baseline.Service.baseline.state.residents |> Option.get in
@@ -53,31 +52,6 @@ let mutation_request client baseline owner registration ~request_id ~mutation_id
 
 let second_graph = uuid "9c000000-0000-4000-8000-000000000003"
 let client_id = uuid "9c000000-0000-4000-8000-000000000001"
-
-let crypto =
-  SR.crypto
-    ~encrypt_aes_gcm:(fun ~key:_ ~plaintext:_ -> Error "unused")
-    ~decrypt_aes_gcm:(fun ~key:_ ~iv:_ ~ciphertext:_ -> Error "unused")
-  |> Result.get_ok
-;;
-
-let secrets =
-  SR.secrets
-    ~unlock_private_key:
-      (fun
-        ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
-      Error "unused")
-    ~unlock_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
-      Error "unused")
-    ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
-      Error (SR.Wrapped_graph_key_unavailable "unused"))
-    ~verify_and_save_wrapped_graph_key:
-      (fun
-        ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
-      Error "unused")
-    ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
-  |> Result.get_ok
-;;
 
 let host_asset_demand host ~receive ~(owner:Service.timeline_scope) ~graph_generation ~name priority assets =
   let module H=Journal_worker_coordination_host in
@@ -352,9 +326,6 @@ let with_service_fixture
              ~limits:(let limits=Logseq_overlay_db.Database.dependency_limits fixture.overlay in
                match change_max_items with None->limits|Some change_max_items->{limits with change_max_items})
            |> Result.get_ok)
-        ~crypto
-        ~secrets
-        ~tls_authenticator:(SR.system_tls_authenticator () |> Result.get_ok)
     in
     f deps fixture.config)
 ;;
@@ -1936,7 +1907,7 @@ let test_client_to_typed_read () =
         "ordinary typed acquisition did not retain the imported local version";
       let module Descriptor=Logseq_db_types.Asset_descriptor in
       let remote_version=Descriptor.version
-        ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum "synthetic published second version")
+        ~checksum:(Logseq_sync_native_crypto.Asset_codec.checksum "synthetic published second version")
         ~file_type:"png" |> Result.get_ok in
       let changed=Descriptor.create ~uuid:source.asset ~source:(Managed(Some remote_version))
         ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
@@ -3350,6 +3321,116 @@ let with_observation_service ?epoch_ms ?prepare ?change_max_items ?(observe_push
     f client ~call ~send ~wait ~replies ~notices ~baseline ~owner ~registration)
 ;;
 
+let test_native_registration_network_epochs () =
+  let module Registration = Logseq_db_worker_lui.Journal_sync_registration in
+  let module Pure = Logseq_db_worker.Pure_reducer in
+  let exception Finished in
+  T.with_managed (fun fixture -> with_service_fixture (fun _ config ->
+    Eio_main.run (fun environment -> try Eio.Switch.run (fun sw ->
+      let epochs = ref [] in
+      let expected_generation = ref 1 in
+      let bridge = Registration.create ~sw
+        ~clock:(Eio.Stdenv.mono_clock environment) ~network:(Eio.Stdenv.net environment)
+        ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+        ~config ~overlay:fixture.overlay
+        ~token:(fun ~user:_ ~account_generation ~epoch ~refresh:_ ->
+          require (account_generation= !expected_generation) "network reopen changed token account identity";
+          epochs := epoch :: !epochs;
+          Error (Authentication_failure "Synthetic token rejection")) () |> Result.get_ok in
+      Fun.protect ~finally:bridge.shutdown (fun () ->
+        let settle () = for _ = 1 to 200 do Eio.Fiber.yield () done in
+        let intent event = bridge.lifecycle (Pure.Sync_intent event); settle () in
+        intent (Sync.Restore_local_account {user_id="user-1"});
+        let scope : Sync.startup_scope = {account_generation=1;presentation_generation=1} in
+        intent (Sync.Sign_in_requested scope);
+        intent (Sync.Account_authenticated {user_id=Some "user-1"});
+        require (!epochs<>[]) "native registration did not request a token";
+        let previous = ref (List.hd !epochs) in
+        let reopened label =
+          epochs:=[];
+          intent (Sync.Catalog_refresh_requested scope);
+          require (!epochs<>[]) (label ^ ": current gate did not admit catalog IO");
+          let epoch=List.hd !epochs in
+          require (epoch > !previous) (label ^ ": network authorization epoch was reused");
+          previous:=epoch in
+        for _ = 1 to 3 do
+          bridge.lifecycle (Pure.Foreground_intent false);settle ();
+          bridge.lifecycle (Pure.Foreground_intent true);settle ();
+          reopened "background/foreground"
+        done;
+        let stale_controls stale =
+          let timeline : Sync.timeline_scope = {startup=stale;graph_id=Test_support.graph_uuid;graph_generation=1} in
+          List.iter (fun control ->
+            require (match bridge.validate_control control with Error Stale_context -> true | _ -> false)
+              "stale registration control did not return Stale_context")
+            [Registration.Sign_in stale;Cancel_startup stale;Refresh_catalog stale;Recover_online timeline];
+          let before=List.length !epochs in
+          List.iter intent [Sync.Online_cancelled stale;Catalog_refresh_requested stale;Online_recovery_requested timeline;Sign_in_requested stale];
+          require (List.length !epochs=before) "stale registration control performed IO" in
+        stale_controls {scope with presentation_generation=scope.presentation_generation+1};
+        stale_controls {scope with account_generation=scope.account_generation+1};
+        let wrong_graph : Sync.timeline_scope = {startup=scope;graph_id=Test_support.graph_uuid;graph_generation=max_int} in
+        require (match bridge.validate_control (Registration.Recover_online wrong_graph) with
+          | Error Stale_context -> true | _ -> false) "retired graph recovery was admitted";
+        let before=List.length !epochs in
+        intent (Sync.Online_recovery_requested wrong_graph);
+        require (List.length !epochs=before) "retired graph recovery performed IO";
+        epochs:=[];
+        intent (Sync.Catalog_refresh_requested scope);
+        require (!epochs<>[] && List.hd !epochs= !previous) "stale control changed current gate";
+        for _ = 1 to 3 do
+          intent (Sync.Online_cancelled scope);
+          epochs:=[];
+          stale_controls {scope with presentation_generation=scope.presentation_generation+1};
+          stale_controls {scope with account_generation=scope.account_generation+1};
+          intent (Sync.Catalog_refresh_requested scope);
+          require (!epochs=[]) "stale sign-in reopened cancelled authorization";
+          bridge.lifecycle (Pure.Foreground_intent false);settle ();
+          bridge.lifecycle (Pure.Foreground_intent true);settle ();
+          intent (Sync.Account_authenticated {user_id=Some "user-1"});
+          intent (Sync.Catalog_refresh_requested scope);
+          require (!epochs=[]) "cancelled authorization was resurrected";
+          intent (Sync.Sign_in_requested scope);
+          intent (Sync.Account_authenticated {user_id=Some "user-1"});
+          reopened "cancel/sign-in same account"
+        done;
+        expected_generation:=2;
+        intent (Sync.Restore_local_account {user_id="other-synthetic-user"});
+        let current : Sync.startup_scope = {account_generation=2;presentation_generation=2} in
+        intent (Sync.Sign_in_requested current);
+        intent (Sync.Account_authenticated {user_id=Some "other-synthetic-user"});
+        let epoch=List.hd !epochs in
+        require (epoch > !previous) "account replacement reused authorization epoch";
+        stale_controls scope;
+        epochs:=[];
+        intent (Sync.Catalog_refresh_requested current);
+        require (!epochs<>[] && List.hd !epochs=epoch) "old account controls changed new account gate");
+      Eio.Switch.fail sw Finished) with Finished -> ())))
+;;
+
+let test_native_service_rejects_stale_network_commands () =
+  with_observation_service (fun _ ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration:_ ->
+    let rejected command =
+      require (match call (Service.Client_command command) with Mailbox.Failed _ -> true | _ -> false)
+        "stale network command reported success" in
+    let stale : Sync.startup_scope = {owner.startup with presentation_generation=owner.startup.presentation_generation+1} in
+    rejected (Service.Cancel_online stale);
+    rejected (Service.Refresh_catalog stale);
+    rejected (Service.Request_sign_in stale);
+    rejected (Service.Begin_online_recovery {owner with graph_generation=owner.graph_generation+1});
+    ignore (call (Service.Client_command Return_to_graph_picker));
+    wait (fun () -> (Option.get !baseline).Service.baseline.state.sync.selected=None);
+    rejected (Service.Cancel_online owner.startup);
+    rejected (Service.Refresh_catalog owner.startup);
+    rejected (Service.Begin_online_recovery owner);
+    ignore (call (Service.Client_command (Restore_local_account {user_id="other-synthetic-user"})));
+    wait (fun () -> Option.exists (fun account -> account.Sync.user_id="other-synthetic-user")
+      (Option.get !baseline).Service.baseline.state.sync.account);
+    rejected (Service.Cancel_online owner.startup);
+    rejected (Service.Refresh_catalog owner.startup);
+    rejected (Service.Begin_online_recovery owner))
+;;
+
 let prepare_enriched_read_data ~count ~title support =
   let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
   let module Session = Logseq_db_storage.Storage_session in
@@ -3742,7 +3823,9 @@ let test_revoked_hidden_lease_blocks_unregister_ack () =
         "revoked exact hidden lease lost physical cleanup authority";
       require(call(Service.Release_coordination 7991L)=Completed(Service.Coordination_released 7991L))
         "unregister did not retry its original physical cleanup after actual release";
-      require(not(Sys.file_exists path))"successful unregister left old scoped resource bytes live"))
+      require(call(Service.Acquire_asset_file{scope;handle})=Completed(Service.Asset_file None))
+        "successful unregister retained old preview acquisition authority";
+      require(Sys.file_exists path)"unregister deleted the durable pending import source"))
 ;;
 
 let test_prepared_import_survives_worker_lifetime () =
@@ -4720,6 +4803,14 @@ let test_physical_outbox_failure_carries_unknown_reason () =
 ;;
 
 let () =
+  if Array.mem "--network-epochs-only" Sys.argv then (
+    test_native_registration_network_epochs (); print_endline "Native registration network epochs passed"; exit 0);
+  if Array.mem "--network-scopes-only" Sys.argv then (
+    test_native_service_rejects_stale_network_commands (); print_endline "Native Service network scope guards passed"; exit 0);
+  test_native_registration_network_epochs ();
+  test_native_service_rejects_stale_network_commands ();
+  if Array.mem "--source-recovery-only" Sys.argv then (
+    test_host_recovers_only_pending_import_sources();print_endline "Exact pending source evidence recovery passed";exit 0);
   if Array.mem "--physical-outbox-cause-only" Sys.argv then (
     test_physical_outbox_failure_carries_unknown_reason (); exit 0);
   test_physical_outbox_failure_carries_unknown_reason ();
@@ -4746,8 +4837,6 @@ let () =
     print_endline "Migrated real typed read boundary cases passed";exit 0);
   if Array.mem "--changes-application-only" Sys.argv then (
     test_changefeed_business_waits_for_ui_application(); print_endline "Real typed Changes application barrier passed"; exit 0);
-  if Array.mem "--source-recovery-only" Sys.argv then (
-    test_host_recovers_only_pending_import_sources();print_endline "Exact pending source evidence recovery passed";exit 0);
   test_host_recovers_only_pending_import_sources();
   if Array.mem "--observation-retirement-only" Sys.argv then (
     test_service_binding_retirement_reclaims_observation_history();

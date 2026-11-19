@@ -1,5 +1,5 @@
-module T = Logseq_sync_pure_reducer.Asset_transfer
-module C = Logseq_sync_pure_reducer.Core
+module T = Logseq_sync_asset_transfer.Core
+module C = Logseq_sync_domain.Core
 module A = Logseq_db_types.Asset_descriptor
 module U = Logseq_db_types.Graph_types.Uuid
 

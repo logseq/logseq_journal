@@ -32,7 +32,8 @@
   logseq_db_worker.contract
   logseq_db_worker.pure_reducer
   logseq_overlay_db
-  logseq_sync.pure_reducer
+  logseq_sync.protocol
+  logseq_sync.domain logseq_sync.asset_transfer
   uri
   yojson
   rrbvec
@@ -49,13 +50,13 @@
   logseq_db_worker
   logseq_db_worker.lui
   logseq_db_worker_test_support
-  logseq_sync.effect_runner
+  logseq_sync.native_crypto logseq_sync.assets
   digestif
   eio
   logseq_db_storage
   logseq_db_types
   logseq_db_worker.pure_reducer
-  logseq_sync.pure_reducer
+  logseq_sync.domain logseq_sync.asset_transfer
   rrbvec
   sqlite3
   threads
@@ -66,10 +67,9 @@
 (test
  (name test_effect_runner)
  (modules test_effect_runner)
- (libraries datascript-ocaml-native logseq_db_worker.typed_data logseq_db_worker.typed_read logseq_db_worker.identity
+ (libraries datascript_ocaml.types sync_dsl execute logseq_sync.worker_owner logseq_sync.crypto datascript-ocaml-native logseq_db_worker.typed_data logseq_db_worker.typed_read logseq_db_worker.identity
   alcotest
   datascript_ocaml
-  datascript_ocaml.types
   eio
   eio_main
   eio.unix
@@ -82,8 +82,9 @@
   logseq_db_worker.pure_reducer
   logseq_db_worker_test_support
   logseq_overlay_db_test_support
-  logseq_sync.effect_runner
-  logseq_sync.pure_reducer
+  logseq_sync.native_crypto logseq_sync.assets
+  logseq_sync.protocol
+  logseq_sync.domain logseq_sync.asset_transfer
   rrbvec
   unix
   uri
@@ -127,7 +128,8 @@
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.lui
-  logseq_sync.pure_reducer
+  logseq_sync.protocol
+  logseq_sync.domain logseq_sync.asset_transfer
   managed_sync_e2e_support
   mirage-crypto-rng
   mirage-crypto-rng.unix
@@ -154,10 +156,10 @@
   alcotest
   logseq_db_worker.pure_reducer
   logseq_db_types
-  logseq_sync.pure_reducer
+  logseq_sync.domain logseq_sync.asset_transfer
   uri))
 
 (test
  (name test_asset_protocol)
  (modules test_asset_protocol)
- (libraries alcotest logseq_db_worker logseq_db_worker.contract logseq_db_worker.typed_read logseq_db_worker.typed_data logseq_db_worker.identity logseq_db_types logseq_sync.pure_reducer uri yojson))
+ (libraries alcotest logseq_db_worker logseq_db_worker.contract logseq_db_worker.typed_read logseq_db_worker.typed_data logseq_db_worker.identity logseq_db_types logseq_sync.domain logseq_sync.asset_transfer uri yojson))

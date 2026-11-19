@@ -1,0 +1,1296 @@
+module D = Sync_dsl.Core
+module S = Logseq_sync_transport.Snapshot
+module C = Logseq_sync_transport.Http_client
+module H = Logseq_sync_native_transport.Http
+module N = Logseq_sync_native_transport.Http_eio
+
+let get = function
+  | Ok value -> value
+  | Error error -> Alcotest.fail (D.error_message error)
+;;
+
+let identity =
+  get
+    (D.identity
+       ~origin:"https://example.com"
+       ~account:"synthetic"
+       ~graph:"60000000-0000-4000-8000-000000000001"
+       ~account_generation:0L
+       ~graph_generation:0L)
+;;
+
+let cursor = Result.get_ok (Logseq_overlay_db.Types.Server_cursor.of_int64 3L)
+
+let limits =
+  get
+    (D.limits
+       ~maximum_items:1024
+       ~maximum_bytes:1048576
+       ~maximum_pending:8
+       ~maximum_resources:8
+       ~steps_per_turn:8
+       ~maximum_tasks:8
+       ~maximum_messages:4
+       ~maximum_message_bytes:1048576
+       ~maximum_demands:8
+       ~maximum_active_assets:2
+       ~foreground_reserve:1
+       ~foreground_demand_reserve:1
+       ~foreground_descriptor_reserve_bytes:128
+       ~asset_cache_budget_bytes:4096L
+       ~asset_maximum_file_bytes:1024
+       ~asset_pending_budget_bytes:4096L
+       ~snapshot_maximum_artifact_bytes:8388608L
+       ~snapshot_staging_budget_bytes:33554432L
+       ~snapshot_scratch_budget_bytes:33554432L)
+;;
+
+let scope : C.scope =
+  { check_current = (fun () -> Ok ()); admit_network = (fun () -> Ok ()) }
+;;
+
+let response ?(status = 200) ?(headers = []) body : N.response = { status; headers; body }
+
+let rec remove path =
+  match Unix.lstat path with
+  | { st_kind = Unix.S_DIR; _ } ->
+    Array.iter (fun name -> remove (Filename.concat path name)) (Sys.readdir path);
+    Unix.rmdir path
+  | _ -> Unix.unlink path
+  | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ()
+;;
+
+let with_directory callback =
+  let path = Filename.temp_file "snapshot-owner-" "" in
+  Sys.remove path;
+  Unix.mkdir path 0o700;
+  Fun.protect ~finally:(fun () -> remove path) (fun () -> callback path)
+;;
+
+let fixture () =
+  let open Yojson.Safe.Util in
+  let rec root path =
+    if Sys.file_exists (Filename.concat path "dune-project")
+    then path
+    else root (Filename.dirname path)
+  in
+  let rows =
+    Yojson.Safe.from_file
+      (Filename.concat
+         (root (Sys.getcwd ()))
+         "logseq_sync/test/production_transport/snapshot_rows.json")
+    |> member "rows"
+    |> to_list
+  in
+  let module V = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let rows =
+    List.map
+      (fun row ->
+         V.Array
+           [ V.Int (row |> member "addr" |> to_int)
+           ; V.String (row |> member "content" |> to_string)
+           ; (match row |> member "addresses" with
+              | `Null -> V.Null
+              | value -> V.String (to_string value))
+           ])
+      rows
+  in
+  let payload = Codec.to_string ~mode:Codec.Verbose (V.Array rows) in
+  let prefix = Bytes.create 4 in
+  for index = 0 to 3 do
+    Bytes.set
+      prefix
+      index
+      (Char.chr ((String.length payload lsr ((3 - index) * 8)) land 255))
+  done;
+  Bytes.to_string prefix ^ payload, List.length rows
+;;
+
+let write path wire =
+  let channel = open_out_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_out_noerr channel)
+    (fun () -> output_string channel wire)
+;;
+
+let expect predicate = function
+  | Error error when predicate error -> ()
+  | Error error -> Alcotest.fail (D.error_message error)
+  | Ok _ -> Alcotest.fail "Expected failure"
+;;
+
+let protocol = function
+  | D.Protocol_failure _ -> true
+  | _ -> false
+;;
+
+let with_owner
+      ?(encrypted = false)
+      ?(metadata = "{\"ok\":true,\"url\":\"https://cdn.example.com/snapshot\",\"t\":3}")
+      ?wire
+      ?rows
+      callback
+  =
+  Eio_main.run (fun _ ->
+    with_directory (fun root ->
+      let original, count = fixture () in
+      let wire = Option.value wire ~default:original
+      and rows = Option.value rows ~default:count in
+      let requests = ref []
+      and downloads = ref 0
+      and tokens = ref [] in
+      let backend : C.backend =
+        { perform =
+            (fun request ->
+              requests := request :: !requests;
+              Ok (response metadata))
+        ; download =
+            (fun ~request ~destination ~maximum_bytes ->
+              incr downloads;
+              requests := request :: !requests;
+              Alcotest.(check bool) "bounded stream" true (maximum_bytes > 0);
+              write destination wire;
+              Ok (response ~headers:[ "x-snapshot-row-count", string_of_int rows ] ""))
+        }
+      in
+      let http =
+        C.create ~backend ~token:(fun ~epoch ~refresh ->
+          tokens := (epoch, refresh) :: !tokens;
+          Ok "synthetic-bearer")
+      in
+      let owner =
+        get
+          (S.create
+             ~verify:Logseq_overlay_db.Database.inspect_snapshot_storage
+             ~root
+             ~identity
+             ~limits
+             ~encrypted
+             ~http)
+      in
+      Fun.protect
+        ~finally:(fun () -> get (S.close owner))
+        (fun () -> callback root owner requests downloads tokens)))
+;;
+
+let encryption_failure () =
+  with_owner ~encrypted:true (fun root owner _ _ _ ->
+    expect
+      protocol
+      (S.acquire
+         owner
+         ~scope
+         ~epoch:7L
+         ~handoff:(fun _ -> Alcotest.fail "Invalid encryption must not hand off")
+         cursor);
+    Alcotest.(check int)
+      "encryption failure cleans staging"
+      0
+      (Array.length (Sys.readdir root)))
+;;
+
+let acquire owner handoff = S.acquire owner ~scope ~epoch:7L ~handoff cursor
+
+let success () =
+  with_owner (fun root owner requests downloads tokens ->
+    let handed = ref [] in
+    let snapshot =
+      get
+        (acquire owner (fun refs ->
+           handed := Rrbvec.to_list refs;
+           Ok ()))
+    in
+    let source = get (S.source owner snapshot) in
+    Alcotest.(check bool) "retained actual file" true (Sys.file_exists source.path);
+    Alcotest.(check int) "single download" 1 !downloads;
+    Alcotest.(check int) "no preliminary pull" 2 (List.length !requests);
+    Alcotest.(check int) "only metadata authenticates" 1 (List.length !tokens);
+    let artifact = List.hd !requests in
+    Alcotest.(check bool)
+      "no CDN bearer"
+      false
+      (List.mem_assoc "authorization" artifact.H.headers);
+    Alcotest.(check int) "original handoff" 1 (List.length !handed);
+    Alcotest.(check int)
+      "canonical checksum length"
+      28
+      (String.length snapshot.D.checksum);
+    let forged_resource =
+      get (D.resource ~owner:identity ~token:snapshot.resource.token)
+    in
+    let forged =
+      get
+        (D.snapshot
+           ~resource:forged_resource
+           ~through:cursor
+           ~checksum:snapshot.checksum
+           ~encrypted:false)
+    in
+    expect
+      (function
+        | D.Stale_context -> true
+        | _ -> false)
+      (S.source owner forged);
+    get (S.release owner ~identity snapshot);
+    get (S.release owner ~identity snapshot);
+    Alcotest.(check bool) "physical release" false (Sys.file_exists source.path);
+    Alcotest.(check int) "all owned staging gone" 0 (Array.length (Sys.readdir root)))
+;;
+
+let metadata_failure () =
+  List.iter
+    (fun metadata ->
+       with_owner ~metadata (fun root owner _ downloads _ ->
+         expect
+           protocol
+           (acquire owner (fun _ -> Alcotest.fail "invalid metadata handed off"));
+         Alcotest.(check int) "no download" 0 !downloads;
+         Alcotest.(check int) "no artifacts" 0 (Array.length (Sys.readdir root))))
+    [ "{\"ok\":true,\"url\":\"https://cdn.example.com/x\"}"
+    ; "{\"ok\":true,\"url\":\"https://cdn.example.com/x\",\"t\":-1}"
+    ; "{\"ok\":true,\"url\":\"https://cdn.example.com/x\",\"t\":4}"
+    ; "{\"ok\":true,\"url\":\"http://cdn.example.com/x\",\"t\":3}"
+    ]
+;;
+
+let framing_failure () =
+  with_owner ~wire:"\000\000\000\010broken" ~rows:2 (fun root owner _ _ _ ->
+    expect
+      protocol
+      (acquire owner (fun _ -> Alcotest.fail "malformed artifact handed off"));
+    Alcotest.(check int) "failed framing cleaned" 0 (Array.length (Sys.readdir root)))
+;;
+
+let row_failure () =
+  with_owner ~rows:1 (fun root owner _ _ _ ->
+    expect protocol (acquire owner (fun _ -> Alcotest.fail "wrong count handed off"));
+    Alcotest.(check int) "failed rows cleaned" 0 (Array.length (Sys.readdir root)))
+;;
+
+let handoff_failure () =
+  with_owner (fun root owner _ _ _ ->
+    expect
+      (function
+        | D.Stale_context -> true
+        | _ -> false)
+      (acquire owner (fun _ -> Error D.Stale_context));
+    Alcotest.(check int) "failed handoff cleaned" 0 (Array.length (Sys.readdir root)))
+;;
+
+let auth () =
+  Eio_main.run (fun _ ->
+    let calls = ref 0
+    and tokens = ref [] in
+    let backend : C.backend =
+      { perform =
+          (fun _ ->
+            incr calls;
+            Ok (response ~status:(if !calls = 1 then 401 else 200) "ok"))
+      ; download = (fun ~request:_ ~destination:_ ~maximum_bytes:_ -> assert false)
+      }
+    in
+    let client =
+      C.create ~backend ~token:(fun ~epoch:_ ~refresh ->
+        tokens := refresh :: !tokens;
+        Ok "synthetic")
+    in
+    ignore
+      (get
+         (C.perform client ~scope ~epoch:7L ~authenticated:true (fun token ->
+            H.catalog ~base_url:(Uri.of_string identity.origin) ~token:(Option.get token))));
+    Alcotest.(check (list bool)) "one checked refresh" [ true; false ] !tokens;
+    Alcotest.(check int) "two attempts" 2 !calls)
+;;
+
+let http_status_policy () =
+  List.iter
+    (fun (status, network) ->
+       let calls = ref 0 in
+       let backend : C.backend =
+         { perform =
+             (fun _ ->
+               incr calls;
+               Ok (response ~status ""))
+         ; download = (fun ~request:_ ~destination:_ ~maximum_bytes:_ -> assert false)
+         }
+       in
+       let client =
+         C.create ~backend ~token:(fun ~epoch:_ ~refresh:_ -> Ok "synthetic")
+       in
+       let result =
+         C.perform client ~scope ~epoch:1L ~authenticated:true (fun _ ->
+           H.artifact
+             ~base_url:(Uri.of_string identity.origin)
+             ~uri:(Uri.of_string identity.origin)
+             ~token:None)
+       in
+       expect
+         (function
+           | D.Network_failure _ -> network
+           | D.Protocol_failure _ -> not network
+           | _ -> false)
+         result;
+       Alcotest.(check int) "no hidden refresh or retry" 1 !calls)
+    [ 400, false; 422, false; 429, false; 500, false; 503, false ]
+;;
+
+let native_client
+      ~environment
+      ~sw
+      ?(http_response_seconds = 1.)
+      ?(download_seconds = 3.)
+      ()
+  =
+  let deadlines : Execute.Core.network_deadlines =
+    { setup_seconds = 1.
+    ; tls_handshake_seconds = 1.
+    ; http_response_seconds
+    ; download_seconds
+    }
+  in
+  C.create
+    ~backend:
+      (C.native_backend
+         ~sw
+         ~clock:(Eio.Stdenv.mono_clock environment)
+         ~network:(Eio.Stdenv.net environment)
+         ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+         ~deadlines)
+    ~token:(fun ~epoch:_ ~refresh:_ -> Ok "synthetic-bearer")
+;;
+
+let wire_response headers body = "HTTP/1.1 200 OK\r\n" ^ headers ^ "\r\n" ^ body
+
+let check_retired report =
+  let open Yojson.Basic.Util in
+  report
+  |> to_list
+  |> List.iter (fun row ->
+    Alcotest.(check bool) "physical peer close" true (row |> member "closed" |> to_bool))
+;;
+
+let native_snapshot layers () =
+  let wire, rows = fixture () in
+  let metadata = "{\"ok\":true,\"url\":\"{{ORIGIN}}/snapshot\",\"t\":3}" in
+  let metadata =
+    wire_response
+      "Content-Type: application/json\r\nContent-Length: {{LENGTH}}\r\n"
+      metadata
+  in
+  let artifact =
+    wire_response
+      (Printf.sprintf "Content-Length: {{LENGTH}}\r\nX-Snapshot-Row-Count: %d\r\n" rows)
+      wire
+  in
+  let artifact =
+    match Tls_peer.case artifact with
+    | `Assoc fields -> `Assoc (("gzip_layers", `Int layers) :: fields)
+    | _ -> assert false
+  in
+  let report =
+    Tls_peer.with_peer
+      [ Tls_peer.case metadata; artifact ]
+      (fun ~environment ~sw ~support ~origin ->
+         let http = native_client ~environment ~sw () in
+         let identity =
+           get
+             (D.identity
+                ~origin:(Uri.to_string origin)
+                ~account:"synthetic"
+                ~graph:identity.graph
+                ~account_generation:0L
+                ~graph_generation:0L)
+         in
+         let staging = Filename.concat support "staging" in
+         Unix.mkdir staging 0o700;
+         let owner =
+           get
+             (S.create
+                ~verify:Logseq_overlay_db.Database.inspect_snapshot_storage
+                ~root:staging
+                ~identity
+                ~limits
+                ~encrypted:false
+                ~http)
+         in
+         Fun.protect
+           ~finally:(fun () -> get (S.close owner))
+           (fun () ->
+              let result = acquire owner (fun _ -> Ok ()) in
+              if layers > 2
+              then expect protocol result
+              else (
+                let snapshot = get result in
+                let source = get (S.source owner snapshot) in
+                Alcotest.(check string)
+                  "actual native artifact"
+                  wire
+                  (Tls_peer.read_file source.path);
+                get (S.release owner ~identity snapshot));
+              Alcotest.(check int)
+                "native staging cleaned"
+                0
+                (Array.length (Sys.readdir staging))))
+  in
+  check_retired report
+;;
+
+let remote_graph_fixture () =
+  with_directory (fun root ->
+    let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+    let attribute : Datascript.schema_attr =
+      { cardinality = One
+      ; unique = None
+      ; indexed = true
+      ; is_component = false
+      ; no_history = false
+      ; doc = None
+      ; value_type = None
+      ; tuple_attrs = None
+      ; tuple_types = None
+      }
+    in
+    let schema =
+      List.map
+        (fun name -> name, attribute)
+        [ "db/ident"
+        ; "block/uuid"
+        ; "block/title"
+        ; "block/parent"
+        ; "block/page"
+        ; "block/order"
+        ; "kv/value"
+        ]
+    in
+    let fact e a v : Datascript.datom = { e; a; v; tx = 536870913; added = true } in
+    let kv e name value = [ fact e "db/ident" (Keyword name); fact e "kv/value" value ] in
+    let database =
+      Datascript.init_db
+        ~schema
+        (List.concat
+           [ kv 1 "logseq.kv/graph-remote?" (Bool true)
+           ; kv 2 "logseq.kv/graph-uuid" (Uuid identity.graph)
+           ; kv 3 "logseq.kv/db-type" (String "db")
+           ; kv
+               4
+               "logseq.kv/schema-version"
+               (Map [ Keyword "major", Int64 65L; Keyword "minor", Int64 33L ])
+           ])
+    in
+    let path = Filename.concat root "db.sqlite" in
+    let sqlite = Sqlite3.db_open path in
+    Sqlite3.Rc.check
+      (Sqlite3.exec
+         sqlite
+         "CREATE TABLE kvs (addr INTEGER PRIMARY KEY, content TEXT, addresses JSON)");
+    ignore (Sqlite3.db_close sqlite);
+    let connection = Result.get_ok (Storage.open_database path) in
+    let callbacks = Storage.connection_callbacks connection in
+    Fun.protect
+      ~finally:(fun () -> ignore (Storage.close callbacks))
+      (fun () ->
+         Result.get_ok (callbacks.begin_staging ());
+         ignore (Datascript.store ~storage:callbacks.storage database);
+         let batch = Result.get_ok (callbacks.finish_staging None []) in
+         Result.get_ok (Storage.commit_batch callbacks batch));
+    let checksum =
+      Result.get_ok
+        (Logseq_overlay_db.Database.inspect_snapshot_storage
+           ~check_current:(fun () -> ())
+           ~scratch_bytes:33554432L
+           ~encrypted:false
+           ~path)
+    in
+    let sqlite = Sqlite3.db_open path in
+    let rows = ref [] in
+    Fun.protect
+      ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+      (fun () ->
+         Sqlite3.Rc.check
+           (Sqlite3.exec
+              sqlite
+              ~cb:(fun values _ ->
+                let open Transit_core.Json in
+                rows
+                := Array
+                     [ Int (int_of_string (Option.get values.(0)))
+                     ; String (Option.get values.(1))
+                     ; (match values.(2) with
+                        | None -> Null
+                        | Some value -> String value)
+                     ]
+                   :: !rows)
+              "SELECT addr, content, addresses FROM kvs ORDER BY addr"));
+    let module Codec = Transit_native.Transit.Json in
+    let payload =
+      Codec.to_string ~mode:Codec.Verbose (Transit_core.Json.Array (List.rev !rows))
+    in
+    let prefix =
+      Bytes.init 4 (fun index ->
+        Char.chr ((String.length payload lsr ((3 - index) * 8)) land 255))
+    in
+    Bytes.to_string prefix ^ payload, List.length !rows, checksum)
+;;
+
+let native_service_bootstrap () =
+  let module App = Journal_sync_lifecycle.Core in
+  let module X = Execute.Core in
+  let module Database = Logseq_overlay_db.Database in
+  let module Types = Logseq_overlay_db.Types in
+  let wire, rows, checksum = remote_graph_fixture () in
+  let metadata =
+    wire_response
+      "Content-Type: application/json\r\nContent-Length: {{LENGTH}}\r\n"
+      "{\"ok\":true,\"url\":\"{{ORIGIN}}/snapshot\",\"t\":3}"
+  in
+  let artifact =
+    wire_response
+      (Printf.sprintf "Content-Length: {{LENGTH}}\r\nX-Snapshot-Row-Count: %d\r\n" rows)
+      wire
+  in
+  let module Protocol = Logseq_sync_protocol.Sync_protocol in
+  let wire_checksum = Types.Checksum.to_string checksum in
+  let wire_checksum = String.sub wire_checksum (String.length "checksum:v1:") 16 in
+  let hello =
+    Result.get_ok
+      (Protocol.encode_server_message
+         (Protocol.Server.Hello { t = cursor; checksum = Some wire_checksum }))
+  in
+  let frame =
+    String.make 1 (Char.chr 0x81) ^ String.make 1 (Char.chr (String.length hello)) ^ hello
+  in
+  let socket =
+    match Tls_peer.case ~ws:true "" with
+    | `Assoc fields ->
+      `Assoc
+        (("parallel", `Bool true)
+         :: ("lifetime", `Int 10)
+         :: ("reply_text", `String (Tls_peer.hex frame))
+         :: fields)
+    | _ -> assert false
+  in
+  let report =
+    Tls_peer.with_peer
+      [ socket; Tls_peer.case ~eof:true metadata; Tls_peer.case ~eof:true artifact ]
+      (fun ~environment ~sw ~support ~origin ->
+         let identity =
+           get
+             (D.identity
+                ~origin:(Uri.to_string origin)
+                ~account:"synthetic"
+                ~graph:identity.graph
+                ~account_generation:0L
+                ~graph_generation:0L)
+         in
+         let root = Filename.concat support "application" in
+         Unix.mkdir root 0o700;
+         let dependencies =
+           Result.get_ok
+             (Database.dependencies
+                ~epoch_ms:(fun () -> 0L)
+                ~monotonic_ns:Mtime_clock.elapsed_ns
+                ~limits:
+                  { Types.response_budget_bytes = 1048576
+                  ; outbox_max_records = 32
+                  ; outbox_max_bytes = 4194304
+                  ; change_max_items = 1024
+                  ; change_max_bytes = 1048576
+                  ; dispatcher_capacity = 32
+                  ; wire_batch_max_bytes = 1048576
+                  })
+         in
+         let sqlite = Sqlite3.db_open ":memory:" in
+         Fun.protect
+           ~finally:(fun () ->
+             Alcotest.(check bool)
+               "App upload store released"
+               true
+               (Sqlite3.db_close sqlite))
+           (fun () ->
+              Result.get_ok
+                (Logseq_db_storage.Asset_upload_store.initialize_database sqlite);
+              let retry =
+                get
+                  (D.retry_policy
+                     ~initial_seconds:0.01
+                     ~maximum_seconds:0.01
+                     ~multiplier:1.
+                     ~maximum_attempts:0)
+              in
+              let config : Logseq_sync_sync_service.Core.config =
+                { identity
+                ; limits
+                ; network = D.Open { authorization_epoch = 1L }
+                ; policy =
+                    get
+                      (D.policy_config
+                         ~sync_retry:retry
+                         ~asset_retry:retry
+                         ~no_progress_seconds:0.01)
+                }
+              in
+              let errors = ref [] in
+              let service =
+                get
+                  (App.start_owned_native
+                     ~sw
+                     ~clock:(Eio.Stdenv.mono_clock environment)
+                     ~network:(Eio.Stdenv.net environment)
+                     ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+                     ~config
+                     ~deadlines:
+                       { X.setup_seconds = 2.
+                       ; tls_handshake_seconds = 2.
+                       ; http_response_seconds = 2.
+                       ; download_seconds = 2.
+                       }
+                     ~liveness:X.Peer_close_only
+                     ~cleanup_seconds:2.
+                     ~root
+                     ~dependencies
+                     ~graph_name:"Synthetic native bootstrap"
+                     ~upload_store:(Logseq_sync_worker_owner.Core.store sqlite)
+                     ~namespace:(String.make 64 'a')
+                     ~encrypted:false
+                     ~token:(fun ~epoch:_ ~refresh:_ -> Ok "synthetic-fixture-token")
+                     ~on_change:(fun status ->
+                       match status.Logseq_sync_sync_service.Core.observation.status with
+                       | D.Service_blocked error -> errors := error :: !errors
+                       | _ -> ())
+                     ~on_error:(fun error -> errors := error :: !errors))
+              in
+              Fun.protect
+                ~finally:(fun () -> App.close service)
+                (fun () ->
+                   Tls_peer.wait (Eio.Stdenv.clock environment) (fun () ->
+                     (match !errors with
+                      | D.Activation_failure (Types.Snapshot_parse_error message) :: _ ->
+                        Alcotest.fail ("Activation parse: " ^ message)
+                      | D.Activation_failure Types.Snapshot_limit_exceeded :: _ ->
+                        Alcotest.fail "Activation limit exceeded"
+                      | D.Activation_failure
+                          (Types.Snapshot_commit_persistence_failed message)
+                        :: _ -> Alcotest.fail ("Activation persistence: " ^ message)
+                      | error :: _ -> Alcotest.fail (D.error_message error)
+                      | [] -> ());
+                     Option.is_some
+                       (get (X.database_if_open (App.database_owner service))));
+                   let database = get (X.database (App.database_owner service)) in
+                   let view = Result.get_ok (Database.inspect_sync database) in
+                   Alcotest.(check int64)
+                     "native service activates exact server checkpoint"
+                     3L
+                     (Types.sync_view_checkpoint view |> Types.Server_cursor.to_int64);
+                   Alcotest.(check int)
+                     "bootstrap subscription errors"
+                     0
+                     (List.length !errors))))
+  in
+  check_retired report
+;;
+
+let native_http ~download ~success ~eof wire () =
+  let report =
+    Tls_peer.with_peer
+      [ Tls_peer.case ~eof wire ]
+      (fun ~environment ~sw ~support ~origin ->
+         let http = native_client ~environment ~sw () in
+         let destination = Filename.concat support "artifact" in
+         let request token =
+           H.
+             { operation = Get
+             ; uri = origin
+             ; headers = H.authorization (Option.get token)
+             ; maximum_response_bytes = 16
+             ; expected_content_type = Asset_binary
+             }
+         in
+         let result =
+           if download
+           then
+             C.download
+               http
+               ~scope
+               ~epoch:1L
+               ~authenticated:true
+               ~destination
+               ~maximum_bytes:16
+               request
+           else C.perform http ~scope ~epoch:1L ~authenticated:true request
+         in
+         Alcotest.(check bool) "HTTP outcome" success (Result.is_ok result);
+         if not success
+         then
+           expect
+             (function
+               | D.Protocol_failure _ -> true
+               | _ -> false)
+             result;
+         if download
+         then (
+           Alcotest.(check bool)
+             "publish only complete body"
+             success
+             (Sys.file_exists destination);
+           Alcotest.(check bool)
+             "no partial files"
+             false
+             (Array.exists
+                (fun name -> Filename.check_suffix name ".partial")
+                (Sys.readdir support))))
+  in
+  check_retired report
+;;
+
+let native_assets () =
+  let report =
+    Tls_peer.with_peer
+      [ Tls_peer.case (wire_response "Content-Length: 4\r\n" "wire")
+      ; Tls_peer.case (wire_response "Content-Length: 0\r\n" "")
+      ]
+      (fun ~environment ~sw ~support:_ ~origin ->
+         let http = native_client ~environment ~sw () in
+         let identity =
+           get
+             (D.identity
+                ~origin:(Uri.to_string origin)
+                ~account:"synthetic"
+                ~graph:identity.graph
+                ~account_generation:0L
+                ~graph_generation:0L)
+         in
+         let asset =
+           Result.get_ok
+             (Logseq_db_types.Graph_types.Uuid.of_string
+                "11111111-1111-4111-8111-111111111111")
+         in
+         let version =
+           Result.get_ok
+             (Logseq_db_types.Asset_descriptor.version
+                ~checksum:(String.make 64 'a')
+                ~file_type:"png")
+         in
+         Alcotest.(check (option string))
+           "GET preserves protected wire"
+           (Some "wire")
+           (get
+              (C.get_asset
+                 http
+                 ~scope
+                 ~epoch:1L
+                 ~identity
+                 ~asset
+                 ~version
+                 ~maximum_wire_bytes:16));
+         get
+           (C.put_asset
+              http
+              ~scope
+              ~epoch:1L
+              ~identity
+              ~asset
+              ~version
+              ~wire:"protected-wire"))
+  in
+  check_retired report;
+  let open Yojson.Basic.Util in
+  let requests =
+    report |> to_list |> List.map (fun row -> row |> member "request" |> to_string)
+  in
+  let decode hex =
+    String.init
+      (String.length hex / 2)
+      (fun index -> Char.chr (int_of_string ("0x" ^ String.sub hex (index * 2) 2)))
+  in
+  let put = decode (List.nth requests 1) in
+  Alcotest.(check bool)
+    "production PUT method"
+    true
+    (String.starts_with ~prefix:"PUT /assets/" put);
+  Alcotest.(check bool)
+    "PUT exact frozen wire"
+    true
+    (String.ends_with ~suffix:"protected-wire" put)
+;;
+
+let native_cancel () =
+  let case =
+    match Tls_peer.case (wire_response "Content-Length: 1\r\n" "x") with
+    | `Assoc fields -> `Assoc (("body_delay", `Float 0.2) :: fields)
+    | _ -> assert false
+  in
+  let report =
+    Tls_peer.with_peer [ case ] (fun ~environment ~sw ~support ~origin ->
+      let http = native_client ~environment ~sw ~download_seconds:0.05 () in
+      let destination = Filename.concat support "artifact" in
+      expect
+        (function
+          | D.Network_failure _ -> true
+          | _ -> false)
+        (C.download
+           http
+           ~scope
+           ~epoch:1L
+           ~authenticated:false
+           ~destination
+           ~maximum_bytes:16
+           (fun _ -> H.artifact ~base_url:origin ~uri:origin ~token:None));
+      Alcotest.(check bool)
+        "deadline leaves no artifact"
+        false
+        (Sys.file_exists destination))
+  in
+  check_retired report
+;;
+
+let native_response_deadline () =
+  let case =
+    match Tls_peer.case (wire_response "Content-Length: 1\r\n" "x") with
+    | `Assoc fields -> `Assoc (("response_delay", `Float 0.2) :: fields)
+    | _ -> assert false
+  in
+  let report =
+    Tls_peer.with_peer [ case ] (fun ~environment ~sw ~support:_ ~origin ->
+      let http = native_client ~environment ~sw ~http_response_seconds:0.05 () in
+      expect
+        (function
+          | D.Network_failure _ -> true
+          | _ -> false)
+        (C.perform http ~scope ~epoch:1L ~authenticated:false (fun _ ->
+           H.artifact ~base_url:origin ~uri:origin ~token:None)))
+  in
+  check_retired report
+;;
+
+let scaled_mono clock scale =
+  let started = Eio.Time.Mono.now clock |> Mtime.to_uint64_ns in
+  let module Clock = struct
+    type t = unit
+    type time = Mtime.t
+
+    let now () =
+      let elapsed = Int64.sub (Mtime.to_uint64_ns (Eio.Time.Mono.now clock)) started in
+      Mtime.of_uint64_ns (Int64.of_float (Int64.to_float elapsed *. scale))
+    ;;
+
+    let sleep_until () deadline =
+      let elapsed = Int64.to_float (Mtime.to_uint64_ns deadline) /. scale in
+      Eio.Time.Mono.sleep_until
+        clock
+        (Mtime.of_uint64_ns (Int64.add started (Int64.of_float elapsed)))
+    ;;
+  end
+  in
+  Eio.Resource.T ((), Eio.Time.Pi.clock (module Clock))
+;;
+
+let native_phase_budget phase ~expires () =
+  let delay = if phase = "body_delay" then 1.6 else 0.4 in
+  let fields =
+    match Tls_peer.case (wire_response "Content-Length: 1\r\n" "x") with
+    | `Assoc fields -> fields
+    | _ -> assert false
+  in
+  let cases =
+    if expires && phase = "tls_delay"
+    then (
+      let case = `Assoc (("stall_tls", `Bool true) :: fields) in
+      [ case; case ])
+    else [ `Assoc ((phase, `Float delay) :: fields) ]
+  in
+  let report =
+    Tls_peer.with_peer cases (fun ~environment ~sw ~support ~origin ->
+      let deadlines : Execute.Core.network_deadlines =
+        { setup_seconds = 60.
+        ; tls_handshake_seconds = 60.
+        ; http_response_seconds = 60.
+        ; download_seconds = 600.
+        }
+      in
+      let deadlines =
+        if not expires
+        then deadlines
+        else (
+          match phase with
+          | "tls_delay" -> { deadlines with tls_handshake_seconds = 3. }
+          | "response_delay" -> { deadlines with http_response_seconds = 3. }
+          | _ -> { deadlines with download_seconds = 3. })
+      in
+      let http =
+        C.create
+          ~backend:
+            (C.native_backend
+               ~sw
+               ~clock:(scaled_mono (Eio.Stdenv.mono_clock environment) 100.)
+               ~network:(Eio.Stdenv.net environment)
+               ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+               ~deadlines)
+          ~token:(fun ~epoch:_ ~refresh:_ -> Ok "synthetic")
+      in
+      let request _ = H.artifact ~base_url:origin ~uri:origin ~token:None in
+      let result =
+        if phase = "body_delay"
+        then
+          C.download
+            http
+            ~scope
+            ~epoch:1L
+            ~authenticated:false
+            ~destination:(Filename.concat support "artifact")
+            ~maximum_bytes:16
+            request
+        else C.perform http ~scope ~epoch:1L ~authenticated:false request
+      in
+      if expires
+      then
+        expect
+          (function
+            | D.Network_failure _ -> true
+            | _ -> false)
+          result
+      else ignore (get result))
+  in
+  check_retired report
+;;
+
+let native_download_budget_starts_at_body () =
+  let case =
+    match Tls_peer.case (wire_response "Content-Length: 1\r\n" "x") with
+    | `Assoc fields -> `Assoc (("response_delay", `Float 0.2) :: fields)
+    | _ -> assert false
+  in
+  let report =
+    Tls_peer.with_peer [ case ] (fun ~environment ~sw ~support ~origin ->
+      let http =
+        native_client ~environment ~sw ~http_response_seconds:1. ~download_seconds:0.1 ()
+      in
+      let destination = Filename.concat support "artifact" in
+      ignore
+        (get
+           (C.download
+              http
+              ~scope
+              ~epoch:1L
+              ~authenticated:false
+              ~destination
+              ~maximum_bytes:16
+              (fun _ -> H.artifact ~base_url:origin ~uri:origin ~token:None)));
+      Alcotest.(check bool)
+        "body gets its own budget after headers"
+        true
+        (Sys.file_exists destination))
+  in
+  check_retired report
+;;
+
+let native_download_body_budget () =
+  let case =
+    match Tls_peer.case (wire_response "Content-Length: 1\r\n" "x") with
+    | `Assoc fields -> `Assoc (("body_delay", `Float 0.2) :: fields)
+    | _ -> assert false
+  in
+  let report =
+    Tls_peer.with_peer [ case ] (fun ~environment ~sw ~support ~origin ->
+      let destination = Filename.concat support "artifact" in
+      let result =
+        N.download_with_deadlines
+          ~setup_seconds:1.
+          ~tls_handshake_seconds:1.
+          ~http_response_seconds:1.
+          ~download_seconds:0.03
+          ~sw
+          ~clock:
+            (Logseq_sync_native_transport.Transport_time.monotonic
+               (Eio.Stdenv.mono_clock environment))
+          ~network:(Eio.Stdenv.net environment)
+          ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+          ~request:(H.artifact ~base_url:origin ~uri:origin ~token:None)
+          ~destination
+          ~maximum_bytes:16
+          ~on_progress:(fun _ -> ())
+      in
+      Alcotest.(check bool)
+        "native body timer expires without outer timeout"
+        true
+        (match result with
+         | Error (N.Network _) -> true
+         | _ -> false);
+      Alcotest.(check bool)
+        "body timeout prevents publication"
+        false
+        (Sys.file_exists destination))
+  in
+  check_retired report
+;;
+
+let native_setup_configured_budget () =
+  let report =
+    Tls_peer.with_peer
+      [ Tls_peer.case (wire_response "Content-Length: 1\r\n" "x") ]
+      (fun ~environment ~sw ~support:_ ~origin ->
+         let underlying = Eio.Stdenv.net environment in
+         let attempts = ref 0 in
+         let module Network = struct
+           type t = unit
+
+           type tag =
+             [ `Generic
+             | `Unix
+             ]
+
+           let connect () ~sw address =
+             incr attempts;
+             Eio.Time.sleep (Eio.Stdenv.clock environment) 0.2;
+             if !attempts = 1 then raise (Unix.Unix_error (Unix.ECONNREFUSED, "", ""));
+             Eio.Net.connect ~sw underlying address
+           ;;
+
+           let listen () ~reuse_addr:_ ~reuse_port:_ ~backlog:_ ~sw:_ _ = assert false
+           let datagram_socket () ~reuse_addr:_ ~reuse_port:_ ~sw:_ _ = assert false
+           let getaddrinfo () ~service:_ _ = assert false
+           let getnameinfo () _ = assert false
+         end
+         in
+         let network = Eio.Resource.T ((), Eio.Net.Pi.network (module Network)) in
+         let deadlines : Execute.Core.network_deadlines =
+           { setup_seconds = 60.
+           ; tls_handshake_seconds = 60.
+           ; http_response_seconds = 60.
+           ; download_seconds = 600.
+           }
+         in
+         let http =
+           C.create
+             ~backend:
+               (C.native_backend
+                  ~sw
+                  ~clock:(scaled_mono (Eio.Stdenv.mono_clock environment) 100.)
+                  ~network
+                  ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+                  ~deadlines)
+             ~token:(fun ~epoch:_ ~refresh:_ -> Ok "synthetic")
+         in
+         ignore
+           (get
+              (C.perform http ~scope ~epoch:1L ~authenticated:false (fun _ ->
+                 H.artifact ~base_url:origin ~uri:origin ~token:None))))
+  in
+  check_retired report
+;;
+
+let native_setup_budget () =
+  Eio_main.run (fun environment ->
+    Eio.Switch.run (fun sw ->
+      let module Network = struct
+        type t = unit
+        type tag = [ `Generic ]
+
+        let connect () ~sw:_ _ =
+          Eio.Time.sleep (Eio.Stdenv.clock environment) 0.2;
+          assert false
+        ;;
+
+        let listen () ~reuse_addr:_ ~reuse_port:_ ~backlog:_ ~sw:_ _ = assert false
+        let datagram_socket () ~reuse_addr:_ ~reuse_port:_ ~sw:_ _ = assert false
+        let getaddrinfo () ~service:_ _ = assert false
+        let getnameinfo () _ = assert false
+      end
+      in
+      let network = Eio.Resource.T ((), Eio.Net.Pi.network (module Network)) in
+      let deadlines : Execute.Core.network_deadlines =
+        { setup_seconds = 0.03
+        ; tls_handshake_seconds = 1.
+        ; http_response_seconds = 1.
+        ; download_seconds = 3.
+        }
+      in
+      let http =
+        C.create
+          ~backend:
+            (C.native_backend
+               ~sw
+               ~clock:(Eio.Stdenv.mono_clock environment)
+               ~network
+               ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+               ~deadlines)
+          ~token:(fun ~epoch:_ ~refresh:_ -> Ok "synthetic")
+      in
+      Eio.Time.with_timeout_exn (Eio.Stdenv.clock environment) 0.1 (fun () ->
+        expect
+          (function
+            | D.Network_failure _ -> true
+            | _ -> false)
+          (C.perform http ~scope ~epoch:1L ~authenticated:false (fun _ ->
+             H.artifact
+               ~base_url:(Uri.of_string "https://localhost:1")
+               ~uri:(Uri.of_string "https://localhost:1")
+               ~token:None)))))
+;;
+
+let native_reject_auth () =
+  let report =
+    Tls_peer.with_peer
+      [ Tls_peer.case "" ]
+      (fun ~environment ~sw ~support:_ ~origin ->
+         let deadlines : Execute.Core.network_deadlines =
+           { setup_seconds = 1.
+           ; tls_handshake_seconds = 1.
+           ; http_response_seconds = 1.
+           ; download_seconds = 3.
+           }
+         in
+         let tokens = ref [] in
+         let http =
+           C.create
+             ~backend:
+               (C.native_backend
+                  ~sw
+                  ~clock:(Eio.Stdenv.mono_clock environment)
+                  ~network:(Eio.Stdenv.net environment)
+                  ~authenticator:(fun ?ip:_ ~host:_ _ ->
+                    Error (`Msg "synthetic credential must not appear"))
+                  ~deadlines)
+             ~token:(fun ~epoch:_ ~refresh ->
+               tokens := refresh :: !tokens;
+               Ok "synthetic")
+         in
+         let result =
+           C.perform http ~scope ~epoch:1L ~authenticated:true (fun _ ->
+             H.artifact ~base_url:origin ~uri:origin ~token:None)
+         in
+         expect
+           (function
+             | D.Authentication_failure message -> message = "TLS authentication failed"
+             | _ -> false)
+           result;
+         Alcotest.(check (list bool))
+           "TLS authentication does not refresh"
+           [ false ]
+           !tokens)
+  in
+  check_retired report
+;;
+
+let native_error_cause kind () =
+  let wire =
+    match kind with
+    | "content-type" ->
+      wire_response "Content-Type: credential-secret\r\nContent-Length: 1\r\n" "x"
+    | "crypto" -> wire_response "Content-Length: 2\r\n" "x"
+    | _ -> wire_response "Content-Length: 1\r\n" "x"
+  in
+  let case =
+    match Tls_peer.case wire with
+    | `Assoc fields when kind = "crypto" -> `Assoc (("corrupt_tls", `Bool true) :: fields)
+    | case -> case
+  in
+  let report =
+    Tls_peer.with_peer [ case ] (fun ~environment ~sw ~support ~origin ->
+      let http = native_client ~environment ~sw () in
+      let result =
+        C.download
+          http
+          ~scope
+          ~epoch:1L
+          ~authenticated:false
+          ~destination:
+            (Filename.concat
+               support
+               (if kind = "storage" then "missing/artifact" else "artifact"))
+          ~maximum_bytes:16
+          (fun _ -> H.artifact ~base_url:origin ~uri:origin ~token:None)
+      in
+      expect
+        (function
+          | D.Protocol_failure message when kind = "content-type" ->
+            message = "Invalid HTTP response Content-Type"
+          | D.Storage_failure _ when kind = "storage" -> true
+          | D.Crypto_failure _ when kind = "crypto" -> true
+          | _ -> false)
+        result;
+      Alcotest.(check bool)
+        "no failed artifact publication"
+        false
+        (Sys.file_exists (Filename.concat support "artifact")))
+  in
+  check_retired report
+;;
+
+let () =
+  let tests =
+    [ "App owned native absent mirror bootstrap", native_service_bootstrap
+    ; "encryption metadata rejects and cleans", encryption_failure
+    ; "actual framed artifact and original ledger", success
+    ; "metadata rejects before download", metadata_failure
+    ; "framing rejects and cleans", framing_failure
+    ; "row count rejects and cleans", row_failure
+    ; "handoff failure cleans", handoff_failure
+    ; "HTTP refresh once", auth
+    ; "HTTP status classification", http_status_policy
+    ; "native response phase deadline", native_response_deadline
+    ; "native setup phase deadline", native_setup_budget
+    ; "native setup configured budget", native_setup_configured_budget
+    ; "native TLS authentication cause", native_reject_auth
+    ; "native content type cause and redaction", native_error_cause "content-type"
+    ; "native storage cause", native_error_cause "storage"
+    ; "native crypto cause", native_error_cause "crypto"
+    ; "native TLS configured budget", native_phase_budget "tls_delay" ~expires:false
+    ; "native TLS phase expires", native_phase_budget "tls_delay" ~expires:true
+    ; ( "native response configured budget"
+      , native_phase_budget "response_delay" ~expires:false )
+    ; "native response phase expires", native_phase_budget "response_delay" ~expires:true
+    ; "native download configured budget", native_phase_budget "body_delay" ~expires:false
+    ; "native download phase expires", native_phase_budget "body_delay" ~expires:true
+    ; "native download budget starts at body", native_download_budget_starts_at_body
+    ; "native body phase without outer timer", native_download_body_budget
+    ; "native asset GET and PUT", native_assets
+    ; "native deadline physically joins", native_cancel
+    ]
+  in
+  let tests =
+    tests
+    @ List.init 4 (fun layers ->
+      "native snapshot gzip layers " ^ string_of_int layers, native_snapshot layers)
+  in
+  let cases =
+    [ "fixed", true, false, wire_response "Content-Length: 1\r\n" "x"
+    ; ( "chunked"
+      , true
+      , false
+      , wire_response "Transfer-Encoding: chunked\r\n" "1\r\nx\r\n0\r\n\r\n" )
+    ; "close delimited", true, true, wire_response "" "x"
+    ; "malformed status", false, true, "not HTTP\r\n\r\n"
+    ; "HTTP 400", false, false, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
+    ; ( "HTTP 422"
+      , false
+      , false
+      , "HTTP/1.1 422 Unprocessable Content\r\nContent-Length: 0\r\n\r\n" )
+    ; "truncated", false, true, wire_response "Content-Length: 2\r\n" "x"
+    ; ( "body bound"
+      , false
+      , false
+      , wire_response "Content-Length: 17\r\n" (String.make 17 'x') )
+    ; ( "bad chunk"
+      , false
+      , true
+      , wire_response "Transfer-Encoding: chunked\r\n" "Z\r\nx\r\n" )
+    ]
+  in
+  let tests =
+    tests
+    @ List.concat_map
+        (fun (name, success, eof, wire) ->
+           List.map
+             (fun download ->
+                ( (if download then "download " else "GET ") ^ name
+                , native_http ~download ~success ~eof wire ))
+             [ false; true ])
+        cases
+  in
+  Alcotest.run
+    "snapshot producer"
+    [ ( "acquisition"
+      , List.map (fun (name, test) -> Alcotest.test_case name `Quick test) tests )
+    ]
+;;
