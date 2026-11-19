@@ -521,6 +521,48 @@ let import_request_guard () =
       Ok ())))) [1; 2; 3; 4; 5; 6; 7; 8]
 ;;
 
+let staging_reconciliation_serializes_preparation () =
+  with_worker (fun worker packed _ root ->
+    let module W = (val packed : X.WORKER_OWNER) in
+    Eio.Switch.run (fun sw ->
+      let source_file = Filename.concat root "serialized.png" in
+      let channel = open_out_bin source_file in
+      output_string channel wire;
+      close_out channel;
+      let request : Logseq_db_types.Asset_import.t =
+        { operation = id 3; asset = uuid; replace_reference = None; target = id 100
+        ; local_mutation = id 203; metadata_mutation = id 403; source_file
+        ; title = "Serialized"; file_type = "png" } in
+      let finished, resolve = Eio.Promise.create () in
+      let started = ref false in
+      let current () =
+        if not !started then (
+          started := true;
+          Eio.Fiber.fork ~sw (fun () ->
+            Eio.Promise.resolve resolve
+              (Worker.run_assets worker ~identity ~operation:(id 903) D.Reconcile_staging)));
+        for _ = 1 to 4 do Eio.Fiber.yield () done;
+        Alcotest.(check bool) "reconciliation waits throughout stage and durable Prepared" false
+          (Eio.Promise.is_resolved finished);
+        true in
+      let intent = ok (W.with_scope ~identity ~operation:request.operation (fun scope ->
+        W.prepare_import scope request ~current)) in
+      Alcotest.(check int) "serialized reconciliation keeps the committed source" 0
+        (ok (Eio.Promise.await finished));
+      Sys.remove source_file;
+      ok (W.with_scope ~identity ~operation:request.operation (fun scope ->
+        let file = ok (W.retain_imported_file scope intent) |> Option.get in
+        Alcotest.(check bool) "original source remains readable without picker" true
+          (Sys.file_exists (W.imported_file_path file));
+        W.release_imported_file file));
+      let other = ok (D.identity ~origin:identity.origin ~account:"other" ~graph:identity.graph
+        ~account_generation:0L ~graph_generation:0L) in
+      rejected (Worker.run_assets worker ~identity:other ~operation:(id 904) D.Reconcile_staging);
+      ok (Worker.fence worker ~identity);
+      rejected (Worker.run_assets worker ~identity ~operation:(id 905) D.Reconcile_staging);
+      ok (Worker.await_quiescent worker ~identity)))
+;;
+
 let import_ownership () =
   with_worker (fun worker packed database_owner root ->
     let module W = (val packed : X.WORKER_OWNER) in
@@ -691,6 +733,9 @@ let committed_import_hooks () =
               "every successful or recovered commit notifies"
               4
               !notifications;
+            Sys.remove source_file;
+            Alcotest.(check int) "owner reconciliation retains Metadata_pending source" 0
+              (ok (Worker.run_assets worker ~identity ~operation:(id 902) D.Reconcile_staging));
             held := ok (W.retain_imported_file scope intent);
             Ok ()));
        let module O = D.Overlay in
@@ -1199,6 +1244,7 @@ let () =
             (absent_native_coordinator ~owned:true ~available:true)
         ; Alcotest.test_case "native coordinator owns real offline imports" `Quick native_coordinator
         ; Alcotest.test_case "request guard fences Prepared" `Quick import_request_guard
+        ; Alcotest.test_case "staging reconciliation serializes preparation" `Quick staging_reconciliation_serializes_preparation
         ; Alcotest.test_case "assets share worker crypto key" `Quick shared_crypto_key
         ; Alcotest.test_case
             "real commits and postcommit hooks"

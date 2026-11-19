@@ -236,7 +236,7 @@ struct JournalLocalAccount: Equatable, Sendable {
   private(set) var timelinePresented = false
   private(set) var onlineAllowed = false
   private var authenticationGeneration: UInt64 = 0
-  private var signingOut = false
+  private(set) var signingOut = false
   private(set) var accountIssue: JournalAccountIssue?
   private var preparedUserID: String?
 

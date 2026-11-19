@@ -9,15 +9,73 @@ import Foundation
 enum JournalCognitoSession { static let changed = Notification.Name("journal.tests.auth.changed") }
 struct JournalEnvironmentSample: Equatable, Codable {}
 @MainActor final class PlatformTestAuth: JournalAuthCapability {
-  func currentUserID() async throws -> String? { "fixture-user" }
+  var identityFailure: Error?
+  func currentUserID() async throws -> String? {
+    if let identityFailure { throw identityFailure }
+    return "fixture-user"
+  }
+  var signOutStarted = false
+  var signOutCompletion: CheckedContinuation<Void, Never>?
+  var holdSignOut = false
   func freshIDToken() async throws -> String { "fixture-token" }
   var signOutFailure: Error?
-  func signOut() async throws { if let signOutFailure { throw signOutFailure } }
+  func signOut() async throws {
+    signOutStarted = true
+    NotificationCenter.default.post(name: JournalCognitoSession.changed, object: self)
+    if holdSignOut { await withCheckedContinuation { signOutCompletion = $0 } }
+    if let signOutFailure { throw signOutFailure }
+  }
 }
 @main struct JournalApplicationPlatformTests {
   @MainActor static func main() async throws {
     func packet(_ tag: UInt8) -> Data {
       var bytes = Data("LJP2".utf8); bytes.append(contentsOf: [2,0,tag,0]); bytes.append(Data(repeating:0,count:24)); return bytes
+    }
+    for failSignOut in [false, true] {
+      let auth = PlatformTestAuth()
+      auth.holdSignOut = true
+      if failSignOut { auth.signOutFailure = NSError(domain: "test.signout", code: 9) }
+      var cleared = false
+      let owner = JournalPlatformServices(auth: auth, account: JournalAccountStore(
+        load: { nil }, save: { _ in JournalAccountSave(commit: {}, rollback: {}) },
+        clear: { cleared = true }), managedSyncOrigin: "https://api.logseq.io")
+      let bridge = JournalApplicationPlatform(services: owner)
+      let port = JournalRuntime()
+      bridge.connect(to: port)
+      _ = try await owner.response(for: .timelinePresented)
+      let (notificationCompletions, notificationCompletion) = AsyncStream<Void>.makeStream(
+        bufferingPolicy: .bufferingNewest(1))
+      bridge.authenticationNotificationCompletionObserver = { notificationCompletion.yield(()) }
+      let logout = Task { await bridge.request(packet(10)) }
+      var notifications = notificationCompletions.makeAsyncIterator()
+      let notificationCompleted: Void? = await notifications.next()
+      precondition(notificationCompleted != nil)
+      bridge.authenticationNotificationCompletionObserver = nil
+      notificationCompletion.finish()
+      precondition(auth.signOutStarted && auth.signOutCompletion != nil,
+        "Notification refresh must complete while native sign-out is suspended")
+      let notificationIssue = bridge.accountIssue
+      auth.signOutCompletion?.resume()
+      let result = await logout.value
+      precondition(notificationIssue == nil,
+        "Sign-out notification must not publish identityLookup.unavailable while native revocation is pending")
+      if failSignOut {
+        precondition(result?.prefix(4) == Data("LJF1".utf8) && !cleared,
+          "Real native sign-out failure must still complete as failure without clearing the binding")
+        auth.identityFailure = NSError(domain: "test.identity", code: 7)
+        let refresh = bridge.refreshAuthentication()
+        precondition(refresh != nil)
+        await refresh?.value
+        precondition(bridge.accountIssue?.kind == .unavailable,
+          "Real current identity lookup errors after failed sign-out must remain visible")
+      } else {
+        precondition(result?.prefix(4) == Data("LJP2".utf8) && cleared,
+          "Successful sign-out must acknowledge native and local cleanup")
+        precondition(bridge.authenticationRequired && bridge.localAccountAvailable == false
+          && bridge.accountIssue == nil && !owner.onlineAllowed,
+          "Completed sign-out must remain a clean signed-out state")
+      }
+      bridge.disconnect()
     }
     let faultAuth = PlatformTestAuth()
     faultAuth.signOutFailure = NSError(domain:"SECRET token path",code:1)

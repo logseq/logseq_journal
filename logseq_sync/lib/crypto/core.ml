@@ -210,7 +210,13 @@ let run (type a) t ~check_current ~identity (operation : a Dsl.crypto)
         let items = Logseq_overlay_db.Database.protection_plaintexts request in
         let* () = bounded (List.map snd items) in
         if not t.encrypted
-        then Error (Dsl.Crypto_failure "Encryption requires a graph key")
+        then
+          traverse
+            (fun (id, source) ->
+               let* plaintext = decrypt source in
+               Ok (id, plaintext))
+            []
+            items
         else
           let* encrypted =
             traverse

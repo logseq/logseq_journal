@@ -425,13 +425,14 @@ let run
   let* () = same_owner t identity in
   let precheck : type value. value Dsl.assets -> (unit, Dsl.error) result = function
     | Dsl.Release_file _ | Release_lease _ -> Ok ()
-    | Prune_cache | Lookup _ | Retain _ | Upload _ | Download _ -> check t check_current
+    | Prune_cache | Reconcile_staging | Lookup _ | Retain _ | Upload _ | Download _ -> check t check_current
   in
   let* () = precheck operation in
   let perform : type value. value Dsl.assets -> (value, Dsl.error) result = function
     | Dsl.Release_file file -> release_file t ~identity file
     | Release_lease lease -> release_lease t ~identity lease
     | Dsl.Prune_cache -> locked t (fun () -> storage (Cache.prune t.cache))
+    | Reconcile_staging -> Error (Dsl.Invalid_input "Staging reconciliation requires worker owner")
     | Lookup asset ->
       let* () = protected t in
       locked t (fun () -> lookup t ~original asset)
@@ -525,7 +526,7 @@ let dispatch t ~original ~upload ~scope ~identity operation =
        | Available file -> Rrbvec.singleton (Dsl.File_reference file)
        | Waiting_remote | Missing_local -> Rrbvec.empty)
     | Retain _ -> Rrbvec.singleton (Dsl.Lease_reference result)
-    | Prune_cache | Upload _ | Release_file _ | Release_lease _ -> Rrbvec.empty
+    | Prune_cache | Reconcile_staging | Upload _ | Release_file _ | Release_lease _ -> Rrbvec.empty
   in
   let refs = references operation result in
   match Execute.Core.handoff scope refs with

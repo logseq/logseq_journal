@@ -420,7 +420,6 @@ type t =
   ; mutable next_asset_operation : int64
   ; upload_staging_lock : Eio.Mutex.t
   ; mutable staging_reconciled : Sync.graph_scope list
-  ; local_imports : (Sync.graph_scope * Graph.Uuid.t * string, Graph.Uuid.t) Hashtbl.t
   ; recovery_current : Core.upload_recovery_ticket -> bool
   ; upload_current : Upload.ticket -> bool
   ; asset_current : Logseq_sync_asset_transfer.Core.ticket -> bool
@@ -480,7 +479,6 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; next_asset_operation = 0L
     ; upload_staging_lock = Eio.Mutex.create ()
     ; staging_reconciled = []
-    ; local_imports = Hashtbl.create 32
     ; observation_slots = Hashtbl.create 32
     ; observation_registry = Core.Observation_registry.empty
     ; orphan_cleanup = Core.Orphan_cleanup.empty
@@ -618,6 +616,10 @@ let native_asset_failure = function
   | Sync_dsl.Core.Network_failure _ -> Sync.Asset_network
   | Authentication_failure _ -> Asset_authentication
   | Locked -> Asset_locked
+  | Storage_failure source ->
+    Sync.Asset_with_cause (Sync.Asset_invalid_content source,
+      Logseq_db_types.Failure_diagnostic.of_source
+        ~operation:"assetCache" ~reason:"persistenceFailed" source)
   | Cancelled | Stale_context | Network_closed -> Asset_cancelled
   | error -> Asset_invalid_content (Sync_dsl.Core.error_message error)
 ;;
@@ -653,9 +655,13 @@ let native_asset_call t ~scope action =
     Logseq_db_types.Asset_descriptor.create ~uuid:asset ~source:(Managed (Some version))
       ~current_checksum:None ~size:None ~dimensions:None
     |> Result.map_error (fun message -> Sync.Asset_invalid_content message) in
-  let* () = capacity () |> Result.map_error (fun message -> Sync.Asset_invalid_content message) in
   match action with
+  | Sync.Prune_asset_staging _ ->
+    Owner.run_assets owner ~identity ~operation Dsl.Reconcile_staging
+    |> Result.map (fun count -> Sync.Asset_pruned count)
+    |> Result.map_error native_asset_failure
   | Sync.Check_asset_cache (asset,version) ->
+    let* () = capacity () |> Result.map_error (fun message -> Sync.Asset_invalid_content message) in
     let* descriptor = descriptor asset version in
     let* file = Owner.run_assets owner ~identity ~operation (Dsl.Lookup descriptor)
       |> Result.map_error native_asset_failure in
@@ -664,6 +670,7 @@ let native_asset_call t ~scope action =
      | Some file -> file_result file |> Result.map (fun (handle,_) -> Sync.Asset_cached (Some handle))
          |> Result.map_error (fun message -> Sync.Asset_invalid_content message))
   | Fetch_asset {asset;version;_} ->
+    let* () = capacity () |> Result.map_error (fun message -> Sync.Asset_invalid_content message) in
     let* descriptor = descriptor asset version in
     let* result = Owner.run_assets owner ~identity ~operation (Dsl.Download descriptor)
       |> Result.map_error native_asset_failure in
@@ -695,6 +702,8 @@ let asset_call ?(started = fun _ -> ()) ?on_diagnostic t ~scope action =
           resource.imported_retain () |> Result.map (fun file -> Sync.Asset_retained file)
           |> Result.map_error (fun message -> Sync.Asset_invalid_content message)
         | Sync.Check_asset_cache _ | Fetch_asset _ -> native_asset_call t ~scope action
+        | Sync.Prune_asset_staging _ ->
+          native_asset_call t ~scope action
         | _ -> t.dependencies.services.asset request in
       (match result, waiter.diagnostic with
        | Error Sync.Asset_cancelled, _ | Ok _, _ | _, None -> ()
@@ -862,56 +871,15 @@ let reconcile_staging t (scope : Sync.graph_scope) ~current =
   else if List.mem scope t.staging_reconciled
   then Ok ()
   else (
-    Hashtbl.filter_map_inplace (fun (owner,_,_) operation -> if owner=scope then None else Some operation) t.local_imports;
-    let keep =
-      with_upload_store t (fun db ->
-        let rec read after reversed =
-          if (not (current ())) || t.stopped
-          then Error "Stale staging recovery"
-          else
-            Result.bind
-              (Logseq_db_storage.Asset_upload_store.list
-                 db
-                 ~origin:(Uri.to_string scope.account.managed_sync_origin)
-                 ~account:scope.account.user_id
-                 ~graph:scope.graph_id
-                 ~after
-                 ~limit:128)
-              (fun intents ->
-                 let reversed =
-                   List.fold_left
-                     (fun files intent ->
-                        let module I = Logseq_db_types.Asset_upload_intent in
-                        if intent.I.phase <> I.Cancelled then
-                          Hashtbl.replace t.local_imports
-                            (scope, intent.asset, intent.version.checksum) intent.operation_id;
-                        intent.staged_file :: files)
-                     reversed
-                     intents
-                 in
-                 match List.rev intents with
-                 | [] -> Ok (List.rev reversed)
-                 | last :: _ when List.length intents = 128 ->
-                   read
-                     (Some last.Logseq_db_types.Asset_upload_intent.operation_id)
-                     reversed
-                 | _ -> Ok (List.rev reversed))
-        in
-        read None [])
-    in
-    Result.bind keep (fun keep ->
-      if (not (current ())) || t.stopped
-      then Error "Stale staging recovery"
-      else (
-        match asset_call t ~scope (Sync.Prune_asset_staging keep) with
-        | Ok (Sync.Asset_pruned _) ->
-          if current ()
-          then (
-            t.staging_reconciled <- scope :: t.staging_reconciled;
-            Ok ())
-          else Error "Stale staging recovery"
-        | Error failure -> Error (asset_failure_message failure)
-        | Ok _ -> Error "Unexpected staging recovery completion")))
+    match asset_call t ~scope (Sync.Prune_asset_staging []) with
+    | Ok (Sync.Asset_pruned _) ->
+      if current ()
+      then (
+        t.staging_reconciled <- scope :: t.staging_reconciled;
+        Ok ())
+      else Error "Stale staging recovery"
+    | Error failure -> Error (asset_failure_message failure)
+    | Ok _ -> Error "Unexpected staging recovery completion")
 ;;
 
 let worker_error ~code message =

@@ -946,10 +946,16 @@ let publish_lifecycle state sync coordination attachments =
         session.saved_uploads in
       let closes = match session.saved_assets, session.saved_uploads with
         | None, [] -> []
+        | _ when external_fence_blocks state session.owner.graph_id -> []
         | _ -> [Close_asset_scope session.owner] in
       assets @ uploads @ closes) in
   let next=install_lifecycle state ~sync ~coordination ~attachments in
-  {next;effects=cleanup @ (Publish(Sync_output(Sync.Resident_scopes_changed(List.map fst coordination.residents))) ::
+  let next, recovery = List.fold_left (fun (state,effects) ((scope:Sync.graph_scope),_) ->
+    if external_fence_blocks state scope.Sync.graph_id then state,effects else
+    let resumed=step_session (load_graph state scope) Start in
+    remember_graph resumed.next,effects @ resumed.effects) (next,[]) attachments in
+  let next=restore_visible_graph next in
+  {next;effects=cleanup @ recovery @ (Publish(Sync_output(Sync.Resident_scopes_changed(List.map fst coordination.residents))) ::
     Publish(Sync_output(Sync.State_changed sync)) ::
     List.concat_map(fun(scope,state)->
       [Publish(Sync_output(Sync.Session_state_changed(scope,state)));

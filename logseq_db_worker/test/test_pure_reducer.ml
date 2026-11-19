@@ -166,7 +166,8 @@ let worker_open_graph_transition () =
      residents=[scope,sync];desired_residents=[graph.graph_id];deletion=None} in
   let projected=Core.step state (Lifecycle_snapshot(sync,coordination,
     [scope,Core.database_opened ~database_id:"db-delete" ~graph_id:graph.graph_id])) in
-  Core.step projected.next Start,scope
+  let started = Core.step projected.next Start in
+  {started with effects=projected.effects @ started.effects},scope
 ;;
 
 let worker_open_graph () =
@@ -881,6 +882,42 @@ let project_residents state (sync:Sync.state) (coordination:Sync.coordination_st
       then "db-delete" else "resident-" ^ Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id in
     scope,Core.database_opened ~database_id ~graph_id:scope.graph_id) coordination.residents in
   Core.step state (Lifecycle_snapshot(sync,coordination,attachments))
+;;
+
+let test_lifecycle_snapshot_restores_uploads () =
+  let module U = Logseq_db_worker_pure_reducer.Asset_upload in
+  let module I = Logseq_db_types.Asset_upload_intent in
+  let ready, scope = worker_open_graph () in
+  let sync = (Core.view ready).sync in
+  let coordination = (Core.coordination_state ready).sync in
+  let background = {scope with graph_id=uuid "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"; graph_generation=2} in
+  let coordination = {coordination with residents=[scope,sync;background,sync];
+    desired_residents=[scope.graph_id;background.graph_id]} in
+  let restored = project_residents (raw_initial ()) sync coordination in
+  let reads = List.filter_map (function Core.Read_uploads ticket -> Some ticket | _ -> None) restored.effects in
+  Alcotest.(check int) "snapshot alone starts every resident's bounded recovery" 2 (List.length reads);
+  let repeated = project_residents restored.next sync coordination in
+  Alcotest.(check bool) "repeated snapshot does not duplicate pending reads" true
+    (List.for_all (function Core.Read_uploads _ -> false | _ -> true) repeated.effects);
+  let ticket = List.find (fun ticket -> ticket.Core.scope=background) reads in
+  let prepared = recovery_intent background 1 in
+  let pending = List.fold_left (fun intent phase -> I.advance intent phase |> Result.get_ok)
+    prepared [I.Local_committed;Uploading;Remote_stored;Metadata_pending] in
+  let loaded = Core.step repeated.next (Uploads_loaded (ticket, Ok [pending])) in
+  let inspect = List.find_map (function
+    | Core.Run_upload (context,U.Inspect (ticket,intent)) when context.scope=background && intent=pending -> Some ticket
+    | _ -> None) loaded.effects |> Option.get in
+  let observed = Core.step loaded.next (Upload_completed (inspect,U.Inspected U.Publication_acknowledged)) in
+  let save = List.find_map (function
+    | Core.Run_upload (_,U.Persist (ticket,intent,Some 4)) when intent.phase=I.Complete -> Some ticket
+    | _ -> None) observed.effects |> Option.get in
+  let completed = Core.step observed.next (Upload_completed (save,U.Persisted)) in
+  Alcotest.(check bool) "exact original ACK releases staging after durable Complete" true
+    (List.exists (function Core.Run_upload (_,U.Release_staging intent) -> intent.operation_id=pending.operation_id | _ -> false) completed.effects);
+  Alcotest.(check bool) "replay never stages, inserts, uploads or republishes metadata" true
+    (List.for_all (function
+      | Core.Run_upload (_, (U.Apply_local _ | Put _ | Apply_metadata _)) -> false
+      | _ -> true) (loaded.effects @ observed.effects @ completed.effects))
 ;;
 
 let project_selection state graph_id =
@@ -1843,6 +1880,29 @@ let test_host_deletion_private_resource_owner () =
     (List.mem first(Core.graph_scopes started.next))
 ;;
 
+let test_host_gate_defers_physical_close_to_settlement () =
+  let opened,first,_=resident_worker_fixture() in
+  let opened=(Core.step opened(asset_demand first)).next in
+  let closes effects=List.filter_map(function Core.Close_asset_scope scope->Some scope|_->None)effects in
+  let ordinary=retire_projected_graph opened in
+  Alcotest.(check bool) "ordinary withdrawal still closes the resource owner" true
+    (List.mem first (closes ordinary.effects));
+  List.iter(fun target->
+    let sync=(Core.view opened).sync and coordination=(Core.coordination_state opened).sync in
+    let owner=Option.get coordination.account in
+    let fence:Sync.host_fence={id=uuid "10000000-0000-4000-8000-000000079005";owner;target;
+      captured_scopes=Rrbvec.of_list(Core.graph_scopes opened);previous=None} in
+    let fenced=Core.step opened(Sync_event(Sync.Host_fence_started fence)) in
+    Alcotest.(check bool) "host fence withdraws execution before physical settlement" false
+      (List.mem first(Core.graph_scopes fenced.next));
+    Alcotest.(check int) "host settlement alone may close its fenced resource owner" 0
+      (List.length(closes fenced.effects));
+    let republished=project_residents fenced.next sync coordination in
+    Alcotest.(check int) "late lifecycle projection cannot start a competing close" 0
+      (List.length(closes republished.effects)))
+    [Sync.One_graph first.graph_id;All_graphs]
+;;
+
 let test_account_host_gate_blocks_new_catalog_producer () =
   let opened,_,_=resident_worker_fixture() in
   let owner=Option.get(Core.coordination_state opened).sync.account in
@@ -2141,6 +2201,7 @@ let () =
     ; ( "asset session"
       , [ Alcotest.test_case "projection withdrawal cancels upload" `Quick test_projection_withdrawal_cancels_upload
         ; Alcotest.test_case "projection withdrawal closes lookup scope" `Quick test_projection_withdrawal_cancels_asset_lookup
+        ; Alcotest.test_case "lifecycle snapshot restores acknowledged uploads" `Quick test_lifecycle_snapshot_restores_uploads
         ; Alcotest.test_case "bounded upload recovery" `Quick test_upload_recovery
         ; Alcotest.test_case
             "upload recovery backpressure"
@@ -2174,7 +2235,7 @@ let () =
             `Quick
             test_asset_manual_retry_is_unlimited
         ] )
-    ; ( "host handoff",[Alcotest.test_case "revoked hidden resource cleanup owner" `Quick test_revoked_account_keeps_hidden_cleanup_owner; Alcotest.test_case "private deletion resource owner" `Quick test_host_deletion_private_resource_owner; Alcotest.test_case "account gate blocks catalog producer" `Quick test_account_host_gate_blocks_new_catalog_producer; Alcotest.test_case "target gate preserves other execution" `Quick test_host_gate_keeps_other_graph_live; Alcotest.test_case "single-use and reopen witness" `Quick test_host_handoff_single_use_and_reopen; Alcotest.test_case "generated owner/late result traces" `Quick test_host_handoff_properties])
+    ; ( "host handoff",[Alcotest.test_case "host gate defers physical resource close" `Quick test_host_gate_defers_physical_close_to_settlement; Alcotest.test_case "revoked hidden resource cleanup owner" `Quick test_revoked_account_keeps_hidden_cleanup_owner; Alcotest.test_case "private deletion resource owner" `Quick test_host_deletion_private_resource_owner; Alcotest.test_case "account gate blocks catalog producer" `Quick test_account_host_gate_blocks_new_catalog_producer; Alcotest.test_case "target gate preserves other execution" `Quick test_host_gate_keeps_other_graph_live; Alcotest.test_case "single-use and reopen witness" `Quick test_host_handoff_single_use_and_reopen; Alcotest.test_case "generated owner/late result traces" `Quick test_host_handoff_properties])
     ; ( "writer fence",[Alcotest.test_case "only physical completion drains" `Quick test_writer_fence_physical_completion; Alcotest.test_case "generated scoped fence traces" `Quick test_writer_fence_properties])
     ; ( "typed demand registry",[Alcotest.test_case "generated owner retirement traces" `Quick test_demand_registry_properties; Alcotest.test_case "retirement and exact settlement" `Quick test_demand_registry_retirement_requires_physical_settlement; Alcotest.test_case "resource history finalization" `Quick test_resource_registry_finalization])
     ; ( "orphan resource cleanup",[Alcotest.test_case "failed release and stale attempt ACK" `Quick test_orphan_cleanup_retains_failed_release])
