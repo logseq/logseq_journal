@@ -976,7 +976,7 @@ while True: time.sleep(1)
                     envelope=envelope, path=path, root=root, save=save, runtime=runtime, provenance=provenance)
 
     @contextmanager
-    def native_dune_producer(self):
+    def native_dune_producer(self, single_member=False):
         """A real Dune complete-object rule, including removable host C providers."""
         with self.ordinary_producer_fixture() as f:
             repo = self.build.ROOT
@@ -1003,6 +1003,8 @@ while True: time.sleep(1)
             obj = c.with_suffix('.o')
             subprocess.run(['xcrun', 'clang', '-c', c, '-o', obj], check=True, capture_output=True)
             stub = effect / 'liblogseq_sync_native_crypto_stubs.a'
+            if single_member:
+                stub.unlink()
             subprocess.run(['ar', 'rcs', stub, obj], check=True, capture_output=True)
             archive = effect / 'logseq_sync_native_crypto.cmxa'
             subprocess.run([compiler, '-a', '-o', archive, effect / 'effect.cmx',
@@ -1054,6 +1056,33 @@ while True: time.sleep(1)
             f.build.report['native_object'] = dict(path=str(native), sha256=self.build.sha(native), mode='native-producer')
             yield SimpleNamespace(**vars(f), workspace=workspace, original_native=native, compiler=compiler)
 
+    def test_producer_links_after_stripping_single_member_stub_archive(self):
+        with self.native_dune_producer(single_member=True) as f:
+            original = self.build.ROOT / 'logseq_sync/lib/native_crypto/liblogseq_sync_native_crypto_stubs.a'
+            original_digest = self.build.sha(original)
+            members = subprocess.check_output(['ar', '-t', original], text=True).splitlines()
+            self.assertEqual([name for name in members if not name.startswith('__.SYMDEF')],
+                             ['platform_crypto_stubs.o'])
+            envelope_path = f.build.produce_native(f.original_native, f.workspace)
+            envelope = json.loads(envelope_path.read_text())
+            link = self.build.read_evidence(envelope['link'], envelope_path.parent)
+            staged = envelope_path.parent / 'host-stubs' / original.name
+            self.assertEqual(subprocess.check_output(['ar', '-t', staged], text=True).splitlines(),
+                             ['__.SYMDEF'])
+            self.assertEqual(staged.stat().st_size, 76)
+            self.assertEqual(self.build.sha(original), original_digest)
+            dune_stub = f.original_native.parent.parent / 'logseq_sync/lib/native_crypto' / original.name
+            self.assertEqual(link['direct_native_input_sha256'][str(dune_stub)], original_digest)
+            self.assertEqual(link['direct_native_input_sha256'][str(staged)], self.build.sha(staged))
+            self.assertEqual(link['patched_host_stub_archive_sha256'], self.build.sha(staged))
+            f.build.args.native_manifest = envelope_path
+            imported = f.build.imported_native(f.build.inputs['source'])
+            self.assertEqual(imported['ocaml_units'], dict(runtime=True, mldoc=True, xmlm=False))
+            symbols = subprocess.check_output(['nm', '-g', envelope_path.parent / 'production-host.o'], text=True)
+            self.assertNotRegex(symbols, r'(?m)\b[TDS] _logseq_(?:transport_dns_start|journal_crypto_call)$')
+            self.assertFalse(f.build.report['cross_abi_validated'])
+            self.assertFalse(f.build.report['runtime_acceptance'])
+
     def test_producer_uses_current_dune_rule_even_after_a_noop_build(self):
         self.assertTrue(hasattr(self.build.Build, 'produce_native'), 'producer-only entry is missing')
         with self.native_dune_producer() as f:
@@ -1069,6 +1098,8 @@ while True: time.sleep(1)
                 source = self.build.read_evidence(envelope['source'], envelope_path.parent)
                 link = self.build.read_evidence(envelope['link'], envelope_path.parent)
                 self.assertEqual(link['compiler_sha256'], self.build.sha(f.compiler))
+                staged = envelope_path.parent / 'host-stubs/liblogseq_sync_native_crypto_stubs.a'
+                self.assertIn('stub.o', subprocess.check_output(['ar', '-t', staged], text=True).splitlines())
                 self.assertEqual(self.build.sha(f.original_native), f.build.report['native_object']['sha256'])
                 self.assertNotEqual(source['production_native_object'], str(f.original_native))
                 f.build.args.native_manifest = envelope_path
