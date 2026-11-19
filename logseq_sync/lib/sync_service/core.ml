@@ -90,11 +90,20 @@ let set_network t gate =
               `Stop_daemon));
          Ok ())
     | Dsl.Open { authorization_epoch } ->
-      (match Execute.open_network t.runtime ~authorization_epoch with
+      let joined =
+        match t.network_join with
+        | None -> Ok ()
+        | Some retirement -> Execute.await_network_retirement retirement
+      in
+      (match joined with
        | Error error -> Error error
+       | Ok () when State.lifecycle t.state <> Running -> Error Dsl.Stale_context
        | Ok () ->
-         t.network_join <- None;
-         Ok ()))
+         (match Execute.open_network t.runtime ~authorization_epoch with
+          | Error error -> Error error
+          | Ok () ->
+            t.network_join <- None;
+            Ok ())))
 ;;
 
 let close t =

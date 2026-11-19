@@ -206,6 +206,40 @@ let task_projection () =
   check (!calls = 0) "task continuation not run by projection"
 ;;
 
+let authoritative_errors () =
+  let module T = Logseq_overlay_db.Types in
+  let module Diagnostic = Logseq_db_types.Authoritative_diagnostic in
+  let render error = D.error_message (D.Authoritative_failure error) in
+  Alcotest.(check string)
+    "checksum classification"
+    "Authoritative transition failed: checksum mismatch"
+    (render T.Authoritative_checksum_mismatch);
+  Alcotest.(check string)
+    "origin classification"
+    "Authoritative transition failed: origin unresolved"
+    (render T.Authoritative_origin_unresolved);
+  let diagnostic = Diagnostic.create ~stage:Decode ~reason:Reference_shape () in
+  Alcotest.(check string)
+    "typed decode context survives"
+    (Diagnostic.message diagnostic)
+    (render (T.Authoritative_decode_failed (Diagnostic.encode diagnostic)));
+  let secret = String.make 4096 '\001' ^ " secret-payload-token" in
+  List.iter
+    (fun error ->
+       let message = render error in
+       check (String.length message < 512) "bounded message";
+       check (not (String.contains message '\001')) "raw source excluded")
+    [ T.Authoritative_decode_failed secret
+    ; T.Authoritative_integrity_failure secret
+    ; T.Authoritative_commit_persistence_failed secret
+    ; T.Authoritative_commit_fatal_state secret
+    ];
+  Alcotest.(check string)
+    "legacy decode source fails closed"
+    "Authoritative transition failed: transaction decode rejected"
+    (render (T.Authoritative_decode_failed secret))
+;;
+
 let () =
   Alcotest.run
     "sync DSL"
@@ -219,7 +253,8 @@ let () =
         ; Alcotest.test_case "task projection" `Quick task_projection
         ] )
     ; ( "validation"
-      , [ Alcotest.test_case "invalid input" `Quick validation
+      , [ Alcotest.test_case "authoritative errors" `Quick authoritative_errors
+        ; Alcotest.test_case "invalid input" `Quick validation
         ; Alcotest.test_case "limits" `Quick limits_validation
         ; Alcotest.test_case "identity" `Quick identity_validation
         ] )

@@ -1233,7 +1233,85 @@ let decrypt_submitted_request request behavior =
   request, plaintexts
 ;;
 
-let atomic_append_submits_and_replays_complete_tree ?(remote_day = false) database =
+let reordered_echo_rejects_changed_uuid database =
+  let behavior = "reordered echo rejects changed UUID" in
+  let local = commit_insert database ~ordinal:7796 ~uuid:T.block_uuid behavior in
+  let submitted = submit_one database local behavior in
+  let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, crypto =
+    Database.begin_outbox_transition
+      database
+      ~expected:(sync_view_token sync)
+      (Accept_group
+         { batch_id = submission_batch_id submitted
+         ; barrier = { through = server_cursor 1; checksum = checksum "0000000000000000" }
+         })
+    |> T.require_ok ~behavior
+  in
+  T.require (Option.is_none crypto) "acceptance requested crypto";
+  ignore
+    (Database.apply_outbox_transition database prepared ~encrypted:None
+     |> T.require_ok ~behavior);
+  let module J = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let wire =
+    server_transaction ~mutation_id:local.mutation_id ~operation:"insert-blocks" submitted
+    |> Codec.of_string
+    |> function
+    | J.Array operations ->
+      J.Array
+        (List.rev_map
+           (function
+             | J.Array [ operation; entity; J.Keyword "block/uuid"; _; source ] ->
+               J.Array
+                 [ operation
+                 ; entity
+                 ; J.Keyword "block/uuid"
+                 ; J.Uuid (Logseq_db_types.Graph_types.Uuid.to_string T.child_uuid)
+                 ; source
+                 ]
+             | operation -> operation)
+           operations)
+      |> Codec.to_string ~mode:Codec.Verbose
+    | _ -> Alcotest.fail "insert echo is not an array"
+  in
+  let batch =
+    authoritative_batch
+      ~maximum_count:16
+      ~maximum_bytes:65536
+      ~transactions:
+        [ authoritative_transaction
+            ~cursor:(server_cursor 1)
+            ~transaction:(encoded ~maximum_bytes:65536 wire)
+        ]
+      ~through:(server_cursor 1)
+      ~checksum:None
+    |> T.require_ok ~behavior
+  in
+  let before = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, crypto =
+    Database.begin_authoritative database ~expected:(sync_view_token before) batch
+    |> T.require_ok ~behavior
+  in
+  let decrypted =
+    Option.map (fun request -> decrypt_submitted_request request behavior) crypto
+  in
+  (match Database.apply_authoritative database prepared ~decrypted with
+   | Error (Authoritative_integrity_failure _) -> ()
+   | Error _ -> Alcotest.fail "changed UUID did not reach origin integrity validation"
+   | Ok _ -> Alcotest.fail "reordered echo accepted a changed UUID");
+  let after = Database.inspect_sync database |> T.require_ok ~behavior in
+  T.require
+    (sync_view_checkpoint before = sync_view_checkpoint after
+     && sync_view_submissions before = sync_view_submissions after)
+    "identity rejection changed checkpoint or retired accepted evidence"
+;;
+
+let atomic_append_submits_and_replays_complete_tree
+      ?(remote_day = false)
+      ?(reverse_operations = false)
+      database
+  =
   let behavior = "atomic append submission and authoritative echo" in
   T.seed_task_statuses database;
   let page = T.mutation_uuid 7790
@@ -1340,6 +1418,18 @@ let atomic_append_submits_and_replays_complete_tree ?(remote_day = false) databa
       ~mutation_id:local.mutation_id
       ~operation:"append-journal"
       submitted
+  in
+  let wire =
+    if reverse_operations
+    then
+      let module Codec = Transit_native.Transit.Json in
+      match Codec.of_string wire with
+      | Transit_core.Json.Array operations ->
+        Codec.to_string
+          ~mode:Codec.Verbose
+          (Transit_core.Json.Array (List.rev operations))
+      | _ -> Alcotest.fail "append echo is not an array"
+    else wire
   in
   let barrier =
     { through = server_cursor echo_cursor
@@ -5210,6 +5300,12 @@ let () =
         ; T.database_case
             "complete protected transaction echoes atomically"
             (atomic_append_submits_and_replays_complete_tree ~remote_day:false)
+        ; T.database_case
+            "server-reordered append keeps UUID identities"
+            (atomic_append_submits_and_replays_complete_tree ~reverse_operations:true)
+        ; T.database_case
+            "reordered echo still rejects changed UUID"
+            reordered_echo_rejects_changed_uuid
         ; T.database_case
             "queued append adopts remote day and follows its tail"
             (atomic_append_submits_and_replays_complete_tree ~remote_day:true)

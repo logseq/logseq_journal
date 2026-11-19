@@ -346,6 +346,8 @@ type notification =
 type service_status =
   | Service_idle
   | Service_connecting
+  | Service_pulling
+  | Service_submitting
   | Service_online
   | Service_waiting_network
   | Service_waiting_unlock
@@ -888,7 +890,45 @@ let error_message = function
   | Capacity_exceeded message -> "Capacity exceeded: " ^ message
   | Sync_read_failure _ -> "Sync read failure"
   | Outbox_failure _ -> "Outbox transition failure"
-  | Authoritative_failure _ -> "Authoritative transition failure"
+  | Authoritative_failure error ->
+    let module T = Overlay.Types in
+    let module Diagnostic = Logseq_db_types.Authoritative_diagnostic in
+    let classified reason = "Authoritative transition failed: " ^ reason in
+    let diagnostic fallback source =
+      match Diagnostic.decode source with
+      | Some detail -> Diagnostic.message detail
+      | None -> classified fallback
+    in
+    (match error with
+     | T.Authoritative_database_closed -> classified "database closed during preparation"
+     | Authoritative_sync_token_conflict -> classified "preparation sync token conflict"
+     | Authoritative_cursor_discontinuous -> classified "server cursor discontinuous"
+     | Authoritative_checksum_mismatch -> classified "checksum mismatch"
+     | Authoritative_crypto_required -> classified "decryption result required"
+     | Authoritative_crypto_unexpected -> classified "unexpected decryption result"
+     | Authoritative_crypto_error error ->
+       classified
+         (match error with
+          | Crypto_result_missing_item _ -> "decryption result missing item"
+          | Crypto_result_extra_item _ -> "decryption result extra item"
+          | Crypto_result_duplicate_item _ -> "decryption result duplicate item"
+          | Crypto_result_reordered -> "decryption result reordered"
+          | Crypto_result_stale -> "decryption result stale"
+          | Crypto_result_limit_exceeded -> "decryption result limit exceeded")
+     | Authoritative_decode_failed source ->
+       diagnostic "transaction decode rejected" source
+     | Authoritative_origin_unresolved -> classified "origin unresolved"
+     | Authoritative_preparation_consumed -> classified "preparation already consumed"
+     | Authoritative_prepare_busy -> classified "preparation busy"
+     | Authoritative_integrity_failure source ->
+       diagnostic "integrity validation rejected" source
+     | Authoritative_commit_database_closed -> classified "database closed during commit"
+     | Authoritative_commit_token_conflict -> classified "commit sync token conflict"
+     | Authoritative_commit_generation_invalidated ->
+       classified "commit generation invalidated"
+     | Authoritative_commit_busy -> classified "commit busy"
+     | Authoritative_commit_persistence_failed _ -> classified "commit persistence failed"
+     | Authoritative_commit_fatal_state _ -> classified "commit fatal state")
   | Activation_failure _ -> "Snapshot activation failure"
   | Asset_failure diagnostic -> Logseq_db_types.Failure_diagnostic.message diagnostic
   | Unexpected_failure message -> "Unexpected failure: " ^ message
@@ -1037,6 +1077,7 @@ let queued view =
 ;;
 
 let recover_submission connection view batch_id =
+  let* () = task_effect (Publish_status Service_submitting) in
   let* batch = frozen_batch view (Types.Retry_group batch_id) in
   let* reply = request connection (Push batch) in
   settle_reply batch reply
@@ -1069,6 +1110,7 @@ let rec apply_batch config connection batch =
 ;;
 
 let pull_once ?head config connection view =
+  let* () = task_effect (Publish_status Service_pulling) in
   let since = checkpoint view in
   let* pulled = request connection (Pull since) in
   match pulled with
@@ -1124,6 +1166,7 @@ let pull_once ?head config connection view =
 ;;
 
 let send_batch ?head config connection batch =
+  let* () = task_effect (Publish_status Service_submitting) in
   let* outcome = capture_task (request connection (Push batch)) in
   match outcome with
   | Ok reply ->
@@ -1566,6 +1609,7 @@ let schedule config scope state =
                | None -> head.through
              in
              let task =
+               let* () = task_effect (Publish_status Service_pulling) in
                let* () = activate_initial config connection head in
                mapped (round config connection head target state.checked) (fun cursor ->
                  Policy_round cursor)
@@ -1854,7 +1898,7 @@ let policy_task config =
         let failure =
           match state.failure with
           | Some Network_closed when network_open gate -> None
-          | Some (Network_failure _ | Authentication_failure _) when new_epoch -> None
+          | Some (Network_failure _) when new_epoch -> None
           | failure -> failure
         in
         let state =
@@ -1891,9 +1935,13 @@ let policy_task config =
           else state
         in
         let* () =
-          if network_open gate
-          then task_effect Resample_outbox
-          else task_effect (Publish_status Service_waiting_network)
+          if not (network_open gate)
+          then task_effect (Publish_status Service_waiting_network)
+          else (
+            match state.failure with
+            | Some Locked -> task_effect (Publish_status Service_waiting_unlock)
+            | Some error -> task_effect (Publish_status (Service_blocked error))
+            | None -> task_effect Resample_outbox)
         in
         loop state
       | Child_ready child ->
@@ -1977,7 +2025,10 @@ let policy_task config =
                    | Some target -> Cursor.compare cursor target < 0
                    | None -> false
                  in
-                 let* () = task_effect (Publish_status Service_online) in
+                 let* () =
+                   task_effect
+                     (Publish_status (if dirty then Service_pulling else Service_online))
+                 in
                  loop { state with initialized = true; retries = 0; dirty }
                | Policy_outbox check ->
                  loop { state with checked = Some check; dirty = true }
