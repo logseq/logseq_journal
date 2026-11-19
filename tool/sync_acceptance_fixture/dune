@@ -1,0 +1,6 @@
+(executable
+ (name fixture)
+ (modules fixture)
+ (libraries datascript_ocaml datascript-ocaml-native logseq_db_storage
+  logseq_db_types logseq_overlay_db melange-transit-core melange-transit-native
+  sqlite3 unix yojson eio eio_main))

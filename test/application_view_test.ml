@@ -7614,7 +7614,8 @@ let test_graph_picker_controls scenario () =
              publish{previous with snapshot={previous.snapshot with resident_graphs=ids;
                resident_scopes=List.mapi(fun index id->resident_scope id (index+1))ids}}
            | Select_graph id | Focus_resident_graph id ->
-             let generation = if held_close then
+             let generation = if scenario=`Select then previous.snapshot.startup.graph_generation
+               else if held_close then
                (List.find(fun(s:Service.asset_scope)->s.graph_id=id)previous.snapshot.resident_scopes).graph_generation
                else previous.snapshot.startup.graph_generation + 1 in
              publish { previous with snapshot = { previous.snapshot with selected_graph = Some id
@@ -8047,13 +8048,30 @@ let test_graph_picker_controls scenario () =
         wait "focused graph presents even when its initial push preceded membership" (fun()->
           (Atomic.get current).snapshot.selected_graph=Some second && Atomic.get graph_opens>before)
       | `Select ->
+        consume (hooks.extension_event (picker_list ()) "event"
+          {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":0,\"last\":7}"}|});
+        wait "initial presence checks complete" (fun () -> Atomic.get inspections >= 2);
+        let before_selection = Atomic.get inspections in
+        let before_open = Atomic.get graph_opens in
         press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "name selection reaches worker" (fun () ->
            List.exists
              (function
                | Service.Focus_resident_graph id -> id = second
                | _ -> false)
-             (Atomic.get commands))
+             (Atomic.get commands));
+        wait "selected graph is projected and opens through Application" (fun () ->
+          (Atomic.get current).snapshot.selected_graph = Some second
+          && Atomic.get graph_opens > before_open);
+        wait "selected graph toolbar mounts" (fun () ->
+          Option.is_some (find "text" "Switch graph"));
+        press (Option.get (find "text" "Switch graph"));
+        wait "picker remounts after selection" (fun () ->
+          Option.is_some (find "accessibility-identifier" "graph-picker-list"));
+        consume (hooks.extension_event (picker_list ()) "event"
+          {|{"id":2,"payload":"{\"type\":\"visible_range\",\"first\":0,\"last\":7}"}|});
+        wait "selection with reused generations rechecks local presence" (fun () ->
+          Atomic.get inspections > before_selection)
       | `Late_graph_cancel ->
         press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "new graph is visible while old cancellation cleanup is held" (fun () ->

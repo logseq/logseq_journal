@@ -258,6 +258,7 @@ type t =
   ; mutable queryable_block_effects : outbox_record Rrbvec.t Uuid_map.t
   ; mutable queryable_page_effects : outbox_record Rrbvec.t Uuid_map.t
   ; mutable queryable_children_effects : outbox_record list Uuid_map.t
+  ; sync_changed : Eio.Condition.t
   ; mutable sync_revision : int
   ; mutable durable_sync_revision : int
   ; mutable durable_outbox : Logseq_db_storage.Sync_outbox_store.row Uuid_map.t
@@ -2385,6 +2386,7 @@ let close database =
       then false, [], [], []
       else (
         database.closed <- true;
+        Eio.Condition.broadcast database.sync_changed;
         database.timeline_versions <- empty_timeline_history ();
         database.release_slot := None;
         let callback_waiters =
@@ -7057,6 +7059,7 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                         ; queryable_block_effects
                         ; queryable_page_effects
                         ; queryable_children_effects
+                        ; sync_changed = Eio.Condition.create ()
                         ; sync_revision
                         ; durable_sync_revision = sync_revision
                         ; durable_outbox
@@ -7276,6 +7279,7 @@ let persist_outbox ?(terminal_batches = []) ?intent_commit database =
                         | Ok () ->
                           database.durable_outbox <- durable_outbox;
                           database.durable_sync_revision <- database.sync_revision;
+                          Eio.Condition.broadcast database.sync_changed;
                           Ok ()
                         | Error message -> rollback message))))))
 ;;
@@ -7786,6 +7790,15 @@ let inspect_sync database =
            ~token:(sync_token database.sync_revision)
            ~checkpoint:database.checkpoint
            ~submissions:(List.map descriptor database.outbox)))
+;;
+
+let await_sync_change database ~after =
+  Eio.Condition.loop_no_mutex database.sync_changed (fun () ->
+    match inspect_sync database with
+    | Error _ as error -> Some error
+    | Ok view when not (Types.sync_token_equal after (Types.sync_view_token view)) ->
+      Some (Ok view)
+    | Ok _ -> None)
 ;;
 
 let check_checkpoint_checksum database ~through ~expected =
@@ -12092,6 +12105,7 @@ let commit_authoritative_candidate database prepared =
                     database.checkpoint <- through;
                     database.checkpoint_metadata <- metadata;
                     database.sync_revision <- database.sync_revision + 1;
+                    Eio.Condition.broadcast database.sync_changed;
                     let before_revision = projection_revision before_projection in
                     let after_revision = projection_revision database.projection in
                     let logical_change_summary =

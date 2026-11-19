@@ -125,6 +125,24 @@ class Build:
                        "commands": [], "mode": mode, "cross_abi_validated": False,
                        "runtime_acceptance": False, "installed": False, "ignored_environment": ignored}
 
+    def native_entry(self):
+        if getattr(self.args, "sync_network_probe", False):
+            return {"role": "sync-network-probe", "dune_target": "tool/sync_acceptance_probe/native_probe.exe.o"}
+        return {"role": "production", "dune_target": "app/native_embed.exe.o"}
+
+    def native_sources(self, source):
+        return {name: digest for name, digest in source.items()
+                if Path(name).suffix in {".ml", ".mli", ".c", ".h"}
+                and (not {"tool", "test", "apple-tests"}.intersection(Path(name).parts)
+                     or (getattr(self.args, "sync_network_probe", False)
+                         and name.startswith("tool/sync_acceptance_probe/")))}
+
+    def native_configuration(self, source):
+        return {name: digest for name, digest in source.items()
+                if Path(name).name in {"dune", "dune-project", "dune-workspace"}
+                or name.endswith((".opam", ".opam.locked"))
+                or name == ".agents/skills/journal-build/scripts/native_static_link_flags.sh"}
+
     def save(self):
         (self.run_dir / "manifest.json").write_text(json.dumps(self.report, indent=2) + "\n")
 
@@ -394,12 +412,42 @@ class Build:
     def imported_native(self, source):
         """Read producer records as data; never execute their recorded commands."""
         envelope = json.loads(self.args.native_manifest.read_text())
+        entry = self.native_entry()
+        if envelope.get("native_entry", {"role": "production", "dune_target": "app/native_embed.exe.o"}) != entry:
+            raise ValueError("native entry role/target differs from explicit build mode")
         version = envelope.get("schema_version")
         if type(version) is not int or version not in (1, 2):
             raise ValueError("unsupported native manifest schema_version")
         self.native_schema_version = version
         directory = self.args.native_manifest.resolve().parent
         pre, link = [read_evidence(envelope[name], directory) for name in ("source", "link")]
+        expected_build = {"configuration": self.args.configuration,
+                          "dune_profile": "dev" if self.args.configuration == "debug" else "release"}
+        if any(record.get("native_build") is None for record in (pre, link)):
+            raise ValueError("native configuration/profile proof missing; rerun native producer with requested configuration")
+        if any(record["native_build"] != expected_build for record in (pre, link)):
+            raise ValueError("producer configuration/profile differs from requested build; rerun native producer")
+        if "dune_rule" in envelope:
+            rule = read_evidence(envelope["dune_rule"], directory)
+            query = rule.get("query", [])
+            if (rule.get("native_build") != expected_build
+                    or query[:4] != ["exec", "--", "dune", "rules"]
+                    or query.count("--profile") != 1
+                    or query[-4:] != ["--profile", expected_build["dune_profile"], "--format=json", entry["dune_target"]]):
+                raise ValueError("Dune configuration/profile proof differs or is missing; rerun native producer")
+        if getattr(self.args, "sync_network_probe", False):
+            if version != 2 or any(record.get("native_entry") != entry for record in (pre, link)):
+                raise ValueError("probe native entry role/target is not hash-bound by producer records")
+            if pre.get("native_configuration_sha256") != self.native_configuration(source):
+                raise ValueError("probe native build configuration differs from current inputs")
+            rule = read_evidence(envelope["dune_rule"], directory)
+            if (rule.get("native_entry") != entry
+                    or not rule["original_object"]["path"].endswith("/" + entry["dune_target"])
+                    or rule["command"].count("-o") != 1
+                    or rule["command"][rule["command"].index("-o") + 1] != entry["dune_target"]):
+                raise ValueError("probe Dune target differs from explicit native entry")
+        elif any(record.get("native_entry", entry) != entry for record in (pre, link)):
+            raise ValueError("native entry role/target differs from producer records")
         xmlm = read_evidence(envelope["xmlm_force_link"], directory) if version == 1 else None
         if version == 2 and "xmlm_force_link" in envelope:
             raise ValueError("ordinary-archive schema must not reinterpret a legacy XMLm force-link proof")
@@ -408,7 +456,7 @@ class Build:
         # Build/tool/docs commits may advance HEAD; native bytes/configuration below must still match exactly.
         self.run("git", "merge-base", "--is-ancestor", pre["commit"], self.report["source_sha"])
         removed = self.run("git", "diff", "--name-only", "--diff-filter=D", pre["commit"], "--").splitlines()
-        for name in sorted(set(source) | set(removed)):
+        for name in ([] if getattr(self.args, "sync_network_probe", False) else sorted(set(source) | set(removed))):
             if (Path(name).name in {"dune", "dune-project", "dune-workspace"}
                     or name.endswith((".opam", ".opam.locked")) or name == ".agents/skills/journal-build/scripts/native_static_link_flags.sh"):
                 original = subprocess.check_output(["git", "show", pre["commit"] + ":" + name], cwd=ROOT)
@@ -422,9 +470,7 @@ class Build:
         native_sources = dict(pre["native_source_sha256"])
         for name, digest in link["device_c_source_sha256"].items():
             native_sources["logseq_sync/lib/native_crypto/" + name] = digest
-        required = {name: digest for name, digest in source.items()
-                    if Path(name).suffix in {".ml", ".mli", ".c", ".h"}
-                    and not {"tool", "test", "apple-tests"}.intersection(Path(name).parts)}
+        required = self.native_sources(source)
         mismatch = [name for name in sorted(set(required) | set(native_sources))
                     if native_sources.get(name) != required.get(name)]
         if mismatch:
@@ -467,6 +513,8 @@ class Build:
             raise ValueError("host object still provides DNS/crypto; target C must provide them")
         self.host_object, self.native_files = host, inputs
         self.report["native_source_sha"] = pre["commit"]
+        if getattr(self.args, "sync_network_probe", False):
+            self.report["production_code_source_validated"] = True
         self.report["abi_limit"] = ("Host ARM64 producer only; no Apple App or iOS ABI validation"
             if getattr(self.args, "producer_only", False) else
             "EXPERIMENTAL: host ARM64 OCaml/runtime restamped; full iOS runtime ABI is not validated")
@@ -482,6 +530,11 @@ class Build:
         """Reuse a fixed complete object, with a hash-bound prior validation receipt."""
         receipt = read_evidence(envelope["validated_build"], directory)
         previous = receipt["inputs"]["dependencies"]
+        if getattr(self.args, "sync_network_probe", False) and (
+                receipt.get("native_entry") != self.native_entry()
+                or receipt.get("production_acceptance") is not False
+                or receipt["inputs"]["flags"].get("native_entry") != self.native_entry()):
+            raise ValueError("validated receipt does not prove the explicit probe role")
         version = envelope["schema_version"]
         if (receipt["status"] != "built" or receipt["mode"] != "experimental-host-restamp"
                 or previous.get("source_sha", receipt["source_sha"]) != pre["commit"]
@@ -638,6 +691,12 @@ class Build:
         if probe and (not self.info["CFBundleIdentifier"].endswith("-probe")
                       or any(path == ROOT or ROOT in path.parents for path in (self.swift_dir, self.plist))):
             raise RuntimeError("probe mode requires external staged Swift/plist and a distinct -probe bundle ID")
+        if getattr(a, "sync_network_probe", False):
+            if self.swift_dir != ROOT / "swift" or self.plist != ROOT / "apple/Info.plist":
+                raise RuntimeError("sync-network-probe requires maintained real Swift App sources and Info.plist")
+            self.info.update(CFBundleIdentifier="com.logseq.journal.sync-probe",
+                             CFBundleName="Journal Sync Probe", CFBundleDisplayName="Journal Sync Probe",
+                             JournalSyncNetworkProbe=True)
         if a.version:
             self.info["CFBundleShortVersionString"] = a.version
         if a.build_number:
@@ -686,15 +745,20 @@ class Build:
                                  "mode": "native" if getattr(a, "producer_only", False) else self.report["mode"],
                                  "info": self.info, "sign_identity": a.sign_identity}}
         self.inputs["flags"]["teams"] = {name: self.env.get(name) for name in ("JOURNAL_IOS_TEAM_ID", "JOURNAL_MACOS_TEAM_ID")}
+        if getattr(a, "sync_network_probe", False):
+            self.inputs["flags"]["native_entry"] = self.native_entry()
+            self.report.update(native_entry=self.native_entry(), production_acceptance=False,
+                               production_code_source_validated=bool(a.native_manifest))
         self.report.update(inputs=self.inputs, target=triple, sdk_name=sdk_name, architecture="arm64",
                            cache_key=fingerprint(self.inputs))
         self.save()
 
     def native_link_rule(self, workspace):
         """Read the current rule even when Dune's incremental build ran no linker."""
-        rules = json.loads(self.opam("exec", "--", "dune", "rules", "--root", ROOT, "--no-config",
+        query = list(map(str, ("exec", "--", "dune", "rules", "--root", ROOT, "--no-config",
             "--cache=disabled", "--build-dir", workspace / "dune", "--profile",
-            "dev" if self.args.configuration == "debug" else "release", "--format=json", "app/native_embed.exe.o"))
+            "dev" if self.args.configuration == "debug" else "release", "--format=json", self.native_entry()["dune_target"])))
+        rules = json.loads(self.opam(*query))
         if len(rules) != 1:
             raise ValueError("producer needs exactly one native Dune link rule")
         action, cwd = rules[0]["action"], ROOT
@@ -710,6 +774,7 @@ class Build:
         compiler = self.prefix / "bin/ocamlopt.opt"
         if command[0] != str(compiler) or sha(compiler) != self.inputs["toolchain"]["compiler_sha256"]:
             raise ValueError("Dune producer compiler identity differs from preflight")
+        self.native_rule_query = query
         return cwd, command
 
     def producer_pin(self, name):
@@ -751,10 +816,16 @@ class Build:
             raise ValueError("original native object hash changed before production")
         self.verify_target(native, "MACOS")
         cwd, original = self.native_link_rule(workspace)
+        self.selected_rule = (workspace, self.args.configuration, self.native_entry(), (cwd, original))
+        native_build = {"configuration": self.args.configuration,
+                        "dune_profile": self.native_rule_query[self.native_rule_query.index("--profile") + 1]}
         directory = workspace / "native-producer"
         envelope_path = directory / "native-input.json"
-        rule = {"working_directory": str(cwd), "command": original,
+        rule = {"working_directory": str(cwd), "command": original, "native_build": native_build,
+                "query": self.native_rule_query,
                 "original_object": {"path": str(native), "sha256": sha(native)}}
+        if getattr(self.args, "sync_network_probe", False):
+            rule["native_entry"] = self.native_entry()
         reused = directory.exists()
         if reused:
             if not envelope_path.is_file() or json.loads((directory / "dune-rule.json").read_text()) != rule:
@@ -848,9 +919,7 @@ class Build:
             pre = {"commit": self.report["source_sha"], "lui": self.lui_sha,
                 "signal": self.producer_pin("ocaml-signal")["resolved_sha"],
                 "datascript": self.producer_pin("datascript-ocaml-native")["resolved_sha"],
-                "native_source_sha256": {name: digest for name, digest in self.inputs["source"].items()
-                    if Path(name).suffix in {".ml", ".mli", ".c", ".h"}
-                    and not {"tool", "test", "apple-tests"}.intersection(Path(name).parts)},
+                "native_source_sha256": self.native_sources(self.inputs["source"]),
                 "installed_lui_source_sha256": {str(p): sha(p) for p in (self.prefix / "lib/lui").rglob("*")
                     if p.is_file() and p.suffix in {".ml", ".mli"}},
                 "production_native_object": str(directory / "production-host.o")}
@@ -860,6 +929,10 @@ class Build:
                 "patched_host_stub_archive_sha256": sha(patched),
                 "device_c_source_sha256": {p.name: sha(p) for p in
                     (ROOT / "logseq_sync/lib/native_crypto").iterdir() if p.suffix in {".c", ".h"}}}
+            pre["native_build"] = link["native_build"] = native_build
+            pre["native_entry"] = link["native_entry"] = self.native_entry()
+            if getattr(self.args, "sync_network_probe", False):
+                pre["native_configuration_sha256"] = self.native_configuration(self.inputs["source"])
             # Reject unbound/unknown command forms before executing the current Dune-derived relink.
             self.ordinary_native_inputs(pre, link)
             link["command"] = self.ordinary_command
@@ -868,7 +941,8 @@ class Build:
             if any(sha(path) != digest for path, digest in inputs.items()):
                 raise ValueError("native link input hash changed during production")
             pre["production_native_object_sha256"] = link["production_host_sha256"] = sha(pre["production_native_object"])
-            envelope = {"schema_version": 2, "source": dump("source.json", pre), "link": dump("link.json", link),
+            envelope = {"schema_version": 2, "native_entry": self.native_entry(),
+                        "source": dump("source.json", pre), "link": dump("link.json", link),
                         "dune_rule": dump("dune-rule.json", rule)}
             dump("native-input.json", envelope)
         self.phase = "verify-producer"
@@ -914,12 +988,14 @@ class Build:
             self.opam("exec", "--", "dune", "build", "--root", ROOT, "--no-config", "--cache=disabled",
                       "--build-dir", dune_dir, "--trace-file", self.run_dir / "native-trace.json",
                       "--profile", "dev" if a.configuration == "debug" else "release",
-                      "-j", str(a.jobs), "app/native_embed.exe.o")
-            native = dune_dir / "default/app/native_embed.exe.o"
+                      "-j", str(a.jobs), self.native_entry()["dune_target"])
+            native = dune_dir / "default" / self.native_entry()["dune_target"]
             self.native_gmp = dune_dir / "default/app/libgmp.a"
             self.report["linked_gmp"] = {"path": str(self.native_gmp), "sha256": sha(self.native_gmp)}
             native_units = self.verify_ocaml_units(native, require_xmlm=False)
         self.report["native_object"] = {"path": str(native), "sha256": sha(native), "mode": self.report["mode"]}
+        if getattr(a, "sync_network_probe", False):
+            self.report["native_object"]["native_entry"] = self.native_entry()
         if native_units is not None:
             self.report["native_object"]["ocaml_units"] = native_units
         if getattr(a, "producer_only", False):
@@ -1090,6 +1166,11 @@ class Build:
 
     def verify_inputs(self):
         self.phase = "verify-inputs"
+        if hasattr(self, "selected_rule"):
+            workspace, configuration, entry, captured = self.selected_rule
+            if (self.args.configuration != configuration or self.native_entry() != entry
+                    or self.native_link_rule(workspace) != captured):
+                raise RuntimeError("selected native Dune rule changed during build; rerun with stable inputs")
         if (source_inputs() != self.inputs["source"] or files(self.swift_dir) != self.inputs["swift"]
                 or files(self.lui) != self.inputs["lui"] or sha(self.plist) != self.inputs["plist"]
                 or files(self.entitlements) != self.inputs["entitlements"]):
@@ -1124,6 +1205,7 @@ def arguments():
     parser.add_argument("--lui-package", type=Path, help="local LUI platform/apple package")
     parser.add_argument("--preflight", action="store_true", help="check inputs without compiling")
     parser.add_argument("--producer-only", action="store_true", help="native macOS producer evidence only; no Swift, App packaging or signing")
+    parser.add_argument("--sync-network-probe", action="store_true", help="separate real-App Simulator network fault diagnostic; explicit producer/import role, never production acceptance")
     parser.add_argument("--link-only", action="store_true", help="explicit stub build; not runnable acceptance")
     parser.add_argument("--experimental-host-restamp", action="store_true", help="explicit existing host ARM64 compatibility route; full iOS ABI unverified")
     parser.add_argument("--native-manifest", type=Path, help="hash-verified source/link/XMLm producer evidence envelope")
@@ -1138,6 +1220,12 @@ def arguments():
     parser.add_argument("--provisioning-profile", type=Path, help="existing device profile; never downloaded")
     parser.add_argument("--sign-entitlements", type=Path, help="existing device signing entitlements")
     a = parser.parse_args()
+    if a.sync_network_probe and a.configuration != "debug":
+        parser.error("sync-network-probe requires --configuration debug")
+    if a.sync_network_probe and (a.link_only or a.probe_native_object
+            or not ((a.platform == "macos" and a.producer_only)
+                    or (a.platform == "ios-simulator" and a.experimental_host_restamp and a.native_manifest))):
+        parser.error("sync-network-probe requires macOS --producer-only or explicit Simulator native-manifest import")
     if a.producer_only and (a.platform != "macos" or a.link_only or a.native_manifest or a.experimental_host_restamp
                            or a.probe_native_object or a.app_dir or a.app_directory or a.sign_identity != "-"
                            or a.provisioning_profile or a.sign_entitlements):
