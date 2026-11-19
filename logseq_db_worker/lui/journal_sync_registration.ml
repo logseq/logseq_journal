@@ -645,7 +645,7 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
     then Ok ()
     else
       let* next =
-        if (not !network_authorized) || not !foreground
+        if (not !authenticated) || (not !network_authorized) || not !foreground
         then Ok Dsl.Closed
         else (
           match !gate with
@@ -719,13 +719,12 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
         network_authorized := false;
         gate := Dsl.Closed;
         Account.logout account)
-    | Sync_event (Account_authenticated { user_id = Some _ }) when not !network_authorized
-      -> Ok ()
     | Sync_event (Account_authenticated { user_id = Some user_id }) ->
       checked (fun () ->
+        let authorized = !network_authorized in
         let* () = replace user_id in
         authenticated := true;
-        network_authorized := true;
+        network_authorized := authorized;
         let* () = apply_network () in
         let generation = !account_generation
         and epoch = !network_epoch in

@@ -3321,22 +3321,25 @@ let with_observation_service ?epoch_ms ?prepare ?change_max_items ?(observe_push
     f client ~call ~send ~wait ~replies ~notices ~baseline ~owner ~registration)
 ;;
 
-let test_native_registration_network_epochs () =
+let test_native_registration_network_epochs ?(confirmation_first=false) () =
   let module Registration = Logseq_db_worker_lui.Journal_sync_registration in
   let module Pure = Logseq_db_worker.Pure_reducer in
   let exception Finished in
   T.with_managed (fun fixture -> with_service_fixture (fun _ config ->
     Eio_main.run (fun environment -> Eio.Time.with_timeout_exn (Eio.Stdenv.clock environment) 10. (fun () -> try Eio.Switch.run (fun sw ->
       let epochs = ref [] in
+      let platform_user = ref None in
       let expected_generation = ref 1 in
       let bridge = Registration.create ~sw
         ~clock:(Eio.Stdenv.mono_clock environment) ~network:(Eio.Stdenv.net environment)
         ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
         ~config ~overlay:fixture.overlay
-        ~token:(fun ~user:_ ~account_generation ~epoch ~refresh:_ ->
-          require (account_generation= !expected_generation) "network reopen changed token account identity";
+        ~token:(fun ~user ~account_generation ~epoch ~refresh:_ ->
           epochs := epoch :: !epochs;
-          Error (Authentication_failure "Synthetic token rejection")) () |> Result.get_ok in
+          require (account_generation= !expected_generation) "network reopen changed token account identity";
+          if !platform_user <> Some user then
+            Error (Authentication_failure "Authentication authority changed")
+          else Error (Authentication_failure "Synthetic token rejection")) () |> Result.get_ok in
       let module Db = Logseq_db_worker in
       let module Runner = Db.Effect_runner in
       let limits = Sync.limits ~maximum_response_bytes:config.response_budget_bytes
@@ -3359,8 +3362,32 @@ let test_native_registration_network_epochs () =
         require (not (Db.view worker).sync.snapshot.startup.bootstrapping)
           "native registration left an attached mirror bootstrapping";
         let scope : Sync.startup_scope = {account_generation=1;presentation_generation=1} in
-        intent (Sync.Sign_in_requested scope);
-        intent (Sync.Account_authenticated {user_id=Some "user-1"});
+        if confirmation_first then (
+          platform_user:=Some "user-1";
+          intent (Sync.Account_authenticated {user_id=Some "user-1"});
+          require (!epochs=[]) "identity confirmation invented network intent";
+          require ((Db.view worker).sync.snapshot.startup.authenticated)
+            "verified identity was dropped before timeline admission");
+        let timeline : Sync.timeline_scope =
+          {startup=scope;graph_id=Test_support.graph_uuid;
+           graph_generation=(Db.view worker).sync.snapshot.startup.graph_generation} in
+        require (Result.is_ok (bridge.validate_control (Registration.Recover_online timeline)))
+          "cold restored timeline scope is not current";
+        intent (Sync.Timeline_presented timeline);
+        require ((Db.view worker).sync.snapshot.startup.network_phase=Sync.Online_after_timeline)
+          "cold restored timeline did not request online admission";
+        for _ = 1 to 3 do
+          bridge.lifecycle (Pure.Foreground_intent false);settle ();
+          bridge.lifecycle (Pure.Foreground_intent true);settle ()
+        done;
+        if not confirmation_first then (
+          require (!epochs=[]) "cold restored timeline requested an unverified token";
+          require ((Db.view worker).sync.snapshot.last_error=None)
+            "cold restored timeline failed before identity confirmation";
+          intent (Sync.Sign_in_requested scope);
+          require (!epochs=[]) "explicit sign-in opened cached service before platform confirmation";
+          platform_user:=Some "user-1";
+          intent (Sync.Account_authenticated {user_id=Some "user-1"}));
         require (!epochs<>[]) "native registration did not request a token";
         let snapshot = (Db.view worker).sync.snapshot in
         require (snapshot.last_error = Some "Synthetic token rejection")
@@ -3420,6 +3447,7 @@ let test_native_registration_network_epochs () =
         intent (Sync.Restore_local_account {user_id="other-synthetic-user"});
         let current : Sync.startup_scope = {account_generation=2;presentation_generation=2} in
         intent (Sync.Sign_in_requested current);
+        platform_user:=Some "other-synthetic-user";
         intent (Sync.Account_authenticated {user_id=Some "other-synthetic-user"});
         let epoch=List.hd !epochs in
         require (epoch > !previous) "account replacement reused authorization epoch";
@@ -3428,6 +3456,90 @@ let test_native_registration_network_epochs () =
         intent (Sync.Catalog_refresh_requested current);
         require (!epochs<>[] && List.hd !epochs=epoch) "old account controls changed new account gate");
       Eio.Switch.fail sw Finished) with Finished -> ()))))
+;;
+
+let test_native_service_cold_restore_waits_for_identity ?(confirmation_first = false) () =
+  let requests = ref []
+  and snapshot = ref None in
+  let observe_push = function
+    | Service.Need_id_token request -> requests := request :: !requests
+    | Service.Client_state_changed state -> snapshot := Some state.snapshot
+    | _ -> ()
+  in
+  with_observation_service
+    ~observe_push
+    (fun _ ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline:_ ~owner ~registration:_ ->
+       let command value =
+         require
+           (match call (Service.Client_command value) with
+            | Mailbox.Completed Service.Client_command_completed -> true
+            | _ -> false)
+           "native cold restore control failed"
+       in
+       let confirm () =
+         command (Service.Reconcile_authenticated_user { user_id = Some "user-1" })
+       in
+       let foreground_cycles () =
+         for _ = 1 to 3 do
+           command (Service.Set_foreground false);
+           command (Service.Set_foreground true)
+         done
+       in
+       let no_premature_io () =
+         require (!requests = []) "native cold restore performed premature token IO";
+         require
+           (Option.exists (fun value -> value.Service.last_error = None) !snapshot)
+           "native cold restore published a premature authentication failure"
+       in
+       if confirmation_first
+       then (
+         confirm ();
+         foreground_cycles ();
+         no_premature_io ());
+       command (Service.Acknowledge_timeline_presented owner);
+       if not confirmation_first
+       then (
+         foreground_cycles ();
+         wait (fun () ->
+           Option.exists
+             (fun value ->
+                value.Service.startup.network_phase = Sync.Online_after_timeline)
+             !snapshot);
+         no_premature_io ();
+         command (Service.Request_sign_in owner.startup);
+         no_premature_io ();
+         confirm ());
+       wait (fun () -> !requests <> []);
+       require (List.length !requests = 1) "native gate opened more than one token flight";
+       (match call (Service.Register_coordination 910001L) with
+        | Mailbox.Completed (Service.Coordination_registered value) ->
+          require
+            (value.authority_user = Some (Some "user-1"))
+            "native token authority did not retain the verified user"
+        | _ -> failwith "native verified authority baseline failed");
+       confirm ();
+       command (Service.Acknowledge_timeline_presented owner);
+       require
+         (List.length !requests = 1)
+         "native gate did not reuse its pending token flight";
+       command (Service.Reject_token (List.hd !requests));
+       wait (fun () ->
+         Option.exists (fun value -> value.Service.last_error <> None) !snapshot);
+       require
+         (Option.exists
+            (fun value ->
+               value.Service.last_error <> Some "Authentication authority changed")
+            !snapshot)
+         "same-user confirmation did not authorize the actual token owner";
+       command (Service.Cancel_online owner.startup);
+       let count = List.length !requests in
+       foreground_cycles ();
+       confirm ();
+       command (Service.Acknowledge_timeline_presented owner);
+       command (Service.Refresh_catalog owner.startup);
+       require
+         (List.length !requests = count)
+         "native cancelled authorization was reopened by confirmation or timeline")
 ;;
 
 let test_native_service_rejects_stale_network_commands () =
@@ -4826,9 +4938,15 @@ let test_physical_outbox_failure_carries_unknown_reason () =
 
 let () =
   if Array.mem "--network-epochs-only" Sys.argv then (
+    test_native_service_cold_restore_waits_for_identity ~confirmation_first:true ();
+    test_native_service_cold_restore_waits_for_identity ();
+    test_native_registration_network_epochs ~confirmation_first:true ();
     test_native_registration_network_epochs (); print_endline "Native registration network epochs passed"; exit 0);
   if Array.mem "--network-scopes-only" Sys.argv then (
     test_native_service_rejects_stale_network_commands (); print_endline "Native Service network scope guards passed"; exit 0);
+  test_native_service_cold_restore_waits_for_identity ~confirmation_first:true ();
+  test_native_service_cold_restore_waits_for_identity ();
+  test_native_registration_network_epochs ~confirmation_first:true ();
   test_native_registration_network_epochs ();
   test_native_service_rejects_stale_network_commands ();
   if Array.mem "--source-recovery-only" Sys.argv then (
