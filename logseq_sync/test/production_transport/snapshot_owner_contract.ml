@@ -63,7 +63,7 @@ let rec remove path =
 ;;
 
 let with_directory callback =
-  let path = Filename.temp_file "snapshot-owner-" "" in
+  let path = Filename.temp_file ~temp_dir:(Sys.getcwd ()) "snapshot-owner-" "" in
   Sys.remove path;
   Unix.mkdir path 0o700;
   Fun.protect ~finally:(fun () -> remove path) (fun () -> callback path)
@@ -455,10 +455,25 @@ let remote_graph_fixture ?(protected_titles = []) () =
     in
     let schema =
       List.map
-        (fun name -> name, attribute)
+        (fun name ->
+           let attribute =
+             match name with
+             | "db/ident" | "block/uuid" -> { attribute with unique = Some Identity }
+             | "block/parent" | "block/page" ->
+               { attribute with value_type = Some RefType }
+             | "block/tags" ->
+               { attribute with cardinality = Many; value_type = Some RefType }
+             | _ -> attribute
+           in
+           name, attribute)
         [ "db/ident"
         ; "block/uuid"
         ; "block/title"
+        ; "block/name"
+        ; "block/journal-day"
+        ; "block/link"
+        ; "block/refs"
+        ; "block/tags"
         ; "block/parent"
         ; "block/page"
         ; "block/order"
@@ -481,6 +496,7 @@ let remote_graph_fixture ?(protected_titles = []) () =
            ; (if protected_titles = []
               then []
               else kv 5 "logseq.kv/graph-rtc-e2ee?" (Bool true))
+           ; [ fact 6 "db/ident" (Keyword "logseq.class/Journal") ]
            ; List.concat
                (List.mapi
                   (fun index title ->
@@ -549,7 +565,295 @@ let remote_graph_fixture ?(protected_titles = []) () =
     Bytes.to_string prefix ^ payload, List.length !rows, checksum)
 ;;
 
-let encrypted_snapshot_activation () =
+let protected_append_echo database ~path ~protect ~unprotect ~duplicate =
+  let module Database = Logseq_overlay_db.Database in
+  let module Types = Logseq_overlay_db.Types in
+  let module Graph = Logseq_db_types.Graph_types in
+  let module J = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let ok result =
+    match result with
+    | Ok value -> value
+    | Error _ -> Alcotest.fail "Synthetic protected append operation failed"
+  in
+  let uuid ordinal =
+    ok (Graph.Uuid.of_string (Printf.sprintf "90000000-0000-4000-8000-%012d" ordinal))
+  in
+  let page = uuid 7790
+  and root = uuid 7791
+  and child = uuid 7792 in
+  let expected = ok (Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[]) in
+  let intent =
+    ok
+      (Database.persist_local_intent
+         database
+         ~namespace:(String.make 64 'a')
+         ~payload:"Synthetic AES append"
+         ~expected
+         (Types.Append_journal
+            { mutation_id = uuid 7793
+            ; page
+            ; title = "2026-11-02"
+            ; journal_day = 20261102
+            ; root =
+                { uuid = root
+                ; title = "Synthetic AES root"
+                ; task_status = None
+                ; children =
+                    Rrbvec.singleton
+                      { Types.uuid = child
+                      ; title = "Synthetic AES child"
+                      ; task_status = None
+                      ; children = Rrbvec.empty
+                      }
+                }
+            }))
+  in
+  let local = ok (Database.commit_local_intent database intent) in
+  let local = Database.intent_commit_outcome local in
+  let view () = ok (Database.inspect_sync database) in
+  let transition change =
+    ok
+      (Database.begin_outbox_transition
+         database
+         ~expected:(Types.sync_view_token (view ()))
+         change)
+  in
+  let prepared, request = transition (Types.Submit_group [ local.mutation_id ]) in
+  let request = Option.get request in
+  let protected = request, get (protect request) in
+  let submitted =
+    ok (Database.apply_outbox_transition database prepared ~encrypted:(Some protected))
+    |> fun commit -> Option.get commit.Types.submission_batch
+  in
+  let wires = Types.submission_batch_wires submitted in
+  Alcotest.(check int) "one atomic AES transaction" 1 (List.length wires);
+  let operations =
+    Types.submission_wire_protected_transaction (List.hd wires)
+    |> Codec.of_string
+    |> function
+    | J.Array operations -> List.rev operations
+    | _ -> Alcotest.fail "Synthetic append wire is not an array"
+  in
+  let through = ok (Types.Server_cursor.of_int64 4L) in
+  let barrier =
+    { Types.through
+    ; checksum = ok (Types.Checksum.of_string "checksum:v1:0000000000000000")
+    }
+  in
+  let prepared, crypto =
+    transition
+      (Types.Accept_group { batch_id = Types.submission_batch_id submitted; barrier })
+  in
+  Alcotest.(check bool) "acceptance needs no crypto" true (crypto = None);
+  ignore (ok (Database.apply_outbox_transition database prepared ~encrypted:None));
+  let state () =
+    let sync = view () in
+    let snapshot = ok (Database.current_snapshot database) in
+    Fun.protect
+      ~finally:(fun () -> Database.release_snapshot snapshot)
+      (fun () ->
+         ( Types.sync_view_checkpoint sync
+         , Types.sync_view_submissions sync
+         , Database.snapshot_version snapshot
+         , ok (Database.get_outline_blocks snapshot [ root; child ]) ))
+  in
+  let apply operations =
+    let wire = Codec.to_string ~mode:Codec.Verbose (J.Array operations) in
+    let batch =
+      ok
+        (Types.authoritative_batch
+           ~maximum_count:16
+           ~maximum_bytes:1048576
+           ~transactions:
+             [ Types.authoritative_transaction
+                 ~cursor:through
+                 ~transaction:
+                   (ok (Types.encoded_transaction_of_string ~maximum_bytes:1048576 wire))
+             ]
+           ~through
+           ~checksum:None)
+    in
+    let prepared, request =
+      ok
+        (Database.begin_authoritative
+           database
+           ~expected:(Types.sync_view_token (view ()))
+           batch)
+    in
+    let request = Option.get request in
+    let decrypted = request, get (unprotect request) in
+    let result =
+      Database.apply_authoritative database prepared ~decrypted:(Some decrypted)
+    in
+    (match result with
+     | Error (Types.Authoritative_decode_failed message) ->
+       Alcotest.failf "Synthetic echo decode: %s" message
+     | _ -> ());
+    result
+  in
+  let durable_state () =
+    let sqlite = Sqlite3.db_open ~mode:`READONLY path in
+    Fun.protect
+      ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+      (fun () ->
+         let tables = ref [] in
+         Sqlite3.Rc.check
+           (Sqlite3.exec
+              sqlite
+              ~cb:(fun row _ -> tables := Option.get row.(0) :: !tables)
+              "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+         List.map
+           (fun table ->
+              let rows = ref [] in
+              Sqlite3.Rc.check
+                (Sqlite3.exec
+                   sqlite
+                   ~cb:(fun row _ -> rows := Array.to_list row :: !rows)
+                   ("SELECT * FROM \""
+                    ^ String.concat "\"\"" (String.split_on_char '"' table)
+                    ^ "\""));
+              table, List.sort compare !rows)
+           !tables)
+  in
+  let before = state ()
+  and durable_before = durable_state () in
+  let reject label operations =
+    (match apply operations with
+     | Error (Types.Authoritative_integrity_failure _) -> ()
+     | _ -> Alcotest.fail ("AES echo must reject " ^ label));
+    Alcotest.(check bool)
+      (label ^ " leaves logical view unchanged")
+      true
+      (state () = before);
+    Alcotest.(check bool)
+      (label ^ " leaves every durable table unchanged")
+      true
+      (durable_state () = durable_before)
+  in
+  if not duplicate
+  then (
+    reject
+      "changed UUID"
+      (List.map
+         (function
+           | J.Array [ op; entity; J.Keyword "block/uuid"; J.Uuid value ]
+             when value = Graph.Uuid.to_string child ->
+             J.Array
+               [ op
+               ; entity
+               ; J.Keyword "block/uuid"
+               ; J.Uuid (Graph.Uuid.to_string (uuid 7794))
+               ]
+           | operation -> operation)
+         operations);
+    reject
+      "changed reference"
+      (List.map
+         (function
+           | J.Array [ op; entity; J.Keyword "block/parent"; _ ] ->
+             J.Array
+               [ op
+               ; entity
+               ; J.Keyword "block/parent"
+               ; J.Array [ J.Keyword "block/uuid"; J.Uuid (Graph.Uuid.to_string child) ]
+               ]
+           | operation -> operation)
+         operations);
+    reject
+      "changed ident reference"
+      (List.map
+         (function
+           | J.Array [ op; entity; J.Keyword "block/tags"; _ ] ->
+             J.Array
+               [ op
+               ; entity
+               ; J.Keyword "block/tags"
+               ; J.Array [ J.Keyword "db/ident"; J.Keyword "logseq.kv/graph-remote?" ]
+               ]
+           | operation -> operation)
+         operations);
+    let title =
+      List.find
+        (function
+          | J.Array [ _; _; J.Keyword "block/title"; _ ] -> true
+          | _ -> false)
+        operations
+    in
+    reject "missing fact" (List.filter (fun operation -> operation <> title) operations);
+    let entity =
+      match title with
+      | J.Array [ _; entity; _; _ ] -> entity
+      | _ -> assert false
+    in
+    reject
+      "extra fact"
+      (operations
+       @ [ J.Array [ J.Keyword "db/add"; entity; J.Keyword "block/updated-at"; J.Int 123 ]
+         ]);
+    let repeated =
+      match title with
+      | J.Array [ op; _; attr; value ] ->
+        J.Array [ op; J.String "synthetic-extra-owner"; attr; value ]
+      | _ -> assert false
+    in
+    reject "changed multiplicity" (operations @ [ repeated ]));
+  let operations = if duplicate then operations @ operations else operations in
+  (match ok (apply operations) with
+   | Database.Authoritative_applied _ -> ()
+   | _ -> Alcotest.fail "AES reordered append was deferred");
+  Alcotest.(check int64)
+    "AES echo advances checkpoint"
+    4L
+    (Types.Server_cursor.to_int64 (Types.sync_view_checkpoint (view ())));
+  Alcotest.(check int)
+    "AES echo retires accepted owner"
+    0
+    (List.length (Types.sync_view_submissions (view ())));
+  let actual =
+    ok
+      (Database.inspect_snapshot_storage
+         ~check_current:(fun () -> ())
+         ~scratch_bytes:33554432L
+         ~encrypted:true
+         ~path)
+  in
+  Alcotest.(check (option bool))
+    "AES echo actual durable checksum"
+    (Some true)
+    (ok (Database.check_checkpoint_checksum database ~through ~expected:actual));
+  let wrong = ok (Types.Checksum.of_string "checksum:v1:ffffffffffffffff") in
+  Alcotest.(check (option bool))
+    "AES echo wrong checksum rejected"
+    (Some false)
+    (ok (Database.check_checkpoint_checksum database ~through ~expected:wrong));
+  let snapshot = ok (Database.current_snapshot database) in
+  Fun.protect
+    ~finally:(fun () -> Database.release_snapshot snapshot)
+    (fun () ->
+       match ok (Database.get_outline_blocks snapshot [ root; child ]) with
+       | [ Types.Present_block { value = first; _ }
+         ; Types.Present_block { value = second; _ }
+         ] ->
+         Alcotest.(check bool)
+           "AES echo stable parent/page references"
+           true
+           (first.block.parent = page
+            && second.block.parent = root
+            && first.block.page = page
+            && second.block.page = page);
+         Alcotest.(check string)
+           "AES root authenticated title"
+           "Synthetic AES root"
+           first.block.title;
+         Alcotest.(check string)
+           "AES child authenticated title"
+           "Synthetic AES child"
+           second.block.title
+       | _ -> Alcotest.fail "AES echo lost the complete tree")
+;;
+
+let encrypted_snapshot_activation ?echo () =
   let module Crypto = Logseq_sync_crypto.Core in
   let module Owner = Logseq_sync_execute_owners.Database_owner in
   let module Database = Logseq_overlay_db.Database in
@@ -718,7 +1022,39 @@ let encrypted_snapshot_activation () =
                 Alcotest.(check int64)
                   "activated checkpoint"
                   3L
-                  (Types.Server_cursor.to_int64 (Types.sync_view_checkpoint view))))))
+                  (Types.Server_cursor.to_int64 (Types.sync_view_checkpoint view));
+                Option.iter
+                  (fun duplicate ->
+                     let echo_crypto =
+                       Crypto.create ~identity ~limits ~encrypted:true ~backend
+                     in
+                     let run operation =
+                       Crypto.run
+                         echo_crypto
+                         ~identity
+                         ~check_current:(fun () -> Ok ())
+                         operation
+                     in
+                     Fun.protect
+                       ~finally:(fun () -> Crypto.retire echo_crypto)
+                       (fun () ->
+                          ignore
+                            (get
+                               (run
+                                  (D.Unlock
+                                     (get (D.unlock_input ~wrapped_graph_key:"synthetic")))));
+                          protected_append_echo
+                            database
+                            ~path:
+                              (Filename.concat
+                                 root
+                                 ("logseq-db-worker/synced-graphs/"
+                                  ^ identity.graph
+                                  ^ "/db.sqlite"))
+                            ~protect:(fun request -> run (D.Protect request))
+                            ~unprotect:(fun request -> run (D.Unprotect request))
+                            ~duplicate))
+                  echo))))
 ;;
 
 let native_service_bootstrap ?(checksum_mode = `Valid) () =
@@ -1444,7 +1780,11 @@ let native_error_cause kind () =
 let () =
   let tests =
     [ ( "encrypted native snapshot activation respects crypto bounds"
-      , encrypted_snapshot_activation )
+      , fun () -> encrypted_snapshot_activation () )
+    ; ( "AES protected append reordered echo and six exact-payload rejections"
+      , fun () -> encrypted_snapshot_activation ~echo:false () )
+    ; ( "AES protected append duplicate operations retain exact datoms"
+      , fun () -> encrypted_snapshot_activation ~echo:true () )
     ; ("App owned native absent mirror bootstrap", fun () -> native_service_bootstrap ())
     ; ( "native bootstrap rejects wrong Hello checksum"
       , fun () -> native_service_bootstrap ~checksum_mode:`Invalid () )

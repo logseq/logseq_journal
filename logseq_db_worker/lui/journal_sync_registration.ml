@@ -210,8 +210,10 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
              | Service_backoff _ -> Connecting
              | Service_connecting -> Connecting
              | Service_idle -> Paused
+             | Service_pulling -> Pulling
+             | Service_submitting -> Submitting
              | Service_online ->
-               if observed.state.pending_submissions > 0 then Submitting else Pulling)
+               if observed.state.pending_submissions > 0 then Submitting else Current)
         in
         let phase =
           if Option.is_some entry.attachment_error || Option.is_some !failure
@@ -787,7 +789,46 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
     | Sync_event (Online_recovery_requested scope) ->
       checked (fun () ->
         let* () = current_timeline scope in
-        refresh ())
+        let selected_failure =
+          Option.bind
+            (List.find_opt
+               (fun entry ->
+                  (not entry.retiring)
+                  && entry.scope.graph_id = scope.graph_id
+                  && entry.scope.graph_generation = scope.graph_generation)
+               !entries)
+            (fun entry ->
+               match entry.attachment_error, entry.status with
+               | Some error, _ -> Some error
+               | None, Some status ->
+                 let observed = status.Lifecycle.Service.observation in
+                 (match observed.status with
+                  | Dsl.Service_blocked error -> Some error
+                  | _ -> observed.state.last_failure)
+               | None, None -> None)
+        in
+        let* retry =
+          match selected_failure, !failure with
+          | _, Some error
+            when match error with
+                 | Dsl.Network_closed | Network_failure _ -> false
+                 | _ -> true -> Error error
+          | Some (Dsl.Network_closed | Network_failure _), _
+          | None, (None | Some (Dsl.Network_closed | Network_failure _)) -> Ok true
+          | Some _, _ -> Ok false
+          | None, Some error -> Error error
+        in
+        if not retry
+        then Ok ()
+        else
+          let* () =
+            if !authenticated && !network_authorized && !foreground
+            then (
+              gate := Dsl.Closed;
+              Account.set_network account Dsl.Closed)
+            else Ok ()
+          in
+          refresh ())
     | Sync_event (Online_cancelled scope) ->
       checked (fun () ->
         let* () = current_presentation scope in

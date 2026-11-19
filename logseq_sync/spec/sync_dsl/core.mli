@@ -467,6 +467,8 @@ type notification =
 type service_status =
   | Service_idle
   | Service_connecting
+  | Service_pulling
+  | Service_submitting
   | Service_online
   | Service_waiting_network
   | Service_waiting_unlock

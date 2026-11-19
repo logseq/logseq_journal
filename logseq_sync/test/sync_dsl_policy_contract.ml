@@ -313,6 +313,10 @@ let rec transport
                ~checksum:"checksum:v1:verified"
                ~encrypted:false)))
   | D.Push actual ->
+    Alcotest.(check bool)
+      "push exposes actual submitting workflow"
+      true
+      (fixture.status = D.Service_submitting);
     record fixture "push";
     Alcotest.(check bool)
       "exact frozen ID"
@@ -330,6 +334,10 @@ let rec transport
       Some (Error (D.Outcome_unknown "lost response")))
     else Some (Ok (D.Accepted { through = fixture.remote; checksum }))
   | D.Pull since ->
+    Alcotest.(check bool)
+      "pull exposes actual pulling workflow"
+      true
+      (fixture.status = D.Service_pulling);
     record fixture "pull";
     if fixture.pulls_without_progress > 0 || T.Server_cursor.equal since fixture.remote
     then (
@@ -377,6 +385,16 @@ let responder fixture owner =
        | Error error -> Some (Error error)
        | Ok sequence -> if sequence <> fixture.revision then Some (Ok ()) else None)
     | D.Publish_status status ->
+      if status = D.Service_online
+      then (
+        Alcotest.(check bool)
+          "online has reached authoritative remote checkpoint"
+          true
+          (fixture.checkpoint = Some fixture.remote);
+        Alcotest.(check int)
+          "online has no unsettled submissions"
+          0
+          (List.length fixture.submissions));
       fixture.status <- status;
       fixture.statuses <- status :: fixture.statuses;
       record fixture "status";

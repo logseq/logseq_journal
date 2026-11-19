@@ -358,7 +358,7 @@ let rec remove_fixture path =
   else Sys.remove path
 ;;
 
-let real_activation env () =
+let with_snapshot_fixture run_fixture =
   let root = Filename.temp_file "execute-activation-" "" in
   Sys.remove root;
   Unix.mkdir root 0o700;
@@ -519,13 +519,28 @@ let real_activation env () =
        in
        let target = Filename.concat root "target" in
        Unix.mkdir target 0o700;
+       run_fixture
+         ~dependencies
+         ~inspection:(inspect target)
+         ~path
+         ~rows
+         ~checksum
+         ~inspect_target:(fun () -> inspect target))
+;;
+
+let real_activation env () =
+  with_snapshot_fixture
+    (fun ~dependencies ~inspection ~path ~rows ~checksum ~inspect_target ->
+       let module O = D.Overlay in
+       let require = Result.get_ok in
+       let through = require (Logseq_db_types.Server_cursor.of_int64 0L) in
        Eio.Switch.run (fun sw ->
          let database_owner =
            get
              (X.activation_owner
                 ~sw
                 ~dependencies
-                ~inspection:(inspect target)
+                ~inspection
                 ~graph_name:"Real runtime activation"
                 ~snapshot_source:(fun _ ->
                   Ok { X.path; expected_rows = List.length rows }))
@@ -636,7 +651,7 @@ let real_activation env () =
           | X.Failed (_, D.Invalid_input "Sync view items") -> ()
           | X.Failed (_, error) -> Alcotest.fail (D.error_message error)
           | X.Completed _ -> Alcotest.fail "oversized durable view must fail permanently");
-         match O.Database.mirror_presence (inspect target) with
+         match O.Database.mirror_presence (inspect_target ()) with
          | O.Types.Available { checksum = Some actual; _ } ->
            Alcotest.(check string)
              "durable checksum"
@@ -1152,6 +1167,276 @@ let service_config =
   ; policy =
       get (D.policy_config ~sync_retry:retry ~asset_retry:retry ~no_progress_seconds:0.01)
   }
+;;
+
+let service_exhausted_network_recovery ?terminal maximum_attempts env () =
+  with_snapshot_fixture
+    (fun ~dependencies ~inspection ~path ~rows ~checksum ~inspect_target:_ ->
+       Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 5. (fun () ->
+         Eio.Switch.run (fun sw ->
+           let module Types = Logseq_overlay_db.Types in
+           let cursor value = Result.get_ok (Types.Server_cursor.of_int64 value) in
+           let target = cursor 1L in
+           let database_owner =
+             get
+               (X.activation_owner
+                  ~sw
+                  ~dependencies
+                  ~inspection
+                  ~graph_name:"Recovery fixture"
+                  ~snapshot_source:(fun _ ->
+                    Ok { X.path; expected_rows = List.length rows }))
+           in
+           let checkpoint () =
+             match X.database database_owner with
+             | Error _ -> None
+             | Ok database ->
+               let view = Result.get_ok (D.Overlay.Database.inspect_sync database) in
+               Some (Types.sync_view_checkpoint view)
+           in
+           let snapshot =
+             get
+               (D.snapshot
+                  ~resource:(get (D.resource ~owner:identity ~token:"recovery-snapshot"))
+                  ~through:target
+                  ~checksum
+                  ~encrypted:false)
+           in
+           let attempts = ref 0
+           and repaired = ref false in
+           let authorized = ref []
+           and events = ref []
+           and latest = ref None in
+           let closed, release_close = Eio.Promise.create () in
+           let hold_close = ref true in
+           let expected_checksum = Result.get_ok (Types.Checksum.of_string checksum) in
+           let never, _ = Eio.Promise.create () in
+           let rec transport
+             : type value. X.effect_scope -> value D.transport -> (value, D.error) result
+             =
+             fun scope operation ->
+             match operation with
+             | D.Connect ->
+               incr attempts;
+               if not !repaired
+               then
+                 Error
+                   (Option.value
+                      terminal
+                      ~default:(D.Network_failure "Synthetic offline"))
+               else (
+                 let connection =
+                   get (D.connection ~owner:identity ~token:"recovered" ~generation:1L)
+                 in
+                 Result.map
+                   (fun () -> connection)
+                   (X.handoff
+                      scope
+                      (Rrbvec.singleton (D.Connection_reference connection))))
+             | D.On_connection (_, operation) -> transport scope operation
+             | D.Head ->
+               Ok
+                 { D.through = target
+                 ; snapshot_available = true
+                 ; expected_checksum = Some expected_checksum
+                 }
+             | D.Fetch_snapshot _ ->
+               Result.map
+                 (fun () -> snapshot)
+                 (X.handoff scope (Rrbvec.singleton (D.Snapshot_reference snapshot)))
+             | D.Receive _ ->
+               let () = Eio.Promise.await never in
+               Error D.Cancelled
+             | D.Retire_connection _ -> Ok ()
+             | _ -> Error (D.Protocol_failure "Unexpected recovery transport")
+           in
+           let dispatch : X.dispatch =
+             { (capabilities ()).dispatch with
+               transport = (fun ~scope ~identity:_ operation -> transport scope operation)
+             ; database =
+                 (fun ~owner:_ ~scope:_ ~identity:_ _ ->
+                   Alcotest.fail "recovery must use the physical database owner")
+             }
+           in
+           let caps =
+             capabilities
+               ~dispatch
+               ~restore:(fun ~scope:_ _ ->
+                 Ok
+                   { D.keys = D.Unencrypted; checkpoint = None; recovery_pending = false })
+               ()
+           in
+           let caps =
+             { caps with
+               authorize_network =
+                 (fun _ ~epoch ->
+                   (match !authorized with
+                    | previous :: _ when previous = epoch -> ()
+                    | previous :: _ when previous > epoch ->
+                      Alcotest.fail "stale authorization epoch"
+                    | _ ->
+                      authorized := epoch :: !authorized;
+                      events := "open" :: !events);
+                   Ok ())
+             ; fence_network =
+                 (fun _ ->
+                   events := "fence" :: !events;
+                   Ok ())
+             ; close_network =
+                 (fun _ ->
+                   if !hold_close then Eio.Promise.await closed;
+                   events := "joined" :: !events;
+                   Ok ())
+             ; observe =
+                 (fun _ ->
+                   Ok
+                     { D.identity
+                     ; keys = D.Unencrypted
+                     ; network = D.Closed
+                     ; checkpoint = checkpoint ()
+                     ; pending_submissions = 0
+                     ; pending_assets = 0
+                     ; cleanup_pending = 0
+                     ; last_failure = None
+                     })
+             }
+           in
+           let retry =
+             get
+               (D.retry_policy
+                  ~initial_seconds:0.001
+                  ~maximum_seconds:0.001
+                  ~multiplier:1.
+                  ~maximum_attempts)
+           in
+           let config =
+             { service_config with
+               policy =
+                 get
+                   (D.policy_config
+                      ~sync_retry:retry
+                      ~asset_retry:retry
+                      ~no_progress_seconds:0.01)
+             }
+           in
+           let service =
+             get
+               (Service.start
+                  ~sw
+                  ~config
+                  ~dependencies:
+                    { clock = Eio.Stdenv.mono_clock env
+                    ; database_owner
+                    ; capabilities = caps
+                    ; bind_ingress = (fun _ -> ())
+                    }
+                  ~on_change:(fun status -> latest := Some status.Service.observation))
+           in
+           Fun.protect
+             ~finally:(fun () ->
+               hold_close := false;
+               ignore (Eio.Promise.try_resolve release_close ());
+               Service.close service)
+             (fun () ->
+                let wait predicate =
+                  let remaining = ref 1000 in
+                  while (not (predicate ())) && !remaining > 0 do
+                    decr remaining;
+                    Eio.Time.sleep (Eio.Stdenv.clock env) 0.001
+                  done;
+                  check
+                    (predicate ())
+                    (Printf.sprintf
+                       "service settles after %d attempts (%s)"
+                       !attempts
+                       (match !latest with
+                        | Some { X.status = D.Service_blocked error; _ } ->
+                          D.error_message error
+                        | _ -> "pending"))
+                in
+                get (Service.set_network service (D.Open { authorization_epoch = 7L }));
+                wait (fun () ->
+                  Option.exists
+                    (fun observation ->
+                       match observation.X.status with
+                       | D.Service_blocked error ->
+                         error
+                         = Option.value
+                             terminal
+                             ~default:(D.Network_failure "Synthetic offline")
+                       | _ -> false)
+                    !latest);
+                Alcotest.(check int)
+                  "maximum attempts exhausted exactly"
+                  (maximum_attempts + 1)
+                  !attempts;
+                Eio.Time.sleep (Eio.Stdenv.clock env) 0.02;
+                Alcotest.(check int)
+                  "no remaining automatic retry"
+                  (maximum_attempts + 1)
+                  !attempts;
+                check (checkpoint () = None) "offline checkpoint does not advance";
+                repaired := true;
+                get (Service.set_network service D.Closed);
+                let reopening =
+                  Eio.Fiber.fork_promise ~sw (fun () ->
+                    Service.set_network service (D.Open { authorization_epoch = 8L }))
+                in
+                for _ = 1 to 32 do
+                  Eio.Fiber.yield ()
+                done;
+                (match terminal with
+                 | None -> ()
+                 | Some cause ->
+                   wait (fun () ->
+                     Option.exists
+                       (fun observation ->
+                          observation.X.status = D.Service_waiting_network
+                          && observation.state.last_failure = Some cause)
+                       !latest));
+                let waited_for_join = not (Eio.Promise.is_resolved reopening) in
+                let fenced_epochs = !authorized in
+                hold_close := false;
+                Eio.Promise.resolve release_close ();
+                check waited_for_join "fresh Open waits for physical network join";
+                Alcotest.(check (list int64))
+                  "old epoch remains fenced during join"
+                  [ 7L ]
+                  fenced_epochs;
+                get (Eio.Promise.await_exn reopening);
+                (match terminal with
+                 | Some cause ->
+                   wait (fun () ->
+                     Option.exists
+                       (fun observation ->
+                          observation.X.status = D.Service_blocked cause
+                          && observation.state.last_failure = Some cause)
+                       !latest);
+                   Eio.Time.sleep (Eio.Stdenv.clock env) 0.02;
+                   Alcotest.(check int) "terminal recovery never reconnects" 1 !attempts;
+                   check
+                     (checkpoint () = None)
+                     "terminal recovery never advances checkpoint"
+                 | None ->
+                   wait (fun () ->
+                     Option.exists
+                       (fun observation -> observation.X.status = D.Service_online)
+                       !latest);
+                   check
+                     (checkpoint () = Some target)
+                     "recovery commits actual authoritative checkpoint";
+                   check
+                     (Option.exists
+                        (fun observation -> observation.X.state.checkpoint = Some target)
+                        !latest)
+                     "Current observation carries actual recovered checkpoint";
+                   Alcotest.(check int)
+                     "explicit recovery resumes one fresh connection"
+                     (maximum_attempts + 2)
+                     !attempts);
+                check
+                  (List.rev !events = [ "open"; "fence"; "joined"; "open" ])
+                  "physical fence and join precede fresh authorization"))))
 ;;
 
 let service_receipts_and_consumer ?(withdraw = false) env () =
@@ -2395,6 +2680,31 @@ let () =
               , service_receipts_and_consumer ~withdraw:false )
             ; ( "actual service withdrawal and consumer close"
               , service_receipts_and_consumer ~withdraw:true )
+            ; "actual service zero retries recovery", service_exhausted_network_recovery 0
+            ; ( "actual service exhausted network recovery"
+              , service_exhausted_network_recovery 5 )
+            ; ( "actual service terminal protocol recovery held retirement"
+              , service_exhausted_network_recovery
+                  ~terminal:(D.Protocol_failure "Original protocol diagnostic")
+                  0 )
+            ; ( "actual service terminal storage recovery held retirement"
+              , service_exhausted_network_recovery
+                  ~terminal:(D.Storage_failure "Original storage diagnostic")
+                  0 )
+            ; ( "actual service terminal crypto recovery held retirement"
+              , service_exhausted_network_recovery
+                  ~terminal:(D.Crypto_failure "Original crypto diagnostic")
+                  0 )
+            ; ( "actual service terminal integrity recovery held retirement"
+              , service_exhausted_network_recovery
+                  ~terminal:
+                    (D.Authoritative_failure
+                       Logseq_overlay_db.Types.Authoritative_checksum_mismatch)
+                  0 )
+            ; ( "actual service authentication is not network recovery"
+              , service_exhausted_network_recovery
+                  ~terminal:(D.Authentication_failure "Original auth diagnostic")
+                  0 )
             ; "actual service callback failure cleanup", service_callback_failure
             ; "callback capacity before start", callback_capacity
             ; "callback terminal capacity rejection", callback_terminal_capacity_rejection

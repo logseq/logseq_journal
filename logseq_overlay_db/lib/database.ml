@@ -8759,7 +8759,7 @@ let simulation_failure_context exn =
   [ "exception", authoritative_exception_kind exn; "simulationCause", cause ]
 ;;
 
-let expected_record_transaction_data database record =
+let expected_record_transaction database record =
   try
     Ok
       (Datascript.transact
@@ -8767,23 +8767,77 @@ let expected_record_transaction_data database record =
          database
          (synchronized_record_operations record)
        : Datascript.tx_report)
-        .tx_data
   with
   | exn -> Error (simulation_failure_context exn)
 ;;
 
-let equal_transaction_data left right = List.sort compare left = List.sort compare right
+let expected_record_transaction_data database record =
+  Result.map
+    (fun (report : Datascript.tx_report) -> report.tx_data)
+    (expected_record_transaction database record)
+;;
 
-let transaction_matches_record_at_cursor record cursor root_before transaction_data =
+let canonical_transaction_data root_before root_after transaction_data =
+  let identities = Hashtbl.create 16 in
+  let identity entity =
+    match Hashtbl.find_opt identities entity with
+    | Some reference -> reference
+    | None ->
+      let find database =
+        match uuid_of_entity database entity with
+        | Some uuid ->
+          Some
+            (Datascript.Lookup_ref
+               ("block/uuid", Datascript.Uuid (Graph.Uuid.to_string uuid)))
+        | None ->
+          (match one database entity "db/ident" with
+           | Some (Datascript.Keyword ident) ->
+             Some (Datascript.Lookup_ref ("db/ident", Datascript.Keyword ident))
+           | _ -> None)
+      in
+      let reference =
+        match find root_after with
+        | Some reference -> reference
+        | None -> Option.value (find root_before) ~default:(Datascript.Entity_id entity)
+      in
+      Hashtbl.add identities entity reference;
+      reference
+  in
+  let rec value = function
+    | Datascript.Ref entity -> Datascript.Ref_to (identity entity)
+    | List values -> Datascript.List (List.map value values)
+    | Vector values -> Datascript.Vector (List.map value values)
+    | Set values -> Datascript.Set (List.map value values)
+    | Map entries ->
+      Datascript.Map (List.map (fun (key, item) -> value key, value item) entries)
+    | Tuple values -> Datascript.Tuple (List.map (Option.map value) values)
+    | value -> value
+  in
+  List.map
+    (fun (datom : Datascript.datom) ->
+       identity datom.e, datom.a, value datom.v, datom.tx, datom.added)
+    transaction_data
+  |> List.sort compare
+;;
+
+let transaction_matches_record_at_cursor
+      record
+      cursor
+      root_before
+      root_after
+      transaction_data
+  =
   match expected_origin_cursor record with
   | Error _ -> false
   | Ok expected_cursor ->
     if not (Types.Server_cursor.equal cursor expected_cursor)
     then false
     else (
-      match expected_record_transaction_data root_before record with
+      match expected_record_transaction root_before record with
       | Error _ -> false
-      | Ok expected -> equal_transaction_data expected transaction_data)
+      | Ok expected ->
+        canonical_transaction_data root_before expected.db_after expected.tx_data
+        = canonical_transaction_data root_before root_after transaction_data)
 ;;
 
 let integrity_record_context (record : outbox_record) =
@@ -8835,11 +8889,22 @@ let integrity_batch_source owner batch source =
   |> Authoritative_diagnostic.encode
 ;;
 
-let validate_active_transaction_origin owner cursor root_before transaction_data =
+let validate_active_transaction_origin
+      owner
+      cursor
+      root_before
+      root_after
+      transaction_data
+  =
   let matches =
     List.filter
       (fun record ->
-         transaction_matches_record_at_cursor record cursor root_before transaction_data)
+         transaction_matches_record_at_cursor
+           record
+           cursor
+           root_before
+           root_after
+           transaction_data)
       owner.outbox
   in
   match matches with
@@ -9066,7 +9131,7 @@ let validate_active_transaction_origins
           cursor_rest
           data_rest
           root_rest
-          ((cursor, data, previous) :: reversed)
+          ((cursor, data, previous, root_after) :: reversed)
       | [], [], [] -> List.rev reversed
       | _ -> invalid_arg "authoritative transaction origin context mismatch"
     in
@@ -9075,7 +9140,7 @@ let validate_active_transaction_origins
     in
     let validated =
       List.fold_left
-        (fun result (cursor, data, root_before) ->
+        (fun result (cursor, data, root_before, root_after) ->
            Result.bind result (fun reversed ->
              Result.map
                (fun evidence ->
@@ -9083,7 +9148,12 @@ let validate_active_transaction_origins
                     ~none:reversed
                     ~some:(fun value -> value :: reversed)
                     evidence)
-               (validate_active_transaction_origin owner cursor root_before data)))
+               (validate_active_transaction_origin
+                  owner
+                  cursor
+                  root_before
+                  root_after
+                  data)))
         (Ok [])
         contexts
     in
@@ -9129,13 +9199,14 @@ let validate_active_transaction_origins
                    else (
                      let context =
                        List.find_opt
-                         (fun (cursor, _, _) -> Types.Server_cursor.equal cursor expected)
+                         (fun (cursor, _, _, _) ->
+                            Types.Server_cursor.equal cursor expected)
                          contexts
                      in
                      let reason, counts =
                        match context with
                        | None -> "expected-cursor-missing", []
-                       | Some (_, actual, root_before) ->
+                       | Some (_, actual, root_before, _) ->
                          (match expected_record_transaction_data root_before record with
                           | Error cause ->
                             ( "expected-simulation-failed"
@@ -9821,6 +9892,7 @@ let prepare_authoritative_candidate preparation ~decrypted =
                              record
                              cursor
                              root_before
+                             root_after
                              transaction_data
                          then Ok (`Deferred batch_id)
                          else (

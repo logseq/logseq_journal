@@ -1913,6 +1913,10 @@ let task_operation
   | Dsl.Task_observe -> observation_state t
   | Dsl.Publish_status status ->
     t.status <- status;
+    (match status with
+     | Dsl.Service_blocked error -> t.last_failure <- Some error
+     | Service_connecting | Service_online -> t.last_failure <- None
+     | _ -> ());
     pulse t;
     Ok ()
   | Dsl.Task_database operation -> perform_database t token operation
