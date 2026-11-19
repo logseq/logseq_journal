@@ -242,6 +242,7 @@ type cache_report =
 
 type _ assets =
   | Prune_cache : cache_report assets
+  | Reconcile_staging : int assets
   | Lookup : asset -> asset_file option assets
   | Download : asset -> asset_result assets
   | Upload : asset -> unit assets

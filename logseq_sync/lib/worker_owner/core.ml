@@ -27,6 +27,7 @@ type t =
   { namespace : string
   ; assets : Assets.t
   ; store : store
+  ; staging_mutex : Eio.Mutex.t
   ; notify :
       owner:Execute.database_owner -> identity:Dsl.identity -> (unit, Dsl.error) result
   ; mutable binding : binding option
@@ -73,6 +74,7 @@ let create ~clock ~namespace ~assets ~store ~notify_outbox_changed =
   { namespace
   ; assets
   ; store
+  ; staging_mutex = Eio.Mutex.create ()
   ; notify = notify_outbox_changed
   ; binding = None
   ; scopes = Hashtbl.create 8
@@ -262,7 +264,7 @@ let crypto (scope : scope) operation =
     operation
 ;;
 
-let prepare_import scope (request : Input.t) ~current:request_current =
+let prepare_import_unlocked scope (request : Input.t) ~current:request_current =
   let current scope =
     let* () = current scope in
     if request_current () then Ok () else Error Dsl.Stale_context
@@ -344,6 +346,39 @@ let prepare_import scope (request : Input.t) ~current:request_current =
          | Ok _ -> Ok intent
          | Error error when not !admitted -> discard error
          | Error error -> Error error)
+;;
+
+let prepare_import (scope : scope) request ~current =
+  Eio.Mutex.use_rw ~protect:true scope.owner.staging_mutex (fun () ->
+    prepare_import_unlocked scope request ~current)
+;;
+
+let reconcile_staging t ~check_current =
+  Eio.Mutex.use_rw ~protect:true t.staging_mutex (fun () ->
+    let* () = check_current () in
+    let* owner = input_owner t in
+    with_store t (fun db ->
+      let keep file =
+        let result =
+          let* () = check_current () in
+          let* operation =
+            match String.split_on_char '.' file with
+            | operation :: _ -> Uuid.of_string operation |> storage
+            | [] -> Error (Dsl.Invalid_input "Invalid staged file")
+          in
+          let* intent = storage (Store.read db ~operation) in
+          let* input = storage (Store.Inputs.read db ~owner ~operation) in
+          let matches (intent : Intent.t) =
+            intent.origin = owner.origin && intent.account = owner.account
+            && intent.graph = owner.graph && intent.staged_file = file
+          in
+          Ok (Option.exists matches intent
+              || Option.exists (fun row -> Option.exists matches row.Store.Inputs.prepared) input)
+        in
+        Result.map_error Dsl.error_message result
+      in
+      Cache.prune_staged (Assets.cache t.assets) ~keep
+      |> Result.map_error Assets.cache_error))
 ;;
 
 let publish_import_preview scope intent =
@@ -669,10 +704,13 @@ let run_assets : type value. t -> identity:Dsl.identity -> operation:Uuid.t -> v
   | _ ->
     with_scope t ~identity ~operation (fun scope ->
       let* bound = binding t in
-      let run () = Assets.run t.assets
-        ~check_current:(fun () -> current scope)
-        ~admit_network:(fun () -> current scope)
-        ~original:(original_import t) ~upload:(upload_asset t) ~identity action in
+      let run () : (value, Dsl.error) result =
+        match action with
+        | Dsl.Reconcile_staging -> reconcile_staging t ~check_current:(fun () -> current scope)
+        | _ -> Assets.run t.assets
+          ~check_current:(fun () -> current scope)
+          ~admit_network:(fun () -> current scope)
+          ~original:(original_import t) ~upload:(upload_asset t) ~identity action in
       match action with
       | Dsl.Download _ | Upload _ -> bound.network.with_admission run
       | _ -> run ())
@@ -680,8 +718,15 @@ let run_assets : type value. t -> identity:Dsl.identity -> operation:Uuid.t -> v
 
 let asset_file_path t file = Assets.file_path t.assets file
 
-let assets_dispatch t ~scope ~identity operation =
-  Assets.dispatch
+let assets_dispatch (type value) t ~scope ~identity (operation : value Dsl.assets)
+  : (value, Dsl.error) result =
+  match operation with
+  | Dsl.Reconcile_staging ->
+    let* () = same_owner t identity in
+    let* _ = binding t in
+    reconcile_staging t ~check_current:(fun () ->
+      if t.fenced then Error Dsl.Stale_context else Execute.check_current scope)
+  | _ -> Assets.dispatch
     t.assets
     ~original:(original_import t)
     ~upload:(upload_asset t)

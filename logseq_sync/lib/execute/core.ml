@@ -1575,7 +1575,7 @@ let rec perform_assets : type a. t -> unit ref -> a Dsl.assets -> (a, Dsl.error)
         match operation with
         | Dsl.Download _ -> 2
         | Dsl.Lookup _ | Dsl.Retain _ | Dsl.Upload _ -> 1
-        | Dsl.Prune_cache | Dsl.Release_file _ | Dsl.Release_lease _ -> 0
+        | Dsl.Prune_cache | Dsl.Reconcile_staging | Dsl.Release_file _ | Dsl.Release_lease _ -> 0
       in
       let binding = Eio.Fiber.get asset_binding in
       let background () =
@@ -1611,7 +1611,7 @@ let rec perform_assets : type a. t -> unit ref -> a Dsl.assets -> (a, Dsl.error)
             else
               let* _ = require_resource t (Dsl.Lease_reference value) in
               Ok ()
-          | Dsl.Prune_cache | Dsl.Upload _ | Dsl.Release_file _ | Dsl.Release_lease _ ->
+          | Dsl.Prune_cache | Dsl.Reconcile_staging | Dsl.Upload _ | Dsl.Release_file _ | Dsl.Release_lease _ ->
             Ok ()
         in
         let* () = check_current scope in

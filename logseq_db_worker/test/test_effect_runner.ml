@@ -535,11 +535,16 @@ type owner_fixture =
   { runner : Runner.t
   ; context : Sync.asset_context
   ; support : string
+  ; database : Logseq_overlay_db.Database.t
+  ; crypto : Logseq_sync_crypto.Core.t
+  ; identity : Sync_dsl.Core.identity
   ; actions : Sync.asset_action list ref
   ; fixture_result : Sync.asset_action -> Sync.asset_result
   ; fixture_asset : Sync.asset_action -> Sync.asset_value
   ; set_upload_current : (Logseq_db_worker_pure_reducer.Asset_upload.ticket -> bool) -> unit
   ; upload_events : Logseq_db_worker_pure_reducer.Asset_upload.completion Queue.t
+  ; recover_uploads : unit -> (Logseq_db_types.Asset_upload_intent.t list, string) result
+  ; staged_path : string -> string option
   ; gate : (Sync.asset_output -> bool) -> unit Eio.Promise.t
   ; deliver_held : ?keep_gate:bool -> unit -> unit
   }
@@ -697,11 +702,19 @@ let with_direct_owner run =
         ~sleep:(Eio.Time.sleep (Eio.Stdenv.clock env)) |> Result.get_ok)
       ~services:direct_services ~publish:(fun _ -> ()) |> Result.get_ok in
     let upload_current = ref (fun _ -> false) and upload_events = Queue.create () in
+    let recovery_results = Queue.create () in
+    let state = Core.initial (Core.config ~worker:fixture.config ~sync:(asset_sync_config ())) |> Result.get_ok in
+    let sync, coordination = lifecycle_projection fixture.config scope in
+    let opened = Core.database_opened ~database_id:"staging-recovery" ~graph_id:scope.graph_id in
+    let transition = Core.step state (Core.Lifecycle_snapshot (sync, coordination, [scope, opened])) in
+    let recovery_ticket = List.find_map (function Core.Read_uploads ticket -> Some ticket | _ -> None)
+      transition.effects |> Option.get in
     let runner = Runner.create ~sw dependencies ~post:(function
       | Core.Asset_cleanup_barrier token ->
         Runner.submit (Option.get !runner_ref) (Core.Asset_cleanup_barrier_reached token)
       | Core.Upload_completed (_, event) -> Queue.add event upload_events
-      | _ -> ()) ~recovery_current:(fun _ -> false) ~upload_current:(fun ticket -> !upload_current ticket)
+      | Core.Uploads_loaded (_, result) -> Queue.add result recovery_results
+      | _ -> ()) ~recovery_current:(fun ticket -> ticket = recovery_ticket) ~upload_current:(fun ticket -> !upload_current ticket)
       ~asset_current:(fun _ -> false) |> Result.get_ok in
     runner_ref := Some runner;
     Fun.protect ~finally:(fun () ->
@@ -714,9 +727,17 @@ let with_direct_owner run =
       (fun () ->
         try
           Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 10. (fun () ->
-            run {runner;context={scope;encrypted=false;key=None};support;actions;
+            run {runner;context={scope;encrypted=false;key=None};support;database;crypto;identity;actions;
               fixture_result;fixture_asset=(fun action -> fixture_result action |> Result.get_ok);
-              gate;deliver_held;upload_events;set_upload_current=(fun current -> upload_current := current)})
+              gate;deliver_held;upload_events;set_upload_current=(fun current -> upload_current := current);
+              staged_path=(fun file -> Cache.staged_path cache ~file);
+              recover_uploads=(fun () ->
+                Runner.submit runner (Core.Read_uploads recovery_ticket);
+                let rec await turns =
+                  if not (Queue.is_empty recovery_results) then Queue.take recovery_results
+                  else if turns = 0 then Alcotest.fail "Recovery completion did not arrive"
+                  else (Eio.Fiber.yield (); await (turns - 1)) in
+                await 1000)})
         with Eio.Time.Timeout ->
           Alcotest.fail "Direct owner did not settle within 10s; check physical IO and fixture gate ownership"))))
 ;;
@@ -1217,6 +1238,56 @@ let test_asset_cleanup_stop_does_not_wait_for_lost_io () =
         Alcotest.(check bool) "stopped cleanup reports failure without waiting for lost callback" true returned))
 ;;
 
+let test_recovery_staging_failure_is_not_acknowledged () =
+  with_direct_owner (fun fixture ->
+    let source = picker_import fixture.support 982 in
+    let intent = Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun () -> true) |> Result.get_ok in
+    let path = fixture.staged_path intent.staged_file |> Option.get in
+    let directory = Filename.dirname path in
+    let saved = directory ^ "-synthetic-failure" in
+    Unix.rename directory saved;
+    let channel = open_out_bin directory in
+    close_out channel;
+    Fun.protect ~finally:(fun () -> Sys.remove directory; Unix.rename saved directory)
+      (fun () ->
+        match fixture.recover_uploads () with
+        | Ok _ -> Alcotest.fail "Physical staging error must not acknowledge reconciliation"
+        | Error message ->
+          let cause = "Path component is not a directory" in
+          let rec contains offset =
+            offset + String.length cause <= String.length message
+            && (String.sub message offset (String.length cause) = cause || contains (offset + 1)) in
+          Alcotest.(check bool) "physical failure retains ENOTDIR cause" true (contains 0));
+    Alcotest.(check bool) "failed recovery preserves original physical source" true (Sys.file_exists path);
+    Alcotest.(check bool) "only actual successful prune settles recovery" true
+      (fixture.recover_uploads () = Ok [intent]))
+;;
+
+let test_recovery_prunes_original_owner_staging () =
+  with_direct_owner (fun fixture ->
+    let source = picker_import fixture.support 980 in
+    let intent = Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun () -> true) |> Result.get_ok in
+    let durable_path = fixture.staged_path intent.staged_file |> Option.get in
+    let orphan_source = picker_import fixture.support 981 in
+    let orphan = match fixture.fixture_asset (Sync.Stage_asset_file
+      {operation=orphan_source.operation;file_type=orphan_source.file_type;source_file=orphan_source.source_file}) with
+      | Sync.Asset_staged value -> value.file
+      | _ -> Alcotest.fail "Expected real staged orphan" in
+    let orphan_path = fixture.staged_path orphan |> Option.get in
+    let before = !(fixture.actions) in
+    let recovered = match fixture.recover_uploads () with
+      | Ok rows -> rows
+      | Error message -> Alcotest.fail message in
+    Alcotest.(check bool) "real Read_uploads returns original durable intent" true (recovered = [intent]);
+    Alcotest.(check bool) "unpublished durable source survives" true (Sys.file_exists durable_path);
+    Alcotest.(check bool) "unproven staging is physically pruned" false (Sys.file_exists orphan_path);
+    Alcotest.(check bool) "recovery never reaches registration fallback" true (before = !(fixture.actions));
+    Alcotest.(check bool) "recovery is idempotent without PUT or metadata" true
+      (fixture.recover_uploads () = Ok [intent]))
+;;
+
 let test_upload_checkpoint_io () =
   let module Upload = Logseq_db_worker_pure_reducer.Asset_upload in
   with_direct_owner (fun fixture ->
@@ -1246,6 +1317,73 @@ let test_upload_checkpoint_io () =
     for _=1 to 8 do Eio.Fiber.yield () done;
     Alcotest.(check bool) "stale upload ticket performs no completion" true
       (Queue.is_empty fixture.upload_events))
+;;
+
+let test_plaintext_submission_encoding () =
+  let module D = Sync_dsl.Core in
+  let module C = Logseq_sync_crypto.Core in
+  let module Database = Logseq_overlay_db.Database in
+  let module Types = Logseq_overlay_db.Types in
+  with_direct_owner (fun fixture ->
+    let require = function Ok value -> value | Error _ -> Alcotest.fail "submission setup failed" in
+    let uuid value = Logseq_db_types.Graph_types.Uuid.of_string value |> require in
+    let page = uuid "70000000-0000-4000-8000-000000000001" in
+    let mutation_id = uuid "70000000-0000-4000-8000-000000000002" in
+    let title = "~:plain-中文-\"quoted\"" in
+    let snapshot = Database.current_snapshot fixture.database |> require in
+    let expected = Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot)
+      (fun () -> match Database.get_pages snapshot [page] |> require with
+        | [Types.Missing_page {revision;_}] ->
+          Database.write_precondition ~blocks:[] ~pages:[page,revision] ~scopes:[] |> require
+        | _ -> Alcotest.fail "new page exists") in
+    Database.commit_local fixture.database ~expected
+      (Types.Create_journal_page {mutation_id;page;title;journal_day=20261119}) |> require |> ignore;
+    let view = Database.inspect_sync fixture.database |> require in
+    let prepared, request = Database.begin_outbox_transition fixture.database
+      ~expected:(Types.sync_view_token view) (Types.Submit_group [mutation_id]) |> require in
+    let request = Option.get request in
+    let run crypto operation = C.run crypto ~identity:fixture.identity
+      ~check_current:(fun () -> Ok ()) operation in
+    let locked = C.create ~identity:fixture.identity ~limits:(D.limits
+      ~maximum_items:8 ~maximum_bytes:32768 ~maximum_pending:8 ~maximum_resources:8
+      ~steps_per_turn:8 ~maximum_tasks:8 ~maximum_messages:8 ~maximum_message_bytes:32768
+      ~maximum_demands:8 ~maximum_active_assets:2 ~foreground_reserve:1
+      ~foreground_demand_reserve:1 ~foreground_descriptor_reserve_bytes:128
+      ~asset_cache_budget_bytes:16L ~asset_maximum_file_bytes:16 ~asset_pending_budget_bytes:32L
+      ~snapshot_maximum_artifact_bytes:4096L ~snapshot_staging_budget_bytes:4096L
+      ~snapshot_scratch_budget_bytes:4096L |> require) ~encrypted:true ~backend:C.apple_backend in
+    Fun.protect ~finally:(fun () -> C.retire locked) (fun () ->
+      Alcotest.(check bool) "encrypted graph cannot downgrade without key" true
+        (run locked (D.Protect request) = Error D.Locked));
+    let values = match run fixture.crypto (D.Protect request) with
+      | Ok values -> values
+      | Error error -> Alcotest.fail (D.error_message error) in
+    Alcotest.(check bool) "plain upload decodes the serialized title" true
+      (List.mem title (List.map snd values));
+    let result = Database.apply_outbox_transition fixture.database prepared
+      ~encrypted:(Some (request,values)) |> require in
+    let wire = Option.get result.submission_batch |> Types.submission_batch_wires
+      |> List.hd |> Types.submission_wire_protected_transaction in
+    let operations = match Logseq_db_storage.Logseq_sqlite_codec.decode_transit wire with
+      | Ok (Array operations) -> operations
+      | Ok _ -> Alcotest.fail "submission wire is not a Transit transaction array"
+      | Error message -> Alcotest.fail message in
+    let select_operations select = List.filter_map select operations in
+    let page_entities = select_operations (function
+      | Array [Keyword "db/add"; entity; Keyword "block/uuid"; Uuid value]
+        when value = Logseq_db_types.Graph_types.Uuid.to_string page -> Some entity
+      | _ -> None) in
+    let entity = match page_entities with
+      | [entity] -> entity
+      | _ -> Alcotest.fail "submission must identify exactly one target page entity" in
+    let titles = select_operations (function
+      | Array [Keyword "db/add"; target; Keyword "block/title"; value]
+        when target = entity -> Some value
+      | _ -> None) in
+    match titles with
+    | [String value] ->
+      Alcotest.(check string) "target page title survives Transit decoding" title value
+    | _ -> Alcotest.fail "target page must have exactly one Transit String block/title")
 ;;
 
 let () =
@@ -1284,6 +1422,9 @@ let () =
       ; Alcotest.test_case "asset cleanup snapshot joins queued release" `Quick test_asset_cleanup_snapshot_joins_queued_release
       ; Alcotest.test_case "asset cleanup snapshot joins physical release" `Quick test_asset_cleanup_snapshot_joins_physical_release
       ; Alcotest.test_case "asset cleanup stop does not wait for lost io" `Quick test_asset_cleanup_stop_does_not_wait_for_lost_io
+      ; Alcotest.test_case "recovery prunes original owner staging" `Quick test_recovery_prunes_original_owner_staging
+      ; Alcotest.test_case "failed staging recovery is not acknowledged" `Quick test_recovery_staging_failure_is_not_acknowledged
       ; Alcotest.test_case "durable upload checkpoint IO" `Quick test_upload_checkpoint_io
+      ; Alcotest.test_case "plaintext submission encoding" `Quick test_plaintext_submission_encoding
     ] ]
 ;;
