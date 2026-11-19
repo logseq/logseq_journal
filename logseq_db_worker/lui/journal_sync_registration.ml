@@ -465,17 +465,23 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
             (Account.service ~set_network:(Lifecycle.set_network core) ~close:(fun () ->
                entry.retiring <- true;
                notify ();
-               let* () = Lifecycle.set_network core Dsl.Closed in
+               let diagnose stage = Result.map_error (fun error ->
+                 Printf.eprintf "journal native-close stage=%s\n%!" stage;
+                 error) in
+               let* () = Lifecycle.set_network core Dsl.Closed
+                 |> diagnose "network-close" in
                let* () =
                  Logseq_sync_worker_owner.Core.fence
                    (Lifecycle.worker_owner core)
                    ~identity:(Lifecycle.identity core)
+                 |> diagnose "worker-fence"
                in
                let* () =
                  match !worker, entry.opened with
                  | Some worker, Some _ ->
                    Worker.detach_database_owner worker ~scope
                    |> Result.map_error storage_error
+                   |> diagnose "database-detach"
                  | _ -> Ok ()
                in
                let result =

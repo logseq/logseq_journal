@@ -47,11 +47,16 @@ let close_database_owner owner =
 ;;
 
 let close t =
-  Service.close t.service;
+  (try Service.close t.service with error ->
+    let backtrace = Printexc.get_raw_backtrace () in
+    Printf.eprintf "journal native-close stage=service-close\n%!";
+    Printexc.raise_with_backtrace error backtrace);
   if t.owns_database then
     match close_database_owner t.database_owner with
     | Ok () -> ()
-    | Error error -> raise (Service.Close_failed { error = Some error; cause = None })
+    | Error error ->
+      Printf.eprintf "journal native-close stage=database-close\n%!";
+      raise (Service.Close_failed { error = Some error; cause = None })
 ;;
 
 let listen_error = function
@@ -209,6 +214,9 @@ let start_native_assembled ~sw ~clock ~network ~authenticator ~(config : Service
     incr active_assets;
     Fun.protect ~finally:(fun () -> decr active_assets)
       (fun () -> Eio.Fiber.with_binding effect_binding scope callback) in
+  let diagnose_cleanup stage = Result.map_error (fun error ->
+    Printf.eprintf "journal native-close stage=%s\n%!" stage;
+    error) in
   let caps : Execute.capabilities =
     { validate_identity = (fun requested ->
         if requested = identity then Ok ()
@@ -257,14 +265,18 @@ let start_native_assembled ~sw ~clock ~network ~authenticator ~(config : Service
         Assets.fence assets;
         Worker.fence worker ~identity:requested)
     ; retire = (fun requested ->
-        let* () = Worker.await_quiescent worker ~identity:requested in
-        let* () = Assets.close assets in
+        let* () = Worker.await_quiescent worker ~identity:requested
+          |> diagnose_cleanup "worker-quiescence" in
+        let* () = Assets.close assets |> diagnose_cleanup "asset-cache-close" in
         Crypto.retire crypto;
         release_subscription ();
         Ok ())
-    ; release_file = (fun requested file -> Assets.release_file assets ~identity:requested file)
-    ; release_lease = (fun requested lease -> Assets.release_lease assets ~identity:requested lease)
-    ; release_snapshot = (fun requested snapshot -> Transport.release_snapshot transport ~identity:requested snapshot)
+    ; release_file = (fun requested file -> Assets.release_file assets ~identity:requested file
+        |> diagnose_cleanup "asset-file-release")
+    ; release_lease = (fun requested lease -> Assets.release_lease assets ~identity:requested lease
+        |> diagnose_cleanup "asset-lease-release")
+    ; release_snapshot = (fun requested snapshot -> Transport.release_snapshot transport ~identity:requested snapshot
+        |> diagnose_cleanup "snapshot-release")
     } in
   let caps = Transport.capabilities transport caps in
   let caps = { caps with

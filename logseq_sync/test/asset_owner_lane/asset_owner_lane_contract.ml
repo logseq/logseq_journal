@@ -335,11 +335,22 @@ let seed_database root =
   in
   let schema =
     List.map
-      (fun name -> name, attribute)
+      (fun name ->
+         ( name
+         , if name = "block/uuid" || name = "db/ident"
+           then { attribute with unique = Some Identity }
+           else if name = "block/parent" || name = "block/page"
+           then { attribute with value_type = Some RefType }
+           else if name = "block/tags"
+           then { attribute with cardinality = Many; value_type = Some RefType }
+           else attribute ))
       [ "db/ident"
       ; "block/uuid"
       ; "block/title"
       ; "block/name"
+      ; "block/journal-day"
+      ; "block/link"
+      ; "block/refs"
       ; "block/parent"
       ; "block/page"
       ; "block/order"
@@ -414,6 +425,8 @@ let seed_database root =
 let with_worker
       ?(live_database = false)
       ?(notify = fun ~owner:_ ~identity:_ -> Ok ())
+      ?(on_store = fun _ -> ())
+      ?(wire_batch_max_bytes = 1024)
       callback
   =
   with_assets_env
@@ -429,11 +442,11 @@ let with_worker
                 ~limits:
                   { O.Types.response_budget_bytes = 1024
                   ; outbox_max_records = 8
-                  ; outbox_max_bytes = 4096
+                  ; outbox_max_bytes = max 4096 wire_batch_max_bytes
                   ; change_max_items = 8
                   ; change_max_bytes = 1024
                   ; dispatcher_capacity = 8
-                  ; wire_batch_max_bytes = 1024
+                  ; wire_batch_max_bytes
                   })
          in
          if live_database then seed_database root;
@@ -462,6 +475,7 @@ let with_worker
            ~finally:(fun () -> ignore (Sqlite3.db_close db))
            (fun () ->
               sql_ok (Store.initialize_database db);
+              on_store db;
               let worker =
                 Worker.create
                   ~clock:(Eio.Stdenv.mono_clock env)
@@ -573,7 +587,11 @@ let import_ownership () =
              (Sys.file_exists (W.imported_file_path (Option.get !held)));
            ok (W.cancel_import scope intent);
            let cancelled = sql_ok (Intent.advance intent Cancelled) in
-           rejected (W.release_import_staging scope cancelled);
+           ok (W.release_import_staging scope cancelled);
+           Alcotest.(check bool)
+             "terminal retirement preserves held preview"
+             true
+             (Sys.file_exists (W.imported_file_path (Option.get !held)));
            Ok cancelled))
     in
     ok (Worker.database_changed worker ~owner:database_owner ~identity);
@@ -592,6 +610,10 @@ let import_ownership () =
     let file = Option.get !held in
     ok (W.release_imported_file file);
     ok (W.release_imported_file file);
+    Alcotest.(check bool)
+      "last consumer release removes terminal source"
+      false
+      (Sys.file_exists (W.imported_file_path file));
     ok
       (W.with_scope ~identity ~operation:request.operation (fun scope ->
          W.release_import_staging scope cancelled));
@@ -612,61 +634,361 @@ let committed_import_hooks () =
     then Error (D.Storage_failure "Synthetic postcommit notification failure")
     else Ok ()
   in
-  with_worker ~live_database:true ~notify (fun worker packed database_owner root ->
-    let module W = (val packed : X.WORKER_OWNER) in
-    let source_file = Filename.concat root "picker.png" in
-    let channel = open_out_bin source_file in
-    output_string channel wire;
-    close_out channel;
-    let request : Logseq_db_types.Asset_import.t =
-      { operation = id 1
-      ; asset = uuid
-      ; replace_reference = None
-      ; target = id 100
-      ; local_mutation = id 201
-      ; metadata_mutation = id 401
-      ; source_file
-      ; title = "Import"
-      ; file_type = "png"
-      }
-    in
-    ok
-      (W.with_scope ~identity ~operation:request.operation (fun scope ->
-         let intent = ok (W.prepare_import scope request ~current:(fun () -> true)) in
-         ok (W.publish_import_preview scope intent);
-         rejected (W.apply_local_import scope intent);
+  let upload_store = ref None in
+  with_worker
+    ~live_database:true
+    ~notify
+    ~wire_batch_max_bytes:65536
+    ~on_store:(fun db -> upload_store := Some db)
+    (fun worker packed database_owner root ->
+       let module W = (val packed : X.WORKER_OWNER) in
+       let held = ref None in
+       let source_file = Filename.concat root "picker.png" in
+       let channel = open_out_bin source_file in
+       output_string channel wire;
+       close_out channel;
+       let request : Logseq_db_types.Asset_import.t =
+         { operation = id 1
+         ; asset = uuid
+         ; replace_reference = None
+         ; target = id 100
+         ; local_mutation = id 201
+         ; metadata_mutation = id 401
+         ; source_file
+         ; title = "Import"
+         ; file_type = "png"
+         }
+       in
+       ok
+         (W.with_scope ~identity ~operation:request.operation (fun scope ->
+            let intent = ok (W.prepare_import scope request ~current:(fun () -> true)) in
+            ok (W.publish_import_preview scope intent);
+            rejected (W.apply_local_import scope intent);
+            Alcotest.(check bool)
+              "notification failure preserves local commit"
+              true
+              (ok (W.inspect_import scope intent) = `Local_present);
+            fail_notification := false;
+            ok (W.apply_local_import scope intent);
+            ok (W.put_import scope intent);
+            ok (W.apply_import_metadata scope intent);
+            Alcotest.(check bool)
+              "PUT and metadata are not publication ACK"
+              true
+              (ok (W.inspect_import scope intent) = `Metadata_present);
+            ok (W.apply_import_metadata scope intent);
+            let database = ok (X.database database_owner) in
+            let sync = get (D.Overlay.Database.inspect_sync database) in
+            Alcotest.(check int)
+              "exact original mutations, no replay"
+              2
+              (List.length (D.Overlay.Types.sync_view_submissions sync));
+            Alcotest.(check bool)
+              "exact notification binding"
+              true
+              (Option.get !notified_owner == database_owner);
+            Alcotest.(check int)
+              "every successful or recovered commit notifies"
+              4
+              !notifications;
+            held := ok (W.retain_imported_file scope intent);
+            Ok ()));
+       let module O = D.Overlay in
+       let module T = O.Types in
+       let database = ok (X.database database_owner) in
+       let read_intent () =
+         Option.get
+           (sql_ok (Store.read (Option.get !upload_store) ~operation:request.operation))
+       in
+       let file = Option.get !held in
+       let path = W.imported_file_path file in
+       let sqlite_proof ~pending =
+         let graph = Logseq_db_types.Graph_types.Uuid.to_string uuid in
+         let path =
+           Filename.concat root ("logseq-db-worker/synced-graphs/" ^ graph ^ "/db.sqlite")
+         in
+         let sqlite = Sqlite3.db_open ~mode:`READONLY path in
+         Fun.protect
+           ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+           (fun () ->
+              let count query =
+                let result = ref (-1) in
+                Sqlite3.Rc.check
+                  (Sqlite3.exec sqlite query ~cb:(fun row _ ->
+                     result := int_of_string (Option.get row.(0))));
+                !result
+              in
+              Alcotest.(check int)
+                "SQLite exact metadata terminal Applied receipt before/after ACK"
+                (if pending then 0 else 1)
+                (count
+                   (Printf.sprintf
+                      "SELECT count(*) FROM overlay_mutation_receipts WHERE \
+                       json_extract(receipt,'$[1].mutation_id')='%s' AND \
+                       json_extract(receipt,'$[1].status[0]')='Applied'"
+                      (Logseq_db_types.Graph_types.Uuid.to_string
+                         request.metadata_mutation)));
+              Alcotest.(check int)
+                "SQLite original outbox before/after authoritative echo"
+                (if pending then 2 else 0)
+                (count "SELECT count(*) FROM sync_outbox"))
+       in
+       Eio.Switch.run (fun sw ->
+         let finished, resolver = Eio.Promise.create () in
+         Eio.Fiber.fork ~sw (fun () ->
+           Eio.Promise.resolve
+             resolver
+             (Worker.run_assets
+                worker
+                ~identity
+                ~operation:(id 900)
+                (D.Upload
+                   (descriptor
+                      (A.Managed (Some wire_version))
+                      (Some wire_version.checksum)))));
+         for _ = 1 to 16 do
+           Eio.Fiber.yield ()
+         done;
+         if Eio.Promise.is_resolved finished then ignore (ok (Eio.Promise.await finished));
          Alcotest.(check bool)
-           "notification failure preserves local commit"
+           "upload waits for actual metadata ACK"
            true
-           (ok (W.inspect_import scope intent) = `Local_present);
-         fail_notification := false;
-         ok (W.apply_local_import scope intent);
-         ok (W.put_import scope intent);
-         ok (W.apply_import_metadata scope intent);
-         Alcotest.(check bool)
-           "PUT and metadata are not publication ACK"
-           true
-           (ok (W.inspect_import scope intent) = `Metadata_present);
-         ok (W.apply_import_metadata scope intent);
-         let database = ok (X.database database_owner) in
-         let sync = get (D.Overlay.Database.inspect_sync database) in
-         Alcotest.(check int)
-           "exact original mutations, no replay"
-           2
-           (List.length (D.Overlay.Types.sync_view_submissions sync));
-         Alcotest.(check bool)
-           "exact notification binding"
-           true
-           (Option.get !notified_owner == database_owner);
-         Alcotest.(check int)
-           "every successful or recovered commit notifies"
-           4
-           !notifications;
-         ok (W.cancel_import scope intent);
-         let cancelled = sql_ok (Intent.advance intent Cancelled) in
-         W.release_import_staging scope cancelled));
-    ok (Worker.fence worker ~identity);
-    ok (Worker.await_quiescent worker ~identity))
+           ((read_intent ()).phase = Intent.Metadata_pending
+            && not (Eio.Promise.is_resolved finished));
+         let logical_notifications = ref 0 in
+         let subscription, snapshot = get (O.Database.listen database) in
+         O.Database.release_snapshot snapshot;
+         get
+           (O.Database.activate_subscription subscription ~notify:(fun _ ->
+              incr logical_notifications));
+         Fun.protect
+           ~finally:(fun () -> O.Database.unlisten subscription)
+           (fun () ->
+              let transition action =
+                let view = get (O.Database.inspect_sync database) in
+                let prepared, protection =
+                  match
+                    O.Database.begin_outbox_transition
+                      database
+                      ~expected:(T.sync_view_token view)
+                      action
+                  with
+                  | Ok prepared -> prepared
+                  | Error (T.Outbox_transition_invalid message) -> Alcotest.fail message
+                  | Error T.Outbox_limit_exceeded ->
+                    Alcotest.fail "submission exceeds fixture wire budget"
+                  | Error (T.Outbox_dependency_ineligible _) ->
+                    Alcotest.fail "submission dependency ineligible"
+                  | Error _ -> Alcotest.fail "submission preparation rejected"
+                in
+                let encrypted =
+                  Option.map
+                    (fun request -> request, O.Database.protection_plaintexts request)
+                    protection
+                in
+                get (O.Database.apply_outbox_transition database prepared ~encrypted)
+              in
+              let submitted =
+                Option.get
+                  (transition
+                     (T.Submit_group [ request.local_mutation; request.metadata_mutation ]))
+                    .submission_batch
+              in
+              let wires = T.submission_batch_wires submitted in
+              Alcotest.(check bool)
+                "submission contains exact metadata mutation"
+                true
+                (List.exists
+                   (fun wire ->
+                      T.submission_wire_mutation_id wire = request.metadata_mutation)
+                   wires);
+              let through =
+                get (T.Server_cursor.of_int64 (Int64.of_int (List.length wires)))
+              in
+              ignore
+                (transition
+                   (T.Accept_group
+                      { batch_id = T.submission_batch_id submitted
+                      ; barrier =
+                          { through
+                          ; checksum =
+                              get (T.Checksum.of_string "checksum:v1:0000000000000000")
+                          }
+                      }));
+              Alcotest.(check bool)
+                "transport acceptance alone retains metadata outbox"
+                true
+                (List.exists
+                   (fun (item : T.submission_descriptor) ->
+                      item.mutation_id = request.metadata_mutation)
+                   (T.sync_view_submissions (get (O.Database.inspect_sync database))));
+              let normalize transaction =
+                let module Transit = Transit_core.Json in
+                let module Codec = Transit_native.Transit.Json in
+                let entity = function
+                  | Transit.String value
+                    when String.starts_with ~prefix:"overlay-insert:" value
+                         || String.starts_with ~prefix:"overlay-page:" value ->
+                    let start = String.index value ':' + 1 in
+                    Transit.String (String.sub value start (String.length value - start))
+                  | value -> value
+                in
+                let datom = function
+                  | Transit.Array
+                      [ (Transit.Keyword ("db/add" | "db/retract") as operation)
+                      ; target
+                      ; (Transit.Keyword attribute as encoded_attribute)
+                      ; value
+                      ] ->
+                    let value =
+                      if attribute = "block/parent" || attribute = "block/page"
+                      then entity value
+                      else value
+                    in
+                    Transit.Array
+                      [ operation
+                      ; entity target
+                      ; encoded_attribute
+                      ; value
+                      ; Transit.Int 1
+                      ]
+                  | operation -> operation
+                in
+                match Codec.of_string transaction with
+                | Transit.Array operations ->
+                  Codec.to_string
+                    ~mode:Codec.Verbose
+                    (Transit.Array (List.map datom operations))
+                | _ -> Alcotest.fail "submission is not a transaction"
+              in
+              let transactions =
+                List.mapi
+                  (fun ordinal wire ->
+                     let cursor =
+                       get (T.Server_cursor.of_int64 (Int64.of_int (ordinal + 1)))
+                     in
+                     let normalized =
+                       normalize (T.submission_wire_protected_transaction wire)
+                     in
+                     let transaction =
+                       get
+                         (T.encoded_transaction_of_string ~maximum_bytes:65536 normalized)
+                     in
+                     T.authoritative_transaction ~cursor ~transaction)
+                  wires
+              in
+              let batch =
+                get
+                  (T.authoritative_batch
+                     ~maximum_count:8
+                     ~maximum_bytes:65536
+                     ~transactions
+                     ~through
+                     ~checksum:None)
+              in
+              sqlite_proof ~pending:true;
+              Alcotest.(check bool)
+                "original remains pinned through ACK"
+                true
+                (Sys.file_exists path);
+              let before = get (O.Database.inspect_sync database) in
+              let prepared, protection =
+                get
+                  (O.Database.begin_authoritative
+                     database
+                     ~expected:(T.sync_view_token before)
+                     batch)
+              in
+              let decrypted =
+                Option.map
+                  (fun request ->
+                     ( request
+                     , List.map
+                         (fun (item, encoded) ->
+                            match Transit_native.Transit.Json.of_string encoded with
+                            | Transit_core.Json.String plaintext -> item, plaintext
+                            | _ ->
+                              Alcotest.fail "synthetic protection did not encode a string")
+                         (O.Database.unprotection_ciphertexts request) ))
+                  protection
+              in
+              let commit =
+                match O.Database.apply_authoritative database prepared ~decrypted with
+                | Ok (O.Database.Authoritative_applied commit) -> commit
+                | Ok (Authoritative_deferred _) -> Alcotest.fail "own echo deferred"
+                | Error
+                    ( T.Authoritative_decode_failed message
+                    | Authoritative_integrity_failure message
+                    | Authoritative_commit_persistence_failed message ) ->
+                  Alcotest.fail message
+                | Error _ -> Alcotest.fail "authoritative own echo rejected"
+              in
+              Alcotest.(check bool)
+                "authoritative own echo has no logical change"
+                true
+                (commit.logical_change_summary = T.No_logical_change);
+              Alcotest.(check bool)
+                "exact metadata Applied receipt"
+                true
+                (List.exists
+                   (fun (receipt : T.terminal_receipt) ->
+                      match receipt.receipt with
+                      | T.Applied_receipt { mutation_id; _ } ->
+                        mutation_id = request.metadata_mutation
+                      | _ -> false)
+                   commit.terminal_receipts);
+              Alcotest.(check int)
+                "actual own echo clears outbox"
+                0
+                (List.length
+                   (T.sync_view_submissions (get (O.Database.inspect_sync database))));
+              sqlite_proof ~pending:false;
+              for _ = 1 to 16 do
+                Eio.Fiber.yield ()
+              done;
+              Alcotest.(check int)
+                "ACK never notifies logical subscribers"
+                0
+                !logical_notifications;
+              Alcotest.(check bool)
+                "ACK wakes public upload fiber"
+                true
+                (Eio.Promise.is_resolved finished);
+              ignore (ok (Eio.Promise.await finished));
+              let complete = read_intent () in
+              Alcotest.(check bool)
+                "upload persists Complete to SQLite"
+                true
+                (complete.phase = Intent.Complete);
+              Alcotest.(check bool)
+                "Complete retirement preserves pinned original"
+                true
+                (Sys.file_exists path);
+              ok (W.release_imported_file file);
+              Alcotest.(check bool)
+                "final pin release unlinks original"
+                false
+                (Sys.file_exists path);
+              ok (W.release_imported_file file);
+              ok
+                (W.with_scope ~identity ~operation:request.operation (fun scope ->
+                   W.release_import_staging scope complete));
+              ignore
+                (ok
+                   (Worker.run_assets
+                      worker
+                      ~identity
+                      ~operation:(id 901)
+                      (D.Upload
+                         (descriptor
+                            (A.Managed (Some wire_version))
+                            (Some wire_version.checksum)))));
+              Alcotest.(check bool)
+                "public Complete replay tolerates already absent original"
+                true
+                (read_intent () = complete && not (Sys.file_exists path))));
+       ok (Worker.fence worker ~identity);
+       ok (Worker.await_quiescent worker ~identity))
 ;;
 
 let shared_crypto_key () =

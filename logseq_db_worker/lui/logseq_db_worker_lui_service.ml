@@ -958,7 +958,7 @@ let discarded_asset_retain request response =
   | _->None
 ;;
 
-let create ~(dependencies : dependencies) =
+let create_with_network ~network ~(dependencies : dependencies) =
   let module Session = struct
     type t =
       { worker : Db.t
@@ -1049,6 +1049,8 @@ let create ~(dependencies : dependencies) =
        | _ -> invalid_arg "Only token replies and authentication state are short controls")
     ~init:(fun context config ->
       let sw = Journal_worker.Session_context.switch context in
+      let clock = Journal_worker.Session_context.clock context in
+      let network = network ~sw ~clock (Journal_worker.Session_context.net context) in
       let event_sink = ref (fun (_ : Pure.event) -> ()) in
       let asset_diagnostic_sink =
         ref (fun ~scope:_ ~operation:_ ~request_operation:_
@@ -1077,10 +1079,9 @@ let create ~(dependencies : dependencies) =
           (match Sync.config ~managed_sync_origin:(Uri.of_string base_url) ~limits with
            | Error error -> Error (error_message error)
            | Ok sync_config ->
-             let environment=Journal_worker.Session_context.environment context in
              let tokens=Hashtbl.create 4 in
-             (match Journal_sync_registration.create ~sw ~clock:(Eio.Stdenv.mono_clock environment)
-               ~network:(Eio.Stdenv.net environment) ~authenticator:(Ca_certs_nss.authenticator () |> Result.get_ok)
+             (match Journal_sync_registration.create ~sw ~clock
+               ~network ~authenticator:(Ca_certs_nss.authenticator () |> Result.get_ok)
                ~config ~overlay:dependencies.overlay
                ~token:(fun ~user ~account_generation ~epoch:_ ~refresh ->
                  let account:Sync.account_scope={managed_sync_origin=Uri.of_string base_url;user_id=user;
@@ -1566,7 +1567,15 @@ let create ~(dependencies : dependencies) =
     ()
 ;;
 
+let create ~dependencies =
+  create_with_network ~network:(fun ~sw:_ ~clock:_ net -> net) ~dependencies
+
 let service = create ~dependencies:(production_dependencies ())
+
+module For_testing = struct
+  let service_with_network network =
+    create_with_network ~network ~dependencies:(production_dependencies ())
+end
 
 let answer_token client request answer =
   let command =

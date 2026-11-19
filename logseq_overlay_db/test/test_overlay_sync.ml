@@ -104,9 +104,26 @@ let empty_batch_update_wire =
 
 let empty_authoritative_preserves_logical_state wire database =
   let before, projection, updated = empty_batch_state database in
+  let observed = ref false in
   let commit =
-    apply_empty_compatible_batch database (empty_authoritative_batch [ wire ])
+    Eio.Fiber.first
+      (fun () ->
+         Database.await_sync_change database ~after:(sync_view_token before)
+         |> T.require_ok ~behavior:"nonlogical sync notification"
+         |> ignore;
+         observed := true;
+         Eio.Fiber.await_cancel ())
+      (fun () ->
+         Eio.Fiber.yield ();
+         let commit =
+           apply_empty_compatible_batch database (empty_authoritative_batch [ wire ])
+         in
+         for _turn = 1 to 20 do
+           Eio.Fiber.yield ()
+         done;
+         commit)
   in
+  T.require !observed "nonlogical checkpoint failed to wake sync observer";
   let after, after_projection, after_updated = empty_batch_state database in
   T.require
     (Server_cursor.equal (sync_view_checkpoint after) (server_cursor 1))

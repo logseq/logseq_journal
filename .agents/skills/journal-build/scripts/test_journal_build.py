@@ -60,6 +60,13 @@ class BuildBoundaryTests(unittest.TestCase):
         return subprocess.run(["bash", str(SCRIPT), *args], text=True,
                               capture_output=True, env=env)
 
+    def test_release_network_probe_is_rejected(self):
+        for args in [('macos', '--producer-only', '--switch', 'unused'),
+                     ('ios-simulator', '--experimental-host-restamp', '--native-manifest', '/unused')]:
+            result = self.cli(*args, '--sync-network-probe', '--configuration', 'release')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('debug', result.stderr)
+
     def test_help_is_read_only_and_describes_modes(self):
         result = self.cli("--help")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -114,6 +121,17 @@ class BuildBoundaryTests(unittest.TestCase):
                 result = self.cli(*args, '--preflight')
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('probe mode', result.stderr)
+
+    def test_sync_network_probe_only_accepts_producer_or_simulator_import(self):
+        for args in [('macos', '--switch', 'unused'),
+                     ('macos', '--link-only'),
+                     ('ios-simulator', '--link-only'),
+                     ('ios-device', '--experimental-host-restamp', '--native-manifest', '/tmp/input.json'),
+                     ('ios-simulator', '--probe-native-object', '/tmp/probe.o')]:
+            with self.subTest(args=args):
+                result = self.cli(*args, '--sync-network-probe', '--preflight')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('sync-network-probe requires', result.stderr)
 
     def test_foreign_dune_root_and_runtime_cannot_change_provenance(self):
         for name in ("DUNE_ROOT", "DUNE_WORKSPACE", "DUNE_CROSS_TARGET", "DUNE_INSTRUMENT_WITH", "OCAMLLIB",
@@ -809,11 +827,13 @@ while True: time.sleep(1)
                           str(forced.with_suffix('.a')): dummy, str(effect): dummy,
                           str(effect.with_suffix('.a')): dummy, str(native): host_hash,
                           str(header): self.build.sha(header)}
-                pre = dict(commit=commit, lui=pins['lui'], signal=pins['signal'], datascript=pins['datascript'],
+                pre = dict(native_build=dict(configuration='release', dune_profile='release'),
+                           commit=commit, lui=pins['lui'], signal=pins['signal'], datascript=pins['datascript'],
                            production_native_object=str(native), production_native_object_sha256=host_hash,
                            native_source_sha256={k: v for k, v in source.items() if k.endswith('.ml')},
                            installed_lui_source_sha256={})
-                link = dict(command=[str(compiler), str(effect), str(forced)], compiler_sha256=dummy,
+                link = dict(native_build=dict(configuration='release', dune_profile='release'),
+                            command=[str(compiler), str(effect), str(forced)], compiler_sha256=dummy,
                             compiler_version="5.3.0", production_host_sha256=host_hash,
                             direct_native_input_sha256={k: v for k, v in inputs.items() if k not in (str(native), str(header))},
                             device_c_source_sha256={p.name: self.build.sha(p) for p in platform.iterdir()},
@@ -846,11 +866,41 @@ while True: time.sleep(1)
                 path = root / 'input.json'
                 path.write_text(json.dumps(envelope))
                 build = self.build.Build(SimpleNamespace(native_manifest=path, experimental_host_restamp=True,
-                                                         link_only=False, platform='ios-device'), root)
+                                                         link_only=False, platform='ios-device', configuration='release'), root)
                 build.run = partial(build.run, cwd=repo)
                 build.report['source_sha'], build.lui_sha = commit, pins['lui']
                 yield SimpleNamespace(build=build, source=source, history=history, native=native, header=header,
                                       envelope=envelope, path=path, receipt=receipt, receipt_path=receipt_path, repo=repo)
+
+    def test_native_import_rejects_cross_role_envelopes_before_consuming_inputs(self):
+        with self.producer_fixture() as f:
+            f.envelope['native_entry'] = dict(role='sync-network-probe',
+                dune_target='tool/sync_acceptance_probe/native_probe.exe.o')
+            f.path.write_text(json.dumps(f.envelope))
+            with self.assertRaisesRegex(ValueError, 'native entry role'):
+                f.build.imported_native(f.source)
+            f.envelope.pop('native_entry')
+            f.path.write_text(json.dumps(f.envelope))
+            f.build.args.sync_network_probe = True
+            with self.assertRaisesRegex(ValueError, 'native entry role'):
+                f.build.imported_native(f.source)
+
+    def test_probe_native_identity_and_source_set_are_distinct(self):
+        with self.producer_fixture() as f:
+            probe = f.repo / 'tool/sync_acceptance_probe'
+            probe.mkdir(parents=True)
+            (probe / 'native_probe.ml').write_text('let probe = true\n')
+            (probe / 'test_net.ml').write_text('let network = true\n')
+            (probe / 'dune').write_text('(executable (name native_probe))\n')
+            source = self.build.source_inputs()
+            ordinary = f.build.native_entry()
+            self.assertEqual(ordinary, dict(role='production', dune_target='app/native_embed.exe.o'))
+            self.assertNotIn('tool/sync_acceptance_probe/test_net.ml', f.build.native_sources(source))
+            f.build.args.sync_network_probe = True
+            self.assertNotEqual(ordinary, f.build.native_entry())
+            self.assertEqual(f.build.native_entry()['dune_target'], 'tool/sync_acceptance_probe/native_probe.exe.o')
+            self.assertIn('tool/sync_acceptance_probe/test_net.ml', f.build.native_sources(source))
+            self.assertIn('tool/sync_acceptance_probe/dune', f.build.native_configuration(source))
 
     def test_consumed_archives_may_change_or_disappear_with_fixed_object_receipt(self):
         with self.producer_fixture() as f:
@@ -944,7 +994,8 @@ while True: time.sleep(1)
             commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
             with patch.object(self.build, 'ROOT', repo):
                 source = self.build.source_inputs()
-                pre = dict(commit=commit, **pins, production_native_object=str(native),
+                pre = dict(native_build=dict(configuration='release', dune_profile='release'),
+                    commit=commit, **pins, production_native_object=str(native),
                     production_native_object_sha256=self.build.sha(native),
                     native_source_sha256={'app/unit.ml': self.build.sha(repo / 'app/unit.ml')},
                     installed_lui_source_sha256={})
@@ -953,7 +1004,8 @@ while True: time.sleep(1)
                 for item in provenance.values():
                     archive = Path(item['installed_archive'])
                     inputs.extend([archive, archive.with_suffix('.a')])
-                link = dict(command=command, working_directory=str(root), compiler_sha256=self.build.sha(compiler),
+                link = dict(native_build=dict(configuration='release', dune_profile='release'),
+                    command=command, working_directory=str(root), compiler_sha256=self.build.sha(compiler),
                     compiler_version=subprocess.check_output([compiler, '-version'], text=True).strip(),
                     production_host_sha256=self.build.sha(native),
                     direct_native_input_sha256={str(p): self.build.sha(p) for p in inputs},
@@ -969,14 +1021,14 @@ while True: time.sleep(1)
                     path.write_text(json.dumps(envelope))
                 save()
                 build = self.build.Build(SimpleNamespace(native_manifest=path, experimental_host_restamp=True,
-                    link_only=False, platform='ios-simulator'), root)
+                    link_only=False, platform='ios-simulator', configuration='release'), root)
                 build.run = partial(build.run, cwd=repo)
                 build.report['source_sha'], build.lui_sha = commit, pins['lui']
                 yield SimpleNamespace(build=build, source=source, link=link, pre=pre, native=native,
                     envelope=envelope, path=path, root=root, save=save, runtime=runtime, provenance=provenance)
 
     @contextmanager
-    def native_dune_producer(self, single_member=False):
+    def native_dune_producer(self, single_member=False, sync_probe=False):
         """A real Dune complete-object rule, including removable host C providers."""
         with self.ordinary_producer_fixture() as f:
             repo = self.build.ROOT
@@ -1010,7 +1062,14 @@ while True: time.sleep(1)
             subprocess.run([compiler, '-a', '-o', archive, effect / 'effect.cmx',
                             '-cclib', '-llogseq_sync_native_crypto_stubs'], check=True, capture_output=True)
             # The fixture rule is opaque to the builder: it must read actual Dune argv.
-            command = [str(compiler), '-output-complete-obj', '-w', '@1..3', '-o', 'app/native_embed.exe.o',
+            target = 'tool/sync_acceptance_probe/native_probe.exe.o' if sync_probe else 'app/native_embed.exe.o'
+            rule_directory = repo / Path(target).parent
+            rule_directory.mkdir(parents=True, exist_ok=True)
+            relative_root = os.path.relpath(repo, rule_directory)
+            if sync_probe:
+                (rule_directory / 'native_probe.ml').write_text('let probe = true\n')
+                (rule_directory / 'test_net.ml').write_text('let network = true\n')
+            command = [str(compiler), '-output-complete-obj', '-w', '@1..3', '-o', target,
                        '-cclib', '-Llogseq_sync/lib/native_crypto', '-cclib', 'app/libgmp.a',
                        '-I', 'logseq_sync/lib/native_crypto', 'logseq_sync/lib/native_crypto/' + archive.name,
                        f.provenance['xmlm']['installed_archive'], f.provenance['mldoc']['installed_archive'],
@@ -1018,10 +1077,13 @@ while True: time.sleep(1)
             def atom(value):
                 return json.dumps(str(value))
             (repo / 'dune-project').write_text('(lang dune 3.0)\n')
-            (repo / 'app/dune').write_text('(rule (target native_embed.exe.o) (deps libgmp.a unit.cmx unit.o '
-                + ' '.join(atom('../logseq_sync/lib/native_crypto/' + path.name)
-                           for path in effect.iterdir() if path.suffix in ('.cmxa', '.a'))
-                + ') (action (chdir .. (run ' + ' '.join(map(atom, command)) + '))))\n')
+            dependencies = ['app/libgmp.a', 'app/unit.cmx', 'app/unit.o'] + [
+                'logseq_sync/lib/native_crypto/' + path.name
+                for path in effect.iterdir() if path.suffix in ('.cmxa', '.a')]
+            (rule_directory / 'dune').write_text('(rule (target ' + Path(target).name + ') (deps '
+                + ' '.join(atom(relative_root + '/' + name) for name in dependencies)
+                + ') (action (chdir ' + atom(relative_root) + ' (run '
+                + ' '.join(map(atom, command)) + '))))\n')
             shutil.copyfile(stub, repo / 'app/libgmp.a')
             workspace = f.root / "workspace with spaces 'and quotes'"
             workspace.mkdir()
@@ -1032,7 +1094,7 @@ while True: time.sleep(1)
             f.build.opam = opam
             f.build.args = SimpleNamespace(platform='macos', configuration='release', jobs=1,
                 producer_only=True, link_only=False, experimental_host_restamp=False,
-                native_manifest=None, probe_native_object=None)
+                native_manifest=None, probe_native_object=None, sync_network_probe=sync_probe)
             f.build.report['mode'] = 'native-producer'
             f.build.tools = {'swift': '/unexpected-swift-command'}
             f.build.prefix = f.root / 'package'
@@ -1051,10 +1113,88 @@ while True: time.sleep(1)
                                          ('datascript-ocaml-native', f.pre['datascript'])]}))
             f.build.opam('exec', '--', 'dune', 'build', '--root', repo, '--no-config',
                          '--cache=disabled', '--build-dir', dune_dir, '--profile', 'release',
-                         '-j', '1', 'app/native_embed.exe.o')
-            native = dune_dir / 'default/app/native_embed.exe.o'
+                         '-j', '1', target)
+            native = dune_dir / 'default' / target
             f.build.report['native_object'] = dict(path=str(native), sha256=self.build.sha(native), mode='native-producer')
             yield SimpleNamespace(**vars(f), workspace=workspace, original_native=native, compiler=compiler)
+
+    def test_producer_import_requires_matching_configuration_and_profile(self):
+        with self.native_dune_producer() as f:
+            envelope = f.build.produce_native(f.original_native, f.workspace)
+            f.build.args.native_manifest = envelope
+            f.build.args.configuration = 'debug'
+            with self.assertRaisesRegex(ValueError, 'configuration/profile'):
+                f.build.imported_native(f.build.inputs['source'])
+            f.build.args.configuration = 'release'
+            records = json.loads(envelope.read_text())
+            rule_path = Path(records['dune_rule']['path'])
+            original_rule = json.loads(rule_path.read_text())
+            for profile in ('dev', None):
+                rule = dict(original_rule)
+                rule['query'] = list(rule.get('query', ['--profile', 'release']))
+                rule['query'][rule['query'].index('--profile') + 1] = profile
+                rule_path.write_text(json.dumps(rule))
+                records['dune_rule']['sha256'] = self.build.sha(rule_path)
+                envelope.write_text(json.dumps(records))
+                with self.assertRaisesRegex(ValueError, 'configuration/profile'):
+                    f.build.imported_native(f.build.inputs['source'])
+            rule_path.write_text(json.dumps(original_rule))
+            records['dune_rule']['sha256'] = self.build.sha(rule_path)
+            for name in ('source', 'link'):
+                path = Path(records[name]['path'])
+                value = json.loads(path.read_text())
+                value.pop('native_build', None)
+                path.write_text(json.dumps(value))
+                records[name]['sha256'] = self.build.sha(path)
+            envelope.write_text(json.dumps(records))
+            with self.assertRaisesRegex(ValueError, 'rerun.*producer'):
+                f.build.imported_native(f.build.inputs['source'])
+
+    def test_final_verification_requeries_selected_rule(self):
+        with self.native_dune_producer() as f:
+            f.build.produce_native(f.original_native, f.workspace)
+            f.build.swift_dir = f.root / 'swift'
+            f.build.lui = f.root / 'lui'
+            f.build.entitlements = f.root / 'entitlements'
+            f.build.plist = f.root / 'Info.plist'
+            f.build.plist.write_bytes(b'plist')
+            f.build.inputs.update(swift={}, lui={}, entitlements={}, plist=self.build.sha(f.build.plist), signing={})
+            f.build.inputs['toolchain'].update(hashes={}, sdk_identity={'settings': {}})
+            f.build.tools = {}
+            f.build.args.native_manifest = Path('already-imported')
+            rule_path = self.build.ROOT / 'app/dune'
+            original = rule_path.read_text()
+            changed = original.replace('"@1..3"', '"@1..3" "-g"')
+            self.assertNotEqual(original, changed)
+            rule_path.write_text(changed)
+            with self.assertRaisesRegex(RuntimeError, 'Dune.*rule changed'):
+                f.build.verify_inputs()
+
+    def test_probe_producer_binds_target_sources_configuration_and_warm_cache(self):
+        with self.native_dune_producer(sync_probe=True) as f:
+            envelope_path = f.build.produce_native(f.original_native, f.workspace)
+            envelope = json.loads(envelope_path.read_text())
+            entry = dict(role='sync-network-probe', dune_target='tool/sync_acceptance_probe/native_probe.exe.o')
+            self.assertEqual(envelope['native_entry'], entry)
+            pre = self.build.read_evidence(envelope['source'], envelope_path.parent)
+            self.assertEqual(pre['native_entry'], entry)
+            self.assertIn('tool/sync_acceptance_probe/test_net.ml', pre['native_source_sha256'])
+            self.assertIn('tool/sync_acceptance_probe/dune', pre['native_configuration_sha256'])
+            self.assertEqual(f.build.produce_native(f.original_native, f.workspace), envelope_path)
+            self.assertFalse(f.build.report['producer']['link_executed'])
+            f.build.args.native_manifest = envelope_path
+            f.build.args.sync_network_probe = False
+            with self.assertRaisesRegex(ValueError, 'native entry role'):
+                f.build.imported_native(f.build.inputs['source'])
+            f.build.args.sync_network_probe = True
+            changed = dict(f.build.inputs['source'])
+            changed['tool/sync_acceptance_probe/dune'] = '0' * 64
+            with self.assertRaisesRegex(ValueError, 'build configuration'):
+                f.build.imported_native(changed)
+            changed = dict(f.build.inputs['source'])
+            changed['tool/sync_acceptance_probe/test_net.ml'] = '0' * 64
+            with self.assertRaisesRegex(ValueError, 'native sources'):
+                f.build.imported_native(changed)
 
     def test_producer_links_after_stripping_single_member_stub_archive(self):
         with self.native_dune_producer(single_member=True) as f:

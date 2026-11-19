@@ -5,6 +5,12 @@ requires the OCaml runtime and mldoc. XMLm is a locked dependency used by mldoc'
 OPML units; an unused XMLm unit may be removed by the OCaml linker. Any unresolved
 XMLm reference is rejected. No application anchor or global `-linkall` is needed.
 
+## Explicit sync-network diagnostic role
+
+`--sync-network-probe` is a separate producer/import role, not a production feature or a raw-object exception. Its schema-2 envelope, hash-bound source/link records and Dune rule name the whitelisted `tool/sync_acceptance_probe/native_probe.exe.o`; imports reject absent or different roles/targets. Probe source identity includes that directory's native sources as well as the unchanged production source selection. A complete hash-bound current Dune/lock/static-link configuration snapshot permits this explicitly authorized diagnostic target to be produced from an uncommitted worktree; later changes fail closed. Ordinary production imports retain their existing producer-commit configuration guard. Probe receipts must themselves bind the probe role and cannot become production acceptance. Original compiler, archive, runtime header, target C/GMP, mldoc, source and final-input checks remain in force. Manifests separately record production-code source validation, `production_acceptance=false` and `cross_abi_validated=false`.
+
+The diagnostic requires `--configuration debug`. New producers bind configuration and the actual queried Dune profile in immutable source/link records and retain the Dune query with its rule; import compares these against the requested configuration and selected target. Historical envelopes without configuration/profile proof require a producer rerun, never an inferred default. Final acceptance re-queries the same profile and whitelisted target and rejects a changed normalized rule even when file/tool hashes still match.
+
 ## Ordinary archive inputs (schema 2)
 
 New producers use `schema_version: 2`, with hash-bound `source` and `link` records

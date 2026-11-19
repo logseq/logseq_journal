@@ -406,37 +406,25 @@ let apply_import_metadata scope intent =
 let await_import_publication scope intent =
   let* () = durable_intent scope intent in
   with_database scope (fun database ->
-    let* subscription, predecessor =
-      Database.listen database
-      |> Result.map_error (fun _ ->
-        Dsl.Storage_failure "Import publication subscription failed")
+    let sync_result = Result.map_error (fun error -> Dsl.Sync_read_failure error) in
+    let rec wait () =
+      let* () = current scope in
+      let* before = Database.inspect_sync database |> sync_result in
+      let* observation = inspect_import scope intent in
+      match observation with
+      | `Publication_acknowledged -> Ok ()
+      | `Import_absent | `Entity_cancelled ->
+        Error (Dsl.Invalid_input "Original import mutation was not published")
+      | `Local_present | `Metadata_present ->
+        let* _ =
+          Database.await_sync_change
+            database
+            ~after:(Logseq_overlay_db.Types.sync_view_token before)
+          |> sync_result
+        in
+        wait ()
     in
-    Database.release_snapshot predecessor;
-    Fun.protect
-      ~finally:(fun () -> Database.unlisten subscription)
-      (fun () ->
-         let changed = scope.owner.sync_changed in
-         let* () =
-           Database.activate_subscription subscription ~notify:(fun _ ->
-             scope.owner.sync_revision <- Int64.succ scope.owner.sync_revision;
-             Eio.Condition.broadcast changed)
-           |> Result.map_error (fun _ ->
-             Dsl.Storage_failure "Import publication subscription activation failed")
-         in
-         let rec wait () =
-           let before = scope.owner.sync_revision in
-           let* observation = inspect_import scope intent in
-           match observation with
-           | `Publication_acknowledged -> Ok ()
-           | `Import_absent | `Entity_cancelled ->
-             Error (Dsl.Invalid_input "Original import mutation was not published")
-           | `Local_present | `Metadata_present ->
-             let* () = current scope in
-             if before = scope.owner.sync_revision
-             then Eio.Condition.await_no_mutex changed;
-             wait ()
-         in
-         wait ()))
+    wait ())
 ;;
 
 let cancel_import scope intent =
@@ -459,18 +447,26 @@ let release_import_staging scope intent =
     | Complete ->
       let* observed = inspect_import scope intent in
       if observed = `Publication_acknowledged
-      then
-        Assets.publish_preview
-          scope.owner.assets
-          ~check_current:(fun () -> current scope)
-          intent
+      then (
+        let cache = Assets.cache scope.owner.assets in
+        let* cached =
+          Cache.lookup cache ~asset:intent.asset ~version:intent.version
+          |> Result.map_error Assets.cache_error
+        in
+        match cached with
+        | Some handle ->
+          Cache.release_checked cache handle |> Result.map_error Assets.cache_error
+        | None when Cache.staged_path cache ~file:intent.staged_file = None -> Ok ()
+        | None ->
+          Assets.publish_preview
+            scope.owner.assets
+            ~check_current:(fun () -> current scope)
+            intent)
       else Error (Dsl.Invalid_input "Terminal import has no publication proof")
     | Prepared | Local_committed | Uploading | Remote_stored | Metadata_pending ->
       Error (Dsl.Invalid_input "Import staging is not terminal")
   in
-  Cache.release_staged_if_unused
-    (Assets.cache scope.owner.assets)
-    ~file:intent.staged_file
+  Cache.release_staged (Assets.cache scope.owner.assets) ~file:intent.staged_file
   |> Result.map_error Assets.cache_error
 ;;
 
@@ -657,10 +653,10 @@ let upload_asset t asset =
         | Metadata_pending ->
           let* next = step intent Complete (await_import_publication scope) in
           resume next
-        | Complete ->
-          let* () = await_import_publication scope intent in
-          Ok ()
-        | Cancelled -> Error Dsl.Cancelled
+        | Complete -> release_import_staging scope intent
+        | Cancelled ->
+          let* () = release_import_staging scope intent in
+          Error Dsl.Cancelled
       in
       resume intent)
 ;;

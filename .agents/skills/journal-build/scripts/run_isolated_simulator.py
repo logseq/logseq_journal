@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -36,6 +37,8 @@ def main():
     parser.add_argument('--runtime', required=True)
     parser.add_argument('--device-type', required=True)
     parser.add_argument('--jobs', type=jobs, default=4)
+    parser.add_argument('--sync-network-probe', action='store_true',
+                        help='separate real-App diagnostic; never ordinary production acceptance')
     args = parser.parse_args()
     evidence = args.evidence_dir.expanduser().resolve()
     if evidence == ROOT or ROOT in evidence.parents:
@@ -54,11 +57,14 @@ def main():
     def save():
         (run / 'session.json').write_text(json.dumps(report, indent=2) + '\n')
 
-    def command(label, *argv, cwd=ROOT):
+    if args.sync_network_probe:
+        report.update(role='sync-network-probe', production_acceptance=False)
+
+    def command(label, *argv, cwd=ROOT, env=None):
         argv = list(map(str, argv))
         report['commands'].append(dict(label=label, argv=argv))
         save()
-        result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True,
+        result = subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True,
                                 timeout=1800 if label in {'producer', 'simulator'} else 300)
         (run / (label + '.stdout')).write_text(result.stdout)
         (run / (label + '.stderr')).write_text(result.stderr)
@@ -69,7 +75,8 @@ def main():
         return result
 
     def build(label, *options):
-        result = command(label, 'bash', BUILDER, *options,
+        role = ['--sync-network-probe'] if args.sync_network_probe else []
+        result = command(label, 'bash', BUILDER, *options, *role,
                          '--lui-package', args.lui_package.resolve(),
                          '--cache-dir', evidence / 'build cache', '--jobs', args.jobs)
         matches = re.findall(r'^manifest: (.+)$', result.stderr, re.MULTILINE)
@@ -77,6 +84,10 @@ def main():
             raise RuntimeError(f'{label}: missing unique current manifest')
         path = Path(matches[0])
         manifest = json.loads(path.read_text())
+        if args.sync_network_probe and (
+                manifest.get('native_entry', {}).get('role') != 'sync-network-probe'
+                or manifest.get('production_acceptance') is not False):
+            raise RuntimeError(f'{label}: missing explicit probe role')
         report[label] = dict(manifest=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
         return manifest
 
@@ -100,6 +111,10 @@ def main():
         app = Path(target['artifact']['app'])
         report['app'] = str(app)
         report['bundle_id'] = target['artifact']['info']['CFBundleIdentifier']
+        if args.sync_network_probe and (
+                report['bundle_id'] != 'com.logseq.journal.sync-probe'
+                or target['artifact']['info'].get('JournalSyncNetworkProbe') is not True):
+            raise RuntimeError('Simulator artifact is not the separate sync probe')
         for name, digest in target['artifact']['files'].items():
             if hashlib.sha256((app / name).read_bytes()).hexdigest() != digest:
                 raise RuntimeError(f'artifact changed after build: {name}')
@@ -119,7 +134,16 @@ def main():
         command('bootstatus', 'xcrun', 'simctl', 'bootstatus', udid, '-b')
         verify_manifest_sources(target, source_inputs())
         command('install', 'xcrun', 'simctl', 'install', udid, app)
-        command('launch', 'xcrun', 'simctl', 'launch', udid, report['bundle_id'])
+        launch_env = None
+        if args.sync_network_probe:
+            container = Path(command('data-container', 'xcrun', 'simctl', 'get_app_container',
+                                     udid, report['bundle_id'], 'data').stdout.strip()).resolve()
+            control = Path(tempfile.mkdtemp(prefix='sync-network-probe-', dir=container / 'tmp')).resolve()
+            control.chmod(0o700)
+            report['network_probe'] = dict(directory=str(control), status=str(control / 'status.json'),
+                                           offline_signal=str(control / 'offline'))
+            launch_env = dict(os.environ, SIMCTL_CHILD_JOURNAL_SYNC_NETWORK_PROBE_DIRECTORY=str(control))
+        command('launch', 'xcrun', 'simctl', 'launch', udid, report['bundle_id'], env=launch_env)
         command('container', 'xcrun', 'simctl', 'get_app_container', udid, report['bundle_id'], 'app')
         command('screenshot', 'xcrun', 'simctl', 'io', udid, 'screenshot', run / 'launch.png')
         report['status'] = 'launched'

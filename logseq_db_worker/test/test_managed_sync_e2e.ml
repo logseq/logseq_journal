@@ -292,6 +292,12 @@ let handle_public_state context state =
        "catalog"
        (Printf.sprintf "target-unavailable-count-%d" (List.length snapshot.catalog))
    | Ok (Some graph) ->
+     (match Sys.getenv_opt "LOGSEQ_DB_WORKER_E2E_ACTION" with
+      | Some "guarded-save" ->
+        if Sys.getenv_opt "LOGSEQ_DB_WORKER_E2E_EXPECTED_GRAPH_UUID"
+           <> Some (Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id)
+        then fail_worker context "catalog" "expected-graph-mismatch"
+      | _ -> ());
      context.saw_catalog <- true;
      (match context.selected_graph with
       | Some selected
@@ -1623,13 +1629,115 @@ let run () =
              "recovered-receiver")))
 ;;
 
+let run_guarded_save () =
+  require_macos ();
+  let required name =
+    match Sys.getenv_opt ("LOGSEQ_DB_WORKER_E2E_" ^ name) with
+    | Some value when String.length value > 0 && String.length value <= 4096
+                      && not (String.contains value '\000') -> value
+    | _ -> fail "missing or invalid guarded input: %s" name
+  in
+  let uuid name =
+    match Logseq_db_types.Graph_types.Uuid.of_string (required name) with
+    | Ok value -> value
+    | Error _ -> fail "invalid guarded UUID: %s" name
+  in
+  let graph_id = uuid "EXPECTED_GRAPH_UUID" in
+  let block_uuid = uuid "OWNED_BLOCK_UUID" in
+  let parent_uuid = uuid "EXPECTED_PARENT_UUID" in
+  let expected = required "EXPECTED_BODY" in
+  let prefix = required "SELF_PREFIX" in
+  let title = required "NEW_BODY" in
+  if String.length prefix < 16
+     || not (String.starts_with ~prefix expected)
+     || not (String.starts_with ~prefix:expected title)
+     || String.length title <= String.length expected
+     || String.length title > 512
+     || String.length title - String.length expected > 64
+  then fail "guarded body bounds or ownership prefix rejected";
+  let credentials =
+    match Support.credentials_from_environment Sys.getenv_opt with
+    | Ok value -> value
+    | Error message -> fail "%s" message
+  in
+  let cognito =
+    match Support.authenticate credentials with
+    | Ok value -> value
+    | Error message -> fail "%s" message
+  in
+  let verify context body =
+    let block, revision = require_block context ~block_uuid ~parent_uuid ~title:body in
+    let status =
+      match block.task_status with
+      | Some value -> value
+      | None -> fail "guarded block is not a task"
+    in
+    (match query context (W.Task_status_definitions [ status ]) with
+     | [ Some definition ] when String.equal definition.title "Done" -> ()
+     | _ -> fail "guarded task is not Done");
+    let children =
+      query ~maximum_items:1 context
+        (W.Child_members { parent = block_uuid; revision = None; after = None })
+    in
+    if children.items <> [] then fail "guarded owned block has children";
+    status, revision
+  in
+  with_temp_directory "logseq-guarded-save-" (fun support ->
+    let initial, acknowledged, status =
+      with_client ~label:"guarded-save" ~support ~credentials ~cognito (fun context ->
+        let initial, graph = await_opening_current context in
+        if not (Logseq_db_types.Graph_types.Uuid.equal graph.graph_id graph_id)
+        then fail "guarded graph mismatch";
+        let status, revision = verify context expected in
+        report_phase "guarded-save-guards-passed-Done-children-empty";
+        let acknowledged =
+          run_mutation context ~after_server_t:initial "guarded-save"
+            ~mutation_id:(fresh_uuid ())
+            (W.Save_block
+               { block = block_uuid; title
+               ; preconditions =
+                   { blocks = [ block_uuid, revision ]; pages = []; scopes = [] }
+               })
+        in
+        let after_status, _ = verify context title in
+        if after_status <> status then fail "guarded task status changed";
+        initial, acknowledged, status)
+    in
+    let facts = durable_facts support graph_id in
+    require_durable_advance facts initial "guarded-save";
+    if Logseq_db_types.Server_cursor.compare facts.cursor acknowledged < 0
+    then fail "guarded durable checkpoint behind acknowledgement";
+    report_phase
+      (Printf.sprintf "guarded-save-checkpointAck-%Ld-Done-preserved"
+         (Logseq_db_types.Server_cursor.to_int64 acknowledged));
+    with_temp_directory "logseq-guarded-incoming-" (fun receiver_support ->
+      with_client ~label:"guarded-incoming" ~support:receiver_support
+        ~credentials ~cognito (fun context ->
+          let cursor, _ = await_opening_current context in
+          if Logseq_db_types.Server_cursor.compare cursor acknowledged < 0
+          then fail "incoming checkpoint behind acknowledgement";
+          let incoming_status, _ = verify context title in
+          if incoming_status <> status then fail "incoming task status changed";
+          report_phase "guarded-incoming-exact-body-Done-preserved");
+      let incoming = durable_facts receiver_support graph_id in
+      if not incoming.outbox_empty then fail "incoming durable outbox not empty";
+      report_phase "guarded-incoming-durable-outbox-empty"))
+;;
+
+let selected_run () =
+  match Sys.getenv_opt "LOGSEQ_DB_WORKER_E2E_ACTION" with
+  | None -> run ()
+  | Some "guarded-save" -> run_guarded_save ()
+  | Some _ -> fail "unknown managed sync E2E action"
+;;
+
 let () =
   Printexc.record_backtrace true;
   let status =
     try
       if Sys.getenv_opt platform_crypto_provider_marker = Some "1"
       then (
-        with_execution_lock run;
+        with_execution_lock selected_run;
         0)
       else run_with_platform_crypto_provider ()
     with

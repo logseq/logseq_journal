@@ -1,0 +1,9 @@
+(executable
+ (name native_probe)
+ (modules native_probe test_net)
+ (libraries app lui logseq_db_worker.lui eio eio.unix unix)
+ (link_flags
+  (:standard
+   (:include ../../app/native_static_link_flags.sexp)))
+ (modes
+  (native object)))

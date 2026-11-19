@@ -696,6 +696,12 @@ val unprotection_ciphertexts
 (** Returns the current transport view and synchronization token. *)
 val inspect_sync : t -> (Types.sync_view, Types.sync_read_error) result
 
+(** Waits for a different sync token, including ACK-only changes; cancellation releases the wait. *)
+val await_sync_change
+  :  t
+  -> after:Types.sync_token
+  -> (Types.sync_view, Types.sync_read_error) result
+
 (** Compares the computed authoritative digest without graph reads.
     [None] means a different checkpoint. *)
 val check_checkpoint_checksum

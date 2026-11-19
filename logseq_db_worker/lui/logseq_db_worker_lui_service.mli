@@ -449,6 +449,12 @@ val create
 val service
   : (Logseq_db_worker.Config.t, request, response, push) Journal_worker.Service.t
 
+module For_testing : sig
+  val service_with_network
+    : (sw:Eio.Switch.t -> clock:Journal_worker.mono_clock -> Journal_worker.net -> Journal_worker.net)
+    -> (Logseq_db_worker.Config.t, request, response, push) Journal_worker.Service.t
+end
+
 (** Fixed operation, phase and display text for an internal diagnostic signal.
     Unknown signals use a safe fallback without displaying the input. *)
 val diagnostic_report : string -> string * string * string

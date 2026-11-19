@@ -796,7 +796,9 @@ let apply_manager_state ~discard state (manager_state : Graph_service.state) =
     | None | Some _ -> state
   in
   let state =
-    if owner_changed then (
+    if owner_changed
+       || Option.bind state.manager (fun manager -> manager.selected_graph) <> snapshot.selected_graph
+    then (
       let forget graph_id copies = Option.fold ~none:copies
         ~some:(fun id -> Local_copies.remove (Logseq_db_types.Graph_types.Uuid.to_string id) copies) graph_id in
       let copies = forget (Option.bind state.manager (fun manager -> manager.selected_graph)) state.local_copies in
