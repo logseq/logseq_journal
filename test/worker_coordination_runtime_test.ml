@@ -2954,6 +2954,11 @@ let test_changefeed_business_waits_for_ui_application () =
     and fail_budget_once = ref false
     and saw_failure = ref false in
     let more_seen = ref false in
+    let latest_notice = ref None in
+    let hold_change_root = ref false in
+    let held_change_root = ref None in
+    let accepted_change_roots = ref 0 in
+    let pending_change_roots = ref 0 in
     let active = ref false
     and notices = ref 0
     and generation = ref 1000L
@@ -3014,13 +3019,24 @@ let test_changefeed_business_waits_for_ui_application () =
           Host.plan_query host ~owner ~maximum_items ~maximum_bytes read.query
           |> Result.get_ok
         in
+        (match read.query with W.Changes _ -> incr pending_change_roots | _ -> ());
         Host.watch_read host ticket ~f:(fun origin reply ->
           match reply with
           | W.Answered (Ok value) ->
-            finished request application origin (Journal_graph_runtime.Query_result(read.query,value))
+            let complete () =
+              finished request application origin (Journal_graph_runtime.Query_result(read.query,value));
+              (match read.query with W.Changes _ -> decr pending_change_roots | _ -> ())
+            in
+            (match read.query with
+             | W.Changes _ when !hold_change_root ->
+               hold_change_root := false;
+               held_change_root := Some complete
+             | _ -> complete ())
           | W.Answered (Error (W.Stale_read _)) ->
-            finished request application origin Business.Changes_retired
+            finished request application origin Business.Changes_retired;
+            (match read.query with W.Changes _ -> decr pending_change_roots | _ -> ())
           | W.Answered (Error W.Response_budget_exceeded) when !expected_failure ->
+            (match read.query with W.Changes _ -> decr pending_change_roots | _ -> ());
             finished
               request
               application
@@ -3089,6 +3105,7 @@ let test_changefeed_business_waits_for_ui_application () =
                  ~request_id:request
                  token)
               "business application root was not owned";
+            incr accepted_change_roots;
             batch := Some value;
             Some token, false)
         | _ -> application, false
@@ -3140,6 +3157,7 @@ let test_changefeed_business_waits_for_ui_application () =
     (process_notice
      := fun notice ->
           if Result.is_ok(Host.validate_session host ~owner notice.W.notice_session) then (
+            latest_notice := Some notice;
             incr notices;
             generation := Int64.succ !generation;
             deliver (Business.reconcile_signal business ~request_generation:!generation notice.notice)));
@@ -3255,12 +3273,25 @@ let test_changefeed_business_waits_for_ui_application () =
     wait(fun()-> !ui_title=Some "Unrelated target change");
     expected_failure := true;
     fail_budget_once := true;
+    let accepted_before = !accepted_change_roots in
     write 4 "Business change D";
     wait (fun () ->
       !saw_failure && Option.exists(fun value->C.change_application_error(Host.view host)value<>None)!batch);
     let failed_batch=Option.get !batch in
     require(not(Hashtbl.mem acknowledged_batches failed_batch.through))
       "an actual failed read acknowledged its unapplied window";
+    hold_change_root := true;
+    generation := Int64.succ !generation;
+    deliver
+      (Business.reconcile_signal business ~request_generation:!generation
+         (Option.get !latest_notice).notice);
+    wait (fun () -> Option.is_some !held_change_root);
+    let complete_root = Option.get !held_change_root in
+    held_change_root := None;
+    Queue.add complete_root jobs;
+    wait (fun () -> !accepted_change_roots > accepted_before && !pending_change_roots = 0);
+    require(not(Hashtbl.mem acknowledged_batches failed_batch.through))
+      "root settlement acknowledged the failed UI application";
     active := false;
     ui_title := None;
     detail_loaded := false;
