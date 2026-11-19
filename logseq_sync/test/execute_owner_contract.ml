@@ -176,6 +176,46 @@ let queued_write_rechecks () =
     Alcotest.(check int) "rejected before mutation" 0 !effects)
 ;;
 
+let observation_during_open ~fails () =
+  Eio.Switch.run (fun sw ->
+    let entered, resolve_entered = Eio.Promise.create () in
+    let resume, resolve_resume = Eio.Promise.create () in
+    let owner, _, commits, _, opens =
+      fixture
+        ~open_committed:(fun () ->
+          Eio.Promise.resolve resolve_entered ();
+          Eio.Promise.await resume;
+          if fails then Error (D.Storage_failure "synthetic open failed") else Ok 41)
+        ()
+    in
+    let activation =
+      Eio.Fiber.fork_promise ~sw (fun () ->
+        Binding.activate owner ~check_current:current ())
+    in
+    Eio.Promise.await entered;
+    let observation =
+      Eio.Fiber.fork_promise ~sw (fun () -> Binding.database_if_open owner)
+    in
+    Eio.Fiber.yield ();
+    let premature = Eio.Promise.is_resolved observation in
+    Eio.Promise.resolve resolve_resume ();
+    let activated = Eio.Promise.await_exn activation in
+    let observed = Eio.Promise.await_exn observation in
+    Alcotest.(check bool) "observation waits for activation owner" false premature;
+    if fails
+    then (
+      check_error (D.Storage_failure "synthetic open failed") activated;
+      check_error (D.Storage_failure "Committed mirror requires open recovery") observed)
+    else (
+      Alcotest.(check int) "activation" 41 (require_ok activated);
+      Alcotest.(check (option int))
+        "observed active owner"
+        (Some 41)
+        (require_ok observed));
+    Alcotest.(check int) "one commit" 1 !commits;
+    Alcotest.(check int) "one open" 1 !opens)
+;;
+
 let differing_activation_rejected () =
   let preparations = ref 0 in
   let backend : (int, int, string, int) Binding.backend =
@@ -196,18 +236,23 @@ let differing_activation_rejected () =
 ;;
 
 let () =
-  Eio_main.run (fun _ ->
+  Eio_main.run (fun environment ->
     Alcotest.run
       "Execute owner binding"
       [ ( "binding"
         , List.map
-            (fun (name, test) -> Alcotest.test_case name `Quick test)
+            (fun (name, test) ->
+               Alcotest.test_case name `Quick (fun () ->
+                 Eio.Time.with_timeout_exn (Eio.Stdenv.clock environment) 5. test))
             [ "absent reads are local", absent_rejects_reads
             ; "activation installs exactly once", activated_once
             ; "revocation after preparation", revoked_during_prepare
             ; "open recovery preserves commit", recover_open_without_recommit
             ; "revoked open retains original binding", revoked_during_open_keeps_binding
             ; "sole queue checks after suspension", queued_write_rechecks
+            ; "observation waits for committed open", observation_during_open ~fails:false
+            ; ( "failed committed open remains an error"
+              , observation_during_open ~fails:true )
             ; "different activation proof rejects", differing_activation_rejected
             ] )
       ])

@@ -27,10 +27,11 @@ let absent inspection backend =
 ;;
 
 let database_if_open owner =
-  match owner.state with
-  | Active (database, _) -> Ok (Some database)
-  | Absent _ -> Ok None
-  | Committed _ -> Error (Dsl.Storage_failure "Committed mirror requires open recovery")
+  Eio.Mutex.use_rw ~protect:false owner.queue (fun () ->
+    match owner.state with
+    | Active (database, _) -> Ok (Some database)
+    | Absent _ -> Ok None
+    | Committed _ -> Error (Dsl.Storage_failure "Committed mirror requires open recovery"))
 ;;
 
 let database owner =
