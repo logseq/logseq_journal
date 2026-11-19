@@ -248,7 +248,11 @@ let on_message t entry wire =
           pulse entry)
         else terminal entry (Dsl.Protocol_failure "Unmatched hello response")
       | Ok (Changed { t = through }) ->
-        notify t entry (Dsl.Remote_changed { through; snapshot_available = true })
+        notify
+          t
+          entry
+          (Dsl.Remote_changed
+             { through; snapshot_available = true; expected_checksum = None })
       | Ok (Error _) ->
         terminal entry (Dsl.Protocol_failure "Remote server error");
         notify t entry (Dsl.Remote_error "Remote server error")

@@ -137,6 +137,9 @@ type snapshot =
 
 type _ database =
   | Inspect : Overlay.Types.sync_view database
+  | Verify_checksum :
+      Overlay.Types.server_cursor * Overlay.Types.checksum
+      -> unit database
   | Prepare_submission :
       Overlay.Types.sync_token * Overlay.Types.outbox_transition
       -> Overlay.Types.outbox_commit database
@@ -149,6 +152,7 @@ type _ database =
 type remote_head =
   { through : Overlay.Types.server_cursor
   ; snapshot_available : bool
+  ; expected_checksum : Overlay.Types.checksum option
   }
 
 type pull_result =
@@ -156,6 +160,7 @@ type pull_result =
   | No_progress of
       { since : Overlay.Types.server_cursor
       ; through : Overlay.Types.server_cursor
+      ; expected_checksum : Overlay.Types.checksum option
       }
 
 type submission_reply =
@@ -1063,7 +1068,7 @@ let rec apply_batch config connection batch =
        apply_batch config connection batch)
 ;;
 
-let pull_once config connection view =
+let pull_once ?head config connection view =
   let since = checkpoint view in
   let* pulled = request connection (Pull since) in
   match pulled with
@@ -1071,17 +1076,54 @@ let pull_once config connection view =
     if Cursor.compare (Types.authoritative_batch_through batch) since <= 0
     then task_fail (Protocol_failure "non-advancing authoritative batch")
     else
+      let* batch =
+        match head with
+        | Some head
+          when Cursor.equal head.through (Types.authoritative_batch_through batch) ->
+          (match head.expected_checksum, Types.authoritative_batch_checksum batch with
+           | Some expected, Some actual when not (Types.Checksum.equal expected actual) ->
+             task_fail (Protocol_failure "Conflicting remote checkpoint checksums")
+           | Some expected, None ->
+             let transactions = Types.authoritative_batch_transactions batch in
+             let bytes =
+               List.fold_left
+                 (fun total transaction ->
+                    total
+                    + Types.encoded_transaction_byte_length
+                        (Types.authoritative_transaction_payload transaction))
+                 0
+                 transactions
+             in
+             (match
+                Types.authoritative_batch
+                  ~maximum_count:(List.length transactions)
+                  ~maximum_bytes:bytes
+                  ~transactions
+                  ~through:head.through
+                  ~checksum:(Some expected)
+              with
+              | Ok batch -> task_return batch
+              | Error _ -> task_fail (Protocol_failure "Invalid authoritative batch"))
+           | None, _ | Some _, Some _ -> task_return batch)
+        | None | Some _ -> task_return batch
+      in
       let* () = apply_batch config connection batch in
       task_return (Types.authoritative_batch_through batch)
   | No_progress report ->
     if (not (Cursor.equal report.since since)) || Cursor.compare report.through since < 0
     then task_fail (Protocol_failure "invalid no-progress baseline")
     else
+      let* () =
+        match report.expected_checksum with
+        | Some expected when Cursor.equal report.through since ->
+          task_effect (Task_database (Verify_checksum (report.through, expected)))
+        | None | Some _ -> task_return ()
+      in
       let* () = task_effect (Sleep config.no_progress_seconds) in
       task_return report.through
 ;;
 
-let send_batch config connection batch =
+let send_batch ?head config connection batch =
   let* outcome = capture_task (request connection (Push batch)) in
   match outcome with
   | Ok reply ->
@@ -1098,11 +1140,20 @@ let send_batch config connection batch =
     task_return target
   | Error (Outcome_unknown _) ->
     let* view = inspect () in
-    pull_once config connection view
+    pull_once ?head config connection view
   | Error error -> task_fail error
 ;;
 
-let rec round config connection target check =
+let verify_head_checksum head ~through ~checksum =
+  match head.expected_checksum with
+  | Some expected
+    when Cursor.equal head.through through
+         && not (String.equal (Types.Checksum.to_string expected) checksum) ->
+    task_fail (Protocol_failure "Remote checkpoint checksum mismatch")
+  | None | Some _ -> task_return ()
+;;
+
+let rec round config connection head target check =
   let* inspected = capture_task (inspect ()) in
   let* view =
     match inspected with
@@ -1122,23 +1173,29 @@ let rec round config connection target check =
     | None -> task_return ()
     | Some check -> task_effect (Acknowledge_outbox_check check)
   in
+  let* () =
+    match head.expected_checksum with
+    | Some expected when Cursor.equal head.through (checkpoint view) ->
+      task_effect (Task_database (Verify_checksum (head.through, expected)))
+    | None | Some _ -> task_return ()
+  in
   match recovery with
   | Some batch_id ->
     let* batch = frozen_batch view (Types.Retry_group batch_id) in
-    let* through = send_batch config connection batch in
+    let* through = send_batch ~head config connection batch in
     let* () = task_effect Yield in
-    round config connection (greatest target through) None
+    round config connection head (greatest target through) None
   | None when Cursor.compare (checkpoint view) target < 0 ->
-    let* through = pull_once config connection view in
+    let* through = pull_once ~head config connection view in
     let* () = task_effect Yield in
-    round config connection (greatest target through) None
+    round config connection head (greatest target through) None
   | None ->
     (match fresh with
      | Some descriptor ->
        let* batch = frozen_batch view (Types.Submit_group [ descriptor.mutation_id ]) in
-       let* through = send_batch config connection batch in
+       let* through = send_batch ~head config connection batch in
        let* head = request connection Head in
-       round config connection (greatest through (greatest target head.through)) None
+       round config connection head (greatest through (greatest target head.through)) None
      | None ->
        let unsettled =
          List.exists
@@ -1151,8 +1208,8 @@ let rec round config connection target check =
        in
        if unsettled
        then
-         let* through = pull_once config connection view in
-         round config connection (greatest target through) None
+         let* through = pull_once ~head config connection view in
+         round config connection head (greatest target through) None
        else task_return (checkpoint view))
 ;;
 
@@ -1173,7 +1230,10 @@ let rec activate_initial config connection head =
     let* activation =
       capture_task
         (let* () = task_effect (Acknowledge_outbox_check check) in
-         capacity_task_effect (Task_database (Activate_snapshot staged)))
+         let* () =
+           verify_head_checksum head ~through:staged.through ~checksum:staged.checksum
+         in
+         task_effect (Task_database (Activate_snapshot staged)))
     in
     let* activation =
       finalize activation (task_effect (Task_database (Release_snapshot staged)))
@@ -1507,7 +1567,7 @@ let schedule config scope state =
              in
              let task =
                let* () = activate_initial config connection head in
-               mapped (round config connection target state.checked) (fun cursor ->
+               mapped (round config connection head target state.checked) (fun cursor ->
                  Policy_round cursor)
              in
              let* next = add_job scope state Round_job task in

@@ -21,10 +21,10 @@ let identity =
 
 let cursor = Result.get_ok (Logseq_overlay_db.Types.Server_cursor.of_int64 3L)
 
-let limits =
+let limits_with_items maximum_items =
   get
     (D.limits
-       ~maximum_items:1024
+       ~maximum_items
        ~maximum_bytes:1048576
        ~maximum_pending:8
        ~maximum_resources:8
@@ -44,6 +44,8 @@ let limits =
        ~snapshot_staging_budget_bytes:33554432L
        ~snapshot_scratch_budget_bytes:33554432L)
 ;;
+
+let limits = limits_with_items 1024
 
 let scope : C.scope =
   { check_current = (fun () -> Ok ()); admit_network = (fun () -> Ok ()) }
@@ -436,7 +438,7 @@ let native_snapshot layers () =
   check_retired report
 ;;
 
-let remote_graph_fixture () =
+let remote_graph_fixture ?(protected_titles = []) () =
   with_directory (fun root ->
     let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
     let attribute : Datascript.schema_attr =
@@ -476,6 +478,20 @@ let remote_graph_fixture () =
                4
                "logseq.kv/schema-version"
                (Map [ Keyword "major", Int64 65L; Keyword "minor", Int64 33L ])
+           ; (if protected_titles = []
+              then []
+              else kv 5 "logseq.kv/graph-rtc-e2ee?" (Bool true))
+           ; List.concat
+               (List.mapi
+                  (fun index title ->
+                     let entity = 100 + index in
+                     [ fact
+                         entity
+                         "block/uuid"
+                         (Uuid (Printf.sprintf "70000000-0000-4000-8000-%012d" index))
+                     ; fact entity "block/title" (String title)
+                     ])
+                  protected_titles)
            ])
     in
     let path = Filename.concat root "db.sqlite" in
@@ -499,7 +515,7 @@ let remote_graph_fixture () =
         (Logseq_overlay_db.Database.inspect_snapshot_storage
            ~check_current:(fun () -> ())
            ~scratch_bytes:33554432L
-           ~encrypted:false
+           ~encrypted:(protected_titles <> [])
            ~path)
     in
     let sqlite = Sqlite3.db_open path in
@@ -533,7 +549,179 @@ let remote_graph_fixture () =
     Bytes.to_string prefix ^ payload, List.length !rows, checksum)
 ;;
 
-let native_service_bootstrap () =
+let encrypted_snapshot_activation () =
+  let module Crypto = Logseq_sync_crypto.Core in
+  let module Owner = Logseq_sync_execute_owners.Database_owner in
+  let module Database = Logseq_overlay_db.Database in
+  let module Types = Logseq_overlay_db.Types in
+  let module Aes = Mirage_crypto.AES.GCM in
+  let backend : Crypto.backend =
+    { unlock = (fun ~identity:_ ~wrapped_graph_key:_ -> Ok (String.make 32 'k'))
+    ; crypto =
+        { encrypt_aes_gcm =
+            (fun ~key ~plaintext ->
+              let iv = String.make 12 'i' in
+              Ok
+                (iv, Aes.authenticate_encrypt ~key:(Aes.of_secret key) ~nonce:iv plaintext))
+        ; decrypt_aes_gcm =
+            (fun ~key ~iv ~ciphertext ->
+              match
+                Aes.authenticate_decrypt ~key:(Aes.of_secret key) ~nonce:iv ciphertext
+              with
+              | Some plaintext -> Ok plaintext
+              | None -> Error "Synthetic authentication failure")
+        }
+    }
+  in
+  let crypto_limits = limits_with_items 2 in
+  let crypto = Crypto.create ~identity ~limits:crypto_limits ~encrypted:true ~backend in
+  let run operation =
+    Crypto.run crypto ~identity ~check_current:(fun () -> Ok ()) operation
+  in
+  Fun.protect
+    ~finally:(fun () -> Crypto.retire crypto)
+    (fun () ->
+       ignore (get (run (D.Unlock (get (D.unlock_input ~wrapped_graph_key:"synthetic")))));
+       let titles =
+         List.init 5 (fun index -> Printf.sprintf "Synthetic title %d" index)
+       in
+       let protected_titles =
+         List.map
+           (fun title ->
+              let plaintext =
+                Transit_native.Transit.Json.to_string (Transit_core.Json.String title)
+              in
+              let iv, ciphertext =
+                List.hd
+                  (Rrbvec.to_list
+                     (get (run (D.Encrypt_values (Rrbvec.singleton plaintext)))))
+              in
+              Transit_native.Transit.Json.to_string
+                (Transit_core.Json.Array [ Binary iv; Binary ciphertext ]))
+           titles
+       in
+       let wire, rows, _ = remote_graph_fixture ~protected_titles () in
+       with_owner ~encrypted:true ~wire ~rows (fun root owner _ _ _ ->
+         Eio.Switch.run (fun sw ->
+           let snapshot = get (acquire owner (fun _ -> Ok ())) in
+           let source = get (S.source owner snapshot) in
+           let dependencies =
+             Result.get_ok
+               (Database.dependencies
+                  ~epoch_ms:(fun () -> 0L)
+                  ~monotonic_ns:Mtime_clock.elapsed_ns
+                  ~limits:
+                    { Types.response_budget_bytes = 1048576
+                    ; outbox_max_records = 32
+                    ; outbox_max_bytes = 4194304
+                    ; change_max_items = 1024
+                    ; change_max_bytes = 1048576
+                    ; dispatcher_capacity = 32
+                    ; wire_batch_max_bytes = 1048576
+                    })
+           in
+           let inspection =
+             Result.get_ok
+               (Database.inspect_mirror
+                  ~application_support_directory:root
+                  ~graph_id:
+                    (Result.get_ok
+                       (Logseq_db_types.Graph_types.Uuid.of_string identity.graph)))
+           in
+           let binding =
+             Owner.activation_owner
+               ~sw
+               ~dependencies
+               ~inspection
+               ~graph_name:"Encrypted synthetic"
+           in
+           let batches = ref [] in
+           let unprotect request =
+             batches
+             := List.length (Database.unprotection_ciphertexts request) :: !batches;
+             run (D.Unprotect request)
+           in
+           (match
+              Owner.activate_snapshot
+                binding
+                ~check_current:(fun () -> Ok ())
+                { snapshot
+                ; path = source.path
+                ; expected_rows = source.expected_rows
+                ; maximum_crypto_items = 1024
+                ; maximum_crypto_bytes = crypto_limits.maximum_bytes
+                ; unprotect
+                }
+            with
+            | Error (D.Capacity_exceeded "Crypto items") -> ()
+            | _ ->
+              Alcotest.fail
+                "unbounded snapshot must reproduce the crypto capacity rejection");
+           Alcotest.(check bool)
+             "rejected activation stays absent"
+             true
+             (get (Owner.database_if_open binding) = None);
+           batches := [];
+           ignore
+             (get
+                (Owner.activate_snapshot
+                   binding
+                   ~check_current:(fun () -> Ok ())
+                   { snapshot
+                   ; path = source.path
+                   ; expected_rows = source.expected_rows
+                   ; maximum_crypto_items = crypto_limits.maximum_items
+                   ; maximum_crypto_bytes = crypto_limits.maximum_bytes
+                   ; unprotect =
+                       (fun request ->
+                         batches
+                         := List.length (Database.unprotection_ciphertexts request)
+                            :: !batches;
+                         run (D.Unprotect request))
+                   }));
+           let database = get (Owner.database binding) in
+           Fun.protect
+             ~finally:(fun () -> ignore (Database.close database))
+             (fun () ->
+                Alcotest.(check (list int)) "bounded crypto batches" [ 1; 2; 2 ] !batches;
+                let expected =
+                  Result.get_ok (Types.Checksum.of_string snapshot.checksum)
+                in
+                Alcotest.(check (option bool))
+                  "actual authoritative checksum"
+                  (Some true)
+                  (Result.get_ok
+                     (Database.check_checkpoint_checksum
+                        database
+                        ~through:cursor
+                        ~expected));
+                let wrong =
+                  Result.get_ok (Types.Checksum.of_string "checksum:v1:ffffffffffffffff")
+                in
+                Alcotest.(check (option bool))
+                  "same cursor rejects wrong checksum"
+                  (Some false)
+                  (Result.get_ok
+                     (Database.check_checkpoint_checksum
+                        database
+                        ~through:cursor
+                        ~expected:wrong));
+                Alcotest.(check (option bool))
+                  "different cursor has no checksum comparison"
+                  None
+                  (Result.get_ok
+                     (Database.check_checkpoint_checksum
+                        database
+                        ~through:(Result.get_ok (Types.Server_cursor.of_int64 4L))
+                        ~expected:wrong));
+                let view = Result.get_ok (Database.inspect_sync database) in
+                Alcotest.(check int64)
+                  "activated checkpoint"
+                  3L
+                  (Types.Server_cursor.to_int64 (Types.sync_view_checkpoint view))))))
+;;
+
+let native_service_bootstrap ?(checksum_mode = `Valid) () =
   let module App = Journal_sync_lifecycle.Core in
   let module X = Execute.Core in
   let module Database = Logseq_overlay_db.Database in
@@ -555,7 +743,18 @@ let native_service_bootstrap () =
   let hello =
     Result.get_ok
       (Protocol.encode_server_message
-         (Protocol.Server.Hello { t = cursor; checksum = Some wire_checksum }))
+         (Protocol.Server.Hello
+            { t = cursor
+            ; checksum =
+                (match checksum_mode with
+                 | `Valid -> Some wire_checksum
+                 | `Invalid ->
+                   Some
+                     (if wire_checksum = "ffffffffffffffff"
+                      then "0000000000000000"
+                      else "ffffffffffffffff")
+                 | `Missing -> None)
+            }))
   in
   let frame =
     String.make 1 (Char.chr 0x81) ^ String.make 1 (Char.chr (String.length hello)) ^ hello
@@ -663,29 +862,44 @@ let native_service_bootstrap () =
               Fun.protect
                 ~finally:(fun () -> App.close service)
                 (fun () ->
-                   Tls_peer.wait (Eio.Stdenv.clock environment) (fun () ->
-                     (match !errors with
-                      | D.Activation_failure (Types.Snapshot_parse_error message) :: _ ->
-                        Alcotest.fail ("Activation parse: " ^ message)
-                      | D.Activation_failure Types.Snapshot_limit_exceeded :: _ ->
-                        Alcotest.fail "Activation limit exceeded"
-                      | D.Activation_failure
-                          (Types.Snapshot_commit_persistence_failed message)
-                        :: _ -> Alcotest.fail ("Activation persistence: " ^ message)
-                      | error :: _ -> Alcotest.fail (D.error_message error)
-                      | [] -> ());
-                     Option.is_some
-                       (get (X.database_if_open (App.database_owner service))));
-                   let database = get (X.database (App.database_owner service)) in
-                   let view = Result.get_ok (Database.inspect_sync database) in
-                   Alcotest.(check int64)
-                     "native service activates exact server checkpoint"
-                     3L
-                     (Types.sync_view_checkpoint view |> Types.Server_cursor.to_int64);
-                   Alcotest.(check int)
-                     "bootstrap subscription errors"
-                     0
-                     (List.length !errors))))
+                   if checksum_mode = `Invalid
+                   then (
+                     Tls_peer.wait (Eio.Stdenv.clock environment) (fun () ->
+                       !errors <> []
+                       || Option.is_some
+                            (get (X.database_if_open (App.database_owner service))));
+                     Alcotest.(check bool)
+                       "checksum mismatch blocks before activation"
+                       true
+                       (!errors <> []);
+                     Alcotest.(check bool)
+                       "invalid snapshot remains absent"
+                       true
+                       (get (X.database_if_open (App.database_owner service)) = None))
+                   else (
+                     Tls_peer.wait (Eio.Stdenv.clock environment) (fun () ->
+                       (match !errors with
+                        | D.Activation_failure (Types.Snapshot_parse_error message) :: _
+                          -> Alcotest.fail ("Activation parse: " ^ message)
+                        | D.Activation_failure Types.Snapshot_limit_exceeded :: _ ->
+                          Alcotest.fail "Activation limit exceeded"
+                        | D.Activation_failure
+                            (Types.Snapshot_commit_persistence_failed message)
+                          :: _ -> Alcotest.fail ("Activation persistence: " ^ message)
+                        | error :: _ -> Alcotest.fail (D.error_message error)
+                        | [] -> ());
+                       Option.is_some
+                         (get (X.database_if_open (App.database_owner service))));
+                     let database = get (X.database (App.database_owner service)) in
+                     let view = Result.get_ok (Database.inspect_sync database) in
+                     Alcotest.(check int64)
+                       "native service activates exact server checkpoint"
+                       3L
+                       (Types.sync_view_checkpoint view |> Types.Server_cursor.to_int64);
+                     Alcotest.(check int)
+                       "bootstrap subscription errors"
+                       0
+                       (List.length !errors)))))
   in
   check_retired report
 ;;
@@ -1219,7 +1433,13 @@ let native_error_cause kind () =
 
 let () =
   let tests =
-    [ "App owned native absent mirror bootstrap", native_service_bootstrap
+    [ ( "encrypted native snapshot activation respects crypto bounds"
+      , encrypted_snapshot_activation )
+    ; ("App owned native absent mirror bootstrap", fun () -> native_service_bootstrap ())
+    ; ( "native bootstrap rejects wrong Hello checksum"
+      , fun () -> native_service_bootstrap ~checksum_mode:`Invalid () )
+    ; ( "native bootstrap accepts missing Hello checksum"
+      , fun () -> native_service_bootstrap ~checksum_mode:`Missing () )
     ; "encryption metadata rejects and cleans", encryption_failure
     ; "actual framed artifact and original ledger", success
     ; "metadata rejects before download", metadata_failure

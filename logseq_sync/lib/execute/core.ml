@@ -1375,6 +1375,15 @@ let perform_database : type a. t -> unit ref -> a Dsl.database -> (a, Dsl.error)
           > t.limits.maximum_items
         then Error (Dsl.Invalid_input "Sync view items")
         else Ok view)
+  | Dsl.Verify_checksum (through, expected) ->
+    with_database (fun database ->
+      match
+        Dsl.Overlay.Database.check_checkpoint_checksum database ~through ~expected
+      with
+      | Error error -> Error (Dsl.Sync_read_failure error)
+      | Ok (Some false) ->
+        Error (Dsl.Protocol_failure "Remote checkpoint checksum mismatch")
+      | Ok (Some true | None) -> Ok ())
   | Dsl.Prepare_submission (expected, transition) ->
     let* prepared, request =
       with_database (fun database ->
@@ -1441,6 +1450,8 @@ let perform_database : type a. t -> unit ref -> a Dsl.database -> (a, Dsl.error)
         { snapshot
         ; path = source.path
         ; expected_rows = source.expected_rows
+        ; maximum_crypto_items = t.limits.maximum_items
+        ; maximum_crypto_bytes = t.limits.maximum_bytes
         ; unprotect = (fun request -> perform_crypto t token (Dsl.Unprotect request))
         }
     in

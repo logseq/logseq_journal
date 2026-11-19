@@ -7,6 +7,8 @@ type activation_input =
   { snapshot : Dsl.snapshot
   ; path : string
   ; expected_rows : int
+  ; maximum_crypto_items : int
+  ; maximum_crypto_bytes : int
   ; unprotect :
       Overlay.Database.unprotection_request
       -> ((Overlay.Types.crypto_item_id * string) list, Dsl.error) result

@@ -341,7 +341,11 @@ let pull_validation () =
     (fun _ run _ _ _ _ _ _ _ ->
        let connection = get (run.run D.Connect) in
        (match get (run.run (D.On_connection (connection, D.Pull (cursor 1L)))) with
-        | D.No_progress { since; through } ->
+        | D.No_progress { since; through; expected_checksum } ->
+          Alcotest.(check bool)
+            "missing checksum remains optional"
+            true
+            (Option.is_none expected_checksum);
           Alcotest.(check int64)
             "no progress baseline"
             1L
@@ -351,6 +355,15 @@ let pull_validation () =
             3L
             (O.Server_cursor.to_int64 through)
         | _ -> Alcotest.fail "Expected No_progress");
+       response
+       := P.Server.Pull_ok { t = cursor 3L; checksum = Some "0123456789abcdef"; txs = [] };
+       (match get (run.run (D.Pull (cursor 1L))) with
+        | D.No_progress { expected_checksum = Some expected; _ } ->
+          Alcotest.(check string)
+            "empty Pull retains checksum"
+            "checksum:v1:0123456789abcdef"
+            (O.Checksum.to_string expected)
+        | _ -> Alcotest.fail "Expected No_progress checksum");
        response
        := P.Server.Pull_ok
             { t = cursor 3L
