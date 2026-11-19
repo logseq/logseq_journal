@@ -17,6 +17,10 @@ val absent
   -> ('database, 'inspection, 'input, 'prepared) backend
   -> ('database, 'inspection, 'input, 'prepared) t
 
+val database_if_open
+  :  ('database, 'inspection, 'input, 'prepared) t
+  -> ('database option, Dsl.error) result
+
 val database
   :  ('database, 'inspection, 'input, 'prepared) t
   -> ('database, Dsl.error) result

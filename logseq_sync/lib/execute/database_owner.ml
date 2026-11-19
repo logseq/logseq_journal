@@ -30,6 +30,7 @@ type t =
     Owner_binding.t
 
 let database_owner = Owner_binding.active
+let database_if_open = Owner_binding.database_if_open
 let database = Owner_binding.database
 let with_database = Owner_binding.with_database
 

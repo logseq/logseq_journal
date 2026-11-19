@@ -60,7 +60,7 @@ let test_scoped_authentication_preserves_identity () =
   require (Journal_platform.decode_authenticated_user packet = Ok (Some "synthetic-user"))
     "native scoped authentication loses its verified user";
   require (Journal_platform.decode_authenticated_scope packet =
-    Ok {Logseq_sync_pure_reducer.Core.account_generation=1; presentation_generation=2})
+    Ok {Logseq_sync_domain.Core.account_generation=1; presentation_generation=2})
     "native scoped authentication loses its startup identity"
 ;;
 

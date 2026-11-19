@@ -1,0 +1,7 @@
+(library
+ (name logseq_sync_native_transport)
+ (public_name logseq_sync.native_transport)
+ (modules transport_domain transport_time tls_client_eio websocket_eio http http_eio snapshot_artifact artifact_decoder snapshot_parser snapshot_checksum snapshot_verify)
+ (foreign_stubs (language c) (names gzip_stubs))
+ (libraries yojson logseq_overlay_db melange-transit-core melange-transit-native sqlite3 bigstringaf cstruct digestif domain-name eio eio.unix faraday httpun httpun-eio httpun-ws mtime logseq_db_types logseq_sync.native_crypto mirage-crypto-rng mirage-crypto-rng.unix tls tls-eio unix uri x509)
+ (flags (:standard -open Logseq_db_types)))

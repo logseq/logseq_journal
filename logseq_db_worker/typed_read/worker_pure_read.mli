@@ -40,8 +40,8 @@ val graph_id : session -> Uuid.t
 val equal_session : session -> session -> bool
 val compare_session : session -> session -> int
 val same_logical_graph : session -> session -> bool
-val matches_scope : session -> Logseq_sync_pure_reducer.Core.timeline_scope -> bool
-val matches_asset_scope : session -> Logseq_sync_pure_reducer.Core.graph_scope -> bool
+val matches_scope : session -> Logseq_sync_domain.Core.timeline_scope -> bool
+val matches_asset_scope : session -> Logseq_sync_domain.Core.graph_scope -> bool
 
 val worker_incarnation
   :  runtime_epoch:Journal_worker_ids.Runtime.epoch
@@ -363,13 +363,13 @@ module For_worker : sig
   val binding_serial : binding -> int64
   val binding_origin : binding -> string
   val binding_user : binding -> string
-  val session : binding:binding -> graph:Uuid.t -> account:int -> lifecycle:int64 -> generation:int -> scope:Logseq_sync_pure_reducer.Core.timeline_scope -> asset_scope:Logseq_sync_pure_reducer.Core.graph_scope -> limits:Worker_pure_data.capability_limits -> session
+  val session : binding:binding -> graph:Uuid.t -> account:int -> lifecycle:int64 -> generation:int -> scope:Logseq_sync_domain.Core.timeline_scope -> asset_scope:Logseq_sync_domain.Core.graph_scope -> limits:Worker_pure_data.capability_limits -> session
   val session_binding : session -> binding
   val session_account : session -> int
   val session_lifecycle : session -> int64
   val session_generation : session -> int
-  val session_scope : session -> Logseq_sync_pure_reducer.Core.timeline_scope
-  val session_asset_scope : session -> Logseq_sync_pure_reducer.Core.graph_scope
+  val session_scope : session -> Logseq_sync_domain.Core.timeline_scope
+  val session_asset_scope : session -> Logseq_sync_domain.Core.graph_scope
   val session_limits : session -> Worker_pure_data.capability_limits
   val read_budget : owner:session -> maximum_items:int -> maximum_bytes:int -> read_budget
   val read_budget_owner : read_budget -> session

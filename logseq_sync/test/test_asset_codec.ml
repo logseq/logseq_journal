@@ -1,4 +1,4 @@
-module C = Logseq_sync_effect_runner.Asset_codec
+module C = Logseq_sync_native_crypto.Asset_codec
 module T = Transit_native.Transit.Json
 
 let get = function

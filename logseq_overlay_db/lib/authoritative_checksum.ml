@@ -157,11 +157,12 @@ let entities_with_uuid db =
 
 let hex32 value = Printf.sprintf "%08lx" value
 
-let recompute ~e2ee db =
+let recompute ?(check_current = fun () -> ()) ~e2ee db =
   let state =
     entities_with_uuid db
     |> List.fold_left
          (fun state entity ->
+            check_current ();
             if not (eligible db entity)
             then state
             else

@@ -117,8 +117,10 @@ let require_documentation_only_guide root relative =
     ];
   require_file root relative;
   let candidate = path root relative in
-  if Sys.file_exists candidate && not (Sys.is_directory candidate)
-     && not (is_single_documentation_comment (read_file candidate))
+  if
+    Sys.file_exists candidate
+    && (not (Sys.is_directory candidate))
+    && not (is_single_documentation_comment (read_file candidate))
   then fail "execution guide must contain only one odoc comment: %s" relative
 ;;
 
@@ -206,9 +208,12 @@ let test_no_jane_street_core_or_base_dependency root =
   require_text root "app/dune" [ "\n  mtime.clock\n" ];
   forbid_text root "dune-project" [ "(core ("; "(base (" ];
   require_text root "dune-project" [ "(mtime (= 2.1.0))" ];
-  List.iter (fun relative -> forbid_text root relative [ "\"core\" {"; "\"base\" {" ])
-    [ "logseq_journal.opam"; "logseq_journal.opam.locked"
-    ; "logseq_db_worker.opam.locked" ];
+  List.iter
+    (fun relative -> forbid_text root relative [ "\"core\" {"; "\"base\" {" ])
+    [ "logseq_journal.opam"
+    ; "logseq_journal.opam.locked"
+    ; "logseq_db_worker.opam.locked"
+    ];
   require_text root "logseq_journal.opam" [ "\"mtime\" {= \"2.1.0\"}" ]
 ;;
 
@@ -258,15 +263,7 @@ let test_public_api_only_test_boundaries root =
   in
   List.iter
     (fun relative ->
-       (* The external negative compiler test intentionally names inaccessible
-          paths in rejected source strings, using only public spec CMIs. *)
-       if relative = "logseq_sync/test/test_asset_cache.ml"
-       then
-         forbid_text
-           root
-           relative
-           [ "logseq_sync/lib/effect_runner/."; "logseq_sync/lib/pure_reducer/." ]
-       else if contains_dune_internal_module_path (read_file (path root relative))
+       if contains_dune_internal_module_path (read_file (path root relative))
        then fail "test source names an unexposed Dune module: %s" relative)
     ocaml_files;
   List.concat_map
@@ -274,8 +271,6 @@ let test_public_api_only_test_boundaries root =
     test_roots
   |> List.iter (fun relative ->
     forbid_text root relative [ ".objs/byte"; ".objs/native" ]);
-  require_file root "logseq_sync/test/core_contract.ml";
-  require_file root "logseq_sync/test/runner_contract.ml";
   require_file root "logseq_sync/test/sync_protocol_contract.ml";
   forbid_path root "logseq_sync/test/test_support.ml"
 ;;
@@ -297,10 +292,8 @@ let test_logseq_sync_suite_boundary root =
          ; "logseq_db_worker"
          ])
     sync_test_files;
-  require_text root "logseq_sync/test/test_sync.ml" [ "Alcotest.run" ];
+  require_text root "logseq_sync/test/test_wire_protocol.ml" [ "Alcotest.run" ];
   require_text root "logseq_sync/test/dune" [ "alcotest" ];
-  forbid_text root "logseq_sync/lib/pure_reducer/dune" [ "alcotest" ];
-  forbid_text root "logseq_sync/lib/effect_runner/dune" [ "alcotest" ];
   require_text root "dune-project" [ "(alcotest (and :with-test (= 1.7.0)))" ];
   require_text root "logseq_sync.opam" [ "\"alcotest\" {with-test & = \"1.7.0\"}" ];
   require_text root "logseq_sync.opam.locked" [ "\"alcotest\" {= \"1.7.0\" & with-test}" ];
@@ -334,17 +327,8 @@ let test_logseq_sync_package_boundary root =
     ; "logseq_db_storage/lib/dune"
     ; "logseq_db_storage/lib/sync_checkpoint_store.ml"
     ; "logseq_db_storage/lib/sync_checkpoint_store.mli"
-    ; "logseq_sync/lib/pure_reducer/dune"
-    ; "logseq_sync/lib/pure_reducer/core.ml"
-    ; "logseq_sync/lib/pure_reducer/sync_protocol.ml"
-    ; "logseq_sync/lib/effect_runner/dune"
-    ; "logseq_sync/lib/effect_runner/effect_runner.ml"
-    ; "logseq_sync/lib/effect_runner/platform/platform_crypto.ml"
-    ; "logseq_sync/spec/pure_reducer/dune"
-    ; "logseq_sync/spec/pure_reducer/core.mli"
-    ; "logseq_sync/spec/pure_reducer/sync_protocol.mli"
-    ; "logseq_sync/spec/effect_runner/dune"
-    ; "logseq_sync/spec/effect_runner/effect_runner.mli"
+    ; "logseq_sync/lib/protocol/sync_protocol.ml"
+    ; "logseq_sync/spec/protocol/sync_protocol.mli"
     ];
   List.iter
     (forbid_path root)
@@ -396,20 +380,8 @@ let test_logseq_sync_package_boundary root =
   require_occurrences root "dune-project" "(logseq_overlay_db (= 0.1.0))" 2;
   require_text
     root
-    "logseq_sync/spec/pure_reducer/dune"
-    [ "(name logseq_sync_pure_reducer)"; "(public_name logseq_sync.pure_reducer)" ];
-  require_text
-    root
-    "logseq_sync/spec/effect_runner/dune"
-    [ "(name logseq_sync_effect_runner)"
-    ; "(public_name logseq_sync.effect_runner)"
-    ; "logseq_sync.pure_reducer"
-    ];
-  require_text root "logseq_sync/lib/effect_runner/dune" [ "(private_modules" ];
-  require_text
-    root
     "logseq_db_worker/lib/dune"
-    [ "logseq_overlay_db"; "logseq_sync.pure_reducer" ];
+    [ "logseq_overlay_db"; "execute"; "sync_dsl"; "logseq_sync.domain" ];
   forbid_text root "logseq_db_worker/lib/dune" [ "logseq_db_storage"; "datascript" ];
   require_text root "logseq_db_storage.opam" [ "\"logseq_db_types\" {= \"0.1.0\"}" ];
   require_text root "logseq_sync.opam" [ "\"logseq_overlay_db\" {= \"0.1.0\"}" ];
@@ -467,6 +439,9 @@ let test_logseq_sync_package_boundary root =
          ; "Logseq_db_worker__"
          ; "logseq_db_worker/lib"
          ; "logseq_db_worker.sync_spec"
+         ; "Journal_sync_lifecycle"
+         ; "journal_sync_lifecycle"
+         ; "logseq_journal."
          ])
     (files_with_suffixes root "logseq_sync/lib" [ ".ml"; ".mli"; ".c"; "dune" ]
      @ files_with_suffixes root "logseq_sync/spec" [ ".ml"; ".mli"; "dune" ]);
@@ -486,21 +461,30 @@ let test_logseq_sync_package_boundary root =
     ]
 ;;
 
+let test_removed_sync_api_boundary root =
+  List.iter (forbid_path root)
+    [ "logseq_sync/lib/pure_reducer"; "logseq_sync/spec/pure_reducer"
+    ; "logseq_sync/lib/effect_runner"; "logseq_sync/spec/effect_runner"
+    ; "logseq_sync/test/core_contract.ml"; "logseq_sync/test/runner_contract.ml"
+    ; "logseq_sync/test/test_sync.ml"; "logseq_sync/test/pure_reducer_bad_case_support.ml"
+    ];
+  List.iter
+    (fun directory ->
+       files_with_suffixes root directory [ ".ml"; ".mli"; "dune" ]
+       |> List.filter (fun relative -> relative <> "test/source_boundary_test.ml")
+       |> List.iter (fun relative ->
+         forbid_text root relative
+           [ "Logseq_sync_pure_reducer"; "Logseq_sync_effect_runner"
+           ; "logseq_sync.pure_reducer"; "logseq_sync.effect_runner"
+           ; "logseq_sync_pure_reducer_impl"; "logseq_sync_effect_runner_impl" ]))
+    [ "app"; "logseq_db_worker"; "logseq_sync"; "test" ]
+;;
+
 let test_injected_logseq_sync_api_boundary root =
   List.iter
     (require_file root)
-    [ "logseq_sync/spec/pure_reducer/dune"
-    ; "logseq_sync/spec/pure_reducer/core.mli"
-    ; "logseq_sync/spec/pure_reducer/sync_protocol.mli"
-    ; "logseq_sync/spec/effect_runner/dune"
-    ; "logseq_sync/spec/effect_runner/effect_runner.mli"
-    ; "logseq_sync/lib/pure_reducer/dune"
-    ; "logseq_sync/lib/pure_reducer/sync_protocol.ml"
-    ; "logseq_sync/lib/pure_reducer/core.ml"
-    ; "logseq_sync/lib/effect_runner/dune"
-    ; "logseq_sync/lib/effect_runner/effect_runner.ml"
-    ; "logseq_sync/test/core_contract.ml"
-    ; "logseq_sync/test/runner_contract.ml"
+    [ "logseq_sync/spec/protocol/sync_protocol.mli"
+    ; "logseq_sync/lib/protocol/sync_protocol.ml"
     ];
   List.iter
     (forbid_path root)
@@ -520,62 +504,10 @@ let test_injected_logseq_sync_api_boundary root =
     ];
   require_text
     root
-    "logseq_sync/spec/pure_reducer/dune"
-    [ "(name logseq_sync_pure_reducer)"
-    ; "(public_name logseq_sync.pure_reducer)"
-    ; "(modules core sync_protocol asset_transfer)"
-    ; "(virtual_modules core sync_protocol asset_transfer)"
-    ; "(default_implementation logseq_sync_pure_reducer_impl)"
-    ];
-  require_text
-    root
-    "logseq_sync/spec/effect_runner/dune"
-    [ "(name logseq_sync_effect_runner)"
-    ; "(public_name logseq_sync.effect_runner)"
-    ; "(modules effect_runner asset_codec asset_cache)"
-    ; "(virtual_modules effect_runner asset_codec asset_cache)"
-    ; "(default_implementation logseq_sync_effect_runner_impl)"
-    ; "logseq_sync.pure_reducer"
-    ];
-  require_text
-    root
-    "logseq_sync/spec/pure_reducer/core.mli"
-    [ "type t"
-    ; "type event ="
-    ; "type runner_effect"
-    ; "type worker_effect"
-    ; "type instruction ="
-    ; "val initial : config -> (t, create_error) result"
-    ; "val step : t -> event -> transition"
-    ; "| Run of runner_effect"
-    ; "| Delegate of worker_effect"
-    ; "| Publish of output"
-    ; "Sync_protocol.Client.message"
-    ; "Sync_protocol.Server.message"
-    ];
-  forbid_text
-    root
-    "logseq_sync/spec/pure_reducer/core.mli"
-    [ "type effect ="; "val effect :" ];
-  require_text
-    root
-    "logseq_sync/spec/effect_runner/effect_runner.mli"
-    [ "type t"
-    ; "val create"
-    ; "post:(Logseq_sync_pure_reducer.Core.event -> unit)"
-    ; "val submit : t -> Logseq_sync_pure_reducer.Core.runner_effect -> unit"
-    ; "val shutdown : t -> unit"
-    ];
-  forbid_text
-    root
-    "logseq_sync/lib/pure_reducer/core.ml"
-    [ "mutable"; " := "; "Effect.perform"; "Eio"; "Unix"; "Sys."; "Logseq_db_worker" ];
-  require_text
-    root
     "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     [ "module Pure = Logseq_db_worker_pure_reducer.Core"
     ; "module Worker_runner = Logseq_db_worker_effect_runner.Effect_runner"
-    ; "module Sync_runner = Logseq_sync_effect_runner.Effect_runner"
+    ; "module Sync = Logseq_sync_domain.Core"
     ; "Db.create"
     ; "Db.post"
     ; "Db.read_for_scope"
@@ -599,7 +531,7 @@ let test_injected_logseq_sync_api_boundary root =
 let test_standalone_sync_protocol_boundary root =
   require_text
     root
-    "logseq_sync/spec/pure_reducer/sync_protocol.mli"
+    "logseq_sync/spec/protocol/sync_protocol.mli"
     [ "type cursor = Logseq_db_types.Server_cursor.t"
     ; "type checksum = string"
     ; "module Client : sig"
@@ -613,25 +545,27 @@ let test_standalone_sync_protocol_boundary root =
     ];
   forbid_text
     root
-    "logseq_sync/spec/pure_reducer/sync_protocol.mli"
+    "logseq_sync/spec/protocol/sync_protocol.mli"
     [ "Logseq_sync_pure_core"; "Sync_protocol_core" ];
   require_text
     root
-    "logseq_sync/lib/pure_reducer/dune"
-    [ "(name logseq_sync_pure_reducer_impl)"
-    ; "(public_name logseq_sync.pure_reducer.impl)"
-    ; "(implements logseq_sync_pure_reducer)"
-    ; "(modules core sync_protocol asset_transfer)"
-    ];
-  List.iter
-    (forbid_path root)
-    [ "logseq_sync/lib/pure_reducer/checksum.ml"
-    ; "logseq_sync/lib/pure_reducer/checksum.mli"
-    ; "logseq_sync/lib/pure_reducer/pure_tx.ml"
+    "logseq_sync/spec/protocol/dune"
+    [ "(name logseq_sync_protocol)"
+    ; "(public_name logseq_sync.protocol)"
+    ; "(virtual_modules sync_protocol)"
+    ; "(default_implementation logseq_sync_protocol_impl)"
     ];
   require_text
     root
-    "logseq_sync/lib/pure_reducer/sync_protocol.ml"
+    "logseq_sync/lib/protocol/dune"
+    [ "(name logseq_sync_protocol_impl)"
+    ; "(public_name logseq_sync.protocol.impl)"
+    ; "(implements logseq_sync_protocol)"
+    ; "(modules sync_protocol)"
+    ];
+  require_text
+    root
+    "logseq_sync/lib/protocol/sync_protocol.ml"
     [ "type cursor = Logseq_db_types.Server_cursor.t"
     ; "type checksum = string"
     ; "module Client = struct"
@@ -641,48 +575,12 @@ let test_standalone_sync_protocol_boundary root =
     ];
   forbid_text
     root
-    "logseq_sync/lib/pure_reducer/sync_protocol.ml"
+    "logseq_sync/lib/protocol/sync_protocol.ml"
     [ "Sync_protocol_core"; "include Logseq_sync_pure_core" ];
   require_text
     root
-    "logseq_sync/lib/pure_reducer/core.ml"
-    [ "Sync_protocol.Client.message"
-    ; "Sync_protocol.Server.message"
-    ; "Sync_protocol.codec_error"
-    ];
-  forbid_text
-    root
-    "logseq_sync/lib/pure_reducer/core.ml"
-    [ "type authoritative_message ="
-    ; "let parse_authoritative_message"
-    ; "let pull_payload"
-    ; "let submission_payload"
-    ; "pending_payload"
-    ; "Websocket_frame"
-    ; "non-authoritative WebSocket message"
-    ; "Sync_protocol_core"
-    ; "Core_protocol"
-    ; "Protocol_adapter"
-    ; "export_client_message"
-    ; "import_server_message"
-    ; "import_rejection_reason"
-    ];
-  require_text
-    root
-    "logseq_sync/lib/effect_runner/effect_runner.ml"
-    [ "Sync_protocol.decode_server_message"
-    ; "Sync_protocol.encode_client_message"
-    ; "Core.Websocket_message"
-    ; "Core.Websocket_protocol_error"
-    ];
-  forbid_text
-    root
-    "logseq_sync/lib/effect_runner/effect_runner.ml"
-    [ "Core.Websocket_frame" ];
-  require_text
-    root
     "logseq_sync/test/sync_protocol_contract.ml"
-    [ "module Protocol = Logseq_sync_pure_reducer.Sync_protocol"
+    [ "module Protocol = Logseq_sync_protocol.Sync_protocol"
     ; "all client messages round trip"
     ; "all server messages round trip"
     ; "owned client fields are strict and safe"
@@ -692,21 +590,14 @@ let test_standalone_sync_protocol_boundary root =
 ;;
 
 let test_worker_dune_closure_names root =
-  require_text root "logseq_sync/lib/effect_runner/dune" [ "logseq_sync.pure_reducer" ];
-  require_text root "logseq_db_worker/lib/dune" [ "logseq_sync.pure_reducer" ];
-  let pure_dune = "logseq_sync/lib/pure_reducer/dune" in
-  forbid_text
-    root
-    pure_dune
-    [ "eio"; "unix"; "x509"; "tls"; "httpun"; "logseq_db_storage"; "platform_crypto" ];
+  require_text root "logseq_db_worker/lib/dune"
+    [ "logseq_overlay_db"; "execute"; "sync_dsl"; "logseq_sync.domain" ];
   List.iter
-    (forbid_path root)
-    [ "logseq_sync/lib/pure_core.ml"
-    ; "logseq_sync/lib/sync_protocol_core.ml"
-    ; "logseq_sync/lib/core.ml"
-    ; "logseq_sync/lib/sync_protocol.ml"
-    ; "logseq_sync/lib/effect_runner.ml"
-    ]
+    (fun directory ->
+       require_file root (directory ^ "/dune");
+       forbid_text root (directory ^ "/dune")
+         [ "eio"; "unix"; "x509"; "tls"; "httpun"; "logseq_db_storage"; "platform_crypto" ])
+    [ "logseq_sync/lib/domain"; "logseq_sync/lib/asset_transfer" ]
 ;;
 
 let forbid_worker_storage_access root relative =
@@ -721,6 +612,10 @@ let forbid_worker_storage_access root relative =
 ;;
 
 let test_worker_owned_overlay_orchestration root =
+  List.iter
+    (fun relative -> forbid_text root relative [ "pure_reducer"; "Logseq_db_worker"; "logseq_db_worker" ])
+    (files_with_suffixes root "logseq_sync/lib/worker_owner" [ ".ml"; ".mli"; "dune" ]
+     @ files_with_suffixes root "logseq_sync/test/asset_owner_lane" [ ".ml"; ".mli"; "dune" ]);
   let forbidden_raw_data_plane =
     [ "Datascript.db"
     ; "Datascript.tx_op"
@@ -733,9 +628,33 @@ let test_worker_owned_overlay_orchestration root =
     ]
   in
   List.iter
-    (fun relative -> forbid_text root relative forbidden_raw_data_plane)
+    (fun relative ->
+       if relative = "logseq_sync/lib/worker_owner/core.ml" then (
+         forbid_text root relative (List.filter (fun text -> text <> "Logseq_db_storage") forbidden_raw_data_plane);
+         let contents = read_file (path root relative) in
+         if count_occurrences contents "Logseq_db_storage" <> 1
+            || count_occurrences contents "module Store = Logseq_db_storage.Asset_upload_store" <> 1
+         then fail "asset owner accesses storage outside its upload intent store: %s" relative)
+       else forbid_text root relative forbidden_raw_data_plane)
     (files_with_suffixes root "logseq_sync/spec" [ ".mli" ]
      @ files_with_suffixes root "logseq_sync/lib" [ ".ml"; ".mli" ]);
+  List.iter
+    (fun relative ->
+       forbid_text root relative
+         [ "Datascript."
+         ; "datascript"
+         ; "logseq_db_storage"
+         ; "Logseq_db_storage"
+         ; "Logseq_db_worker"
+         ; "logseq_db_worker"
+         ; "Logseq_sync_pure_reducer"
+         ; "logseq_sync.pure_reducer"
+         ; "Logseq_sync_effect_runner"
+         ; "logseq_sync.effect_runner"
+         ])
+    (List.concat_map
+       (fun directory -> files_with_suffixes root directory [ ".ml"; ".mli"; "dune" ])
+       [ "logseq_sync/lib/native_transport"; "logseq_sync/lib/transport" ]);
   let sync_files = files_with_suffixes root "logseq_sync" [ ".ml"; ".mli" ] in
   List.iter
     (fun relative ->
@@ -744,10 +663,6 @@ let test_worker_owned_overlay_orchestration root =
          relative
          [ "Engine.t"; "Engine.open_"; "Engine.close"; "Logseq_db_worker" ])
     sync_files;
-  require_text
-    root
-    "logseq_sync/spec/pure_reducer/core.mli"
-    [ "Logseq_overlay_db.Types"; "type worker_effect =" ];
   require_text
     root
     "logseq_db_worker/lib/effect_runner/effect_runner.ml"
@@ -762,7 +677,7 @@ let test_worker_owned_overlay_orchestration root =
     "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     [ "Logseq_db_worker_pure_reducer.Core"
     ; "Logseq_db_worker_effect_runner.Effect_runner"
-    ; "Sync_runner.create"
+    ; "Db.create_lifecycle"
     ];
   forbid_text
     root
@@ -777,38 +692,30 @@ let test_worker_owned_overlay_orchestration root =
 
 let test_logseq_sync_install_manifest filename =
   let contents = read_file filename in
-  if
-    not
-      (contains contents {|/lib/logseq_sync/pure_reducer/logseq_sync_pure_reducer.cmi"|})
-  then fail "installed logseq_sync package is missing its pure-reducer interface";
   List.iter
-    (fun module_name ->
-       if
-         not
-           (contains
-              contents
-              (Printf.sprintf
-                 {|/lib/logseq_sync/pure_reducer/logseq_sync_pure_reducer__%s.cmi"|}
-                 module_name))
-       then fail "installed pure-reducer library is missing public %s" module_name)
-    [ "Core"; "Sync_protocol" ];
-  if
-    not
-      (contains
-         contents
-         {|/lib/logseq_sync/effect_runner/logseq_sync_effect_runner.cmi"|})
-  then fail "installed logseq_sync package is missing its effect-runner interface";
-  if
-    not
-      (contains
-         contents
-         {|/lib/logseq_sync/effect_runner/logseq_sync_effect_runner__Effect_runner.cmi"|})
-  then fail "installed effect-runner library is missing public Effect_runner";
+    (fun (library, module_name) ->
+       let interface = Printf.sprintf "/lib/logseq_sync/%s/logseq_sync_%s.cmi\"" library library in
+       let public_module = Printf.sprintf "/lib/logseq_sync/%s/logseq_sync_%s__%s.cmi\"" library library module_name in
+       List.iter
+         (fun expected ->
+            if not (contains contents expected)
+            then fail "installed logseq_sync package is missing %s" expected)
+         [ interface; public_module ])
+    [ "protocol", "Sync_protocol"
+    ; "domain", "Core"
+    ; "asset_transfer", "Core"
+    ; "assets", "Core"
+    ; "crypto", "Core"
+    ; "native_crypto", "Asset_codec"
+    ; "native_transport", "Http"
+    ];
   List.iter
     (fun obsolete ->
        if contains contents obsolete
-       then fail "obsolete combined Logseq_sync interface remains installed: %s" obsolete)
-    [ {|/lib/logseq_sync/logseq_sync.cmi"|}
+       then fail "obsolete Sync interface remains installed: %s" obsolete)
+    [ "/lib/logseq_sync/pure_reducer/"
+    ; "/lib/logseq_sync/effect_runner/"
+    ; {|/lib/logseq_sync/logseq_sync.cmi"|}
     ; "/logseq_sync__Core.cmi"
     ; "/logseq_sync__Effect_runner.cmi"
     ; "/logseq_sync__Sync_protocol.cmi"
@@ -877,9 +784,6 @@ let test_final_overlay_data_plane_boundary root =
     ; "logseq_db_worker/test/fixtures/performance/reference-apple-silicon-v1.json"
     ; "logseq_db_worker/tool/performance_benchmark.ml"
     ; "logseq_db_worker/tool/test_performance.sh"
-    ; "logseq_sync/lib/pure_reducer/pure_tx.ml"
-    ; "logseq_sync/lib/pure_reducer/checksum.ml"
-    ; "logseq_sync/lib/pure_reducer/checksum.mli"
     ; "logseq_db_types/test/test_mutation_identity.ml"
     ; "logseq_db_types/test/dune"
     ];
@@ -909,7 +813,22 @@ let test_final_overlay_data_plane_boundary root =
   require_documentation_only_guide root guide;
   List.iter
     (fun relative -> forbid_text root relative [ "Logseq_overlay_db"; "Logseq_sync" ])
-    (List.filter (fun relative -> relative <> guide) (ocaml_product_files root));
+    (List.filter
+       (fun relative ->
+          relative <> guide
+          && relative <> "app/impl/sync_lifecycle/core.ml"
+          && relative <> "app/spec/sync_lifecycle/core.mli"
+          && relative <> "app/impl/sync_lifecycle/account.ml"
+          && relative <> "app/spec/sync_lifecycle/account.mli")
+       (ocaml_product_files root));
+  forbid_path root "logseq_sync/lib/service_coordinator";
+  require_text root "app/spec/sync_lifecycle/dune"
+    [ "(public_name logseq_journal.sync_lifecycle)"
+    ; "(virtual_modules core account)"
+    ; "(default_implementation journal_sync_lifecycle_impl)"
+    ];
+  require_text root "app/impl/sync_lifecycle/dune"
+    [ "(implements journal_sync_lifecycle)" ];
   forbid_text root "app/dune" [ "logseq_sync"; "logseq_overlay_db" ];
   List.iter
     (fun relative ->
@@ -973,48 +892,13 @@ let test_sync_transport_is_websocket_only root =
   in
   List.iter
     (fun relative -> forbid_text root relative obsolete_symbols)
-    [ "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"; "app/journal_platform.ml" ];
-  forbid_text
-    root
-    "logseq_sync/lib/effect_runner/eio/http.ml"
-    [ "\"since\", string_of_int"; "graph_path graph_id \"tx/batch\"" ];
-  forbid_text
-    root
-    "logseq_sync/lib/effect_runner/eio/http.mli"
-    [ "val pull"; "val transaction_batch" ]
-;;
-
-let has_exact_dependency contents ~package ~version =
-  contains contents (Printf.sprintf "\"%s\" {= \"%s\"}" package version)
+    [ "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"; "app/journal_platform.ml" ]
 ;;
 
 let test_startup_phase_ownership root =
-  require_text
-    root
-    "logseq_sync/spec/pure_reducer/core.mli"
-    [ "type sync_phase ="
-    ; "| Offline"
-    ; "| Connecting"
-    ; "| Pulling"
-    ; "| Submitting"
-    ; "| Current"
-    ; "| Paused"
-    ; "sync_phase : sync_phase"
-    ];
-  forbid_text
-    root
-    "logseq_sync/spec/pure_reducer/core.mli"
-    [ "type phase ="
-    ; "| Signed_out"
-    ; "| Loading_catalog"
-    ; "| Awaiting_selection"
-    ; "| Restoring_local"
-    ; "| Bootstrapping"
-    ; "| Awaiting_e2ee_password"
-    ; "| Opening_graph"
-    ; "| Graph_open"
-    ; "| Sync_paused"
-    ];
+  require_text root "logseq_db_types/lib/sync_account.mli"
+    [ "type sync_phase ="; "| Offline"; "| Connecting"; "| Pulling"
+    ; "| Submitting"; "| Current"; "| Paused"; "sync_phase : sync_phase" ];
   require_text
     root
     "logseq_db_worker/lib/logseq_db_worker.mli"
@@ -1047,6 +931,10 @@ let test_startup_phase_ownership root =
     root
     "app/application.ml"
     [ "Logseq_sync.Core.phase"; "snapshot.Logseq_sync.Core.phase" ]
+;;
+
+let has_exact_dependency contents ~package ~version =
+  contains contents (Printf.sprintf "\"%s\" {= \"%s\"}" package version)
 ;;
 
 let require_exact_dependency root relative ~package ~version =
@@ -1159,6 +1047,7 @@ let () =
   test_public_api_only_test_boundaries root;
   test_logseq_sync_suite_boundary root;
   test_logseq_sync_package_boundary root;
+  test_removed_sync_api_boundary root;
   test_injected_logseq_sync_api_boundary root;
   test_standalone_sync_protocol_boundary root;
   test_worker_dune_closure_names root;
@@ -1290,12 +1179,6 @@ let () =
     ; "app/journal_time.mli"
     ; "app/journal_timeline_state.ml"
     ; "app/journal_timeline_state.mli"
-    ; "logseq_sync/lib/effect_runner/storage/bootstrap.ml"
-    ; "logseq_sync/lib/effect_runner/storage/bootstrap.mli"
-    ; "logseq_sync/lib/effect_runner/protocol/catalog.ml"
-    ; "logseq_sync/lib/effect_runner/protocol/catalog.mli"
-    ; "logseq_sync/lib/effect_runner/eio/http.ml"
-    ; "logseq_sync/lib/effect_runner/eio/http.mli"
     ; "swift/App.swift"
     ; "swift/JournalApplicationPlatform.swift"
     ; "swift/JournalNativeServices.swift"
@@ -1419,10 +1302,21 @@ let () =
     "app/application.ml"
     [ "Ui.Theme.create"; "~mode:System"; "Journal_composer_view.content" ];
   require_text root "app/journal_composer_view.ml" [ "V.composer" ];
-  require_text root "app/journal_detail_view.ml" [ "Detail_list.view"; "journal-detail-route" ];
-  require_text root "app/journal_manager_view.ml"
-    [ "Journal_header.startup"; "V.secure_field"; "graph_picker_list"; "graph-picker-list"
-    ; "e2ee-password-cancel"; "Refresh the authorized graph catalog"; "journal-startup-diagnostics" ];
+  require_text
+    root
+    "app/journal_detail_view.ml"
+    [ "Detail_list.view"; "journal-detail-route" ];
+  require_text
+    root
+    "app/journal_manager_view.ml"
+    [ "Journal_header.startup"
+    ; "V.secure_field"
+    ; "graph_picker_list"
+    ; "graph-picker-list"
+    ; "e2ee-password-cancel"
+    ; "Refresh the authorized graph catalog"
+    ; "journal-startup-diagnostics"
+    ];
   forbid_text root "app/journal_header.ml" [ "V.divider" ];
   forbid_text
     root
@@ -1559,10 +1453,7 @@ let () =
     root
     "app/journal_routes.ml"
     [ "Capture_view"; "open_capture"; "update_capture" ];
-  require_text
-    root
-    "app/application.ml"
-    [ "V.Sheet.create"; "Set status" ];
+  require_text root "app/application.ml" [ "V.Sheet.create"; "Set status" ];
   require_text
     root
     "app/journal_status_view.ml"
@@ -1660,24 +1551,15 @@ let () =
     ; "ProgressView()"
     ];
   forbid_text root "swift/App.swift" [ "Darwin.exit" ];
-  require_text
-    root
-    "logseq_sync/lib/effect_runner/eio/http_eio.ml"
-    [ "Httpun_eio.Client.create_connection"; "Httpun_eio.Client.request" ];
-  forbid_text
-    root
-    "logseq_sync/lib/effect_runner/eio/http_eio.ml"
-    [ "let start_connection"; "HTTP parser did not consume network input" ];
-  require_text root "logseq_sync/lib/effect_runner/dune" [ "httpun-eio" ];
   List.iter
     (require_file root)
-    [ "logseq_sync/lib/effect_runner/eio/tls_client_eio.ml"
-    ; "logseq_sync/lib/effect_runner/eio/tls_client_eio.mli"
+    [ "logseq_sync/lib/native_transport/tls_client_eio.ml"
+    ; "logseq_sync/lib/native_transport/tls_client_eio.mli"
     ];
-  require_occurrences root "logseq_sync/lib/effect_runner/dune" "tls_client_eio" 2;
+  require_occurrences root "logseq_sync/lib/native_transport/dune" "tls_client_eio" 1;
   require_text
     root
-    "logseq_sync/lib/effect_runner/eio/tls_client_eio.ml"
+    "logseq_sync/lib/native_transport/tls_client_eio.ml"
     [ "Mirage_crypto_rng_unix.use_default"
     ; "Domain_name.of_string"
     ; "Domain_name.host"
@@ -1704,8 +1586,8 @@ let () =
          ; "Eio.Net.connect"
          ; "Tls_eio.client_of_flow"
          ])
-    [ "logseq_sync/lib/effect_runner/eio/http_eio.ml"
-    ; "logseq_sync/lib/effect_runner/eio/websocket_eio.ml"
+    [ "logseq_sync/lib/native_transport/http_eio.ml"
+    ; "logseq_sync/lib/native_transport/websocket_eio.ml"
     ];
   require_text
     root
@@ -1788,10 +1670,6 @@ let () =
     root
     "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     [ "interpret_local_action"; "interpret_network_action"; "Local_completion" ];
-  require_text
-    root
-    "logseq_sync/lib/pure_reducer/core.ml"
-    [ "type diagnostics"; "type state ="; "let state core = core.public_state" ];
   require_text
     root
     "logseq_db_worker/lui/logseq_db_worker_lui_service.mli"
@@ -1914,9 +1792,7 @@ let () =
   List.iter
     (fun relative ->
        forbid_text root relative [ "history : string list"; "append_diagnostic_history" ])
-    [ "logseq_sync/spec/pure_reducer/core.mli"
-    ; "logseq_sync/lib/pure_reducer/core.ml"
-    ; "logseq_db_worker/lui/logseq_db_worker_lui_service.mli"
+    [ "logseq_db_worker/lui/logseq_db_worker_lui_service.mli"
     ; "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     ];
   forbid_text root "app/application.ml" [ "Recent sync transitions" ];
@@ -2025,26 +1901,6 @@ let () =
     root
     "app/application.ml"
     [ "Journal_calendar.Sampler.sample"; "Journal_calendar.present_journal_day" ];
-  require_text
-    root
-    "logseq_sync/spec/pure_reducer/core.mli"
-    [ "type runner_effect = private"; "Asset_requested"; "Asset_finished" ];
-  forbid_text
-    root
-    "logseq_sync/spec/effect_runner/effect_runner.mli"
-    [ "val submit_asset"
-    ; "val run_scoped_asset"
-    ; "val upload_asset"
-    ; "val stage_asset"
-    ; "val retain_asset_file"
-    ; "val release_asset_file"
-    ; "val close_asset_scope"
-    ; "val delete_graph_assets"
-    ; "val staged_asset_path"
-    ; "val release_staged_asset"
-    ; "val prune_staged_assets"
-    ; "val retain_staged_file"
-    ];
   match List.rev !failures with
   | [] -> print_endline "source boundary is clean"
   | failures ->

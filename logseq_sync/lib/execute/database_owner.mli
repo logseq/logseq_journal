@@ -21,6 +21,7 @@ val activation_owner
   -> graph_name:string
   -> t
 
+val database_if_open : t -> (Overlay.Database.t option, Dsl.error) result
 val database : t -> (Overlay.Database.t, Dsl.error) result
 
 val with_database

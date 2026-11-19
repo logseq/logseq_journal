@@ -1,11 +1,11 @@
 (library
  (name coordination_test_fixture)
  (modules coordination_test_fixture)
- (libraries logseq_db_worker.typed_read logseq_db_worker.identity datascript_ocaml journal_worker_coordination_impl logseq_journal.worker_coordination uri
+ (libraries logseq_db_worker.pure_reducer logseq_db_worker.typed_read logseq_db_worker.identity datascript_ocaml journal_worker_coordination_impl logseq_journal.worker_coordination uri
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.lui
-  logseq_sync.pure_reducer
+  logseq_sync.domain logseq_sync.asset_transfer
   logseq_db_worker.typed_data
   worker_effect_authority))
 
@@ -16,7 +16,7 @@
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.lui
-  logseq_sync.pure_reducer
+  logseq_sync.domain logseq_sync.asset_transfer
   logseq_db_worker.typed_data))
 
 (test
@@ -24,7 +24,7 @@
  (modules journal_platform_test)
  (libraries app
   logseq_db_worker.lui
-  logseq_sync.pure_reducer
+  logseq_sync.domain logseq_sync.asset_transfer
   yojson
   journal_app_business))
 
@@ -123,7 +123,7 @@
 (test
  (name application_view_test)
  (modules application_view_test)
- (libraries datascript-ocaml-native logseq_db_worker.typed_read logseq_db_worker.identity coordination_test_fixture alcotest app
+ (libraries datascript_ocaml.types datascript-ocaml-native logseq_db_worker.typed_read logseq_db_worker.identity coordination_test_fixture alcotest app
   logseq_journal.worker_coordination worker_effect_authority
   eio
   logseq_db_types
@@ -132,8 +132,8 @@
   logseq_db_worker.lui
   logseq_db_worker.pure_reducer
   logseq_overlay_db
-  logseq_sync.effect_runner
-  logseq_sync.pure_reducer
+  logseq_sync.native_crypto logseq_sync.assets
+  logseq_sync.domain logseq_sync.asset_transfer
   lui
   mtime.clock
   rrbvec
@@ -310,7 +310,7 @@
  (modules worker_coordination_runtime_test)
  (libraries datascript-ocaml-native logseq_db_worker.typed_read logseq_db_worker.identity logseq_db_storage app journal_worker_coordination_impl logseq_journal.worker_coordination
   logseq_overlay_db_test_support logseq_db_worker_test_support
-  logseq_sync.effect_runner logseq_sync.pure_reducer digestif
+  logseq_sync.native_crypto logseq_sync.assets logseq_sync.domain logseq_sync.asset_transfer digestif
   datascript_ocaml
   eio
   eio_main
@@ -332,7 +332,7 @@
  (name worker_coordination_pure_test)
  (modules worker_coordination_pure_test)
  (libraries datascript-ocaml-native logseq_db_worker.typed_read logseq_db_worker.identity coordination_test_fixture datascript_ocaml journal_worker_coordination_impl logseq_journal.worker_coordination
-  logseq_db_worker logseq_sync.pure_reducer uri
+  logseq_db_worker logseq_sync.domain logseq_sync.asset_transfer uri
   logseq_db_types
   logseq_db_worker.contract
   logseq_db_worker.lui

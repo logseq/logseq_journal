@@ -1,7 +1,7 @@
 (** One durable explicit import, owned by the worker and independent of download demand. *)
 module Intent = Logseq_db_types.Asset_upload_intent
 
-module Scope = Logseq_sync_pure_reducer.Core
+module Scope = Logseq_sync_domain.Core
 
 type failure =
   | Network

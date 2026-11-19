@@ -8,6 +8,40 @@ module Storage = Logseq_db_storage.Logseq_sqlite_storage
 open Types
 open Authoritative_store
 open Overlay_effect
+
+let inspect_snapshot_storage ~check_current ~scratch_bytes ~encrypted ~path =
+  match Storage.open_database path with
+  | Error _ -> Error "Snapshot storage is invalid"
+  | Ok connection ->
+    let callbacks = Storage.connection_callbacks connection in
+    let closed = ref (Ok ()) in
+    let result =
+      Fun.protect
+        ~finally:(fun () -> closed := Storage.close callbacks)
+        (fun () ->
+           check_current ();
+           match
+             Storage.startup_metadata connection, Storage.restore_database connection
+           with
+           | Ok _, Ok database ->
+             if Authoritative_checksum.graph_e2ee database <> encrypted
+             then Error "Snapshot encryption metadata mismatch"
+             else if Int64.of_int (Unix.stat path).st_size > scratch_bytes
+             then Error "Snapshot scratch bound"
+             else
+               Types.Checksum.of_string
+                 ("checksum:v1:"
+                  ^ Authoritative_checksum.recompute
+                      ~check_current
+                      ~e2ee:encrypted
+                      database)
+           | _ -> Error "Snapshot storage is invalid")
+    in
+    (match !closed, result with
+     | Error _, _ -> Error "Snapshot verification storage close failed"
+     | Ok (), result -> result)
+;;
+
 module Uuid_map = Map.Make (String)
 
 type effect_footprint = footprint

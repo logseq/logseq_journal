@@ -6,21 +6,34 @@
   journal_worker_eio_backend
   journal_worker_runtime
   journal_worker
+  journal_sync_registration
   logseq_db_worker_lui_service)
  (libraries logseq_db_worker.identity
   eio
   eio.core
   eio.unix
   eio_posix
+  digestif
   logseq_db_worker
   logseq_db_worker.typed_read
   logseq_db_worker.contract
   logseq_db_worker.pure_reducer
   logseq_db_types
   logseq_overlay_db
-  logseq_sync.effect_runner
-  logseq_sync.pure_reducer
+  logseq_journal.sync_lifecycle
+  journal_sync_lifecycle_impl
+  sync_dsl
+  execute
+  logseq_sync.worker_owner
+  logseq_sync.assets
+  logseq_sync.native_crypto
+  logseq_sync.transport
+  logseq_sync.native_transport
+  x509
+  ca-certs-nss
+  logseq_sync.domain logseq_sync.asset_transfer
   melange-transit-native
+  mirage-crypto-rng
   mtime.clock
   mtime.clock.os
   rrbvec

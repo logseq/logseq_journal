@@ -26,6 +26,13 @@ let absent inspection backend =
   { queue = Eio.Mutex.create (); state = Absent (inspection, backend) }
 ;;
 
+let database_if_open owner =
+  match owner.state with
+  | Active (database, _) -> Ok (Some database)
+  | Absent _ -> Ok None
+  | Committed _ -> Error (Dsl.Storage_failure "Committed mirror requires open recovery")
+;;
+
 let database owner =
   match owner.state with
   | Active (database, _) -> Ok database

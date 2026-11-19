@@ -1,0 +1,5 @@
+(library
+ (name logseq_sync_asset_transfer)
+ (public_name logseq_sync.asset_transfer)
+ (modules core)
+ (libraries logseq_sync.domain logseq_db_types))

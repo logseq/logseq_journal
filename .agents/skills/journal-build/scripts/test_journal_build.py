@@ -781,7 +781,7 @@ while True: time.sleep(1)
                            check=True, capture_output=True)
             repo = root / "repo"
             (repo / "app").mkdir(parents=True)
-            platform = repo / "logseq_sync/lib/effect_runner/platform"
+            platform = repo / "logseq_sync/lib/native_crypto"
             platform.mkdir(parents=True)
             (repo / "app/unit.ml").write_text("let value = 1\n")
             for name in ("platform_crypto_stubs.c", "platform_crypto_stubs.h"):
@@ -803,7 +803,7 @@ while True: time.sleep(1)
                 history.write_text("original archive")
                 forced = root / "xmlm-force/xmlm.cmxa"
                 cmx = root / "xmlm-force/xmlm.cmx"
-                effect = root / "effect/logseq_sync_effect_runner_impl.cmxa"
+                effect = root / "effect/logseq_sync_native_crypto.cmxa"
                 dummy = "a" * 64
                 inputs = {str(history): self.build.sha(history), str(compiler): dummy, str(forced): dummy,
                           str(forced.with_suffix('.a')): dummy, str(effect): dummy,
@@ -835,7 +835,7 @@ while True: time.sleep(1)
                     archive = Path(link['new_dependency_provenance'][name]['installed_archive'])
                     inputs.update({str(archive): dummy, str(archive.with_suffix('.a')): dummy})
                 inputs.update({str(cmx): dummy, str(package / 'lib/xmlm/xmlm.cmx'): dummy,
-                               str(effect.parent / 'liblogseq_sync_effect_runner_impl_stubs.a'): dummy})
+                               str(effect.parent / 'liblogseq_sync_native_crypto_stubs.a'): dummy})
                 receipt = dict(status='built', mode='experimental-host-restamp', source_sha=commit,
                     production_link=dict(runtime_mldoc_xmlm_retained=True, cross_abi_validated=False),
                     inputs=dict(source=source, dependencies=dict(producer=dict(envelope), files=inputs,
@@ -868,7 +868,7 @@ while True: time.sleep(1)
             root = Path(directory).resolve()
             repo, package, effect = root / 'repo', root / 'package', root / 'effect'
             (repo / 'app').mkdir(parents=True)
-            platform = repo / 'logseq_sync/lib/effect_runner/platform'
+            platform = repo / 'logseq_sync/lib/native_crypto'
             platform.mkdir(parents=True)
             for name in ('platform_crypto_stubs.c', 'platform_crypto_stubs.h'):
                 (platform / name).write_text('/* target source */\n')
@@ -889,11 +889,11 @@ while True: time.sleep(1)
             def run(*argv, cwd=root):
                 subprocess.run(list(map(str, argv)), cwd=cwd, check=True, capture_output=True)
             run(compiler, '-c', effect / 'effect.ml')
-            effect_archive = effect / 'logseq_sync_effect_runner_impl.cmxa'
+            effect_archive = effect / 'logseq_sync_native_crypto.cmxa'
             run(compiler, '-a', '-o', effect_archive, effect / 'effect.cmx')
             (effect / 'stub.c').write_text('int harmless_stub;\n')
             run('xcrun', 'clang', '-c', effect / 'stub.c', '-o', effect / 'stub.o')
-            stub = effect / 'liblogseq_sync_effect_runner_impl_stubs.a'
+            stub = effect / 'liblogseq_sync_native_crypto_stubs.a'
             run('ar', 'rcs', stub, effect / 'stub.o')
             provenance = {}
             for name, source in [('mldoc', 'let parse text = String.length text\n'),
@@ -991,7 +991,7 @@ while True: time.sleep(1)
             # Mirror opam exec's selected compiler PATH; omit ambient OCaml fallback even locally.
             compiler_bin = dune.parent if switch else original_compiler.parent
             f.build.env['PATH'] = str(compiler_bin) + os.pathsep + os.defpath
-            effect = repo / 'logseq_sync/lib/effect_runner'
+            effect = repo / 'logseq_sync/lib/native_crypto'
             effect.mkdir(exist_ok=True)
             original = f.root / 'effect'
             for path in original.glob('*'):
@@ -1002,22 +1002,22 @@ while True: time.sleep(1)
                          'int logseq_journal_crypto_call(void) { return 1; }\n')
             obj = c.with_suffix('.o')
             subprocess.run(['xcrun', 'clang', '-c', c, '-o', obj], check=True, capture_output=True)
-            stub = effect / 'liblogseq_sync_effect_runner_impl_stubs.a'
+            stub = effect / 'liblogseq_sync_native_crypto_stubs.a'
             subprocess.run(['ar', 'rcs', stub, obj], check=True, capture_output=True)
-            archive = effect / 'logseq_sync_effect_runner_impl.cmxa'
+            archive = effect / 'logseq_sync_native_crypto.cmxa'
             subprocess.run([compiler, '-a', '-o', archive, effect / 'effect.cmx',
-                            '-cclib', '-llogseq_sync_effect_runner_impl_stubs'], check=True, capture_output=True)
+                            '-cclib', '-llogseq_sync_native_crypto_stubs'], check=True, capture_output=True)
             # The fixture rule is opaque to the builder: it must read actual Dune argv.
             command = [str(compiler), '-output-complete-obj', '-w', '@1..3', '-o', 'app/native_embed.exe.o',
-                       '-cclib', '-Llogseq_sync/lib/effect_runner', '-cclib', 'app/libgmp.a',
-                       '-I', 'logseq_sync/lib/effect_runner', 'logseq_sync/lib/effect_runner/' + archive.name,
+                       '-cclib', '-Llogseq_sync/lib/native_crypto', '-cclib', 'app/libgmp.a',
+                       '-I', 'logseq_sync/lib/native_crypto', 'logseq_sync/lib/native_crypto/' + archive.name,
                        f.provenance['xmlm']['installed_archive'], f.provenance['mldoc']['installed_archive'],
                        'app/unit.cmx']
             def atom(value):
                 return json.dumps(str(value))
             (repo / 'dune-project').write_text('(lang dune 3.0)\n')
             (repo / 'app/dune').write_text('(rule (target native_embed.exe.o) (deps libgmp.a unit.cmx unit.o '
-                + ' '.join(atom('../logseq_sync/lib/effect_runner/' + path.name)
+                + ' '.join(atom('../logseq_sync/lib/native_crypto/' + path.name)
                            for path in effect.iterdir() if path.suffix in ('.cmxa', '.a'))
                 + ') (action (chdir .. (run ' + ' '.join(map(atom, command)) + '))))\n')
             shutil.copyfile(stub, repo / 'app/libgmp.a')
@@ -1407,8 +1407,8 @@ while True: time.sleep(1)
                 elif case == 'runtime_header':
                     f.header.write_text('changed ABI header')
                 else:
-                    key = {'native_source': 'app/unit.ml', 'target_c': 'logseq_sync/lib/effect_runner/platform/platform_crypto_stubs.c',
-                           'target_header': 'logseq_sync/lib/effect_runner/platform/platform_crypto_stubs.h'}[case]
+                    key = {'native_source': 'app/unit.ml', 'target_c': 'logseq_sync/lib/native_crypto/platform_crypto_stubs.c',
+                           'target_header': 'logseq_sync/lib/native_crypto/platform_crypto_stubs.h'}[case]
                     f.source[key] = 'f' * 64
                 with self.assertRaises((ValueError, RuntimeError)):
                     f.build.imported_native(f.source)

@@ -1,4 +1,4 @@
-module Protocol = Logseq_sync_pure_reducer.Sync_protocol
+module Protocol = Logseq_sync_protocol.Sync_protocol
 
 type t
 

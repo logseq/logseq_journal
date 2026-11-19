@@ -12,5 +12,6 @@ depends: [
   "dune" {= "3.23.1"}
   "ppx_deriving_yojson" {>= "3.9.1"}
   "yojson" {= "3.0.0"}
+  "uri"
 ]
 build: [["dune" "build" "-p" name "-j" jobs]]
