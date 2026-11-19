@@ -783,12 +783,19 @@ class Build:
                 shutil.copyfile(effect / name, copied / name)
             stub_name = "liblogseq_sync_native_crypto_stubs.a"
             patched = copied / stub_name
+            record(effect / stub_name)
             shutil.copyfile(effect / stub_name, patched)
             if self.run("ar", "-t", patched).splitlines().count("platform_crypto_stubs.o") != 1:
                 raise ValueError("producer needs exactly one original host DNS/crypto C member")
             self.run("ar", "-d", patched, "platform_crypto_stubs.o", env=dict(self.env, ZERO_AR_DATE="1"))
-            if "platform_crypto_stubs.o" in self.run("ar", "-t", patched).splitlines():
+            members = self.run("ar", "-t", patched).splitlines()
+            if "platform_crypto_stubs.o" in members:
                 raise ValueError("host DNS/crypto member was not removed from the owned archive copy")
+            indexes = {"__.SYMDEF", "__.SYMDEF SORTED", "__.SYMDEF_64", "__.SYMDEF_64 SORTED"}
+            if not any(member not in indexes for member in members):
+                # Apple ar can leave a stale symbol index after deleting the last object.
+                header = f"{'__.SYMDEF':<16}{0:<12}{0:<6}{0:<6}{'100644':<8}{8:<10}`\n"
+                patched.write_bytes(b"!<arch>\n" + header.encode("ascii") + bytes(8))
             command, includes = [original[0]], []
             for index, arg in enumerate(original[1:], 1):
                 previous = original[index - 1]
