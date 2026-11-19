@@ -3147,6 +3147,44 @@ let submit_worker t (Core.Request(ticket,request) as packed) =
     | Error message -> post_worker_result t ticket request (Error (effect_error message))
 ;;
 
+let rec upload_owner_diagnostic error =
+  let module Dsl = Sync_dsl.Core in
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let detail ?source reason = failure_detail ?source ~operation:"assetUpload" ~reason () in
+  match error with
+  | Dsl.Invalid_input source -> detail ~source "invalidRequest"
+  | Identity_mismatch source -> detail ~source "ownershipConflict"
+  | Stale_context -> detail "attachmentStale"
+  | Network_closed -> detail "networkFailed"
+  | Network_failure source -> detail ~source "networkFailed"
+  | Authentication_failure source -> detail ~source "authenticationFailed"
+  | Locked -> detail "locked"
+  | Crypto_failure source -> detail ~source "cryptoInvalid"
+  | Protocol_failure source -> detail ~source "invalidContent"
+  | Storage_failure source -> detail ~source "persistenceFailed"
+  | Cancelled -> detail "cancelled"
+  | Outcome_unknown source -> detail ~source "stateError"
+  | Cleanup_failure {primary; failures} ->
+    let causes = Rrbvec.to_seq failures in
+    (match primary, causes () with
+     | Some primary, Seq.Cons (cleanup, _) ->
+       D.with_related (upload_owner_diagnostic primary) (upload_owner_diagnostic cleanup)
+     | Some primary, Seq.Nil -> upload_owner_diagnostic primary
+     | None, Seq.Cons (cleanup, rest) ->
+       let primary = upload_owner_diagnostic cleanup in
+       (match rest () with
+        | Seq.Nil -> primary
+        | Seq.Cons (cleanup, _) -> D.with_related primary (upload_owner_diagnostic cleanup))
+     | None, Seq.Nil -> detail "cleanupFailed")
+  | Capacity_exceeded source -> detail ~source "limitExceeded"
+  | Sync_read_failure _ -> detail ~source:(Dsl.error_message error) "inspectionFailed"
+  | Outbox_failure _ -> detail ~source:(Dsl.error_message error) "storageOutboxFailed"
+  | Authoritative_failure _ -> detail ~source:(Dsl.error_message error) "integrityFailed"
+  | Activation_failure _ -> detail ~source:(Dsl.error_message error) "restoreFailed"
+  | Asset_failure diagnostic -> D.of_source ~operation:"assetUpload" ~reason:(D.reason diagnostic) (D.encode diagnostic)
+  | Unexpected_failure source -> detail ~source "resourceFailed"
+;;
+
 let run_direct_upload t (context : Sync.asset_context) instruction =
   let module Dsl = Sync_dsl.Core in
   let current ticket = not t.stopped && t.upload_current ticket
@@ -3186,10 +3224,10 @@ let run_direct_upload t (context : Sync.asset_context) instruction =
       clear_notice_diagnostic t context.scope (Upload_notice ticket.operation);
       t.post (Core.Upload_completed (ticket, completion))
     | Some ticket, Error error when current ticket ->
-      let detail = failure_detail ~source:(Dsl.error_message error) ~operation:"assetUpload" ~reason:"ownerFailed" () in
+      let detail = upload_owner_diagnostic error in
       queue_notice_diagnostic t context.scope (Upload_notice ticket.operation) ticket.id detail;
       let failure = match error with
-        | Dsl.Network_failure _ -> Upload.Network
+        | Dsl.Network_closed | Network_failure _ -> Upload.Network
         | Authentication_failure _ | Locked -> Upload.Authentication
         | _ -> Upload.Invalid_content in
       t.post (Core.Upload_completed (ticket, Upload.Failed failure))

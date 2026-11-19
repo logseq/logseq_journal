@@ -543,13 +543,18 @@ type owner_fixture =
   ; fixture_asset : Sync.asset_action -> Sync.asset_value
   ; set_upload_current : (Logseq_db_worker_pure_reducer.Asset_upload.ticket -> bool) -> unit
   ; upload_events : Logseq_db_worker_pure_reducer.Asset_upload.completion Queue.t
+  ; published : Core.output list ref
   ; recover_uploads : unit -> (Logseq_db_types.Asset_upload_intent.t list, string) result
   ; staged_path : string -> string option
   ; gate : (Sync.asset_output -> bool) -> unit Eio.Promise.t
   ; deliver_held : ?keep_gate:bool -> unit -> unit
   }
 
-let with_direct_owner run =
+let with_direct_owner
+    ?(network : Execute.Core.worker_network =
+      {with_admission=(fun _ -> Alcotest.fail "Unexpected owner network admission")})
+    ?(put = fun ~identity:_ ~asset:_ ~version:_ ~wire:_ -> Alcotest.fail "Unexpected network PUT")
+    run =
   T.with_managed (fun fixture -> Eio_main.run (fun env -> Eio.Switch.run (fun sw ->
     let module D = Sync_dsl.Core in
     let module Assets = Logseq_sync_assets.Core in
@@ -578,7 +583,7 @@ let with_direct_owner run =
       ~key:(Assets.native_key ~identity ~crypto)
       ~network:{get=(fun ~identity:_ ~asset:_ ~version:_ ~maximum_wire_bytes:_ ->
           Alcotest.fail "Unexpected network GET");
-        put=(fun ~identity:_ ~asset:_ ~version:_ ~wire:_ -> Alcotest.fail "Unexpected network PUT")}
+        put}
       |> Result.get_ok in
     ignore (Test_support.seed_mirror ~graph_id:scope.graph_id support);
     let inspection = Logseq_overlay_db.Database.inspect_mirror
@@ -687,7 +692,7 @@ let with_direct_owner run =
               ~notify_outbox_changed:(fun ~owner:_ ~identity:_ -> Ok ()) in
             let module Owner = (val Logseq_sync_worker_owner.Core.worker_owner owner : Execute.Core.WORKER_OWNER) in
             Owner.bind_runtime ~identity ~database_owner ~limits ~cleanup_seconds:2.
-              ~network:{with_admission=(fun _ -> Alcotest.fail "Unexpected owner network admission")}
+              ~network
             |> Result.map_error D.error_message
             |> Result.map (fun () -> owner_ref := Some owner; identity, owner))
       ; asset=(fun request ->
@@ -697,10 +702,11 @@ let with_direct_owner run =
             result)
       ; await_io=(fun ~scope:_ -> await_owner ())
       } in
+    let published = ref [] in
     let dependencies = Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay
       ~runtime:(Runner.runtime ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
         ~sleep:(Eio.Time.sleep (Eio.Stdenv.clock env)) |> Result.get_ok)
-      ~services:direct_services ~publish:(fun _ -> ()) |> Result.get_ok in
+      ~services:direct_services ~publish:(fun output -> published := output :: !published) |> Result.get_ok in
     let upload_current = ref (fun _ -> false) and upload_events = Queue.create () in
     let recovery_results = Queue.create () in
     let state = Core.initial (Core.config ~worker:fixture.config ~sync:(asset_sync_config ())) |> Result.get_ok in
@@ -717,6 +723,8 @@ let with_direct_owner run =
       | _ -> ()) ~recovery_current:(fun ticket -> ticket = recovery_ticket) ~upload_current:(fun ticket -> !upload_current ticket)
       ~asset_current:(fun _ -> false) |> Result.get_ok in
     runner_ref := Some runner;
+    Runner.submit runner (Core.Publish (Core.Sync_output (Sync.State_changed sync)));
+    Runner.submit runner (Core.Publish (Core.Sync_output (Sync.Session_state_changed (scope, sync))));
     Fun.protect ~finally:(fun () ->
       deliver_held ();
       Runner.shutdown runner;
@@ -729,7 +737,7 @@ let with_direct_owner run =
           Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 10. (fun () ->
             run {runner;context={scope;encrypted=false;key=None};support;database;crypto;identity;actions;
               fixture_result;fixture_asset=(fun action -> fixture_result action |> Result.get_ok);
-              gate;deliver_held;upload_events;set_upload_current=(fun current -> upload_current := current);
+              gate;deliver_held;upload_events;published;set_upload_current=(fun current -> upload_current := current);
               staged_path=(fun file -> Cache.staged_path cache ~file);
               recover_uploads=(fun () ->
                 Runner.submit runner (Core.Read_uploads recovery_ticket);
@@ -1288,6 +1296,96 @@ let test_recovery_prunes_original_owner_staging () =
       (fixture.recover_uploads () = Ok [intent]))
 ;;
 
+let test_upload_owner_network_classification () =
+  let module D = Sync_dsl.Core in
+  let module U = Logseq_db_worker_pure_reducer.Asset_upload in
+  let module I = Logseq_db_types.Asset_upload_intent in
+  List.iter (fun (error, expected) ->
+    let admission = ref (Some error) and sent = ref [] in
+    let network : Execute.Core.worker_network =
+      {with_admission=(fun callback -> match !admission with
+        | Some error -> Error error
+        | None -> callback ())} in
+    with_direct_owner ~network
+      ~put:(fun ~identity:_ ~asset ~version ~wire ->
+        sent := (asset, version, wire) :: !sent; Ok ()) (fun fixture ->
+      let source = { (picker_import fixture.support 990) with target = Test_support.page_uuid } in
+      let intent = Runner.prepare_import fixture.runner ~context:fixture.context source
+        ~current:(fun () -> true) |> Result.get_ok in
+      let state = ref (U.create ~scope:fixture.context.scope ~available:true) in
+      fixture.set_upload_current (fun ticket -> U.ticket_current !state ticket);
+      let run instruction =
+        Runner.submit fixture.runner (Core.Run_upload (fixture.context, instruction));
+        let rec await turns =
+          if not (Queue.is_empty fixture.upload_events) then Queue.take fixture.upload_events
+          else if turns = 0 then Alcotest.fail "Owner upload completion did not arrive"
+          else (Eio.Fiber.yield (); await (turns - 1)) in
+        await 1000 in
+      let step event = let next, effects = U.step !state event in state := next; effects in
+      let rec reach_put = function
+        | [U.Put _ as put] -> put
+        | [instruction] ->
+          let ticket = match instruction with
+            | U.Persist (ticket, _, _) | Apply_local (ticket, _) -> ticket
+            | _ -> Alcotest.fail "Unexpected instruction before PUT" in
+          let completion = run instruction in
+          (match completion with U.Failed _ -> Alcotest.fail "Local owner setup failed" | _ -> ());
+          reach_put (step (Completed (ticket, completion)))
+        | _ -> Alcotest.fail "Expected one upload instruction" in
+      let put = reach_put (step (Start intent)) in
+      let ticket, uploading = match put with U.Put (ticket, intent) -> ticket, intent | _ -> assert false in
+      Alcotest.(check bool) "Uploading checkpoint precedes network admission" true
+        (uploading.phase = I.Uploading && uploading.revision = 2);
+      let completion = run put in
+      Alcotest.(check bool) "typed owner failure is classified" true (completion = U.Failed expected);
+      ignore (step (Completed (ticket, completion)));
+      Runner.submit fixture.runner (Core.Publish (Core.Asset_notice (fixture.context.scope,
+        Core.Upload_status {operation=intent.operation_id; asset=intent.asset; target=intent.target;
+          title=intent.title; status=U.Failed_upload expected})));
+      let module Diagnostic = Logseq_db_types.Failure_diagnostic in
+      let detail = List.find_map (function
+        | Core.Diagnostic text when String.starts_with ~prefix:Diagnostic.signal_prefix text ->
+          Diagnostic.decode (String.sub text (String.length Diagnostic.signal_prefix)
+            (String.length text - String.length Diagnostic.signal_prefix))
+        | _ -> None) !(fixture.published) |> Option.get in
+      let encoded = Diagnostic.encode detail in
+      Alcotest.(check bool) "safe diagnostic carrier stays bounded" true (String.length encoded <= 1024);
+      Alcotest.(check bool) "safe diagnostic message stays bounded" true
+        (String.length (Diagnostic.message detail) <= 512);
+      Alcotest.(check bool) "raw paths never reach public diagnostic" false (String.contains encoded '/');
+      let reason = match error with
+        | D.Network_closed | Network_failure _ | Cleanup_failure _ -> "networkFailed"
+        | Authentication_failure _ -> "authenticationFailed"
+        | Storage_failure _ -> "persistenceFailed"
+        | Crypto_failure _ -> "cryptoInvalid"
+        | _ -> Alcotest.fail "Unexpected fixture error" in
+      Alcotest.(check string) "specific owner reason survives safe public output"
+        reason (Diagnostic.reason detail);
+      (match error with
+       | D.Cleanup_failure _ ->
+         Alcotest.(check bool) "cleanup cause is retained independently" true
+           (Option.map Diagnostic.reason (Diagnostic.related detail) = Some "persistenceFailed")
+       | _ -> ());
+      Alcotest.(check int) "closed admission sends no bytes" 0 (List.length !sent);
+      let path = fixture.staged_path intent.staged_file |> Option.get in
+      Alcotest.(check string) "original source survives failure" "file"
+        (In_channel.with_open_bin path In_channel.input_all);
+      if expected = U.Network then (
+        admission := None;
+        let retried = match step Retry with [U.Put (_, intent) as put] ->
+          Alcotest.(check bool) "same operation and publication IDs on retry" true (intent = uploading); put
+          | _ -> Alcotest.fail "Network retry did not issue original PUT" in
+        Alcotest.(check bool) "original owner PUT succeeds" true (run retried = U.Put_succeeded);
+        Alcotest.(check bool) "plain source bytes unchanged on wire" true
+          (!sent = [intent.asset, intent.version, "file"]))))
+    [D.Network_closed, U.Network; D.Network_failure "Disconnected", U.Network;
+     D.Authentication_failure "Denied", U.Authentication;
+     D.Storage_failure ("/PRIVATE_SYNTHETIC_PAYLOAD/" ^ String.make 8192 'x'), U.Invalid_content;
+     D.Crypto_failure "Encode failed", U.Invalid_content;
+     D.Cleanup_failure {primary=Some D.Network_closed;
+       failures=Rrbvec.singleton (D.Storage_failure "Release failed")}, U.Invalid_content]
+;;
+
 let test_upload_checkpoint_io () =
   let module Upload = Logseq_db_worker_pure_reducer.Asset_upload in
   with_direct_owner (fun fixture ->
@@ -1424,6 +1522,7 @@ let () =
       ; Alcotest.test_case "asset cleanup stop does not wait for lost io" `Quick test_asset_cleanup_stop_does_not_wait_for_lost_io
       ; Alcotest.test_case "recovery prunes original owner staging" `Quick test_recovery_prunes_original_owner_staging
       ; Alcotest.test_case "failed staging recovery is not acknowledged" `Quick test_recovery_staging_failure_is_not_acknowledged
+      ; Alcotest.test_case "owner upload network classification" `Quick test_upload_owner_network_classification
       ; Alcotest.test_case "durable upload checkpoint IO" `Quick test_upload_checkpoint_io
       ; Alcotest.test_case "plaintext submission encoding" `Quick test_plaintext_submission_encoding
     ] ]
