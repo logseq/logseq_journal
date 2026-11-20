@@ -156,6 +156,11 @@ import UIKit
       _ = emit(Event(action: "unavailable", request: request, reason: reason))
     }
 
+    private func emitFailure(_ reason: String, request: Request) {
+      handled = true
+      _ = emit(Event(action: "picked-batch", items: [], request: request, error: reason))
+    }
+
     private func pick(path: String, title: String, type: String, identity: String) -> Pick {
       Pick(operation: UUID().uuidString.lowercased(), asset: UUID().uuidString.lowercased(),
         localMutation: UUID().uuidString.lowercased(), metadataMutation: UUID().uuidString.lowercased(),
@@ -272,7 +277,7 @@ import UIKit
         case .failure(let failure):
           selection.release()
           if (failure as NSError).code == NSUserCancelledError { emitDismissed() }
-          else if isCurrent(request, epoch: epoch) { emitUnavailable("Unable to access the selected files. Please try again. (\(JournalAssetDiagnostic.classify(failure, stage: .fileSelection)))", request: request) }
+          else if isCurrent(request, epoch: epoch) { emitFailure("Unable to access the selected files. Please try again. (\(JournalAssetDiagnostic.classify(failure, stage: .fileSelection)))", request: request) }
         }
       }
       .photosPicker(isPresented: $photosPresented, selection: $photoItems,
@@ -337,7 +342,7 @@ import UIKit
           #else
           emitUnavailable("Camera capture is not available on this platform.", request: request)
           #endif
-        default: emitUnavailable("Unknown attachment source.", request: request)
+        default: emitFailure("Unknown attachment source.", request: request)
         }
       }
       .onChange(of: properties?.completion) { _, operation in

@@ -109,6 +109,7 @@ module Root_navigation : sig
     | Capture_closed
     | Capture_discarded
     | Capture_picker_requested of Journal_asset_import.source
+    | Capture_picker_unavailable of string
     | Capture_asset_picked of Journal_asset_import.staged * int option
     | Capture_assets_picked of
         Journal_asset_import.staged list * int option * string option
