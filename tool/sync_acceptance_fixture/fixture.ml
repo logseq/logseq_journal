@@ -82,13 +82,57 @@ let storage label = function
   | Error error -> failwith (Storage.diagnostic_error ~operation:label error)
 ;;
 
-let owned_path path =
-  let root = Unix.realpath "_build" ^ "/plain-fixture-" in
+let canonical_path path =
+  require
+    (not (Filename.is_relative path)
+     && not (List.exists (fun part -> part = ".." || part = ".") (String.split_on_char '/' path)))
+    "explicit path must be absolute without traversal";
+  let rec no_symlink current =
+    require ((Unix.lstat current).Unix.st_kind <> Unix.S_LNK) "symlink in explicit path";
+    let parent = Filename.dirname current in
+    if parent <> current then no_symlink parent
+  in
+  no_symlink path;
+  require (Unix.realpath path = path) "explicit path must be canonical"
+;;
+
+let work_root path =
+  canonical_path path;
+  require
+    (Filename.dirname path = "/Users/rcmerci/Library/Application Support/Journal isolated evidence")
+    "work root is outside isolated evidence";
+  let stat = Unix.lstat path in
+  require
+    (stat.Unix.st_kind = Unix.S_DIR && stat.Unix.st_uid = Unix.getuid ()
+     && stat.Unix.st_perm land 0o7777 = 0o700)
+    "work root must be private and owned";
+  path
+;;
+
+let owned_path ?root path =
   let parent = Unix.realpath (Filename.dirname path) in
-  require (String.starts_with ~prefix:root parent) "not a task-owned fixture directory";
+  (match root with
+   | None ->
+     let prefix = Unix.realpath "_build" ^ "/plain-fixture-" in
+     require (String.starts_with ~prefix parent) "not a task-owned fixture directory"
+   | Some root ->
+     canonical_path (Filename.dirname path);
+     require (path = Filename.concat parent (Filename.basename path)) "noncanonical fixture path";
+     require (Filename.basename path <> "." && Filename.basename path <> "..") "invalid fixture filename";
+     let name = Filename.basename parent in
+     require
+       (Filename.dirname parent = root
+        && String.length name = 28
+        && String.sub name 0 14 = "plain-fixture-"
+        && String.for_all
+             (fun character -> (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f'))
+             (String.sub name 14 12)
+        && name.[26] = '-' && (name.[27] = 'A' || name.[27] = 'B'))
+       "not a task-owned fixture directory");
   let stat = Unix.stat parent in
   require
-    (stat.Unix.st_perm land 0o777 = 0o700 && stat.Unix.st_uid = Unix.getuid ())
+    (stat.Unix.st_perm land (if Option.is_some root then 0o7777 else 0o777) = 0o700
+     && stat.Unix.st_uid = Unix.getuid ())
     "fixture directory is not private and owned";
   let resolved = Filename.concat parent (Filename.basename path) in
   (match Unix.lstat resolved with
@@ -344,14 +388,20 @@ let activate root graph_id path expected_rows expected =
 let () =
   try
     Eio_main.run (fun _ ->
+      let root, arguments =
+        if Array.length Sys.argv >= 3 && Sys.argv.(1) = "--work-root"
+        then Some (work_root Sys.argv.(2)), Array.sub Sys.argv 2 (Array.length Sys.argv - 2)
+        else None, Sys.argv
+      in
+      let owned_path = owned_path ?root in
       require
-        (Array.length Sys.argv = 5)
-        "usage: fixture SOURCE DESTINATION UUID SNAPSHOT";
-      if Sys.argv.(1) = "--verify-frame"
+        (Array.length arguments = 5)
+        "usage: fixture [--work-root ROOT] SOURCE DESTINATION UUID SNAPSHOT | --verify-frame PATH UUID ROWS";
+      if arguments.(1) = "--verify-frame"
       then (
-        let path = owned_path Sys.argv.(2) in
-        let graph_id = Sys.argv.(3) in
-        let rows = int_of_string Sys.argv.(4) in
+        let path = owned_path arguments.(2) in
+        let graph_id = arguments.(3) in
+        let rows = int_of_string arguments.(4) in
         let checksum = activate (path ^ ".fresh-read") graph_id path rows None in
         let repeated =
           activate (path ^ ".fresh-verify") graph_id path rows (Some checksum)
@@ -365,11 +415,11 @@ let () =
                  ; "fresh_read_open_current", `Bool true
                  ])))
       else (
-        let source = owned_path Sys.argv.(1) in
-        let destination = owned_path Sys.argv.(2) in
-        let graph_id = Sys.argv.(3) in
+        let source = owned_path arguments.(1) in
+        let destination = owned_path arguments.(2) in
+        let graph_id = arguments.(3) in
         ignore (G.Uuid.of_string graph_id |> ok "UUID");
-        let snapshot = owned_path Sys.argv.(4) in
+        let snapshot = owned_path arguments.(4) in
         let schema = rewrite source destination graph_id in
         let rows, bytes = frame destination snapshot in
         let checksum = activate (snapshot ^ ".activation") graph_id snapshot rows None in
