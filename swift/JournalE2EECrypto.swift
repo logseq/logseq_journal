@@ -112,6 +112,7 @@ enum JournalE2EECryptoError: Error {
   case keyStoreFailure(OSStatus)
   case keyStoreInvalidType
   case invalidPrivateKey
+  case unsupportedPrivateKey
   case rsaDecryptionFailed
   case invalidGraphKeyLength
   case invalidAESInput
@@ -142,7 +143,7 @@ private struct JournalDERReader {
     }
     offset += 1
     let length = try readLength()
-    guard length >= 0, offset + length <= bytes.count else {
+    guard length >= 0, length <= bytes.count - offset else {
       throw JournalE2EECryptoError.operationFailed
     }
     let result = Data(bytes[offset..<(offset + length)])
@@ -159,11 +160,16 @@ private struct JournalDERReader {
     guard count > 0, count <= MemoryLayout<Int>.size, offset + count <= bytes.count else {
       throw JournalE2EECryptoError.operationFailed
     }
+    guard bytes[offset] != 0 else { throw JournalE2EECryptoError.operationFailed }
     var result = 0
     for _ in 0..<count {
-      result = (result << 8) | Int(bytes[offset])
+      guard result <= (Int.max - Int(bytes[offset])) / 256 else {
+        throw JournalE2EECryptoError.operationFailed
+      }
+      result = result * 256 + Int(bytes[offset])
       offset += 1
     }
+    guard result >= 128 else { throw JournalE2EECryptoError.operationFailed }
     return result
   }
 }
@@ -402,13 +408,112 @@ enum JournalE2EECrypto {
     return try AES.GCM.open(box, using: SymmetricKey(data: key))
   }
 
-  private static func unwrapPKCS8(_ data: Data) throws -> Data {
-    var outer = JournalDERReader(bytes: [UInt8](data))
-    let sequence = try outer.element(tag: 0x30)
-    var contents = JournalDERReader(bytes: [UInt8](sequence))
-    _ = try contents.element(tag: 0x02)
-    _ = try contents.element(tag: 0x30)
-    return try contents.element(tag: 0x04)
+  private static func rsaPKCS1(_ data: Data) throws -> Data {
+    do {
+      var outer = JournalDERReader(bytes: [UInt8](data))
+      let sequence = try outer.element(tag: 0x30)
+      guard outer.offset == outer.bytes.count else { throw JournalE2EECryptoError.invalidPrivateKey }
+      var contents = JournalDERReader(bytes: [UInt8](sequence))
+      let version = try contents.element(tag: 0x02)
+      guard contents.offset < contents.bytes.count else { throw JournalE2EECryptoError.invalidPrivateKey }
+      if contents.bytes[contents.offset] == 0x30 {
+        guard version == Data([0]) else { throw JournalE2EECryptoError.unsupportedPrivateKey }
+        var algorithm = JournalDERReader(bytes: [UInt8](try contents.element(tag: 0x30)))
+        let oid = try algorithm.element(tag: 0x06)
+        guard oid == Data([0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]) else {
+          throw JournalE2EECryptoError.unsupportedPrivateKey
+        }
+        if algorithm.offset < algorithm.bytes.count {
+          guard try algorithm.element(tag: 0x05).isEmpty else { throw JournalE2EECryptoError.invalidPrivateKey }
+        }
+        guard algorithm.offset == algorithm.bytes.count else { throw JournalE2EECryptoError.invalidPrivateKey }
+        let key = try contents.element(tag: 0x04)
+        if contents.offset < contents.bytes.count {
+          try validatePrivateKeyAttributes(try contents.element(tag: 0xa0))
+        }
+        guard contents.offset == contents.bytes.count else { throw JournalE2EECryptoError.invalidPrivateKey }
+        var inner = JournalDERReader(bytes: [UInt8](key))
+        let innerSequence = try inner.element(tag: 0x30)
+        guard inner.offset == inner.bytes.count else { throw JournalE2EECryptoError.invalidPrivateKey }
+        var integers = JournalDERReader(bytes: [UInt8](innerSequence))
+        try validateRSAIntegers(&integers)
+        return key
+      }
+      contents.offset = 0
+      try validateRSAIntegers(&contents)
+      return data
+    } catch JournalE2EECryptoError.unsupportedPrivateKey {
+      throw JournalE2EECryptoError.unsupportedPrivateKey
+    } catch {
+      throw JournalE2EECryptoError.invalidPrivateKey
+    }
+  }
+
+  private static func validatePrivateKeyAttributes(_ data: Data) throws {
+    guard data.count <= 65_536 else { throw JournalE2EECryptoError.invalidPrivateKey }
+    func validateOID(_ oid: Data) throws {
+      guard !oid.isEmpty, oid.last! & 0x80 == 0 else {
+        throw JournalE2EECryptoError.invalidPrivateKey
+      }
+      var atStart = true
+      for byte in oid {
+        guard !atStart || byte != 0x80 else { throw JournalE2EECryptoError.invalidPrivateKey }
+        atStart = byte & 0x80 == 0
+      }
+    }
+    func validateValues(_ data: Data, depth: Int) throws {
+      guard depth <= 16 else { throw JournalE2EECryptoError.invalidPrivateKey }
+      var values = JournalDERReader(bytes: [UInt8](data))
+      while values.offset < values.bytes.count {
+        let tag = values.bytes[values.offset]
+        guard tag != 0 else { throw JournalE2EECryptoError.invalidPrivateKey }
+        if tag & 0x1f == 0x1f {
+          values.offset += 1
+          let start = values.offset
+          var tagNumber = 0
+          repeat {
+            guard values.offset < values.bytes.count,
+              values.offset - start < 4,
+              values.offset != start || values.bytes[values.offset] != 0x80
+            else { throw JournalE2EECryptoError.invalidPrivateKey }
+            let byte = values.bytes[values.offset]
+            tagNumber = tagNumber * 128 + Int(byte & 0x7f)
+            if byte & 0x80 == 0 { break }
+            values.offset += 1
+          } while true
+          guard tagNumber >= 31 else { throw JournalE2EECryptoError.invalidPrivateKey }
+        }
+        let value = try values.element(tag: values.bytes[values.offset])
+        if tag & 0x20 != 0 {
+          try validateValues(value, depth: depth + 1)
+        } else if tag == 0x06 {
+          try validateOID(value)
+        }
+      }
+    }
+    var attributes = JournalDERReader(bytes: [UInt8](data))
+    while attributes.offset < attributes.bytes.count {
+      var attribute = JournalDERReader(bytes: [UInt8](try attributes.element(tag: 0x30)))
+      try validateOID(try attribute.element(tag: 0x06))
+      let values = try attribute.element(tag: 0x31)
+      guard attribute.offset == attribute.bytes.count else {
+        throw JournalE2EECryptoError.invalidPrivateKey
+      }
+      try validateValues(values, depth: 0)
+    }
+  }
+
+  private static func validateRSAIntegers(_ contents: inout JournalDERReader) throws {
+    let version = try contents.element(tag: 0x02)
+    guard version == Data([0]) else { throw JournalE2EECryptoError.unsupportedPrivateKey }
+    for _ in 0..<8 {
+      let integer = try contents.element(tag: 0x02)
+      guard let first = integer.first, first < 0x80,
+        integer.contains(where: { $0 != 0 }),
+        integer.count == 1 || first != 0 || integer[integer.startIndex + 1] >= 0x80
+      else { throw JournalE2EECryptoError.invalidPrivateKey }
+    }
+    guard contents.offset == contents.bytes.count else { throw JournalE2EECryptoError.invalidPrivateKey }
   }
 
   private static func rsaPrivateKey(_ privateKeyData: Data) throws -> SecKey {
@@ -417,16 +522,10 @@ enum JournalE2EECrypto {
       kSecAttrKeyClass: kSecAttrKeyClassPrivate,
       kSecAttrKeySizeInBits: 4096,
     ]
+    let pkcs1 = try rsaPKCS1(privateKeyData)
     var error: Unmanaged<CFError>?
-    var key = SecKeyCreateWithData(privateKeyData as CFData, attributes as CFDictionary, &error)
-    if key == nil {
-      error = nil
-      let pkcs1: Data
-      do { pkcs1 = try unwrapPKCS8(privateKeyData) }
-      catch { throw JournalE2EECryptoError.invalidPrivateKey }
-      key = SecKeyCreateWithData(pkcs1 as CFData, attributes as CFDictionary, &error)
-    }
-    guard let key else { throw JournalE2EECryptoError.invalidPrivateKey }
+    guard let key = SecKeyCreateWithData(pkcs1 as CFData, attributes as CFDictionary, &error)
+    else { throw JournalE2EECryptoError.invalidPrivateKey }
     return key
   }
 
@@ -1143,6 +1242,7 @@ func journalCryptoFailureCode(_ error: any Error) -> String {
   switch error as? JournalE2EECryptoError {
   case .invalidRequest: return "cryptoInvalidRequest"
   case .invalidPrivateKey: return "cryptoInvalidPrivateKey"
+  case .unsupportedPrivateKey: return "cryptoUnsupportedPrivateKey"
   case .rsaDecryptionFailed: return "cryptoRSADecryptionFailed"
   case .invalidGraphKeyLength: return "cryptoInvalidGraphKeyLength"
   case .invalidAESInput: return "cryptoInvalidAESInput"
