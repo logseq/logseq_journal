@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import Security
+import OSLog
 
 private enum HarnessError: Error {
   case failed(String)
@@ -47,6 +48,90 @@ private func makeFixture() throws -> (privateKey: Data, wrapped: String) {
     throw HarnessError.failed("failed to encode the wrapped graph key")
   }
   return (external, wrapped)
+}
+
+private func rsaFormatTest() throws {
+  func der(_ tag: UInt8, _ contents: Data) -> Data {
+    let count = contents.count
+    let length: [UInt8] = count < 128 ? [UInt8(count)]
+      : count < 256 ? [0x81, UInt8(count)]
+      : [0x82, UInt8(count >> 8), UInt8(count & 255)]
+    return Data([tag] + length) + contents
+  }
+  let fixture = try makeFixture()
+  let version = Data([0x02, 0x01, 0x00])
+  let rsaAlgorithm = Data([0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+    0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00])
+  let pkcs8 = der(0x30, version + rsaAlgorithm + der(0x04, fixture.privateKey))
+  func verify(_ key: Data) throws {
+    _ = try JournalE2EECrypto.handle(JournalCryptoRequest(
+      operation: "installTestPrivateKey", origin: "https://example.invalid",
+      userId: "rsa-format-synthetic", privateKey: hex(key)))
+    _ = try JournalE2EECrypto.handle(JournalCryptoRequest(
+      operation: "verifyAndSaveWrappedGraphKey", origin: "https://example.invalid",
+      userId: "rsa-format-synthetic", graphId: "10000000-0000-4000-8000-000000000002",
+      encryptedGraphKey: fixture.wrapped))
+  }
+  try verify(fixture.privateKey)
+  let started = Date()
+  try verify(pkcs8)
+  Thread.sleep(forTimeInterval: 2)
+  let store = try OSLogStore(scope: .currentProcessIdentifier)
+  let entries = try store.getEntries(at: store.position(date: started))
+  let errors = entries.compactMap { $0 as? OSLogEntryLog }.filter {
+    $0.level == .error && ($0.subsystem.contains("security") || $0.composedMessage.contains("SecKey"))
+  }
+  print("synthetic-pkcs8 Security E count=\(errors.count)")
+  try require(errors.isEmpty, "valid PKCS8 emitted a Security error")
+  try verify(der(0x30, version + rsaAlgorithm + der(0x04, fixture.privateKey) + Data([0xa0, 0])))
+  try verify(der(0x30, version + der(0x30, Data(rsaAlgorithm.dropFirst(2).dropLast(2)))
+    + der(0x04, fixture.privateKey)))
+  let attributeOID = Data([0x06, 0x02, 0x2a, 0x03])
+  let attribute = der(0x30, attributeOID + der(0x31, der(0x0c, Data("synthetic".utf8))))
+  func withAttributes(_ attributes: Data) -> Data {
+    der(0x30, version + rsaAlgorithm + der(0x04, fixture.privateKey) + der(0xa0, attributes))
+  }
+  try verify(withAttributes(attribute))
+  var nested = der(0x05, Data())
+  for _ in 0..<20 { nested = der(0x30, nested) }
+  let invalidAttributes = [
+    Data([0x30]),
+    der(0x30, attributeOID),
+    der(0x30, der(0x05, Data()) + der(0x31, der(0x05, Data()))),
+    der(0x30, Data([0x06, 0x01, 0x80]) + der(0x31, der(0x05, Data()))),
+    der(0x30, attributeOID + der(0x31, Data([0x30]))),
+    der(0x30, attributeOID + der(0x31, Data([0x0c, 0x81, 0x01, 0x61]))),
+    der(0x30, attributeOID + der(0x31, nested)),
+    attribute + Data([0]),
+  ]
+  for attributes in invalidAttributes {
+    do {
+      try verify(withAttributes(attributes))
+      throw HarnessError.failed("malformed attributes accepted: \(hex(attributes))")
+    } catch let error as JournalE2EECryptoError {
+      try require(journalCryptoFailureCode(error) == "cryptoInvalidPrivateKey",
+        "malformed attributes lost their typed cause")
+    }
+  }
+  print("synthetic attributes: nonempty accepted; malformed rejected=\(invalidAttributes.count)")
+  var otherAlgorithm = rsaAlgorithm
+  otherAlgorithm[12] = 0x02
+  let cases: [(Data, String)] = [
+    (pkcs8 + Data([0]), "cryptoInvalidPrivateKey"),
+    (Data(pkcs8.dropLast()), "cryptoInvalidPrivateKey"),
+    (Data([0x30, 0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]), "cryptoInvalidPrivateKey"),
+    (der(0x30, version + otherAlgorithm + der(0x04, fixture.privateKey)), "cryptoUnsupportedPrivateKey"),
+    (der(0x30, Data([0x02, 0x01, 0x01]) + rsaAlgorithm + der(0x04, fixture.privateKey)), "cryptoUnsupportedPrivateKey"),
+    (der(0x30, version + rsaAlgorithm + der(0x04, Data([0x30, 0]))), "cryptoInvalidPrivateKey"),
+  ]
+  for (key, expected) in cases {
+    do {
+      try verify(key)
+      throw HarnessError.failed("malformed or unsupported RSA input was accepted")
+    } catch let error as JournalE2EECryptoError {
+      try require(journalCryptoFailureCode(error) == expected, "RSA format failure lost its typed cause")
+    }
+  }
 }
 
 private func unlockLogTest() throws {
@@ -143,6 +228,7 @@ private enum WrappedGraphKeyCryptoTest {
       JournalE2EECrypto.resetTestMemoryPrivateKeys()
     }
 
+    try rsaFormatTest()
     try unlockLogTest()
 
     let malformed = "{\"operation\":\"deleteAccountSecrets\",\"origin\":\"\(origin)\",\"userId\":\"\(userID)\",\"iterations\":\"600000\"}"
