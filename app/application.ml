@@ -1805,6 +1805,7 @@ module Root_navigation = struct
     | Capture_closed
     | Capture_discarded
     | Capture_picker_requested of Journal_asset_import.source
+    | Capture_picker_unavailable of string
     | Capture_asset_picked of Journal_asset_import.staged * int option
     | Capture_assets_picked of
         Journal_asset_import.staged list * int option * string option
@@ -1925,6 +1926,12 @@ module Root_navigation = struct
         ; capture_pick_source = source
         ; capture_pick_request = state.capture_pick_request + 1
         }
+      | Capture_picker_unavailable message ->
+        if not state.capture_picker_armed then state
+        else set_composer_error
+          {state with capture_picker_armed=false}
+          (picker_owner state)
+          (Some (Local_capture_failure message))
       | (Capture_asset_picked (_, _) as event)
       | (Capture_assets_picked (_, _, _) as event) ->
         let items, request_id, error =
@@ -6844,13 +6851,7 @@ let start
            then { state with capture_picker_armed = false }
            else state)
        | Journal_asset_import.Unavailable message ->
-         update (fun state ->
-           if not state.capture_picker_armed then state
-           else set_composer_error
-             (report_ui_error {state with capture_picker_armed=false}
-                ~operation:"selectAttachment" ~phase:"native")
-             (picker_owner state)
-             (Some (Local_capture_failure message)))
+         update (fun state -> step_root state (Capture_picker_unavailable message))
        | Journal_asset_import.Removed token ->
          update (fun state -> finish_cleanup (with_cleanup (fun ~discard ->
            match current_composer_owner state with

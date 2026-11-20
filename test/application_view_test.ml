@@ -8317,6 +8317,29 @@ let test_detail_reconciliation_diagnostics mode =
     (List.length (complete()).responses)
 ;;
 
+let test_camera_capability_feedback () =
+  let module A = Root_state in
+  let reason = "The camera is not available on this device." in
+  let draft = A.step (A.create ~graph_generation:7) (Capture_edited "Keep this draft") in
+  let unarmed = A.step draft (Capture_picker_unavailable reason) in
+  Alcotest.(check bool) "unarmed feedback is ignored" true (unarmed == draft);
+  let armed = A.step draft (Capture_picker_requested Journal_asset_import.Camera) in
+  let unavailable = A.step armed (Capture_picker_unavailable reason) in
+  Alcotest.(check (list (pair string string))) "capability is not a native bug" []
+    (A.diagnostic_rows unavailable);
+  Alcotest.(check bool) "capability preserves draft" true
+    (A.capture unavailable = A.capture draft);
+  Alcotest.(check bool) "capability disarms picker" true
+    (A.step unavailable (Capture_picker_unavailable reason) == unavailable);
+  List.iter (fun reason ->
+    let armed = A.step draft (Capture_picker_requested Journal_asset_import.Camera) in
+    let failed = A.step armed (Capture_assets_picked ([], Some 1, Some reason)) in
+    Alcotest.(check bool) (reason ^ " remains a failure") true
+      (A.diagnostic_rows failed <> []))
+    [ "camera-encode.data-unavailable"; "stage-write.no-space"
+    ; "file-selection.permission-denied"; "Unknown attachment source." ]
+;;
+
 (* Root_navigation owns acceptance of feed completions and its issue ledger.
    Generate the failure through the real graph runtime, then retire its owner. *)
 let test_integrity_attention_survives_unrelated_read_success () =
@@ -8436,6 +8459,7 @@ let () =
       Alcotest.test_case "exclusive channel response routing" `Quick test_worker_response_routing])
     ; ( "diagnostic identity", [ Alcotest.test_case "actual worker identity" `Quick test_diagnostic_identity_comes_from_worker ])
     ; ( "diagnostic failure", [
+      Alcotest.test_case "camera capability feedback is not a native failure" `Quick test_camera_capability_feedback;
       Alcotest.test_case "integrity attention survives read success and bounded history" `Quick test_integrity_attention_survives_unrelated_read_success;
       Alcotest.test_case "retired feed Worker failure is ignored" `Quick
         (fun () -> test_retired_feed_failure_does_not_publish_diagnostics false);
