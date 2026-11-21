@@ -2,7 +2,7 @@ let server_cursor_of_int value =
   Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
 ;;
 
-module Protocol = Logseq_sync_pure_reducer.Sync_protocol
+module Protocol = Logseq_sync_protocol.Sync_protocol
 module Client = Protocol.Client
 module Server = Protocol.Server
 

@@ -1,47 +1,13 @@
-(** {1 TLDR}
-
-    Own pure DB Worker lifecycle and request routing, including graph state,
-    pending requests, Sync delegation and resource cleanup ledgers. The host owns
-    {!state}; {!initial} validates construction, and {!step} returns a {!transition}
-    with [next] and ordered [effects]. Install [next] before interpreting effects;
-    callbacks queue exact completion events for a later serialized turn. No DB,
-    network, clock or callback I/O occurs in this reducer.
-
-    The runner GADT and dependent instruction/event families remain below.
-    These are accurate entry-point excerpts, not additional declarations:
-    {[
-      val initial : config -> (state, create_error) result
-      val step : state -> event -> transition
-      val view : state -> view
-    ]}
-    Cleanup admission is not a physical ACK. Scope/attempt identity must still be
-    checked at runtime; process-local tickets do not replace durable intent. *)
-
-(** {1 Minimal usage example}
-
-    The caller supplies validated [config] and the worker runner's [interpret]:
-    {[
-      match initial config with
-      | Error error -> Error error
-      | Ok first ->
-        let state = ref first in
-        let transition = step !state Start in
-        state := transition.next;
-        List.iter interpret transition.effects;
-        Ok state
-    ]}
-    [interpret] queues real completions, preserving the original effect ticket.
-    The host applies later events with the same install-before-interpret order.
-    On retirement feed [Shutdown], then continue processing admitted cleanup and
-    callback barriers; the view's shutdown flag alone is not a physical join. *)
-
-(** {1 Construction and validation} *)
+(** Worker read routing and resource cleanup. App owns account and graph lifecycle.
+    Install [next] before interpreting effects; enqueue exact completions later.
+    Projection withdrawal rejects new reads but retains admitted terminal replies.
+    Cleanup admission and [shutdown] are not physical settlement. *)
 
 type config
 
 val config
   :  worker:Logseq_db_worker_contract.Config.t
-  -> sync:Logseq_sync_pure_reducer.Core.config
+  -> sync:Logseq_sync_domain.Core.config
   -> config
 
 (** {1 Capability details} *)
@@ -92,7 +58,7 @@ type lifecycle_result =
   | Lifecycle_failed of int * Logseq_db_worker_contract.Error.t
 
 type sync_worker_result =
-  { event : Logseq_sync_pure_reducer.Core.event option
+  { event : Logseq_sync_domain.Core.event option
   ; lifecycle : lifecycle_result
   }
 
@@ -104,7 +70,7 @@ type _ runner_request =
       -> Worker_pure_read.answer runner_request
   | Close_database : database_handle -> unit runner_request
   | Handle_sync_worker_effect :
-      Logseq_sync_pure_reducer.Core.worker_effect
+      Logseq_sync_domain.Core.worker_effect
       -> sync_worker_result runner_request
 
 type runner_effect = Request : ticket * 'a runner_request -> runner_effect
@@ -121,7 +87,7 @@ type asset_notice =
       { consumer : string
       ; asset : Logseq_db_types.Graph_types.Uuid.t
       ; descriptor : Logseq_db_types.Asset_descriptor.t
-      ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
+      ; availability : Logseq_sync_asset_transfer.Core.availability
       }
   | Asset_demand_accepted of string
   | Asset_backpressure of string
@@ -134,38 +100,38 @@ type asset_notice =
       ; status : Asset_upload.status
       }
 
+type lifecycle_intent = Sync_intent of Logseq_sync_domain.Core.event | Foreground_intent of bool | Stop_intent
+
 type output =
-  | Asset_notice of Logseq_sync_pure_reducer.Core.graph_scope * asset_notice
+  | Lifecycle_intent of lifecycle_intent
+  | Asset_notice of Logseq_sync_domain.Core.graph_scope * asset_notice
   | Reply of request_id * Worker_pure_read.answer
   | Graph_push of Worker_pure_data.changefeed_signal
-  | Sync_output of Logseq_sync_pure_reducer.Core.output
+  | Sync_output of Logseq_sync_domain.Core.output
   | Graph_state_changed of graph_state
-  | Scoped_graph_state_changed of Logseq_sync_pure_reducer.Core.graph_scope * graph_state
-  | Scoped_graph_push of Logseq_sync_pure_reducer.Core.graph_scope * Worker_pure_data.changefeed_signal
+  | Scoped_graph_state_changed of Logseq_sync_domain.Core.graph_scope * graph_state
+  | Scoped_graph_push of Logseq_sync_domain.Core.graph_scope * Worker_pure_data.changefeed_signal
   | Diagnostic of string
 
 (** {2 Upload recovery and instructions} *)
 
 type upload_recovery_ticket = private
-  { scope : Logseq_sync_pure_reducer.Core.graph_scope
+  { scope : Logseq_sync_domain.Core.graph_scope
   ; after : Logseq_db_types.Graph_types.Uuid.t option
   ; limit : int
   ; serial : int
   }
 
 type instruction =
-  | Sync_io_fence_reached of int64 * Logseq_sync_pure_reducer.Core.effect_scope * (unit,string) result
   | Asset_cleanup_barrier_reached of int64
-  | Deliver_protected_result of Logseq_sync_pure_reducer.Core.protected_output
-  | Deliver_asset_result of Logseq_sync_pure_reducer.Core.asset_output
+  | Deliver_asset_result of Logseq_sync_domain.Core.asset_output
   | Read_uploads of upload_recovery_ticket
-  | Run_upload of Logseq_sync_pure_reducer.Core.asset_context * Asset_upload.instruction
+  | Run_upload of Logseq_sync_domain.Core.asset_context * Asset_upload.instruction
   | Run_asset of
-      Logseq_sync_pure_reducer.Core.asset_context
-      * Logseq_sync_pure_reducer.Asset_transfer.instruction
-  | Close_asset_scope of Logseq_sync_pure_reducer.Core.graph_scope
+      Logseq_sync_domain.Core.asset_context
+      * Logseq_sync_asset_transfer.Core.instruction
+  | Close_asset_scope of Logseq_sync_domain.Core.graph_scope
   | Run_worker of runner_effect
-  | Run_sync of Logseq_sync_pure_reducer.Core.runner_effect
   | Publish of output
 
 val instruction_diagnostic : instruction -> string
@@ -174,7 +140,7 @@ val equal_instructions : instruction list -> instruction list -> bool
 
 type view =
   { graph : graph_state
-  ; sync : Logseq_sync_pure_reducer.Core.state
+  ; sync : Logseq_sync_domain.Core.state
   ; pending_requests : int
   ; pending_effects : int
   ; shutdown : bool
@@ -189,6 +155,7 @@ val initial : config -> (state, create_error) result
 val view : state -> view
 
 type event =
+  | Lifecycle_snapshot of Logseq_sync_domain.Core.state * Logseq_sync_domain.Core.coordination_state * (Logseq_sync_domain.Core.graph_scope * database_opened) list
   | Asset_cleanup_barrier of int64
   | Upload_requested of
       { graph_generation : int
@@ -200,25 +167,25 @@ type event =
   | Upload_completed of Asset_upload.ticket * Asset_upload.completion
   | Asset_requested of
       { graph_generation : int
-      ; event : Logseq_sync_pure_reducer.Asset_transfer.event
+      ; event : Logseq_sync_asset_transfer.Core.event
       }
   | Asset_completed of
-      Logseq_sync_pure_reducer.Core.graph_scope
-      * Logseq_sync_pure_reducer.Asset_transfer.event
+      Logseq_sync_domain.Core.graph_scope
+      * Logseq_sync_asset_transfer.Core.event
   | Graph_request_for_scope of
-      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      { scope : Logseq_sync_domain.Core.graph_scope
       ; id : request_id
       ; read : Worker_pure_read.packed_query
       }
-  | Projection_push_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Worker_pure_data.changefeed_signal
-  | Asset_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_sync_pure_reducer.Asset_transfer.event
-  | Upload_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_types.Graph_types.Uuid.t * Asset_upload.event
+  | Projection_push_for_scope of Logseq_sync_domain.Core.graph_scope * Worker_pure_data.changefeed_signal
+  | Asset_requested_for_scope of Logseq_sync_domain.Core.graph_scope * Logseq_sync_asset_transfer.Core.event
+  | Upload_requested_for_scope of Logseq_sync_domain.Core.graph_scope * Logseq_db_types.Graph_types.Uuid.t * Asset_upload.event
   | Start
   | Graph_request of
       { id : request_id
       ; read : Worker_pure_read.packed_query
       }
-  | Sync_event of Logseq_sync_pure_reducer.Core.event
+  | Sync_event of Logseq_sync_domain.Core.event
   | Projection_push of Worker_pure_data.changefeed_signal
   | Set_foreground of bool
   | Runner_completed of runner_completion
@@ -236,26 +203,29 @@ val complete_execute
   -> (Worker_pure_read.answer, effect_error) result
   -> event option
 
-val asset_ticket_current : state -> Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
-val asset_scope_current : state -> Logseq_sync_pure_reducer.Core.graph_scope -> bool
+val asset_ticket_current : state -> Logseq_sync_asset_transfer.Core.ticket -> bool
+val asset_scope_current : state -> Logseq_sync_domain.Core.graph_scope -> bool
 val upload_ticket_current : state -> Asset_upload.ticket -> bool
 val upload_recovery_current : state -> upload_recovery_ticket -> bool
 
 val import_context
   :  state
   -> graph_generation:int
-  -> Logseq_sync_pure_reducer.Core.asset_context option
+  -> Logseq_sync_domain.Core.asset_context option
 
-val graph_scopes : state -> Logseq_sync_pure_reducer.Core.graph_scope list
+val graph_scopes : state -> Logseq_sync_domain.Core.graph_scope list
 
-val graph_state_for_scope : state -> Logseq_sync_pure_reducer.Core.graph_scope -> graph_state option
+val graph_state_for_scope : state -> Logseq_sync_domain.Core.graph_scope -> graph_state option
 
 type coordination_state =
-  { sync : Logseq_sync_pure_reducer.Core.coordination_state
-  ; residents : (Logseq_sync_pure_reducer.Core.graph_scope * graph_state) list
+  { sync : Logseq_sync_domain.Core.coordination_state
+  ; residents : (Logseq_sync_domain.Core.graph_scope * graph_state) list
   }
 val coordination_state : state -> coordination_state
-val import_context_for_scope : state -> Logseq_sync_pure_reducer.Core.graph_scope -> Logseq_sync_pure_reducer.Core.asset_context option
+val install_lifecycle : state -> sync:Logseq_sync_domain.Core.state
+  -> coordination:Logseq_sync_domain.Core.coordination_state
+  -> attachments:(Logseq_sync_domain.Core.graph_scope * database_opened) list -> state
+val import_context_for_scope : state -> Logseq_sync_domain.Core.graph_scope -> Logseq_sync_domain.Core.asset_context option
 
 (** {1 Lifecycle and recovery} *)
 
@@ -287,7 +257,7 @@ module Observation_registry : sig
     :  t
     -> registration:int64
     -> id:Logseq_db_types.Graph_types.Uuid.t
-    -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+    -> scope:Logseq_sync_domain.Core.graph_scope
     -> read:Worker_pure_read.packed_query
     -> t * decision
 
@@ -295,14 +265,14 @@ module Observation_registry : sig
     :  t
     -> registration:int64
     -> id:Logseq_db_types.Graph_types.Uuid.t
-    -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+    -> scope:Logseq_sync_domain.Core.graph_scope
     -> t * release
 
   (** Fence an unallocated logical ID even after its graph owner has disappeared.
       This cannot release a known live/closing resource or grant a graph fence. *)
   val release_unallocated
     : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
-    -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> t * release
+    -> owner:Logseq_sync_domain.Core.timeline_scope -> t * release
 
   (** External completion after physical listener/read cleanup; only then is
       its active-resource capacity reusable. *)
@@ -310,7 +280,7 @@ module Observation_registry : sig
     :  t
     -> registration:int64
     -> id:Logseq_db_types.Graph_types.Uuid.t
-    -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+    -> scope:Logseq_sync_domain.Core.graph_scope
     -> t
 
   val advance
@@ -330,7 +300,7 @@ module Observation_registry : sig
     :  t
     -> registration:int64
     -> id:Logseq_db_types.Graph_types.Uuid.t
-    -> Logseq_sync_pure_reducer.Core.graph_scope option
+    -> Logseq_sync_domain.Core.graph_scope option
 
   val epoch
     :  t
@@ -348,7 +318,7 @@ module Observation_registry : sig
       and physical settlement. Already absent is a non-allocating no-op; it grants
       no release or host fence. Failures retain the same finalization obligation. *)
   val finalize : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
-    -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> t * (unit,string) result
+    -> owner:Logseq_sync_domain.Core.timeline_scope -> t * (unit,string) result
 
   val active : t -> int
   val retained : t -> int
@@ -416,7 +386,7 @@ end
     failure retains that obligation. Attempt tokens prevent an old ACK from settling a retry. No
     clock, callback, transport or filesystem access occurs here. *)
 module Orphan_cleanup : sig
-  type resource = { scope : Logseq_sync_pure_reducer.Core.graph_scope; handle : string }
+  type resource = { scope : Logseq_sync_domain.Core.graph_scope; handle : string }
   type t
   type work
   val empty : t
@@ -435,11 +405,11 @@ end
     Physical settlement remains separate from command admission. *)
 module Demand_registry : sig
   type t
-  type owner={registration:int64;scope:Logseq_sync_pure_reducer.Core.graph_scope;consumer:string}
+  type owner={registration:int64;scope:Logseq_sync_domain.Core.graph_scope;consumer:string}
   type reservation=Start|Existing|Retired|Mismatch|Full|Invalid
   type release=Release|Already_settled|Unknown|Mismatch|Full
   val empty:t
-  val reserve:t -> owner -> priority:Logseq_sync_pure_reducer.Asset_transfer.priority
+  val reserve:t -> owner -> priority:Logseq_sync_asset_transfer.Core.priority
     -> assets:Logseq_db_types.Asset_descriptor.t list -> t * reservation
   val admitted:t -> owner -> bool
   val retire:t -> owner -> t * release
@@ -466,15 +436,15 @@ module Writer_fence : sig
   type fence
   type error = Fenced | Full
   val empty : t
-  val admit : t -> Logseq_sync_pure_reducer.Core.graph_scope -> t * (operation,error) result
-  val admit_cleanup : t -> Logseq_sync_pure_reducer.Core.graph_scope -> t * (operation,error) result
+  val admit : t -> Logseq_sync_domain.Core.graph_scope -> t * (operation,error) result
+  val admit_cleanup : t -> Logseq_sync_domain.Core.graph_scope -> t * (operation,error) result
   val finish : t -> operation -> t
-  val freeze : t -> Logseq_sync_pure_reducer.Core.graph_scope -> t * (fence,error) result
+  val freeze : t -> Logseq_sync_domain.Core.graph_scope -> t * (fence,error) result
   val drained : t -> fence -> bool
-  val fenced : t -> Logseq_sync_pure_reducer.Core.graph_scope -> bool
-  val pending : t -> Logseq_sync_pure_reducer.Core.graph_scope -> int
+  val fenced : t -> Logseq_sync_domain.Core.graph_scope -> bool
+  val pending : t -> Logseq_sync_domain.Core.graph_scope -> int
   val operation_id : operation -> int64
-  val same_incarnation : Logseq_sync_pure_reducer.Core.graph_scope -> Logseq_sync_pure_reducer.Core.graph_scope -> bool
+  val same_incarnation : Logseq_sync_domain.Core.graph_scope -> Logseq_sync_domain.Core.graph_scope -> bool
 end
 
 (** Pure unregister roster. The first authoritative account stays immutable
@@ -482,14 +452,14 @@ end
     that actually settled the returned scopes and optional old account IO. *)
 module Registration_retirement : sig
   type t
-  type plan={owner:Logseq_sync_pure_reducer.Core.account_scope option;
-    scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t;join_account:bool;blocked:bool}
+  type plan={owner:Logseq_sync_domain.Core.account_scope option;
+    scopes:Logseq_sync_domain.Core.graph_scope Rrbvec.t;join_account:bool;blocked:bool}
   val empty:t
-  val bind:t -> registration:int64 -> account:Logseq_sync_pure_reducer.Core.account_scope option -> (t,string)result
-  val observe:t -> registration:int64 option -> account:Logseq_sync_pure_reducer.Core.account_scope option -> t
-  val begin_release:t -> registration:int64 -> active_account:Logseq_sync_pure_reducer.Core.account_scope option
-    -> active_scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t
-    -> physical_scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t -> t * plan
+  val bind:t -> registration:int64 -> account:Logseq_sync_domain.Core.account_scope option -> (t,string)result
+  val observe:t -> registration:int64 option -> account:Logseq_sync_domain.Core.account_scope option -> t
+  val begin_release:t -> registration:int64 -> active_account:Logseq_sync_domain.Core.account_scope option
+    -> active_scopes:Logseq_sync_domain.Core.graph_scope Rrbvec.t
+    -> physical_scopes:Logseq_sync_domain.Core.graph_scope Rrbvec.t -> t * plan
   val released:t -> registration:int64 -> t
 end
 
@@ -503,12 +473,12 @@ module Host_handoff : sig
   type change=Close_graph of Logseq_db_types.Graph_types.Uuid.t
     |Remove_graph of Logseq_db_types.Graph_types.Uuid.t * mode
     |Replace_account|Stop_connection
-  type facts={authenticated:bool;version:int64;registration:int64 option;account:Logseq_sync_pure_reducer.Core.account_scope option;
-    scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t;catalog:Logseq_db_types.Graph_types.Uuid.t Rrbvec.t}
+  type facts={authenticated:bool;version:int64;registration:int64 option;account:Logseq_sync_domain.Core.account_scope option;
+    scopes:Logseq_sync_domain.Core.graph_scope Rrbvec.t;catalog:Logseq_db_types.Graph_types.Uuid.t Rrbvec.t}
   type request={version:int64;id:Logseq_db_types.Graph_types.Uuid.t;registration:int64;
-    owner:Logseq_sync_pure_reducer.Core.account_scope;change:change;
-    expected:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t;
-    captured:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t}
+    owner:Logseq_sync_domain.Core.account_scope;change:change;
+    expected:Logseq_sync_domain.Core.graph_scope Rrbvec.t;
+    captured:Logseq_sync_domain.Core.graph_scope Rrbvec.t}
   type t
   type attempt
   type receipt
@@ -516,8 +486,8 @@ module Host_handoff : sig
   type phase=Preparing|Safe of receipt|Consumed of receipt|Failed of error
   type admission=Start of attempt|Existing of phase|Refused of error
   val empty:lifetime:Logseq_db_types.Graph_types.Uuid.t -> t
-  val capture:owner:Logseq_sync_pure_reducer.Core.account_scope -> change:change
-    -> Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t -> Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t
+  val capture:owner:Logseq_sync_domain.Core.account_scope -> change:change
+    -> Logseq_sync_domain.Core.graph_scope Rrbvec.t -> Logseq_sync_domain.Core.graph_scope Rrbvec.t
   val prepare:t -> facts -> request -> t * admission
   val observe:t -> facts -> t
   val settled:t -> attempt -> copy_generation:Logseq_overlay_db.Types.mirror_generation option -> t
@@ -542,4 +512,30 @@ end
 (** {1 Observation and helpers} *)
 
 val host_fence_blocks : state -> Logseq_db_types.Graph_types.Uuid.t -> bool
-val host_fence_active : state -> Logseq_sync_pure_reducer.Core.host_fence option
+val host_fence_active : state -> Logseq_sync_domain.Core.host_fence option
+
+module Lifecycle : sig
+  type scope = Logseq_sync_domain.Core.graph_scope
+  type snapshot = { revision : int64; scopes : scope list; selected : scope option }
+  type t
+  type event =
+    | Projection of snapshot
+    | Attach of scope * database_opened
+    | Retire of scope
+    | Read of { scope : scope; id : request_id; read : Worker_pure_read.packed_query }
+    | Push of scope * Worker_pure_data.changefeed_signal
+    | Completed of runner_completion
+  type instruction =
+    | Worker of runner_effect
+    | Publish of output
+    | Attached of scope
+    | Retired of scope
+  type transition = { next : t; effects : instruction list }
+  val empty : t
+  val snapshot : t -> snapshot
+
+  (** Attach borrows the service database. Retired acknowledges physical read drain;
+      only the external owner closes the database after this acknowledgement.
+      Snapshot revisions and scope generations must increase across replacement. *)
+  val step : t -> event -> transition
+end

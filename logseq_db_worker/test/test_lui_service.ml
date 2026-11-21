@@ -1,41 +1,12 @@
 module T = Logseq_db_worker_test_support.Test_support
 module ID = Journal_worker_ids
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
-module Runner = Logseq_sync_effect_runner.Effect_runner
 module Worker = Logseq_db_worker_lui.Journal_worker
 module Worker_runtime = Logseq_db_worker_lui.Journal_worker_runtime
-
-let crypto =
-  Runner.crypto
-    ~encrypt_aes_gcm:(fun ~key:_ ~plaintext:_ -> Error "unavailable")
-    ~decrypt_aes_gcm:(fun ~key:_ ~iv:_ ~ciphertext:_ -> Error "unavailable")
-  |> Result.get_ok
-;;
-
-let secrets =
-  Runner.secrets
-    ~unlock_private_key:
-      (fun
-        ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
-      Error "unavailable")
-    ~unlock_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
-      Error "unavailable")
-    ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
-      Error (Runner.Wrapped_graph_key_unavailable "unavailable"))
-    ~verify_and_save_wrapped_graph_key:
-      (fun
-        ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
-      Error "unavailable")
-    ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
-  |> Result.get_ok
-;;
 
 let dependencies =
   Service.dependencies
     ~overlay:(T.overlay_dependencies ())
-    ~tls_authenticator:(Runner.system_tls_authenticator () |> Result.get_ok)
-    ~secrets
-    ~crypto
 ;;
 
 let accepted = function
@@ -131,8 +102,17 @@ let test_host_handoff_real_service_single_use () =
   T.with_managed(fun fixture->with_client fixture.config(fun client->
     let send request=await_response client(Worker.send client request |> accepted) in
     ignore(send(Service.Client_command(Restore_local_account{user_id="host-synthetic"})));
-    let baseline=match send(Service.Register_coordination 71L)with
-      |Coordination_registered value->value|_->T.fail "host baseline" in
+    let deadline = Unix.gettimeofday () +. 2. in
+    let rec account_baseline () =
+      match send (Service.Register_coordination 71L) with
+      | Coordination_registered value when Option.is_some value.baseline.state.sync.account -> value
+      | Coordination_registered _ when Unix.gettimeofday () < deadline ->
+        Thread.delay 0.001;
+        account_baseline ()
+      | Coordination_registered _ -> T.fail "restored account never reached the host baseline"
+      | _ -> T.fail "host baseline"
+    in
+    let baseline = account_baseline () in
     let owner=Option.get baseline.baseline.state.sync.account in
     let plan:Logseq_db_worker.host_plan={version=baseline.baseline.version;
       id=Logseq_db_types.Graph_types.Uuid.of_string "00000000-0000-4000-8000-000000079071" |> Result.get_ok;
@@ -186,39 +166,22 @@ let test_managed_client_command_is_accepted () =
       | _ -> T.fail "managed client command returned the wrong response"))
 ;;
 
-(* Build opaque unlock evidence through the production reducer, including its
-   actual key-package and attachment owners. No boolean-to-receipt fixture. *)
-let synthetic_unlock_prompt graph_id =
-  let module C = Logseq_sync_pure_reducer.Core in
-  let limits = C.limits ~maximum_response_bytes:Logseq_db_types.Limits.maximum_response_bytes
-    ~maximum_artifact_bytes:1048576 ~submission_batch_size:32 |> Result.get_ok in
-  let initial = C.config ~managed_sync_origin:(Uri.of_string "https://example.invalid") ~limits
-    |> Result.get_ok |> C.initial |> Result.get_ok in
-  let permitted = C.step initial (C.Sign_in_requested
-    { account_generation = 0; presentation_generation = 0 }) in
-  let auth = C.step permitted.next (C.Account_authenticated { user_id = Some "synthetic-user" }) in
-  let graph : C.graph = { graph_id; name = "Private Journal"; encrypted = true
-    ; schema = { major = 65; minor = 33; exact = true } } in
-  let catalog = List.find_map (function
-    | C.Run (C.Request (ticket, C.Fetch_catalog _)) -> Some (C.step auth.next
-        (C.Runner_completed (C.Completion (ticket, Ok [graph]))))
-    | _ -> None) auth.effects |> Option.get in
-  let selected = C.step catalog.next (C.Graph_selected graph_id) in
-  let mirror = List.find_map (function C.Delegate (C.Inspect_mirror request) -> Some request
-    | _ -> None) selected.effects |> Option.get in
-  let local = C.step selected.next (C.Mirror_inspected (C.Mirror_available mirror)) in
-  let prepare = List.find_map (function
-    | C.Run (C.Request (ticket, C.Load_and_unlock_graph_key _)) -> Some (C.step local.next
-        (C.Runner_completed (C.Completion (ticket, Error (C.Effect_failed "synthetic missing key")))))
-    | _ -> None) local.effects |> Option.get in
-  let wrapped = List.find_map (function
-    | C.Run (C.Request (ticket, C.Fetch_e2ee_graph_key _)) -> Some (C.step prepare.next
-        (C.Runner_completed (C.Completion (ticket, Ok "synthetic-wrapped"))))
-    | _ -> None) prepare.effects |> Option.get in
-  List.find_map (function
-    | C.Run (C.Request (ticket, C.Fetch_e2ee_user_keys _)) -> Some (C.step wrapped.next
-        (C.Runner_completed (C.Completion (ticket, Ok "synthetic-package"))))
-    | _ -> None) wrapped.effects |> Option.get
+let synthetic_unlock_prompt graph_id : Logseq_sync_domain.Core.unlock_challenge =
+  { challenge_scope =
+      { account =
+          { managed_sync_origin = Uri.of_string "https://example.invalid"
+          ; user_id = "synthetic-user"
+          ; account_generation = 1
+          ; presentation_generation = 1
+          ; lifecycle_generation = 0L
+          }
+      ; graph_id
+      ; graph_generation = 1
+      }
+  ; challenge_id = 1
+  ; encrypted_graph_key = "synthetic-wrapped"
+  ; private_key_package = "synthetic-package"
+  }
 ;;
 
 let test_unlock_ignored_logging () =
@@ -243,11 +206,9 @@ let test_unlock_ignored_logging () =
         with_client fixture.config (fun client ->
           let id = Worker.send client (Service.Client_command
             (Submit_e2ee_password
-              (Logseq_sync_pure_reducer.Core.unlock_challenge
-                (Logseq_sync_pure_reducer.Core.state
-                  (synthetic_unlock_prompt (Logseq_db_types.Graph_types.Uuid.of_string
-                    "00000000-0000-0000-0000-000000000901" |> Result.get_ok)).next).snapshot.unlock
-                |> Option.get, "LOG_SECRET_PASSWORD"))) |> accepted in
+              (synthetic_unlock_prompt (Logseq_db_types.Graph_types.Uuid.of_string
+                 "00000000-0000-0000-0000-000000000901" |> Result.get_ok),
+               "LOG_SECRET_PASSWORD"))) |> accepted in
           (match await_response client id with
            | Service.Client_command_completed -> ()
            | _ -> T.fail "password queue acknowledgement changed");
@@ -263,7 +224,7 @@ let test_unlock_ignored_logging () =
 ;;
 
 module Mailbox = Logseq_db_worker_lui.Journal_bounded_mailbox.Coalesced
-module Transfer = Logseq_sync_pure_reducer.Asset_transfer
+module Transfer = Logseq_sync_asset_transfer.Core
 
 let asset_scope generation : Service.asset_scope =
   { account =
@@ -1391,7 +1352,11 @@ let test_real_auth_control ~transition () =
          Atomic.set pause false;
          if transition = `Late_restore then (
            control_wait "local reset closes network permission" (fun () ->
-             drain (); !account_generation > initial_account_generation && not !authenticated);
+             drain ();
+             !account_generation > initial_account_generation
+             && Option.exists
+                  (fun startup -> startup.Service.network_phase = Service.Local_only)
+                  !current_startup);
            permit_online ();
            reconcile ());
          let retry_permitted = ref false in
@@ -1433,7 +1398,7 @@ let test_real_auth_control ~transition () =
 ;;
 
 let test_local_copy_presence mode () =
-  let module Core = Logseq_sync_pure_reducer.Core in
+  let module Core = Logseq_sync_domain.Core in
   let module G = Logseq_db_types.Graph_types in
   T.with_managed (fun fixture ->
     let root = fixture.config.Logseq_db_worker.Config.application_support_directory in
@@ -1553,7 +1518,7 @@ let test_local_copy_presence mode () =
    reducer already emits Diagnostic. Corrupt only a synthetic mirror, then
    observe the real service's existing Client_state_changed/Diagnostics push. *)
 let test_restore_error_reaches_diagnostics () =
-  let module Core = Logseq_sync_pure_reducer.Core in
+  let module Core = Logseq_sync_domain.Core in
   let module G = Logseq_db_types.Graph_types in
   T.with_managed (fun fixture ->
     let root = fixture.config.Logseq_db_worker.Config.application_support_directory in
@@ -1676,7 +1641,7 @@ let test_authoritative_detail_rows () =
 (* Integrity text originates below the pure reducer; this public publisher boundary
    owns validating and displaying its bounded carrier. *)
 let test_asset_failure_rows () =
-  let module A=Logseq_sync_pure_reducer.Asset_transfer in
+  let module A=Logseq_sync_asset_transfer.Core in
   let module U=Logseq_db_worker_pure_reducer.Asset_upload in
   let module D=Logseq_db_types.Failure_diagnostic in
   let uuid=Logseq_db_types.Graph_types.Uuid.of_string "94000000-0000-4000-8000-000000000799" |> Result.get_ok in

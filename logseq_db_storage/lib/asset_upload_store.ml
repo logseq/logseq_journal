@@ -36,6 +36,9 @@ let initialize_database db =
          db
          "CREATE INDEX IF NOT EXISTS asset_upload_scope ON asset_upload_intents(origin, \
           account, graph, operation)") in
+    let* () = check db (Sqlite3.exec db "DROP INDEX IF EXISTS asset_upload_original") in
+    let* () = check db (Sqlite3.exec db
+      "CREATE INDEX IF NOT EXISTS asset_upload_original_v2 ON asset_upload_intents(origin,account,graph,json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.asset'),json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.version.checksum'),operation) WHERE json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.phase[0]') <> 'Cancelled'") in
     Mutation_effect_store.initialize_database db |> Result.map_error input_store_error)
 ;;
 
@@ -148,6 +151,21 @@ let list db ~origin ~account ~graph ~after ~limit =
              Error "Unexpected upload recovery query result"
          in
          rows [])
+;;
+
+let find_original db ~origin ~account ~graph ~asset ~checksum =
+  statement db
+    "SELECT operation,payload FROM asset_upload_intents INDEXED BY asset_upload_original_v2 WHERE origin=? AND account=? AND graph=? AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.asset')=? AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.version.checksum')=? AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.phase[0]') <> 'Cancelled' ORDER BY operation LIMIT 1"
+    (fun stmt ->
+      bind stmt [TEXT origin; TEXT account; TEXT (Uuid.to_string graph); TEXT (Uuid.to_string asset); TEXT checksum];
+      match Sqlite3.step stmt with
+      | DONE -> Ok None
+      | ROW ->
+        let* intent = decode (Sqlite3.column_text stmt 1) in
+        if intent.origin = origin && intent.account = account && intent.graph = graph && intent.asset = asset && intent.version.checksum = checksum && intent.phase <> Intent.Cancelled && Uuid.to_string intent.operation_id = Sqlite3.column_text stmt 0
+        then Ok (Some intent)
+        else Error "Original upload checkpoint scope mismatch"
+      | rc -> let* () = check db rc in Error "Unexpected original upload query result")
 ;;
 
 let transact db action =

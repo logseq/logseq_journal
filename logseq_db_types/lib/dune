@@ -1,6 +1,6 @@
 (library
  (name logseq_db_types)
  (public_name logseq_db_types)
- (libraries ppx_deriving_yojson.runtime yojson)
+ (libraries ppx_deriving_yojson.runtime uri yojson)
  (preprocess
   (pps ppx_deriving_yojson)))

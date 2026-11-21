@@ -2,7 +2,7 @@ module W = Journal_worker_coordination.Worker_api
 module Read = Worker_pure_read
 module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Id = Journal_worker_ids
-module Sync = Logseq_sync_pure_reducer.Core
+module Sync = Logseq_sync_domain.Core
 
 let check condition message = if not condition then failwith message
 let uuid s = W.Uuid.of_string s |> Result.get_ok
@@ -52,7 +52,20 @@ let fixture ?(graph = graph) ?(graph_generation = 7) ?(limits = limits) epoch =
     |> fun limits ->
     Sync.config ~managed_sync_origin:account.managed_sync_origin ~limits |> Result.get_ok
   in
-  let state = Sync.initial cfg |> Result.get_ok |> Sync.state in
+  let module Pure = Logseq_db_worker_pure_reducer.Core in
+  let worker =
+    Logseq_db_worker.Config.create
+      ~application_support_directory:(Filename.get_temp_dir_name ())
+      ~target:(Managed_sync { base_url = Uri.to_string account.managed_sync_origin })
+      ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:limits.response_budget_bytes
+      ~default_page_size:32
+    |> Result.get_ok
+  in
+  let state =
+    Pure.config ~worker ~sync:cfg |> Pure.initial |> Result.get_ok |> Pure.view
+    |> fun view -> view.sync
+  in
   let state =
     { state with
       snapshot =

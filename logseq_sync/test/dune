@@ -1,55 +1,57 @@
 (test
- (name test_sync)
- (modules
-  test_sync
-  core_contract
-  local_restore_failure_reconciliation
-  pure_reducer_bad_case_support
-  pure_reducer_bad_case_01
-  pure_reducer_bad_case_02
-  pure_reducer_bad_case_03
-  pure_reducer_bad_case_04
-  pure_reducer_bad_case_05
-  pure_reducer_bad_case_06
-  pure_reducer_bad_case_07
-  pure_reducer_bad_case_08
-  pure_reducer_bad_case_09
-  pure_reducer_bad_case_10
-  runner_contract
-  transport_contract
-  sync_protocol_contract)
- (libraries
-  alcotest
-  eio
-  eio_main
-  eio.unix
-  logseq_db_types
-  logseq_overlay_db
-  logseq_sync.effect_runner
-  logseq_sync.pure_reducer
-  melange-transit-core
-  melange-transit-native
-  mtime
-  ptime.clock.os
-  unix
-  uri
-  x509
-  yojson))
+ (name crypto_contract)
+ (modules crypto_contract)
+ (libraries datascript_ocaml.types alcotest logseq_sync.crypto logseq_sync_sync_dsl_impl logseq_sync_execute_impl rrbvec mirage-crypto melange-transit-core melange-transit-native))
+
+(test
+ (name execute_runtime_contract)
+ (modules execute_runtime_contract)
+ (libraries datascript_ocaml.types logseq_sync_sync_service logseq_sync_sync_service_impl alcotest eio eio_main datascript-ocaml-native logseq_db_storage execute logseq_sync_execute_impl sync_dsl logseq_sync_sync_dsl_impl logseq_overlay_db logseq_db_types rrbvec melange-transit-core melange-transit-native unix))
+
+(test
+ (name execute_owner_contract)
+ (modules execute_owner_contract)
+ (libraries alcotest eio eio_main sync_dsl logseq_sync_sync_dsl_impl logseq_sync_execute_owners))
+
+(test
+ (name service_lifecycle_contract)
+ (modules service_lifecycle_contract)
+ (libraries alcotest logseq_sync_service_lifecycle))
+
+(test
+ (name sync_dsl_contract)
+ (modules sync_dsl_contract sync_dsl_interpreter sync_dsl_policy_contract)
+ (libraries alcotest sync_dsl logseq_sync_sync_dsl_impl logseq_overlay_db logseq_db_types rrbvec))
+
+(test
+ (name indexed_program_contract)
+ (modules indexed_program_contract)
+ (libraries alcotest logseq_sync_indexed_program))
+
+(test
+ (name test_wire_protocol)
+ (modules test_wire_protocol sync_protocol_contract)
+ (libraries alcotest logseq_db_types logseq_sync.protocol yojson))
+
+(test
+ (name native_framing_contract)
+ (modules native_framing_contract tls_peer)
+ (libraries alcotest eio eio_main logseq_sync.native_transport ptime.clock.os unix uri x509 yojson))
 
 (test
  (name test_asset_transfer)
  (modules test_asset_transfer)
- (libraries alcotest logseq_db_types logseq_sync.pure_reducer uri))
+ (libraries alcotest logseq_db_types logseq_sync.domain logseq_sync.asset_transfer uri))
 
 (test
  (name test_asset_codec)
  (modules test_asset_codec)
- (libraries alcotest logseq_db_types logseq_sync.effect_runner melange-transit-core melange-transit-native unix))
+ (libraries alcotest logseq_db_types logseq_sync.native_crypto logseq_sync.assets melange-transit-core melange-transit-native unix))
 
 (test
  (name test_asset_cache)
  (modules test_asset_cache)
- (libraries alcotest logseq_sync.effect_runner logseq_sync.pure_reducer logseq_db_types unix uri))
+ (libraries alcotest logseq_sync.native_crypto logseq_sync.assets logseq_sync.domain logseq_sync.asset_transfer logseq_db_types unix uri))
 
 (test
  (name test_asset_descriptor)
@@ -59,9 +61,9 @@
 (executable
  (name asset_native_interop)
  (modules asset_native_interop)
- (libraries logseq_db_types logseq_sync.effect_runner melange-transit-core melange-transit-native yojson))
+ (libraries logseq_db_types logseq_sync.native_crypto logseq_sync.assets melange-transit-core melange-transit-native yojson))
 
 (executable
  (name asset_adapter_memory)
  (modules asset_adapter_memory)
- (libraries logseq_sync.effect_runner logseq_sync.pure_reducer logseq_db_types eio eio_main uri melange-transit-core melange-transit-native))
+ (libraries datascript_ocaml.types execute sync_dsl logseq_sync.crypto logseq_sync.native_crypto logseq_sync.assets logseq_db_types eio eio_main uri melange-transit-core melange-transit-native))

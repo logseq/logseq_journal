@@ -33,19 +33,13 @@ Reuse the warm-start fixture's binary PPX compilation pipeline for
 with the generated `.cmo` file. Avoid pretty-printing a generated AST back into
 source: compiler-only identifiers may not survive that conversion. Pass the copied support directory,
 PNG directory and, for an older fixture, its existing journal-page UUID. The
-generator uses public storage sessions and `Core.step` → `Effect_runner.submit`
-asset requests. It starts a disposable Python HTTPS server on an ephemeral
-loopback port, generates a temporary certificate with OpenSSL, and fetches the
-three PNGs through the production asset runner. Its network provider routes
-asset connections to that server while retaining the fixture's
-`https://api.logseq.io` account identity; the production resolver may resolve
-that hostname, but no production server receives an HTTP request. The temporary
-certificate is trusted only by this runner, and the server and certificate files
-are removed when preparation ends. Python 3 with `ssl` and OpenSSL with
-`req -addext` must be available on `PATH`.
+generator uses public storage sessions, `Logseq_sync_native_crypto.Asset_codec`
+verification and `Logseq_sync_assets.Cache` publication. It retains the fixture's
+`https://api.logseq.io` account identity without opening network connections or
+using a temporary server, certificate or trust override.
 
-The generator releases each lease, closes the cache scope, and reads the
-persisted asset back through the public cache requests before emitting PPX
+The generator releases each handle, closes and reopens the cache, and checks the
+persisted asset's path and exact bytes through the public cache API before emitting PPX
 metadata. It adds three ordered direct image children to the known fixture root
 and updates only the synthetic journal day and title. Regenerate the synthetic
 date after midnight. Run it only against the separate disposable support copy.

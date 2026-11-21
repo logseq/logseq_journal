@@ -9,7 +9,7 @@ module Core = Logseq_db_worker_pure_reducer.Core
 module Database = Logseq_overlay_db.Database
 module Overlay = Logseq_overlay_db.Types
 module Graph = Logseq_db_types.Graph_types
-module Sync = Logseq_sync_pure_reducer.Core
+module Sync = Logseq_sync_domain.Core
 module Transit = Transit_core.Json
 module Transit_codec = Transit_native.Transit.Json
 
@@ -308,17 +308,20 @@ type runtime =
   ; sleep : float -> unit
   }
 
-type sync_runner =
-  { submit : Sync.runner_effect -> unit
+type services =
+  { post : Core.lifecycle_intent -> unit
+  ; owner : scope:Sync.graph_scope -> (Sync_dsl.Core.identity * Logseq_sync_worker_owner.Core.t, string) result
+  ; asset : Sync.asset_request -> Sync.asset_result
+  ; await_io : scope:Sync.effect_scope -> (unit, string) result
   ; shutdown : unit -> unit
-  ; retire_account : account:Sync.account_scope -> (unit,string)result
+  ; retire_account : account:Sync.account_scope -> (unit, string) result
   }
 
 type dependencies =
   { runtime : runtime
   ; config : Logseq_db_worker_contract.Config.t
   ; overlay : Database.dependencies
-  ; sync_runner : sync_runner
+  ; services : services
   ; publish : Core.output -> unit
   }
 
@@ -330,12 +333,8 @@ type waiter =
   ; resolve : Read.answer Eio.Promise.u
   }
 
-type asset_waiter =
+type asset_diagnostic =
   { request : Sync.asset_request
-  ; resolve : Sync.asset_output Eio.Promise.u
-  ; mutable delivered : Sync.asset_output option
-  ; mutable accepted : bool
-  ; mutable reclaimed : bool
   ; mutable diagnostic : Logseq_db_types.Failure_diagnostic.t option
   }
 
@@ -346,11 +345,6 @@ type notice_diagnostic =
   ; key : notice_diagnostic_key
   ; detail : Logseq_db_types.Failure_diagnostic.t
   ; ticket_id : int
-  }
-
-type protected_waiter =
-  { protected_request : Sync.protected_request
-  ; protected_resolve : Sync.protected_output Eio.Promise.u
   }
 
 type change_window =
@@ -366,6 +360,8 @@ type change_window =
 type database_session =
   { graph_scope : Sync.graph_scope
   ; database : Database.t
+  ; database_owner : Execute.Core.database_owner
+  ; borrowed : bool
   ; subscription : Database.subscription
   ; mutable generation : string
   ; mutable next_window : int
@@ -405,22 +401,28 @@ type host_copy={mutable copy_handoff:Graph.Uuid.t;copy_registration:int64;copy_o
   copy_preparation:Database.prepared_mirror_deletion;copy_generation:Overlay.mirror_generation;
   mutable copy_bound:Sync.mirror_deletion option}
 
+type imported_resource =
+  { imported_scope : Sync.graph_scope
+  ; imported_retain : unit -> ((string * string) option, string) result
+  ; imported_release : unit -> (unit, string) result
+  }
+
 type t =
   { sw : Eio.Switch.t
+  ; imported_resources : (string, imported_resource) Hashtbl.t
+  ; mutable next_imported_resource : int64
   ; dependencies : dependencies
   ; post : Core.event -> unit
   ; upload_operations : (Upload.ticket, unit Eio.Promise.u) Hashtbl.t
-  ; protected_waiters : (string, protected_waiter) Hashtbl.t
-  ; asset_waiters : (string, asset_waiter) Hashtbl.t
+  ; asset_waiters : (string, asset_diagnostic) Hashtbl.t
   ; mutable notice_diagnostics : notice_diagnostic list
-  ; asset_operations : (Logseq_sync_pure_reducer.Asset_transfer.ticket, string) Hashtbl.t
+  ; asset_operations : (Logseq_sync_asset_transfer.Core.ticket, string) Hashtbl.t
   ; mutable next_asset_operation : int64
   ; upload_staging_lock : Eio.Mutex.t
   ; mutable staging_reconciled : Sync.graph_scope list
-  ; local_imports : (Sync.graph_scope * Graph.Uuid.t * string, Graph.Uuid.t) Hashtbl.t
   ; recovery_current : Core.upload_recovery_ticket -> bool
   ; upload_current : Upload.ticket -> bool
-  ; asset_current : Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
+  ; asset_current : Logseq_sync_asset_transfer.Core.ticket -> bool
   ; observation_slots : (int64 * Graph.Uuid.t, observation_slot) Hashtbl.t
   ; mutable observation_registry : Core.Observation_registry.t
   ; mutable orphan_cleanup : Core.Orphan_cleanup.t
@@ -429,9 +431,8 @@ type t =
   ; mutable next_asset_barrier : int64
   ; asset_cleanup_jobs : (int64,asset_cleanup_job) Hashtbl.t
   ; asset_cleanup_barriers : (int64,unit Eio.Promise.u) Hashtbl.t
-  ; sync_io_waiters : (int64,Sync.effect_scope * (unit,string)result Eio.Promise.u)Hashtbl.t
-  ; cancelled_asset_jobs : (Logseq_sync_pure_reducer.Asset_transfer.ticket,asset_cleanup_job)Hashtbl.t
-  ; asset_result_sources : ((Sync.graph_scope*string),Logseq_sync_pure_reducer.Asset_transfer.ticket)Hashtbl.t
+  ; cancelled_asset_jobs : (Logseq_sync_asset_transfer.Core.ticket,asset_cleanup_job)Hashtbl.t
+  ; asset_result_sources : ((Sync.graph_scope*string),Logseq_sync_asset_transfer.Core.ticket)Hashtbl.t
   ; asset_cleanup_stopped : unit Eio.Promise.t * unit Eio.Promise.u
   ; resource_cleanup_owners : ((Sync.graph_scope * string),asset_cleanup_job) Hashtbl.t
   ; resource_release_waiters : ((Sync.graph_scope * string),unit Eio.Promise.u list) Hashtbl.t
@@ -453,32 +454,31 @@ type t =
   ; mutable authorized_graphs : Authorized_graphs.t
   ; mutable host_copy : host_copy option
   ; mutable deletion_owner : Sync.mirror_deletion option
+  ; mutable sync_store : Sqlite3.db option
   }
 
 let runtime ~fork ~sleep = Ok { fork; sleep }
-let sync_runner ~submit ~shutdown ~retire_account () = { submit; shutdown;retire_account }
-
-let dependencies ~runtime ~config ~overlay ~sync_runner ~publish =
-  Ok { runtime; config; overlay; sync_runner; publish }
+let dependencies ~runtime ~config ~overlay ~services ~publish =
+  Ok { runtime; config; overlay; services; publish }
 ;;
 
 let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_current =
   Ok
     { sw
+    ; imported_resources = Hashtbl.create 16
+    ; next_imported_resource = 0L
     ; dependencies
     ; post
     ; asset_current
     ; upload_current
     ; recovery_current
     ; upload_operations = Hashtbl.create 32
-    ; protected_waiters = Hashtbl.create 32
     ; asset_waiters = Hashtbl.create 32
     ; notice_diagnostics = []
     ; asset_operations = Hashtbl.create 8
     ; next_asset_operation = 0L
     ; upload_staging_lock = Eio.Mutex.create ()
     ; staging_reconciled = []
-    ; local_imports = Hashtbl.create 32
     ; observation_slots = Hashtbl.create 32
     ; observation_registry = Core.Observation_registry.empty
     ; orphan_cleanup = Core.Orphan_cleanup.empty
@@ -487,7 +487,6 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; next_asset_barrier = 0L
     ; asset_cleanup_jobs = Hashtbl.create 16
     ; asset_cleanup_barriers = Hashtbl.create 16
-    ; sync_io_waiters = Hashtbl.create 4
     ; cancelled_asset_jobs = Hashtbl.create 16
     ; asset_result_sources = Hashtbl.create 16
     ; asset_cleanup_stopped = Eio.Promise.create ()
@@ -511,6 +510,7 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; authorized_graphs = Authorized_graphs.empty
     ; host_copy = None
     ; deletion_owner = None
+    ; sync_store = None
     }
 ;;
 
@@ -520,20 +520,40 @@ let with_upload_store t action =
   try
     let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
     Unix.close fd;
-    let db = Sqlite3.db_open path in
-    Fun.protect
-      ~finally:(fun () -> (if not (Sqlite3.db_close db) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
-      (fun () ->
-         Unix.chmod path 0o600;
-         Result.bind
-           (Logseq_db_storage.Asset_upload_store.initialize_database db)
-           (fun () -> action db))
+    let opened = match t.sync_store with
+      | Some db -> Ok db
+      | None ->
+        let db = Sqlite3.db_open path in
+        Unix.chmod path 0o600;
+        (match Logseq_db_storage.Asset_upload_store.initialize_database db with
+         | Ok () -> t.sync_store <- Some db; Ok db
+         | Error message ->
+           if Sqlite3.db_close db then Error message
+           else (t.sync_store <- Some db; Error (message ^ "; upload store close failed"))) in
+    Result.bind opened action
     |> Result.map (fun value ->
       let fd = Unix.openfile root [ Unix.O_RDONLY ] 0 in
       Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> Unix.fsync fd);
       value)
   with
   | exn -> Error (Printexc.to_string exn)
+;;
+
+let sync_upload_store t =
+  if t.stopped then Error "The Worker upload store is retired."
+  else with_upload_store t (fun db -> Ok (Logseq_sync_worker_owner.Core.store db))
+;;
+
+let worker_owner t ~(scope : Sync.graph_scope) =
+  if t.stopped then Error "The Worker is retired."
+  else Result.bind (t.dependencies.services.owner ~scope) (fun ((identity, _) as owner) ->
+      if identity.Sync_dsl.Core.origin = Uri.to_string scope.account.managed_sync_origin
+         && identity.account = scope.account.user_id
+         && identity.graph = Graph.Uuid.to_string scope.graph_id
+         && identity.account_generation = Int64.of_int scope.account.account_generation
+         && identity.graph_generation = Int64.of_int scope.graph_generation
+      then Ok owner
+      else Error "The direct Sync owner belongs to a different graph incarnation.")
 ;;
 
 let asset_request t ~scope action =
@@ -543,7 +563,17 @@ let asset_request t ~scope action =
   { Sync.scope; operation; action }
 ;;
 
-let post_asset_request t request = t.post (Core.Sync_event (Sync.Asset_requested request))
+let post_asset_request t request =
+  t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+      match t.dependencies.services.asset request with
+      | Ok _ -> ()
+      | Error failure ->
+        let detail = Sync.asset_failure_cause failure in
+        t.dependencies.publish (Core.Diagnostic
+          (match detail with
+           | Some detail -> Logseq_db_types.Failure_diagnostic.signal_prefix
+               ^ Logseq_db_types.Failure_diagnostic.encode detail
+           | None -> "Direct Sync asset cleanup failed")))
 
 let send_asset t ~scope action =
   Eio.Cancel.protect (fun () -> post_asset_request t (asset_request t ~scope action))
@@ -561,13 +591,6 @@ let reclaim_asset_output t (output : Sync.asset_output) =
     | Ok _ | Error _ -> None
   in
   Option.iter (send_asset t ~scope:output.request.scope) action
-;;
-
-let reclaim_waiter t waiter =
-  if (not waiter.accepted) && not waiter.reclaimed
-  then (
-    waiter.reclaimed <- true;
-    Option.iter (reclaim_asset_output t) waiter.delivered)
 ;;
 
 let current_graph_scope t (scope : Sync.graph_scope) =
@@ -589,56 +612,125 @@ let publish_scoped_asset_detail t scope detail =
     try t.dependencies.publish (Core.Diagnostic (D.signal_prefix ^ D.encode detail)) with _ -> ())
 ;;
 
+let native_asset_failure = function
+  | Sync_dsl.Core.Network_failure _ -> Sync.Asset_network
+  | Authentication_failure _ -> Asset_authentication
+  | Locked -> Asset_locked
+  | Storage_failure source ->
+    Sync.Asset_with_cause (Sync.Asset_invalid_content source,
+      Logseq_db_types.Failure_diagnostic.of_source
+        ~operation:"assetCache" ~reason:"persistenceFailed" source)
+  | Cancelled | Stale_context | Network_closed -> Asset_cancelled
+  | error -> Asset_invalid_content (Sync_dsl.Core.error_message error)
+;;
+
+let native_asset_call t ~scope action =
+  let module Owner = Logseq_sync_worker_owner.Core in
+  let module Dsl = Sync_dsl.Core in
+  let ( let* ) = Result.bind in
+  let* identity, owner = worker_owner t ~scope
+    |> Result.map_error (fun message -> Sync.Asset_invalid_content message) in
+  let* operation = Graph.Uuid.of_string
+    (Printf.sprintf "00000000-0000-4000-8000-%012Lx" t.next_asset_operation)
+    |> Result.map_error (fun message -> Sync.Asset_invalid_content message) in
+  let run : type value. value Dsl.assets -> (value, string) result = fun action ->
+    Owner.run_assets owner ~identity ~operation action |> Result.map_error Dsl.error_message in
+  let capacity () =
+    if Hashtbl.length t.imported_resources >= 2048 || t.next_imported_resource = Int64.max_int
+    then Error "Consumer resource capacity exceeded." else Ok () in
+  let register ~path ~retain ~release =
+    t.next_imported_resource <- Int64.succ t.next_imported_resource;
+    let handle = "worker-file:" ^ Int64.to_string t.next_imported_resource in
+    Hashtbl.add t.imported_resources handle
+      { imported_scope = scope; imported_retain = retain; imported_release = release };
+    handle, path in
+  let file_result file =
+    let* path = Owner.asset_file_path owner file |> Result.map_error Dsl.error_message in
+    let rec retain () =
+      let* () = capacity () in
+      let* lease = run (Dsl.Retain file) in
+      Ok (Some (register ~path ~retain ~release:(fun () -> run (Dsl.Release_lease lease)))) in
+    Ok (register ~path ~retain ~release:(fun () -> run (Dsl.Release_file file))) in
+  let descriptor asset version =
+    Logseq_db_types.Asset_descriptor.create ~uuid:asset ~source:(Managed (Some version))
+      ~current_checksum:None ~size:None ~dimensions:None
+    |> Result.map_error (fun message -> Sync.Asset_invalid_content message) in
+  match action with
+  | Sync.Prune_asset_staging _ ->
+    Owner.run_assets owner ~identity ~operation Dsl.Reconcile_staging
+    |> Result.map (fun count -> Sync.Asset_pruned count)
+    |> Result.map_error native_asset_failure
+  | Sync.Check_asset_cache (asset,version) ->
+    let* () = capacity () |> Result.map_error (fun message -> Sync.Asset_invalid_content message) in
+    let* descriptor = descriptor asset version in
+    let* file = Owner.run_assets owner ~identity ~operation (Dsl.Lookup descriptor)
+      |> Result.map_error native_asset_failure in
+    (match file with
+     | None -> Ok (Sync.Asset_cached None)
+     | Some file -> file_result file |> Result.map (fun (handle,_) -> Sync.Asset_cached (Some handle))
+         |> Result.map_error (fun message -> Sync.Asset_invalid_content message))
+  | Fetch_asset {asset;version;_} ->
+    let* () = capacity () |> Result.map_error (fun message -> Sync.Asset_invalid_content message) in
+    let* descriptor = descriptor asset version in
+    let* result = Owner.run_assets owner ~identity ~operation (Dsl.Download descriptor)
+      |> Result.map_error native_asset_failure in
+    (match result with
+     | Dsl.Available file -> file_result file |> Result.map (fun (handle,_) -> Sync.Asset_downloaded handle)
+         |> Result.map_error (fun message -> Sync.Asset_invalid_content message)
+     | Waiting_remote | Missing_local -> Error Sync.Asset_not_found)
+  | _ -> Error (Sync.Asset_invalid_content "Unsupported native asset action")
+;;
+
 let asset_call ?(started = fun _ -> ()) ?on_diagnostic t ~scope action =
   let request = asset_request t ~scope action in
-  let promise, resolve = Eio.Promise.create () in
-  let waiter =
-    { request; resolve; delivered = None; accepted = false; reclaimed = false; diagnostic = None }
-  in
+  let waiter = { request; diagnostic = None } in
   Hashtbl.add t.asset_waiters request.operation waiter;
   Fun.protect
-    ~finally:(fun () ->
-      Hashtbl.remove t.asset_waiters request.operation;
-      if not waiter.accepted
-      then (
-        reclaim_waiter t waiter;
-        send_asset t ~scope (Sync.Cancel_asset_operation request.operation)))
+    ~finally:(fun () -> Hashtbl.remove t.asset_waiters request.operation)
     (fun () ->
-       started request.operation;
-       post_asset_request t request;
-       let output = Eio.Promise.await promise in
-       waiter.accepted <- true;
-       (match output.Sync.result, waiter.diagnostic with
-        | Error Sync.Asset_cancelled, _ | Ok _, _ | _, None -> ()
-        | Error _, Some detail ->
-          (try (Option.value on_diagnostic ~default:(publish_scoped_asset_detail t scope)) detail with _ -> ()));
-       waiter.diagnostic <- None;
-       output.Sync.result)
+      started request.operation;
+      let result = match action with
+        | Sync.Release_asset_file handle when Hashtbl.mem t.imported_resources handle ->
+          let resource = Hashtbl.find t.imported_resources handle in
+          if resource.imported_scope <> scope then Error Sync.Asset_cancelled else
+          (match resource.imported_release () with
+           | Error message -> Error (Sync.Asset_invalid_content message)
+           | Ok () -> Hashtbl.remove t.imported_resources handle; Ok Sync.Asset_unit)
+        | Sync.Retain_asset_file handle when Hashtbl.mem t.imported_resources handle ->
+          let resource = Hashtbl.find t.imported_resources handle in
+          if resource.imported_scope <> scope then Error Sync.Asset_cancelled else
+          resource.imported_retain () |> Result.map (fun file -> Sync.Asset_retained file)
+          |> Result.map_error (fun message -> Sync.Asset_invalid_content message)
+        | Sync.Check_asset_cache _ | Fetch_asset _ -> native_asset_call t ~scope action
+        | Sync.Prune_asset_staging _ ->
+          native_asset_call t ~scope action
+        | _ -> t.dependencies.services.asset request in
+      (match result, waiter.diagnostic with
+       | Error Sync.Asset_cancelled, _ | Ok _, _ | _, None -> ()
+       | Error _, Some detail ->
+         (Option.value on_diagnostic ~default:(publish_scoped_asset_detail t scope)) detail);
+      result)
 ;;
 
 let protected_call t action =
-  let key =
-    match action with
-    | Sync.Encrypt_values (key, _) | Decrypt_value (key, _) -> key
-  in
-  let operation = "worker-protected:" ^ Int64.to_string t.next_asset_operation in
-  t.next_asset_operation <- Int64.succ t.next_asset_operation;
-  let request =
-    { Sync.protected_operation = operation
-    ; protected_scope = Sync.graph_key_handle_scope key
-    ; protected_action = action
-    }
-  in
-  let promise, resolve = Eio.Promise.create () in
-  Hashtbl.add
-    t.protected_waiters
-    operation
-    { protected_request = request; protected_resolve = resolve };
-  Fun.protect
-    ~finally:(fun () -> Hashtbl.remove t.protected_waiters operation)
-    (fun () ->
-       t.post (Core.Sync_event (Sync.Protected_requested request));
-       (Eio.Promise.await promise).Sync.protected_result)
+    let key = match action with
+      | Sync.Encrypt_values (key, _) | Decrypt_value (key, _) -> key in
+    let scope = Sync.graph_key_handle_scope key in
+    let result = Result.bind (worker_owner t ~scope) (fun (identity, owner) ->
+      let module Owner = (val Logseq_sync_worker_owner.Core.worker_owner owner : Execute.Core.WORKER_OWNER) in
+      let operation = Graph.Uuid.of_string
+        (Printf.sprintf "00000000-0000-4000-8000-%012Lx" t.next_asset_operation) in
+      t.next_asset_operation <- Int64.succ t.next_asset_operation;
+      Result.bind operation (fun operation -> Owner.with_scope ~identity ~operation (fun owned ->
+        match action with
+        | Sync.Encrypt_values (_, plaintexts) ->
+          Result.map (fun values -> Sync.Encrypted_values (Rrbvec.to_list values))
+            (Owner.crypto owned (Sync_dsl.Core.Encrypt_values (Rrbvec.of_list plaintexts)))
+        | Sync.Decrypt_value (_, ciphertext) ->
+          Result.map (fun plaintext -> Sync.Decrypted_value plaintext)
+            (Owner.crypto owned (Sync_dsl.Core.Decrypt_value ciphertext)))
+      |> Result.map_error Sync_dsl.Core.error_message)) in
+    Result.map_error (fun message -> Sync.Effect_failed message) result
 ;;
 
 let encrypt_protected_values t key plaintexts =
@@ -779,62 +871,15 @@ let reconcile_staging t (scope : Sync.graph_scope) ~current =
   else if List.mem scope t.staging_reconciled
   then Ok ()
   else (
-    Hashtbl.filter_map_inplace (fun (owner,_,_) operation -> if owner=scope then None else Some operation) t.local_imports;
-    let keep =
-      with_upload_store t (fun db ->
-        let rec read after reversed =
-          if (not (current ())) || t.stopped
-          then Error "Stale staging recovery"
-          else
-            Result.bind
-              (Logseq_db_storage.Asset_upload_store.list
-                 db
-                 ~origin:(Uri.to_string scope.account.managed_sync_origin)
-                 ~account:scope.account.user_id
-                 ~graph:scope.graph_id
-                 ~after
-                 ~limit:128)
-              (fun intents ->
-                 let reversed =
-                   List.fold_left
-                     (fun files intent ->
-                        let module I = Logseq_db_types.Asset_upload_intent in
-                        if intent.I.phase <> I.Cancelled then
-                          Hashtbl.replace t.local_imports
-                            (scope, intent.asset, intent.version.checksum) intent.operation_id;
-                        intent.staged_file :: files)
-                     reversed
-                     intents
-                 in
-                 match List.rev intents with
-                 | [] -> Ok (List.rev reversed)
-                 | last :: _ when List.length intents = 128 ->
-                   read
-                     (Some last.Logseq_db_types.Asset_upload_intent.operation_id)
-                     reversed
-                 | _ -> Ok (List.rev reversed))
-        in
-        read None [])
-    in
-    Result.bind keep (fun keep ->
-      if (not (current ())) || t.stopped
-      then Error "Stale staging recovery"
-      else (
-        match asset_call t ~scope (Sync.Prune_asset_staging keep) with
-        | Ok (Sync.Asset_pruned _) ->
-          if current ()
-          then (
-            t.staging_reconciled <- scope :: t.staging_reconciled;
-            Ok ())
-          else Error "Stale staging recovery"
-        | Error failure -> Error (asset_failure_message failure)
-        | Ok _ -> Error "Unexpected staging recovery completion")))
-;;
-
-let save_upload t intent expected =
-  with_upload_store t (fun db ->
-    Logseq_db_storage.Asset_upload_store.save db ~expected intent)
-  |> Result.map_error (fun message -> Upload.Persistence_failed message)
+    match asset_call t ~scope (Sync.Prune_asset_staging []) with
+    | Ok (Sync.Asset_pruned _) ->
+      if current ()
+      then (
+        t.staging_reconciled <- scope :: t.staging_reconciled;
+        Ok ())
+      else Error "Stale staging recovery"
+    | Error failure -> Error (asset_failure_message failure)
+    | Ok _ -> Error "Unexpected staging recovery completion")
 ;;
 
 let worker_error ~code message =
@@ -1109,6 +1154,29 @@ let publish_projection_change t session = function
          (session.graph_scope, Worker_pure_data.Resync_required {generation=generation;reason=resync_reason reason}))
 ;;
 
+let attach_database_owner t ~(scope:Sync.graph_scope) owner =
+  match Hashtbl.find_opt t.attachments scope with
+  | Some database_id -> Ok(Core.database_opened ~database_id ~graph_id:scope.graph_id)
+  | None ->
+    Result.bind (Execute.Core.database_if_open owner |> Result.map_error Sync_dsl.Core.error_message) (function
+    | None -> Error "The Sync database is not active yet."
+    | Some database ->
+      match Database.listen database with
+      | Error error -> Error(Logseq_db_worker_contract.Error.message(listen_error error))
+      | Ok(subscription,snapshot) ->
+        let version=Database.snapshot_version snapshot in
+        Database.release_snapshot snapshot;
+        let database_id="lifecycle-" ^ Int64.to_string t.next_database_id in
+        t.next_database_id<-Int64.succ t.next_database_id;
+        let session={graph_scope=scope;database;database_owner=owner;borrowed=true;subscription;
+          generation=Overlay.Generation.to_string version.generation;next_window=1;
+          acknowledged_through="change-window:v1:0";windows=Rrbvec.empty;changefeed=Core.Changefeed_owner.empty} in
+        match Database.activate_subscription subscription ~notify:(publish_projection_change t session) with
+        | Error error -> Database.unlisten subscription;Error(Logseq_db_worker_contract.Error.message(listen_error error))
+        | Ok () -> Hashtbl.add t.databases database_id session;Hashtbl.add t.attachments scope database_id;
+          Ok(Core.database_opened ~database_id ~graph_id:scope.graph_id))
+;;
+
 let report_current_graph t (scope : Sync.graph_scope) code =
   if current_graph_scope t scope then
     t.dependencies.publish (Core.Diagnostic code)
@@ -1203,8 +1271,8 @@ let publish_asset_notice t scope notice output =
       (match status with Upload.Uploaded | Cancelled -> true | _ -> false)
     | Asset_availability {asset;availability;_} ->
       Some (Download_notice asset), (match availability with
-        Logseq_sync_pure_reducer.Asset_transfer.Failed {retry_scheduled=false;_} -> true | _ -> false),
-      (match availability with Logseq_sync_pure_reducer.Asset_transfer.Ready _ -> true | _ -> false)
+        Logseq_sync_asset_transfer.Core.Failed {retry_scheduled=false;_} -> true | _ -> false),
+      (match availability with Logseq_sync_asset_transfer.Core.Ready _ -> true | _ -> false)
     | Asset_demand_accepted _ | Asset_backpressure _ | Asset_capacity_available -> None, false, false in
   let detail = Option.bind key (fun key ->
     let found = List.find_opt (fun item -> item.scope=scope && item.key=key) t.notice_diagnostics in
@@ -1310,7 +1378,7 @@ let close_database_by_id ?scope t database_id =
     |Some error->Error error
     |None->
     Database.unlisten session.subscription;
-    let result = Database.close session.database in
+    let result = if session.borrowed then Ok () else Database.close session.database in
     (match result with
      | Ok () -> ()
      | Error error ->
@@ -1336,6 +1404,13 @@ let close_database_by_id ?scope t database_id =
     Result.map_error
       close_error
       result)
+;;
+
+let detach_database_owner t ~scope =
+  match Hashtbl.find_opt t.attachments scope with
+  | None -> Ok ()
+  | Some database_id -> close_database_by_id ~scope t database_id
+    |> Result.map_error Logseq_db_worker_contract.Error.message
 ;;
 
 let close_attached t =
@@ -1910,6 +1985,13 @@ let attached_session t scope =
   Option.bind (Hashtbl.find_opt t.attachments scope) (Hashtbl.find_opt t.databases)
 ;;
 
+let database_owner t ~scope =
+  if t.stopped then Error "The Worker is retired."
+  else match attached_session t scope with
+  | None -> Error "The scoped database is no longer attached."
+  | Some session -> Ok session.database_owner
+;;
+
 let retire_changefeed t ~registration =
   Hashtbl.iter(fun _ session->session.changefeed<-Core.Changefeed_owner.retire session.changefeed ~registration) t.databases
 ;;
@@ -2390,7 +2472,6 @@ let deletion_authorized t (request : Sync.mirror_deletion) =
     snapshot.startup.authenticated
     && snapshot.startup.account_generation = request.account.account_generation
     && snapshot.selected_graph <> Some request.graph_id
-    && snapshot.local_deletion = Some (Sync.Deletion_in_progress Sync.Deleting_mirror)
     && Authorized_graphs.mem (Graph.Uuid.to_string request.graph_id) t.authorized_graphs
   | None -> false
 ;;
@@ -2407,7 +2488,7 @@ let report_asset_diagnostic t ~scope ~operation ~request_operation detail =
       && request.graph_id=scope.graph_id) t.deletion_owner in
   match Hashtbl.find_opt t.asset_waiters request_operation with
   | Some waiter when current && waiter.request.scope=scope
-      && not waiter.accepted && waiter.delivered=None && D.operation detail=operation ->
+      && D.operation detail=operation ->
     waiter.diagnostic <- Some detail
   | Some _ | None -> ()
 ;;
@@ -2794,6 +2875,8 @@ let handle_sync_worker_effect t = function
              let session =
                { graph_scope = request.scope
                ; database
+               ; database_owner = Execute.Core.database_owner database
+               ; borrowed = false
                ; subscription
                ; generation = Overlay.Generation.to_string version.generation
                ; next_window = 1
@@ -2970,6 +3053,21 @@ let run_request t (type a) (request : a Core.runner_request)
   | Handle_sync_worker_effect worker_effect -> handle_sync_worker_effect t worker_effect
 ;;
 
+let delete_local_copy t ?prepared_handoff ~(account:Sync.account_scope) ~graph_id () =
+  let request:Sync.mirror_deletion={account;graph_id;scope=Sync.effect_scope_of_account account} in
+  if t.deletion_owner<>None then Error "Another local deletion is in progress." else
+  let bound=match prepared_handoff with
+    | None -> Ok ()
+    | Some handoff_id -> bind_host_copy t ~handoff_id request |> Result.map_error Logseq_db_worker_contract.Error.message in
+  Result.bind bound(fun()->
+    t.deletion_owner<-Some request;
+    Fun.protect ~finally:(fun()->t.deletion_owner<-None)(fun()->
+      match handle_sync_worker_effect t (Sync.Delete_mirror request) with
+      | Ok {event=Some(Sync.Mirror_deleted(_,result));_}->result
+      | Ok _ -> Error "Local deletion returned an invalid completion."
+      | Error error -> Error(Logseq_db_worker_contract.Error.message error)))
+;;
+
 let request_operation : type a. a Core.runner_request -> string = function
   | Core.Execute_request _ -> "workerOperation"
   | Close_database _ -> "closeDatabase"
@@ -3038,157 +3136,98 @@ let submit_worker t (Core.Request(ticket,request) as packed) =
     | Error message -> post_worker_result t ticket request (Error (effect_error message))
 ;;
 
-let rec upload_failure = function
-  | Sync.Asset_with_cause (failure, _) -> upload_failure failure
-  | Asset_network -> Upload.Network
-  | Asset_authentication | Asset_locked -> Authentication
-  | Asset_missing_source | Asset_not_found -> Missing_source
-  | Asset_size_rejected -> Size_rejected
-  | Asset_revoked_access -> Revoked_access
-  | Asset_checksum_mismatch | Asset_storage_full | Asset_cancelled
-  | Asset_invalid_content _ -> Invalid_content
+let rec upload_owner_diagnostic error =
+  let module Dsl = Sync_dsl.Core in
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let detail ?source reason = failure_detail ?source ~operation:"assetUpload" ~reason () in
+  match error with
+  | Dsl.Invalid_input source -> detail ~source "invalidRequest"
+  | Identity_mismatch source -> detail ~source "ownershipConflict"
+  | Stale_context -> detail "attachmentStale"
+  | Network_closed -> detail "networkFailed"
+  | Network_failure source -> detail ~source "networkFailed"
+  | Authentication_failure source -> detail ~source "authenticationFailed"
+  | Locked -> detail "locked"
+  | Crypto_failure source -> detail ~source "cryptoInvalid"
+  | Protocol_failure source -> detail ~source "invalidContent"
+  | Storage_failure source -> detail ~source "persistenceFailed"
+  | Cancelled -> detail "cancelled"
+  | Outcome_unknown source -> detail ~source "stateError"
+  | Cleanup_failure {primary; failures} ->
+    let causes = Rrbvec.to_seq failures in
+    (match primary, causes () with
+     | Some primary, Seq.Cons (cleanup, _) ->
+       D.with_related (upload_owner_diagnostic primary) (upload_owner_diagnostic cleanup)
+     | Some primary, Seq.Nil -> upload_owner_diagnostic primary
+     | None, Seq.Cons (cleanup, rest) ->
+       let primary = upload_owner_diagnostic cleanup in
+       (match rest () with
+        | Seq.Nil -> primary
+        | Seq.Cons (cleanup, _) -> D.with_related primary (upload_owner_diagnostic cleanup))
+     | None, Seq.Nil -> detail "cleanupFailed")
+  | Capacity_exceeded source -> detail ~source "limitExceeded"
+  | Sync_read_failure _ -> detail ~source:(Dsl.error_message error) "inspectionFailed"
+  | Outbox_failure _ -> detail ~source:(Dsl.error_message error) "storageOutboxFailed"
+  | Authoritative_failure _ -> detail ~source:(Dsl.error_message error) "integrityFailed"
+  | Activation_failure _ -> detail ~source:(Dsl.error_message error) "restoreFailed"
+  | Asset_failure diagnostic -> D.of_source ~operation:"assetUpload" ~reason:(D.reason diagnostic) (D.encode diagnostic)
+  | Unexpected_failure source -> detail ~source "resourceFailed"
 ;;
 
-let run_upload t (context : Sync.asset_context) instruction =
-  let current ticket = (not t.stopped) && t.upload_current ticket
-    && not(Core.Writer_fence.fenced t.writer_fence context.scope) in
-  let on_diagnostic ticket detail =
-    if current ticket then queue_notice_diagnostic t context.scope
-      (Upload_notice ticket.Upload.operation) ticket.id detail in
-  let database ticket f =
-    if not (current ticket)
-    then Error Upload.Invalid_content
-    else (
-      match attached_session t ticket.Upload.scope with
-      | None ->
-        on_diagnostic ticket (failure_detail ~operation:"assetUpload" ~reason:"databaseClosed" ());
-        Error Upload.Invalid_content
-      | Some session -> f session.database)
-  in
-  let finish ticket result success =
-    if current ticket
-    then (
-      if Result.is_ok result then clear_notice_diagnostic t context.scope (Upload_notice ticket.Upload.operation);
-      t.post
-        (Core.Upload_completed
-           ( ticket
-           , match result with
-             | Ok () -> success
-             | Error error -> Upload.Failed error )))
-  in
-  let changed () = t.post (Core.Sync_event Sync.Local_outbox_changed) in
-  match instruction with
-  | Upload.Cancel_operation ticket -> clear_notice_diagnostic ~ticket_id:ticket.id t context.scope (Upload_notice ticket.operation)
-  | Release_staging intent ->
-    let detail = ref None in
-    let on_failure failure = detail := Some (asset_failure_detail ~operation:"assetRelease" failure) in
-    let on_diagnostic value = detail := Some value in
-    (match
-       let can_release =
-         if intent.Logseq_db_types.Asset_upload_intent.phase = Cancelled
-         then Ok ()
-         else (
-           match
-             asset_call
-               t
-               ~scope:context.scope
-               (Sync.Check_asset_cache (intent.asset, intent.version))
-           with
-           | Ok (Sync.Asset_cached (Some handle)) ->
-             asset_unit ~on_failure ~on_diagnostic t ~scope:context.scope (Sync.Release_asset_file handle)
-           | _ ->
-             asset_unit ~on_failure ~on_diagnostic
-               t
-               ~scope:context.scope
-               (Sync.Publish_staged_asset
-                  { asset = intent.asset
-                  ; version = intent.version
-                  ; file = intent.staged_file
-                  }))
-       in
-       Result.bind can_release (fun () ->
-         asset_unit ~on_failure ~on_diagnostic t ~scope:context.scope (Sync.Release_staged_file intent.staged_file))
-     with
-     | Ok () -> ()
-     | Error source ->
-       let detail = Option.value !detail ~default:(failure_detail ~source ~operation:"assetRelease" ~reason:"cleanupFailed" ()) in
-       if Logseq_db_types.Failure_diagnostic.reason detail <> "cancelled" then
-         publish_failure (report_current_graph t context.scope) detail;
-       report_warning "journal: operation=releaseUploadStaging code=cleanupPending\n" )
-  | Persist (ticket, intent, expected) ->
-    if current ticket then finish ticket (save_upload t intent expected) Upload.Persisted
-  | Inspect (ticket, intent) ->
-    if current ticket
-    then (
-      let result = database ticket (fun db -> Upload_database.inspect ~on_diagnostic:(on_diagnostic ticket) db intent) in
-      if current ticket
-      then
-        t.post
-          (Core.Upload_completed
-             ( ticket
-             , match result with
-               | Ok observation -> Upload.Inspected observation
-               | Error error -> Upload.Failed error )))
-  | Apply_local (ticket, intent) ->
-    if current ticket
-    then (
-      let result = database ticket (fun db -> Upload_database.apply_local ~on_diagnostic:(on_diagnostic ticket) db intent) in
-      (match result with
-       | Ok () -> changed ()
-       | Error _ -> ());
-      finish ticket result Upload.Local_applied)
-  | Apply_metadata (ticket, intent) ->
-    if current ticket
-    then (
-      let result = database ticket (fun db -> Upload_database.apply_metadata ~on_diagnostic:(on_diagnostic ticket) db intent) in
-      (match result with
-       | Ok () -> changed ()
-       | Error _ -> ());
-      finish ticket result Upload.Metadata_applied)
-  | Put (ticket, intent) ->
-    if current ticket
-    then (
-      let detail = ref None in
-      finish
-        ticket
-        (match
-           asset_call
-             ~on_diagnostic:(fun value -> detail := Some value)
-             t
-             ~scope:context.scope
-             (Sync.Put_asset_file
-                { asset = intent.asset
-                ; version = intent.version
-                ; file = intent.staged_file
-                ; maximum_plaintext_bytes = 8 * 1024 * 1024
-                })
-         with
-         | Ok Sync.Asset_unit -> Ok ()
-         | Ok _ ->
-           on_diagnostic ticket (failure_detail ~operation:"assetUpload" ~reason:"invalidContent" ());
-           Error Upload.Invalid_content
-         | Error failure ->
-           if current ticket && Sync.asset_failure_kind failure <> Sync.Asset_cancelled then
-             on_diagnostic ticket (Option.value !detail
-               ~default:(asset_failure_detail ~operation:"assetUpload" failure));
-           Error (upload_failure failure))
-        Upload.Put_succeeded)
-  | Await_publication (ticket, intent) ->
-    let rec await () =
-      if current ticket
-      then (
-        match database ticket (fun db -> Upload_database.inspect ~on_diagnostic:(on_diagnostic ticket) db intent) with
-        | Ok Upload.Publication_acknowledged ->
-          finish ticket (Ok ()) Upload.Publication_acked
-        | Ok (Local_present | Metadata_present) ->
-          t.dependencies.runtime.sleep 0.5;
-          await ()
-        | Ok (Absent | Entity_cancelled) ->
-          on_diagnostic ticket (failure_detail ~operation:"assetUpload" ~reason:"missingPrecondition" ());
-          finish ticket (Error Upload.Invalid_content) Upload.Publication_acked
-        | Error error -> finish ticket (Error error) Upload.Publication_acked)
-    in
-    await ()
+let run_direct_upload t (context : Sync.asset_context) instruction =
+  let module Dsl = Sync_dsl.Core in
+  let current ticket = not t.stopped && t.upload_current ticket
+    && not (Core.Writer_fence.fenced t.writer_fence context.scope) in
+  let ticket, intent = match instruction with
+    | Upload.Cancel_operation ticket -> Some ticket, None
+    | Release_staging intent -> None, Some intent
+    | Persist (ticket, intent, _) | Inspect (ticket, intent)
+    | Apply_local (ticket, intent) | Apply_metadata (ticket, intent)
+    | Put (ticket, intent) | Await_publication (ticket, intent) -> Some ticket, Some intent in
+  match intent with
+  | None -> ()
+  | Some _ when Option.fold ~none:false ~some:(fun ticket -> not (current ticket)) ticket -> ()
+  | Some intent ->
+    let result = Result.bind
+      (worker_owner t ~scope:context.scope |> Result.map_error (fun message -> Dsl.Storage_failure message))
+      (fun (identity, owner) ->
+        let module Owner = (val Logseq_sync_worker_owner.Core.worker_owner owner : Execute.Core.WORKER_OWNER) in
+        Owner.with_scope ~identity ~operation:intent.operation_id (fun scope ->
+          match instruction with
+          | Upload.Cancel_operation _ -> Owner.cancel scope |> Result.map (fun () -> Upload.Persisted)
+          | Release_staging _ -> Owner.release_import_staging scope intent |> Result.map (fun () -> Upload.Persisted)
+          | Persist (_, _, expected) -> Owner.persist_import scope intent ~expected |> Result.map (fun () -> Upload.Persisted)
+          | Inspect _ -> Owner.inspect_import scope intent |> Result.map (fun observed ->
+              Upload.Inspected (match observed with
+                | `Import_absent -> Upload.Absent
+                | `Local_present -> Local_present
+                | `Metadata_present -> Metadata_present
+                | `Publication_acknowledged -> Publication_acknowledged
+                | `Entity_cancelled -> Entity_cancelled))
+          | Apply_local _ -> Owner.apply_local_import scope intent |> Result.map (fun () -> Upload.Local_applied)
+          | Apply_metadata _ -> Owner.apply_import_metadata scope intent |> Result.map (fun () -> Upload.Metadata_applied)
+          | Put _ -> Owner.put_import scope intent |> Result.map (fun () -> Upload.Put_succeeded)
+          | Await_publication _ -> Owner.await_import_publication scope intent |> Result.map (fun () -> Upload.Publication_acked))) in
+    match ticket, result with
+    | Some ticket, Ok completion when current ticket ->
+      clear_notice_diagnostic t context.scope (Upload_notice ticket.operation);
+      t.post (Core.Upload_completed (ticket, completion))
+    | Some ticket, Error error when current ticket ->
+      let detail = upload_owner_diagnostic error in
+      queue_notice_diagnostic t context.scope (Upload_notice ticket.operation) ticket.id detail;
+      let failure = match error with
+        | Dsl.Network_closed | Network_failure _ -> Upload.Network
+        | Authentication_failure _ | Locked -> Upload.Authentication
+        | _ -> Upload.Invalid_content in
+      t.post (Core.Upload_completed (ticket, Upload.Failed failure))
+    | None, Error error ->
+      publish_failure (report_current_graph t context.scope)
+        (failure_detail ~source:(Dsl.error_message error) ~operation:"assetRelease" ~reason:"cleanupFailed" ())
+    | Some _, (Ok _ | Error _) | None, Ok _ -> ()
+;;
+
+let run_upload t context instruction =
+  run_direct_upload t context instruction
 ;;
 
 let submit_upload t (context : Sync.asset_context) instruction =
@@ -3225,7 +3264,7 @@ let submit_upload t (context : Sync.asset_context) instruction =
 
 let rec transfer_failure = function
   | Sync.Asset_with_cause (failure, _) -> transfer_failure failure
-  | Sync.Asset_network -> Logseq_sync_pure_reducer.Asset_transfer.Network
+  | Sync.Asset_network -> Logseq_sync_asset_transfer.Core.Network
   | Asset_not_found | Asset_missing_source -> Not_found
   | Asset_checksum_mismatch -> Checksum_mismatch
   | Asset_authentication | Asset_revoked_access -> Authentication
@@ -3237,29 +3276,15 @@ let rec transfer_failure = function
 ;;
 
 let local_import t ~(scope : Sync.graph_scope) ~asset ~checksum ~current =
-  with_staging_lock t (fun () ->
-    let ( let* ) = Result.bind in
-    let* () = reconcile_staging t scope ~current in
-    match Hashtbl.find_opt t.local_imports (scope, asset, checksum) with
-    | None -> Ok None
-    | Some operation ->
-      let* intent =
-        with_upload_store t (fun db ->
-          Logseq_db_storage.Asset_upload_store.read db ~operation)
-      in
-      Ok
-        (Option.bind intent (fun (i : Logseq_db_types.Asset_upload_intent.t) ->
-           if
-             current ()
-             && (not t.stopped)
-             && i.origin = Uri.to_string scope.account.managed_sync_origin
-             && i.account = scope.account.user_id
-             && i.graph = scope.graph_id
-             && i.asset = asset
-             && i.version.checksum = checksum
-             && i.phase <> Logseq_db_types.Asset_upload_intent.Cancelled
-           then Some i
-           else None)))
+    if t.stopped || not (current ()) then Error "Import authority retired."
+    else Result.bind (worker_owner t ~scope) (fun (_, owner) ->
+      Result.bind
+        (Logseq_db_types.Asset_descriptor.create ~uuid:asset ~source:(Managed None)
+          ~current_checksum:(Some checksum) ~size:None ~dimensions:None)
+        (fun descriptor ->
+          let result = Logseq_sync_worker_owner.Core.original_import owner descriptor
+            |> Result.map_error Sync_dsl.Core.error_message in
+          if current () && not t.stopped then result else Error "Import authority retired."))
 ;;
 
 let lookup_local_asset t ~scope ~asset ~checksum ~current ~diagnostic call =
@@ -3408,20 +3433,14 @@ let asset_callback_barrier t =
       (fun()->Eio.Promise.await promise)
       (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped)))
 ;;
-let await_sync_io t ~scope =
+let await_sync_io t ~(scope : Sync.effect_scope) =
   if t.stopped then Error "The Worker stopped before Sync I/O settlement."
-  else if t.next_asset_barrier=Int64.max_int then Error "I/O fence counter exhausted." else
-  let promise,resolve=Eio.Promise.create() in
-  t.next_asset_barrier<-Int64.succ t.next_asset_barrier;
-  let id=t.next_asset_barrier in
-  Hashtbl.add t.sync_io_waiters id(scope,resolve);
-  Fun.protect ~finally:(fun()->Hashtbl.remove t.sync_io_waiters id)(fun()->
-    t.post(Core.Sync_event(Sync.IO_fence_requested(id,scope)));
-    Eio.Fiber.first
-      (fun()->let result=Eio.Promise.await promise in
-        if t.stopped then Error "The Worker stopped before Sync I/O settlement." else result)
-      (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped);
-        Error "The Worker stopped before Sync I/O settlement."))
+  else if Hashtbl.fold (fun _ resource live -> live ||
+    (Option.fold ~none:true ~some:((=)resource.imported_scope.account.account_generation) scope.Sync.account_generation
+     && Option.fold ~none:true ~some:((=)resource.imported_scope.graph_generation) scope.graph_generation))
+    t.imported_resources false
+  then Error "Imported consumer files have not physically released."
+  else t.dependencies.services.await_io ~scope
 ;;
 
 let quiesce_writers t ~scope =
@@ -3480,7 +3499,7 @@ let settle_host_scope t ~(scope:Sync.graph_scope) =
 
 let retire_account t ~account=
   Result.bind (cleanup_account_uploads t account) (fun () ->
-    t.dependencies.sync_runner.retire_account ~account)
+    t.dependencies.services.retire_account ~account)
 ;;
 
 let start_asset_cleanup_job ?parent ?(prepare=(fun _->())) t ~scope work =
@@ -3503,7 +3522,7 @@ let asset_cleanup_parent t scope handle=
 ;;
 
 let run_asset t (context : Sync.asset_context) instruction =
-  let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
+  let module Transfer = Logseq_sync_asset_transfer.Core in
   let perform ticket action success =
     let scope =
       match ticket with
@@ -3646,26 +3665,8 @@ let run_asset t (context : Sync.asset_context) instruction =
 ;;
 
 let submit t = function
-  | Core.Sync_io_fence_reached(id,scope,result)->
-    (match Hashtbl.find_opt t.sync_io_waiters id with
-     |Some(expected,resolve) when expected=scope->ignore(Eio.Promise.try_resolve resolve result:bool)
-     |_->())
-  | Core.Deliver_protected_result output ->
-    (match
-       Hashtbl.find_opt
-         t.protected_waiters
-         output.Sync.protected_request.protected_operation
-     with
-     | Some waiter when waiter.protected_request = output.protected_request ->
-       ignore (Eio.Promise.try_resolve waiter.protected_resolve output : bool)
-     | Some _ | None -> ())
   | Core.Deliver_asset_result output ->
-    (match Hashtbl.find_opt t.asset_waiters output.Sync.request.operation with
-     | Some waiter when waiter.request = output.request && waiter.delivered = None ->
-       waiter.delivered <- Some output;
-       if not (Eio.Promise.try_resolve waiter.resolve output) then reclaim_waiter t waiter
-     | Some waiter when waiter.request = output.request -> ()
-     | Some _ | None -> reclaim_asset_output t output)
+    reclaim_asset_output t output
   | Core.Read_uploads ticket ->
     if (not t.stopped) && t.recovery_current ticket then (
       match reserve_writer t ticket.scope with
@@ -3701,25 +3702,8 @@ let submit t = function
   | Core.Run_worker request ->
     if not t.stopped
     then submit_worker t request
-  | Run_sync (Sync.Request (ticket, Sync.Delete_account_secrets account) as sync_effect)
-    ->
-    if not t.stopped
-    then (
-      match
-        (* This is the serial consumer: never await a staging owner whose asset
-           completion must return through this same consumer. *)
-        cleanup_account_uploads ~wait:false t account
-      with
-      | Ok () -> t.dependencies.sync_runner.submit sync_effect
-      | Error message ->
-        t.post
-          (Core.Sync_event
-             (Sync.Runner_completed
-                (Sync.Completion (ticket, Error (Sync.Effect_failed message))))))
-  | Run_sync (Sync.Asset_io _ as sync_effect) ->
-    t.dependencies.sync_runner.submit sync_effect
-  | Run_sync sync_effect ->
-    if not t.stopped then t.dependencies.sync_runner.submit sync_effect
+  | Publish (Core.Lifecycle_intent intent) ->
+    if not t.stopped then t.dependencies.services.post intent
   | Publish (Core.Sync_output (Sync.Session_state_changed (scope,state)) as output) ->
     if state.snapshot.selected_graph=Some scope.graph_id then Hashtbl.replace t.session_snapshots scope state.snapshot
     else Hashtbl.remove t.session_snapshots scope;
@@ -3765,16 +3749,20 @@ let submit t instruction =
 let shutdown t =
   if not t.stopped
   then (
-    t.post (Core.Sync_event Sync.Shutdown);
     t.stopped <- true;
     ignore(Eio.Promise.try_resolve(snd t.asset_cleanup_stopped)():bool);
     t.notice_diagnostics <- [];
     Hashtbl.iter
       (fun _ resolve -> ignore (Eio.Promise.try_resolve resolve () : bool))
       t.upload_operations;
+    t.dependencies.services.shutdown ();
     ignore (close_attached t);
     Hashtbl.iter (fun id _ -> ignore (close_database_by_id t id)) t.databases;
-    t.dependencies.sync_runner.shutdown ();
+    (match t.sync_store with
+     | None -> ()
+     | Some db ->
+       if Sqlite3.db_close db then t.sync_store <- None
+       else t.dependencies.publish (Core.Diagnostic "Worker upload store close failed"));
     Eio.Mutex.use_rw ~protect:true t.waiter_lock (fun () ->
       Hashtbl.iter
         (fun _ (waiter : waiter) ->
@@ -3804,146 +3792,23 @@ let release_asset_file t ~scope ~handle =
   | Ok _ -> report_source_failure t scope "assetRelease" "invalidContent" "Unexpected asset completion"
 ;;
 
-let prepare_import_unlocked
-      ~on_diagnostic
-      t
-      ~(context : Sync.asset_context)
-      (request : Logseq_db_types.Asset_import.t)
-      ~current
-  =
-  let module I = Logseq_db_types.Asset_upload_intent in
-  let module A = Logseq_db_types.Asset_descriptor in
-  let ( let* ) = Result.bind in
-  let source_error reason result = Result.map_error (fun source ->
-    on_diagnostic (failure_detail ~source ~operation:"assetMetadata" ~reason ()); source) result in
-  let prepare version size staged_file =
-    I.prepare
-      ~replace_reference:request.replace_reference
-      ~operation_id:request.operation
-      ~origin:(Uri.to_string context.scope.account.managed_sync_origin)
-      ~account:context.scope.account.user_id
-      ~graph:context.scope.graph_id
-      ~asset:request.asset
-      ~target:request.target
-      ~local_mutation:request.local_mutation
-      ~metadata_mutation:request.metadata_mutation
-      ~title:request.title
-      ~version
-      ~size
-      ~staged_file
-  in
-  let* version = source_error "invalidRequest" (A.version ~checksum:(String.make 64 '0') ~file_type:request.file_type) in
-  let* _ = source_error "invalidRequest" (prepare version 0L "validation.bin") in
-  let namespace=Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
-    ~origin:context.scope.account.managed_sync_origin ~user:context.scope.account.user_id ~graph:context.scope.graph_id in
-  let input_owner:Logseq_db_storage.Asset_upload_store.Inputs.owner={namespace;
-    origin=Uri.to_string context.scope.account.managed_sync_origin;account=context.scope.account.user_id;graph=context.scope.graph_id} in
-  let* complete_input=Logseq_db_types.Asset_import.Pure_intent.create ~namespace request
-    |> Result.map_error(fun _->"Invalid complete import input") |> source_error "invalidRequest" in
-  if (not (current ())) || t.stopped
-  then Error "The selected graph is no longer active"
-  else if not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup)
-  then Error "Attachment cleanup is pending. Retry after cleanup succeeds."
-  else
-    let* reserved=source_error "persistenceFailed" (Eio.Cancel.protect(fun()->
-      with_upload_store t(fun db->Logseq_db_storage.Asset_upload_store.Inputs.reserve db ~owner:input_owner ~input:complete_input))) in
-    let* () = source_error "restoreFailed" (reconcile_staging t context.scope ~current) in
-    let* existing =
-      source_error "persistenceFailed" (with_upload_store t (fun db ->
-        Logseq_db_storage.Asset_upload_store.read db ~operation:request.operation))
-    in
-    match existing,reserved.prepared with
-    | None,Some _->source_error "restoreFailed" (Error "The original input was Prepared but its local upload checkpoint is unavailable; it cannot be replayed")
-    | Some _,None->source_error "restoreFailed" (Error "The upload checkpoint has no atomic original input proof")
-    | Some intent,Some _
-      when intent.origin = Uri.to_string context.scope.account.managed_sync_origin
-           && intent.account = context.scope.account.user_id
-           && intent.graph = context.scope.graph_id
-           && intent.asset = request.asset
-           && intent.target = request.target
-           && intent.title = request.title
-           && intent.version.file_type = request.file_type
-           && intent.local_mutation = request.local_mutation
-           && intent.replace_reference = request.replace_reference
-           && intent.metadata_mutation = request.metadata_mutation -> Ok intent
-    | Some _,Some _ -> source_error "identityConflict" (Error "This import identity is already in use")
-    | None,None ->
-      let detail = ref None in
-      let* file, checksum, size =
-        match
-          asset_call
-            ~on_diagnostic:(fun value -> detail := Some value)
-            t
-            ~scope:context.scope
-            (Sync.Stage_asset_file
-               { operation = request.operation
-               ; file_type = request.file_type
-               ; source_file = request.source_file
-               })
-        with
-        | Ok (Sync.Asset_staged { file; checksum; size }) -> Ok (file, checksum, size)
-        | Error failure ->
-          if Sync.asset_failure_kind failure <> Sync.Asset_cancelled then
-            on_diagnostic (Option.value !detail ~default:(asset_failure_detail ~operation:"assetMetadata" failure));
-          Error (asset_failure_message failure)
-        | Ok _ -> source_error "invalidContent" (Error "Unexpected staging completion")
-      in
-      let persistence_attempted = ref false in
-      let result =
-        let* version = source_error "invalidRequest" (A.version ~checksum ~file_type:request.file_type) in
-        let* intent = source_error "invalidRequest" (prepare version size file) in
-        if (not (current ())) || t.stopped
-        then Error "The selected graph is no longer active"
-        else (
-          persistence_attempted := true;
-          let* () =
-            source_error "persistenceFailed" (Eio.Cancel.protect (fun () ->
-              with_upload_store t (fun db ->
-                Logseq_db_storage.Asset_upload_store.Inputs.commit_prepared db ~owner:input_owner ~input:complete_input intent |> Result.map(fun _->()))))
-          in
-          Ok intent)
-      in
-      (match result with
-       | Ok _ -> ()
-       | Error _ when not !persistence_attempted ->
-         Eio.Cancel.protect (fun () ->
-           ignore (asset_unit
-             ~on_failure:(fun failure -> if current () then report_asset_failure t context.scope "assetRelease" failure)
-             t ~scope:context.scope (Sync.Release_staged_file file)))
-       | Error _ -> ());
-      result
-;;
-
-let prepare_import_unfenced t ~(context : Sync.asset_context) request ~current =
-  with_staging_lock t (fun () ->
-    let on_diagnostic detail = if current () then
-      publish_failure (report_current_graph t context.scope) detail in
-    Result.map
-      (fun (intent : Logseq_db_types.Asset_upload_intent.t) ->
-         Hashtbl.replace
-           t.local_imports
-           (context.scope, intent.asset, intent.version.checksum)
-           intent.operation_id;
-         if intent.phase <> Logseq_db_types.Asset_upload_intent.Cancelled && current ()
-         then
-           (let detail = ref None in
-            match asset_call ~on_diagnostic:(fun value -> detail := Some value)
-                t
-                ~scope:context.Sync.scope
-                (Sync.Publish_staged_asset
-                   { asset = intent.asset
-                   ; version = intent.version
-                   ; file = intent.staged_file
-                   }) with
-            | Ok Sync.Asset_unit | Error Sync.Asset_cancelled -> ()
-            | Error failure -> if current () then report_asset_failure ?detail:!detail t context.scope "assetPreview" failure
-            | Ok _ -> if current () then report_source_failure t context.scope "assetPreview" "invalidContent" "Unexpected asset completion");
-         intent)
-      (prepare_import_unlocked ~on_diagnostic t ~context request ~current))
-;;
-
 let prepare_import t ~(context:Sync.asset_context) request ~current =
-  with_writer t context.scope(fun()->prepare_import_unfenced t ~context request ~current)
+  with_writer t context.scope (fun () ->
+      if not (current ()) then Error "Import authority retired."
+      else Result.bind (worker_owner t ~scope:context.scope) (fun (identity, owner) ->
+        let module Owner = (val Logseq_sync_worker_owner.Core.worker_owner owner : Execute.Core.WORKER_OWNER) in
+        Owner.with_scope ~identity ~operation:request.Logseq_db_types.Asset_import.operation
+          (fun owned ->
+            let current () = not t.stopped && current () in
+            Result.map (fun intent ->
+              if current () then
+                (match Owner.publish_import_preview owned intent with
+                 | Ok () -> ()
+                 | Error error -> report_source_failure t context.scope "assetPreview" "ownerFailed"
+                     (Sync_dsl.Core.error_message error));
+              intent)
+              (Owner.prepare_import owned request ~current))
+        |> Result.map_error Sync_dsl.Core.error_message))
 ;;
 
 let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
@@ -3960,12 +3825,33 @@ let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
            && intent.account = scope.account.user_id
            && intent.graph = scope.graph_id
            && intent.phase <> Logseq_db_types.Asset_upload_intent.Cancelled ->
-      (let detail = ref None in
-       match asset_call ~on_diagnostic:(fun value -> detail := Some value) t ~scope (Sync.Retain_staged_file intent.staged_file) with
-       | Ok (Sync.Asset_retained file) -> file
-       | Error Sync.Asset_cancelled -> None
-       | Error failure -> report_asset_failure ?detail:!detail t scope "assetPreview" failure; None
-       | Ok _ -> report_source_failure t scope "assetPreview" "invalidContent" "Unexpected asset completion"; None)
+      (let result = Result.bind (worker_owner t ~scope) (fun (identity, owner) ->
+         let module Owner = (val Logseq_sync_worker_owner.Core.worker_owner owner : Execute.Core.WORKER_OWNER) in
+         let rec acquire () =
+           if t.stopped || Core.Writer_fence.fenced t.writer_fence scope
+             || not (Core.Orphan_cleanup.acquisition_open t.orphan_cleanup)
+           then Error "Import acquisition is retired."
+           else if Hashtbl.length t.imported_resources >= 2048 || t.next_imported_resource = Int64.max_int
+           then Error "Imported resource capacity exceeded."
+           else
+             Owner.with_scope ~identity ~operation (fun owned ->
+               Result.map (Option.map (fun file ->
+                 t.next_imported_resource <- Int64.succ t.next_imported_resource;
+                 let handle = "worker-import:" ^ Int64.to_string t.next_imported_resource in
+                 Hashtbl.add t.imported_resources handle
+                   { imported_scope = scope
+                   ; imported_retain = acquire
+                   ; imported_release = (fun () -> Owner.release_imported_file file
+                       |> Result.map_error Sync_dsl.Core.error_message)
+                   };
+                 handle, Owner.imported_file_path file))
+                 (Owner.retain_imported_file owned intent))
+             |> Result.map_error Sync_dsl.Core.error_message
+         in
+         acquire ()) in
+       match result with
+       | Ok file -> file
+       | Error message -> report_source_failure t scope "assetPreview" "ownerFailed" message; None)
     | Ok _ -> None
     | Error source -> report_source_failure t scope "assetMetadata" "persistenceFailed" source; None)
 ;;

@@ -1,7 +1,7 @@
 module U = Logseq_db_worker_pure_reducer.Asset_upload
 module I = Logseq_db_types.Asset_upload_intent
 module A = Logseq_db_types.Asset_descriptor
-module C = Logseq_sync_pure_reducer.Core
+module C = Logseq_sync_domain.Core
 
 let get = function
   | Ok value -> value

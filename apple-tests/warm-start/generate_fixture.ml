@@ -1,5 +1,5 @@
 module Graph = Logseq_db_types.Graph_types
-module Core = Logseq_sync_pure_reducer.Core
+module Core = Logseq_sync_domain.Core
 module Storage = Logseq_db_storage.Logseq_sqlite_storage
 module Session = Logseq_db_storage.Storage_session
 

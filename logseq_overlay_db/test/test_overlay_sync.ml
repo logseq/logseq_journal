@@ -104,9 +104,26 @@ let empty_batch_update_wire =
 
 let empty_authoritative_preserves_logical_state wire database =
   let before, projection, updated = empty_batch_state database in
+  let observed = ref false in
   let commit =
-    apply_empty_compatible_batch database (empty_authoritative_batch [ wire ])
+    Eio.Fiber.first
+      (fun () ->
+         Database.await_sync_change database ~after:(sync_view_token before)
+         |> T.require_ok ~behavior:"nonlogical sync notification"
+         |> ignore;
+         observed := true;
+         Eio.Fiber.await_cancel ())
+      (fun () ->
+         Eio.Fiber.yield ();
+         let commit =
+           apply_empty_compatible_batch database (empty_authoritative_batch [ wire ])
+         in
+         for _turn = 1 to 20 do
+           Eio.Fiber.yield ()
+         done;
+         commit)
   in
+  T.require !observed "nonlogical checkpoint failed to wake sync observer";
   let after, after_projection, after_updated = empty_batch_state database in
   T.require
     (Server_cursor.equal (sync_view_checkpoint after) (server_cursor 1))
@@ -581,7 +598,9 @@ let block_precondition database block behavior =
     ~finally:(fun () -> Database.release_snapshot snapshot)
     (fun () ->
        let revision =
-         match Database.get_outline_blocks snapshot [ block ] |> T.require_ok ~behavior with
+         match
+           Database.get_outline_blocks snapshot [ block ] |> T.require_ok ~behavior
+         with
          | [ Present_block { revision; _ } ] | [ Missing_block { revision; _ } ] ->
            revision
          | _ -> Alcotest.fail "block precondition returned the wrong cardinality"
@@ -1231,203 +1250,600 @@ let decrypt_submitted_request request behavior =
   request, plaintexts
 ;;
 
-let atomic_append_submits_and_replays_complete_tree ?(remote_day=false) database =
-  let behavior="atomic append submission and authoritative echo" in
+let reordered_echo_rejects_changed_uuid database =
+  let behavior = "reordered echo rejects changed UUID" in
+  let local = commit_insert database ~ordinal:7796 ~uuid:T.block_uuid behavior in
+  let submitted = submit_one database local behavior in
+  let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, crypto =
+    Database.begin_outbox_transition
+      database
+      ~expected:(sync_view_token sync)
+      (Accept_group
+         { batch_id = submission_batch_id submitted
+         ; barrier = { through = server_cursor 1; checksum = checksum "0000000000000000" }
+         })
+    |> T.require_ok ~behavior
+  in
+  T.require (Option.is_none crypto) "acceptance requested crypto";
+  ignore
+    (Database.apply_outbox_transition database prepared ~encrypted:None
+     |> T.require_ok ~behavior);
+  let module J = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let wire =
+    server_transaction ~mutation_id:local.mutation_id ~operation:"insert-blocks" submitted
+    |> Codec.of_string
+    |> function
+    | J.Array operations ->
+      J.Array
+        (List.rev_map
+           (function
+             | J.Array [ operation; entity; J.Keyword "block/uuid"; _; source ] ->
+               J.Array
+                 [ operation
+                 ; entity
+                 ; J.Keyword "block/uuid"
+                 ; J.Uuid (Logseq_db_types.Graph_types.Uuid.to_string T.child_uuid)
+                 ; source
+                 ]
+             | operation -> operation)
+           operations)
+      |> Codec.to_string ~mode:Codec.Verbose
+    | _ -> Alcotest.fail "insert echo is not an array"
+  in
+  let batch =
+    authoritative_batch
+      ~maximum_count:16
+      ~maximum_bytes:65536
+      ~transactions:
+        [ authoritative_transaction
+            ~cursor:(server_cursor 1)
+            ~transaction:(encoded ~maximum_bytes:65536 wire)
+        ]
+      ~through:(server_cursor 1)
+      ~checksum:None
+    |> T.require_ok ~behavior
+  in
+  let before = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, crypto =
+    Database.begin_authoritative database ~expected:(sync_view_token before) batch
+    |> T.require_ok ~behavior
+  in
+  let decrypted =
+    Option.map (fun request -> decrypt_submitted_request request behavior) crypto
+  in
+  (match Database.apply_authoritative database prepared ~decrypted with
+   | Error (Authoritative_integrity_failure _) -> ()
+   | Error _ -> Alcotest.fail "changed UUID did not reach origin integrity validation"
+   | Ok _ -> Alcotest.fail "reordered echo accepted a changed UUID");
+  let after = Database.inspect_sync database |> T.require_ok ~behavior in
+  T.require
+    (sync_view_checkpoint before = sync_view_checkpoint after
+     && sync_view_submissions before = sync_view_submissions after)
+    "identity rejection changed checkpoint or retired accepted evidence"
+;;
+
+let atomic_append_submits_and_replays_complete_tree
+      ?(remote_day = false)
+      ?(reverse_operations = false)
+      database
+  =
+  let behavior = "atomic append submission and authoritative echo" in
   T.seed_task_statuses database;
-  let page=T.mutation_uuid 7790 and root_uuid=T.mutation_uuid 7791 and child_uuid=T.mutation_uuid 7792 in
-  let root:Types.append_node={uuid=root_uuid;title="Atomic wire root";task_status=Some(T.status_uuid 2);
-    children=Rrbvec.singleton{uuid=child_uuid;title="Atomic wire child";task_status=Some(T.status_uuid 3);children=Rrbvec.empty}} in
-  let mutation=Types.Append_journal{mutation_id=T.mutation_uuid 7793;page;title="2026-11-02";journal_day=20261102;root} in
-  let expected=Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior in
-  let intent=Database.persist_local_intent database ~namespace:(String.make 64 'f') ~payload:"complete append wire"
-    ~expected mutation |> T.require_ok ~behavior in
-  let proof=Database.commit_local_intent database intent |> T.require_ok ~behavior in
-  let local=Database.intent_commit_outcome proof in
-  let resolved_page=if not remote_day then page else (
-    let module J=Transit_core.Json in
-    let web=T.mutation_uuid 7794 in
-    let page_entity=J.String "remote-web-day" and child_entity=J.String "remote-first-entry" in
-    let add_page attribute value=T.status_add page_entity attribute value in
-    let add_child attribute value=T.status_add child_entity attribute value in
-    T.apply_test_transaction database ~cursor:2
-      [add_page "block/uuid" (J.Uuid(Logseq_db_types.Graph_types.Uuid.to_string web));
-       add_page "block/title" (J.String "Web day");add_page "block/name" (J.String "web-remote-day");
-       add_page "block/journal-day" (J.Int 20261102);
-       add_child "block/uuid" (J.Uuid(Logseq_db_types.Graph_types.Uuid.to_string(T.mutation_uuid 7795)));
-       add_child "block/title" (J.String "Remote first entry");add_child "block/parent" page_entity;
-       add_child "block/page" page_entity;add_child "block/order" (J.String "a9")];
-    let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
-    Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
-      T.require(match Database.get_outline_blocks snapshot [root_uuid] |> T.require_ok ~behavior with
-        |[Present_block{value;_}]->value.block.parent=web && String.compare value.block.order "a9">0
-        |_->false) "queued append did not follow the Web day's existing tail");
-    web) in
-  let echo_cursor=if remote_day then 3 else 2 in
-  let page_value ()=
-    let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
-    Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
-      match Database.get_pages snapshot [resolved_page] |> T.require_ok ~behavior with
-      |[Present_page{value;_}]->value|_->Alcotest.fail "atomic page disappeared") in
-  let before_submit=page_value() in
-  let submitted=submit_one database local behavior in
-  T.require(page_value()=before_submit) "transport submission changed complete append page DTO";
-  T.require(List.length(submission_batch_wires submitted)=1) "append split one atomic action into separate outbox transactions";
-  let wire=server_transaction ~mutation_id:local.mutation_id ~operation:"append-journal" submitted in
-  let barrier={through=server_cursor echo_cursor;checksum=checksum "1111111111111111"} in
-  let sync=Database.inspect_sync database |> T.require_ok ~behavior in
-  let prepared,crypto=Database.begin_outbox_transition database ~expected:(sync_view_token sync)
-    (Accept_group{batch_id=submission_batch_id submitted;barrier}) |> T.require_ok ~behavior in
-  T.require(crypto=None) "append acceptance requested extra crypto";
-  ignore(Database.apply_outbox_transition database prepared ~encrypted:None |> T.require_ok ~behavior);
-  let batch=authoritative_batch ~maximum_count:16 ~maximum_bytes:65536
-    ~transactions:[authoritative_transaction ~cursor:(server_cursor echo_cursor) ~transaction:(encoded ~maximum_bytes:65536 wire)]
-    ~through:(server_cursor echo_cursor) ~checksum:(Some barrier.checksum) |> T.require_ok ~behavior in
-  let sync=Database.inspect_sync database |> T.require_ok ~behavior in
-  let prepared,crypto=Database.begin_authoritative database ~expected:(sync_view_token sync)batch |> T.require_ok ~behavior in
-  let decrypted=Option.map(fun request->decrypt_submitted_request request behavior)crypto in
-  (match Database.apply_authoritative database prepared ~decrypted |> T.require_ok ~behavior with
-   | Authoritative_applied _->()|_->Alcotest.fail "atomic append echo was deferred");
-  let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
-  Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
-    (match Database.get_pages snapshot [resolved_page] |> T.require_ok ~behavior with
-     | [Present_page{value;_}]->T.require(value.page.kind=Logseq_db_types.Graph_types.Journal_page{journal_day=20261102}) "echo lost day"
-     | _->Alcotest.fail "echo lost append page");
-    match Database.get_outline_blocks snapshot [root_uuid;child_uuid] |> T.require_ok ~behavior with
-    | [Present_block{value=root;_};Present_block{value=child;_}]->
-      T.require(root.block.parent=resolved_page && child.block.parent=root_uuid && child.block.page=resolved_page)
-        "echo changed atomic tree ownership";
-      T.require(root.task_status=Some(Status_uuid(T.status_uuid 2)) && child.task_status=Some(Status_uuid(T.status_uuid 3)))
-        "echo lost atomic statuses"
-    | _->Alcotest.fail "echo lost atomic blocks");
-  let sync=Database.inspect_sync database |> T.require_ok ~behavior in
-  T.require(sync_view_submissions sync=[]) "authoritative append did not retire its accepted outbox record";
-  T.require(Database.intent_commit_outcome(Database.commit_local_intent database intent |> T.require_ok ~behavior)=local)
+  let page = T.mutation_uuid 7790
+  and root_uuid = T.mutation_uuid 7791
+  and child_uuid = T.mutation_uuid 7792 in
+  let root : Types.append_node =
+    { uuid = root_uuid
+    ; title = "Atomic wire root"
+    ; task_status = Some (T.status_uuid 2)
+    ; children =
+        Rrbvec.singleton
+          { uuid = child_uuid
+          ; title = "Atomic wire child"
+          ; task_status = Some (T.status_uuid 3)
+          ; children = Rrbvec.empty
+          }
+    }
+  in
+  let mutation =
+    Types.Append_journal
+      { mutation_id = T.mutation_uuid 7793
+      ; page
+      ; title = "2026-11-02"
+      ; journal_day = 20261102
+      ; root
+      }
+  in
+  let expected =
+    Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior
+  in
+  let intent =
+    Database.persist_local_intent
+      database
+      ~namespace:(String.make 64 'f')
+      ~payload:"complete append wire"
+      ~expected
+      mutation
+    |> T.require_ok ~behavior
+  in
+  let proof = Database.commit_local_intent database intent |> T.require_ok ~behavior in
+  let local = Database.intent_commit_outcome proof in
+  let resolved_page =
+    if not remote_day
+    then page
+    else
+      let module J = Transit_core.Json in
+      let web = T.mutation_uuid 7794 in
+      let page_entity = J.String "remote-web-day"
+      and child_entity = J.String "remote-first-entry" in
+      let add_page attribute value = T.status_add page_entity attribute value in
+      let add_child attribute value = T.status_add child_entity attribute value in
+      T.apply_test_transaction
+        database
+        ~cursor:2
+        [ add_page "block/uuid" (J.Uuid (Logseq_db_types.Graph_types.Uuid.to_string web))
+        ; add_page "block/title" (J.String "Web day")
+        ; add_page "block/name" (J.String "web-remote-day")
+        ; add_page "block/journal-day" (J.Int 20261102)
+        ; add_child
+            "block/uuid"
+            (J.Uuid (Logseq_db_types.Graph_types.Uuid.to_string (T.mutation_uuid 7795)))
+        ; add_child "block/title" (J.String "Remote first entry")
+        ; add_child "block/parent" page_entity
+        ; add_child "block/page" page_entity
+        ; add_child "block/order" (J.String "a9")
+        ];
+      let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+      Fun.protect
+        ~finally:(fun () -> Database.release_snapshot snapshot)
+        (fun () ->
+           T.require
+             (match
+                Database.get_outline_blocks snapshot [ root_uuid ]
+                |> T.require_ok ~behavior
+              with
+              | [ Present_block { value; _ } ] ->
+                value.block.parent = web && String.compare value.block.order "a9" > 0
+              | _ -> false)
+             "queued append did not follow the Web day's existing tail");
+      web
+  in
+  let echo_cursor = if remote_day then 3 else 2 in
+  let page_value () =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect
+      ~finally:(fun () -> Database.release_snapshot snapshot)
+      (fun () ->
+         match
+           Database.get_pages snapshot [ resolved_page ] |> T.require_ok ~behavior
+         with
+         | [ Present_page { value; _ } ] -> value
+         | _ -> Alcotest.fail "atomic page disappeared")
+  in
+  let before_submit = page_value () in
+  let submitted = submit_one database local behavior in
+  T.require
+    (page_value () = before_submit)
+    "transport submission changed complete append page DTO";
+  T.require
+    (List.length (submission_batch_wires submitted) = 1)
+    "append split one atomic action into separate outbox transactions";
+  let wire =
+    server_transaction
+      ~mutation_id:local.mutation_id
+      ~operation:"append-journal"
+      submitted
+  in
+  let wire =
+    if reverse_operations
+    then
+      let module Codec = Transit_native.Transit.Json in
+      match Codec.of_string wire with
+      | Transit_core.Json.Array operations ->
+        Codec.to_string
+          ~mode:Codec.Verbose
+          (Transit_core.Json.Array (List.rev operations))
+      | _ -> Alcotest.fail "append echo is not an array"
+    else wire
+  in
+  let barrier =
+    { through = server_cursor echo_cursor
+    ; checksum = checksum (if remote_day then "7c0e6c83a247118b" else "1afbe793c7bf779b")
+    }
+  in
+  let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, crypto =
+    Database.begin_outbox_transition
+      database
+      ~expected:(sync_view_token sync)
+      (Accept_group { batch_id = submission_batch_id submitted; barrier })
+    |> T.require_ok ~behavior
+  in
+  T.require (crypto = None) "append acceptance requested extra crypto";
+  ignore
+    (Database.apply_outbox_transition database prepared ~encrypted:None
+     |> T.require_ok ~behavior);
+  let batch =
+    authoritative_batch
+      ~maximum_count:16
+      ~maximum_bytes:65536
+      ~transactions:
+        [ authoritative_transaction
+            ~cursor:(server_cursor echo_cursor)
+            ~transaction:(encoded ~maximum_bytes:65536 wire)
+        ]
+      ~through:(server_cursor echo_cursor)
+      ~checksum:(Some barrier.checksum)
+    |> T.require_ok ~behavior
+  in
+  let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, crypto =
+    Database.begin_authoritative database ~expected:(sync_view_token sync) batch
+    |> T.require_ok ~behavior
+  in
+  let decrypted =
+    Option.map (fun request -> decrypt_submitted_request request behavior) crypto
+  in
+  (match
+     Database.apply_authoritative database prepared ~decrypted |> T.require_ok ~behavior
+   with
+   | Authoritative_applied _ -> ()
+   | _ -> Alcotest.fail "atomic append echo was deferred");
+  let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect
+    ~finally:(fun () -> Database.release_snapshot snapshot)
+    (fun () ->
+       (match Database.get_pages snapshot [ resolved_page ] |> T.require_ok ~behavior with
+        | [ Present_page { value; _ } ] ->
+          T.require
+            (value.page.kind
+             = Logseq_db_types.Graph_types.Journal_page { journal_day = 20261102 })
+            "echo lost day"
+        | _ -> Alcotest.fail "echo lost append page");
+       match
+         Database.get_outline_blocks snapshot [ root_uuid; child_uuid ]
+         |> T.require_ok ~behavior
+       with
+       | [ Present_block { value = root; _ }; Present_block { value = child; _ } ] ->
+         T.require
+           (root.block.parent = resolved_page
+            && child.block.parent = root_uuid
+            && child.block.page = resolved_page)
+           "echo changed atomic tree ownership";
+         T.require
+           (root.task_status = Some (Status_uuid (T.status_uuid 2))
+            && child.task_status = Some (Status_uuid (T.status_uuid 3)))
+           "echo lost atomic statuses"
+       | _ -> Alcotest.fail "echo lost atomic blocks");
+  let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+  T.require
+    (sync_view_submissions sync = [])
+    "authoritative append did not retire its accepted outbox record";
+  T.require
+    (Database.intent_commit_outcome
+       (Database.commit_local_intent database intent |> T.require_ok ~behavior)
+     = local)
     "authoritative echo replaced original append proof"
 ;;
 
 let atomic_append_queue_replans_actual_owners database =
-  let behavior="queued append prefix preserves day owners and per-day tail" in
-  let expected=Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior in
-  let roots=Rrbvec.init 128(fun index->T.mutation_uuid(80000+index)) in
-  Rrbvec.iteri(fun index uuid->
-    let slot=index mod 3 in
-    let root:Types.append_node={uuid;title=Printf.sprintf "Queued root %d" index;task_status=None;children=Rrbvec.empty} in
-    let mutation=Types.Append_journal{mutation_id=T.mutation_uuid(90000+index);page=T.mutation_uuid(79000+slot);
-      title=Printf.sprintf "Day %d" slot;journal_day=20261101+slot;root} in
-    ignore(T.commit_mutation database ~expected mutation ~behavior)) roots;
-  let web=T.mutation_uuid 78000 in
-  let module J=Transit_core.Json in
-  let owner=J.String "prefix-web-day" and first=J.String "prefix-web-first" in
-  let add entity attribute value=T.status_add entity attribute value in
-  T.apply_test_transaction database ~cursor:1
-    [add owner "block/uuid" (J.Uuid(Logseq_db_types.Graph_types.Uuid.to_string web));
-     add owner "block/title" (J.String "Web middle day");add owner "block/name" (J.String "prefix-web-day");
-     add owner "block/journal-day" (J.Int 20261102);
-     add first "block/uuid" (J.Uuid(Logseq_db_types.Graph_types.Uuid.to_string(T.mutation_uuid 78001)));
-     add first "block/title" (J.String "Remote first");add first "block/parent" owner;
-     add first "block/page" owner;add first "block/order" (J.String "a9")];
-  let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
-  Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
-    let previous=Array.make 3 None in previous.(1)<-Some "a9";
-    let blocks=Database.get_outline_blocks snapshot(Rrbvec.to_list roots) |> T.require_ok ~behavior in
-    List.iteri(fun index->function
-      | Present_block{value;_}->
-        let slot=index mod 3 in
-        let page=if slot=1 then web else T.mutation_uuid(79000+slot) in
-        T.require(value.block.page=page && value.block.parent=page
-          && value.block.title=Printf.sprintf "Queued root %d" index) "prefix changed a root owner/source";
-        Option.iter(fun previous->T.require(String.compare previous value.block.order<0)
-          "prefix order did not advance within the resolved day")previous.(slot);
-        previous.(slot)<-Some value.block.order
-      | _->Alcotest.fail "prefix lost a pending root")blocks;
-    T.require(match Database.get_pages snapshot [T.mutation_uuid 79001] |> T.require_ok ~behavior with
-      |[Missing_page _]->true|_->false) "replan retained the unused candidate day");
-  let view=Database.inspect_sync database |> T.require_ok ~behavior in
-  T.require(List.length(sync_view_submissions view)=128) "prefix replan dropped an unsubmitted intent"
+  let behavior = "queued append prefix preserves day owners and per-day tail" in
+  let expected =
+    Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior
+  in
+  let roots = Rrbvec.init 128 (fun index -> T.mutation_uuid (80000 + index)) in
+  Rrbvec.iteri
+    (fun index uuid ->
+       let slot = index mod 3 in
+       let root : Types.append_node =
+         { uuid
+         ; title = Printf.sprintf "Queued root %d" index
+         ; task_status = None
+         ; children = Rrbvec.empty
+         }
+       in
+       let mutation =
+         Types.Append_journal
+           { mutation_id = T.mutation_uuid (90000 + index)
+           ; page = T.mutation_uuid (79000 + slot)
+           ; title = Printf.sprintf "Day %d" slot
+           ; journal_day = 20261101 + slot
+           ; root
+           }
+       in
+       ignore (T.commit_mutation database ~expected mutation ~behavior))
+    roots;
+  let web = T.mutation_uuid 78000 in
+  let module J = Transit_core.Json in
+  let owner = J.String "prefix-web-day"
+  and first = J.String "prefix-web-first" in
+  let add entity attribute value = T.status_add entity attribute value in
+  T.apply_test_transaction
+    database
+    ~cursor:1
+    [ add owner "block/uuid" (J.Uuid (Logseq_db_types.Graph_types.Uuid.to_string web))
+    ; add owner "block/title" (J.String "Web middle day")
+    ; add owner "block/name" (J.String "prefix-web-day")
+    ; add owner "block/journal-day" (J.Int 20261102)
+    ; add
+        first
+        "block/uuid"
+        (J.Uuid (Logseq_db_types.Graph_types.Uuid.to_string (T.mutation_uuid 78001)))
+    ; add first "block/title" (J.String "Remote first")
+    ; add first "block/parent" owner
+    ; add first "block/page" owner
+    ; add first "block/order" (J.String "a9")
+    ];
+  let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect
+    ~finally:(fun () -> Database.release_snapshot snapshot)
+    (fun () ->
+       let previous = Array.make 3 None in
+       previous.(1) <- Some "a9";
+       let blocks =
+         Database.get_outline_blocks snapshot (Rrbvec.to_list roots)
+         |> T.require_ok ~behavior
+       in
+       List.iteri
+         (fun index -> function
+            | Present_block { value; _ } ->
+              let slot = index mod 3 in
+              let page = if slot = 1 then web else T.mutation_uuid (79000 + slot) in
+              T.require
+                (value.block.page = page
+                 && value.block.parent = page
+                 && value.block.title = Printf.sprintf "Queued root %d" index)
+                "prefix changed a root owner/source";
+              Option.iter
+                (fun previous ->
+                   T.require
+                     (String.compare previous value.block.order < 0)
+                     "prefix order did not advance within the resolved day")
+                previous.(slot);
+              previous.(slot) <- Some value.block.order
+            | _ -> Alcotest.fail "prefix lost a pending root")
+         blocks;
+       T.require
+         (match
+            Database.get_pages snapshot [ T.mutation_uuid 79001 ]
+            |> T.require_ok ~behavior
+          with
+          | [ Missing_page _ ] -> true
+          | _ -> false)
+         "replan retained the unused candidate day");
+  let view = Database.inspect_sync database |> T.require_ok ~behavior in
+  T.require
+    (List.length (sync_view_submissions view) = 128)
+    "prefix replan dropped an unsubmitted intent"
 ;;
 
 let atomic_append_tail_includes_later_submitted_shadow database =
-  let behavior="append tail includes a later submitted dependency shadow" in
-  let module J=Transit_core.Json in let module Codec=Transit_native.Transit.Json in
-  let low=T.mutation_uuid 92000 in
-  let entity=J.String "shadow-low-sibling" in
-  T.apply_test_transaction database ~cursor:1
-    [T.status_add(T.status_lookup T.page_uuid) "block/journal-day" (J.Int 20261102);
-     T.status_add(T.status_lookup T.authoritative_block_uuid) "block/order" (J.String "a9");
-     T.status_add entity "block/uuid" (J.Uuid(Logseq_db_types.Graph_types.Uuid.to_string low));
-     T.status_add entity "block/title" (J.String "Low sibling");
-     T.status_add entity "block/parent" (T.status_lookup T.page_uuid);
-     T.status_add entity "block/page" (T.status_lookup T.page_uuid);T.status_add entity "block/order" (J.String "a0")];
+  let behavior = "append tail includes a later submitted dependency shadow" in
+  let module J = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let low = T.mutation_uuid 92000 in
+  let entity = J.String "shadow-low-sibling" in
+  T.apply_test_transaction
+    database
+    ~cursor:1
+    [ T.status_add (T.status_lookup T.page_uuid) "block/journal-day" (J.Int 20261102)
+    ; T.status_add
+        (T.status_lookup T.authoritative_block_uuid)
+        "block/order"
+        (J.String "a9")
+    ; T.status_add
+        entity
+        "block/uuid"
+        (J.Uuid (Logseq_db_types.Graph_types.Uuid.to_string low))
+    ; T.status_add entity "block/title" (J.String "Low sibling")
+    ; T.status_add entity "block/parent" (T.status_lookup T.page_uuid)
+    ; T.status_add entity "block/page" (T.status_lookup T.page_uuid)
+    ; T.status_add entity "block/order" (J.String "a0")
+    ];
   let append index =
-    let expected=Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior in
-    ignore(T.commit_mutation database ~expected ~behavior
-      (Types.Append_journal{mutation_id=T.mutation_uuid(92100+index);page=T.mutation_uuid 92004;
-        title="Unused candidate";journal_day=20261102;
-        root={uuid=T.mutation_uuid(92001+index);title="Queued append";task_status=None;children=Rrbvec.empty}})) in
+    let expected =
+      Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[]
+      |> T.require_ok ~behavior
+    in
+    ignore
+      (T.commit_mutation
+         database
+         ~expected
+         ~behavior
+         (Types.Append_journal
+            { mutation_id = T.mutation_uuid (92100 + index)
+            ; page = T.mutation_uuid 92004
+            ; title = "Unused candidate"
+            ; journal_day = 20261102
+            ; root =
+                { uuid = T.mutation_uuid (92001 + index)
+                ; title = "Queued append"
+                ; task_status = None
+                ; children = Rrbvec.empty
+                }
+            }))
+  in
   append 0;
-  let saved=match T.commit_mutation database ~expected:(T.delete_precondition database
-    ~block:T.authoritative_block_uuid ~behavior) ~behavior
-      (Types.Save_block{mutation_id=T.mutation_uuid 92003;block=T.authoritative_block_uuid;title="Submitted save"}) with
-    | Local_committed value->value|_->Alcotest.fail "save already existed" in
-  let submitted=submit_one database saved behavior in
+  let saved =
+    match
+      T.commit_mutation
+        database
+        ~expected:
+          (T.delete_precondition database ~block:T.authoritative_block_uuid ~behavior)
+        ~behavior
+        (Types.Save_block
+           { mutation_id = T.mutation_uuid 92003
+           ; block = T.authoritative_block_uuid
+           ; title = "Submitted save"
+           })
+    with
+    | Local_committed value -> value
+    | _ -> Alcotest.fail "save already existed"
+  in
+  let submitted = submit_one database saved behavior in
   append 1;
   (* A genuine own echo at the reserved cursor followed by a remote deletion;
      the Save's transport ACK has not arrived, so its dependency remains owned. *)
-  let own=server_transaction ~mutation_id:saved.mutation_id ~operation:"save-block" submitted in
-  let deletion=Codec.to_string ~mode:Codec.Verbose(J.Array[
-    J.Array[J.Keyword "db/retractEntity";T.status_lookup T.authoritative_block_uuid]]) in
-  let batch=authoritative_batch ~maximum_count:16 ~maximum_bytes:65536
-    ~transactions:[authoritative_transaction ~cursor:(server_cursor 2) ~transaction:(encoded ~maximum_bytes:65536 own);
-      authoritative_transaction ~cursor:(server_cursor 3) ~transaction:(encoded deletion)]
-    ~through:(server_cursor 3) ~checksum:None |> T.require_ok ~behavior in
-  let view=Database.inspect_sync database |> T.require_ok ~behavior in
-  let prepared,crypto=Database.begin_authoritative database ~expected:(sync_view_token view)batch |> T.require_ok ~behavior in
-  let decrypted=Option.map(fun request->decrypt_submitted_request request behavior)crypto in
-  (match Database.apply_authoritative database prepared ~decrypted |> T.require_ok ~behavior with
-   | Authoritative_applied _->()|_->Alcotest.fail "legal delayed-ACK shadow fixture was deferred");
-  let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
-  Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
-    match Database.get_outline_blocks snapshot [T.authoritative_block_uuid;T.mutation_uuid 92001;T.mutation_uuid 92002]
-      |> T.require_ok ~behavior with
-    | [Present_block{value=shadow;_};Present_block{value=first;_};Present_block{value=last;_}]->
-      T.require(shadow.block.order="a9") "fixture did not retain the active submitted shadow";
-      T.require(String.compare last.block.order shadow.block.order>0)
-        "next Append was ordered before a still-owned submitted sibling";
-      T.require(String.compare first.block.order shadow.block.order>0 && String.compare last.block.order first.block.order>0)
-        "replan lost the original queued Append's logical tail"
-    | _->Alcotest.fail "fixture lost the shadow or queued append")
+  let own =
+    server_transaction ~mutation_id:saved.mutation_id ~operation:"save-block" submitted
+  in
+  let deletion =
+    Codec.to_string
+      ~mode:Codec.Verbose
+      (J.Array
+         [ J.Array
+             [ J.Keyword "db/retractEntity"; T.status_lookup T.authoritative_block_uuid ]
+         ])
+  in
+  let batch =
+    authoritative_batch
+      ~maximum_count:16
+      ~maximum_bytes:65536
+      ~transactions:
+        [ authoritative_transaction
+            ~cursor:(server_cursor 2)
+            ~transaction:(encoded ~maximum_bytes:65536 own)
+        ; authoritative_transaction
+            ~cursor:(server_cursor 3)
+            ~transaction:(encoded deletion)
+        ]
+      ~through:(server_cursor 3)
+      ~checksum:None
+    |> T.require_ok ~behavior
+  in
+  let view = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, crypto =
+    Database.begin_authoritative database ~expected:(sync_view_token view) batch
+    |> T.require_ok ~behavior
+  in
+  let decrypted =
+    Option.map (fun request -> decrypt_submitted_request request behavior) crypto
+  in
+  (match
+     Database.apply_authoritative database prepared ~decrypted |> T.require_ok ~behavior
+   with
+   | Authoritative_applied _ -> ()
+   | _ -> Alcotest.fail "legal delayed-ACK shadow fixture was deferred");
+  let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect
+    ~finally:(fun () -> Database.release_snapshot snapshot)
+    (fun () ->
+       match
+         Database.get_outline_blocks
+           snapshot
+           [ T.authoritative_block_uuid; T.mutation_uuid 92001; T.mutation_uuid 92002 ]
+         |> T.require_ok ~behavior
+       with
+       | [ Present_block { value = shadow; _ }
+         ; Present_block { value = first; _ }
+         ; Present_block { value = last; _ }
+         ] ->
+         T.require
+           (shadow.block.order = "a9")
+           "fixture did not retain the active submitted shadow";
+         T.require
+           (String.compare last.block.order shadow.block.order > 0)
+           "next Append was ordered before a still-owned submitted sibling";
+         T.require
+           (String.compare first.block.order shadow.block.order > 0
+            && String.compare last.block.order first.block.order > 0)
+           "replan lost the original queued Append's logical tail"
+       | _ -> Alcotest.fail "fixture lost the shadow or queued append")
 ;;
 
 let submitted_append_page_shadow_stays_in_journal_index database =
-  let behavior="journal catalog hydrates submitted Append's retained page shadow" in
-  let module J=Transit_core.Json in let module Codec=Transit_native.Transit.Json in
-  T.apply_test_transaction database ~cursor:1
-    [T.status_add(T.status_lookup T.page_uuid) "block/journal-day" (J.Int 20261102)];
-  let expected=Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior in
-  let record=match T.commit_mutation database ~expected ~behavior
-    (Types.Append_journal{mutation_id=T.mutation_uuid 92900;page=T.mutation_uuid 92901;
-      title="Unused candidate";journal_day=20261102;
-      root={uuid=T.mutation_uuid 92902;title="Submitted root";task_status=None;children=Rrbvec.empty}}) with
-    |Local_committed record->record|_->Alcotest.fail "Append already existed" in
-  let submitted=submit_one database record behavior in
-  let own=server_transaction ~mutation_id:record.mutation_id ~operation:"append-journal" submitted in
-  let deletion=Codec.to_string ~mode:Codec.Verbose(J.Array[
-    J.Array[J.Keyword "db/retractEntity";T.status_lookup T.page_uuid]]) in
-  let batch=authoritative_batch ~maximum_count:16 ~maximum_bytes:65536
-    ~transactions:[authoritative_transaction ~cursor:(server_cursor 2) ~transaction:(encoded ~maximum_bytes:65536 own);
-      authoritative_transaction ~cursor:(server_cursor 3) ~transaction:(encoded deletion)]
-    ~through:(server_cursor 3) ~checksum:None |> T.require_ok ~behavior in
-  let view=Database.inspect_sync database |> T.require_ok ~behavior in
-  let prepared,crypto=Database.begin_authoritative database ~expected:(sync_view_token view)batch |> T.require_ok ~behavior in
-  let decrypted=Option.map(fun request->decrypt_submitted_request request behavior)crypto in
-  (match Database.apply_authoritative database prepared ~decrypted |> T.require_ok ~behavior with
-   |Authoritative_applied _->()|_->Alcotest.fail "valid delayed-ACK page shadow was deferred");
-  let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
-  Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
-    let journals=Database.get_journals snapshot ~from_day:20261102 ~through_day:20261102 ~limit:1 ~cursor:None
-      |> T.require_ok ~behavior in
-    T.require(List.length journals.items=1 && (List.hd journals.items).page.page.uuid=T.page_uuid)
-      "journal catalog discarded the still-owned submitted page shadow")
+  let behavior = "journal catalog hydrates submitted Append's retained page shadow" in
+  let module J = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  T.apply_test_transaction
+    database
+    ~cursor:1
+    [ T.status_add (T.status_lookup T.page_uuid) "block/journal-day" (J.Int 20261102) ];
+  let expected =
+    Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior
+  in
+  let record =
+    match
+      T.commit_mutation
+        database
+        ~expected
+        ~behavior
+        (Types.Append_journal
+           { mutation_id = T.mutation_uuid 92900
+           ; page = T.mutation_uuid 92901
+           ; title = "Unused candidate"
+           ; journal_day = 20261102
+           ; root =
+               { uuid = T.mutation_uuid 92902
+               ; title = "Submitted root"
+               ; task_status = None
+               ; children = Rrbvec.empty
+               }
+           })
+    with
+    | Local_committed record -> record
+    | _ -> Alcotest.fail "Append already existed"
+  in
+  let submitted = submit_one database record behavior in
+  let own =
+    server_transaction
+      ~mutation_id:record.mutation_id
+      ~operation:"append-journal"
+      submitted
+  in
+  let deletion =
+    Codec.to_string
+      ~mode:Codec.Verbose
+      (J.Array [ J.Array [ J.Keyword "db/retractEntity"; T.status_lookup T.page_uuid ] ])
+  in
+  let batch =
+    authoritative_batch
+      ~maximum_count:16
+      ~maximum_bytes:65536
+      ~transactions:
+        [ authoritative_transaction
+            ~cursor:(server_cursor 2)
+            ~transaction:(encoded ~maximum_bytes:65536 own)
+        ; authoritative_transaction
+            ~cursor:(server_cursor 3)
+            ~transaction:(encoded deletion)
+        ]
+      ~through:(server_cursor 3)
+      ~checksum:None
+    |> T.require_ok ~behavior
+  in
+  let view = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, crypto =
+    Database.begin_authoritative database ~expected:(sync_view_token view) batch
+    |> T.require_ok ~behavior
+  in
+  let decrypted =
+    Option.map (fun request -> decrypt_submitted_request request behavior) crypto
+  in
+  (match
+     Database.apply_authoritative database prepared ~decrypted |> T.require_ok ~behavior
+   with
+   | Authoritative_applied _ -> ()
+   | _ -> Alcotest.fail "valid delayed-ACK page shadow was deferred");
+  let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect
+    ~finally:(fun () -> Database.release_snapshot snapshot)
+    (fun () ->
+       let journals =
+         Database.get_journals
+           snapshot
+           ~from_day:20261102
+           ~through_day:20261102
+           ~limit:1
+           ~cursor:None
+         |> T.require_ok ~behavior
+       in
+       T.require
+         (List.length journals.items = 1
+          && (List.hd journals.items).page.page.uuid = T.page_uuid)
+         "journal catalog discarded the still-owned submitted page shadow")
 ;;
 
 let acceptance_is_transport_only database =
@@ -1571,7 +1987,9 @@ let definitive_rejection_rolls_back_once database =
    | No_logical_change | Logical_resync_required _ ->
      Alcotest.fail "single rejected insertion did not return an exact rollback");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
-  (match Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
+  (match
+     Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior
+   with
    | [ Missing_block _ ] -> ()
    | _ -> Alcotest.fail "rejected insertion remained visible");
   Database.release_snapshot snapshot;
@@ -1692,7 +2110,8 @@ let authoritative_batch_updates_the_logical_snapshot database =
     "visible authoritative update did not advance projection";
   let after = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_outline_blocks after [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks after [ T.authoritative_block_uuid ]
+     |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -1751,7 +2170,8 @@ let authoritative_rebase_replans_queued_ordinary_mutation database =
     "queued ordinary mutation was not reported as replanned";
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+     |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -2057,7 +2477,8 @@ let authoritative_crypto_is_correlated_and_applied database =
    | Ok _ -> Alcotest.fail "stale authoritative crypto was accepted");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+     |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -2091,7 +2512,7 @@ let submitted_delete_defers_authoritative_batch_until_transport_outcome database
     |> encoded
   in
   let cursor = server_cursor 1 in
-  let checksum = checksum "dededededededede" in
+  let checksum = checksum "aa5ce131b706db6b" in
   let batch =
     authoritative_batch
       ~maximum_count:16
@@ -2242,7 +2663,8 @@ let pull_first_delete_conflict_proves_non_execution database =
    | _ -> Alcotest.fail "Pull-first conflict omitted its retained terminal receipt");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+     |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -2517,7 +2939,7 @@ let accepted_member_terminalizes_at_its_authoritative_barrier_with
     | Local_existing _ -> Alcotest.fail "fresh accepted fixture already existed"
   in
   let submitted = submit_one database local behavior in
-  let barrier = { through = server_cursor 1; checksum = checksum "1111111111111111" } in
+  let barrier = { through = server_cursor 1; checksum = checksum "ffffffffffffffff" } in
   let sync = Database.inspect_sync database |> T.require_ok ~behavior in
   let accepted, _crypto =
     Database.begin_outbox_transition
@@ -2541,7 +2963,7 @@ let accepted_member_terminalizes_at_its_authoritative_barrier_with
       ~transactions:
         [ authoritative_transaction ~cursor:(server_cursor 1) ~transaction:wire ]
       ~through:(server_cursor 1)
-      ~checksum:(Some (checksum "1111111111111111"))
+      ~checksum:(Some (checksum "87d0b4e319dbf287"))
     |> T.require_ok ~behavior
   in
   let sync = Database.inspect_sync database |> T.require_ok ~behavior in
@@ -2572,7 +2994,24 @@ let accepted_member_terminalizes_at_its_authoritative_barrier_with
   let final_sync = Database.inspect_sync database |> T.require_ok ~behavior in
   T.require
     (sync_view_submissions final_sync = [])
-    "incorporated accepted member remained in the active outbox"
+    "incorporated accepted member remained in the active outbox";
+  let duplicate, _ =
+    Database.begin_outbox_transition
+      database
+      ~expected:(sync_view_token final_sync)
+      (Accept_group
+         { batch_id = submission_batch_id submitted
+         ; barrier = { barrier with checksum = checksum "0000000000000000" }
+         })
+    |> T.require_ok ~behavior
+  in
+  Database.apply_outbox_transition database duplicate ~encrypted:None
+  |> T.require_ok ~behavior
+  |> ignore;
+  let continued = Database.inspect_sync database |> T.require_ok ~behavior in
+  T.require
+    (Server_cursor.equal (sync_view_checkpoint continued) (server_cursor 1))
+    "checksum-only duplicate ACK prevented subsequent inspection"
 ;;
 
 let accepted_member_terminalizes_at_its_authoritative_barrier database =
@@ -2619,7 +3058,7 @@ let accepted_member_rejects_wrong_payload database =
     | Local_existing _ -> Alcotest.fail "fresh wrong-digest fixture already existed"
   in
   let submitted = submit_one database local behavior in
-  let barrier = { through = server_cursor 1; checksum = checksum "1111111111111111" } in
+  let barrier = { through = server_cursor 1; checksum = checksum "f244e62fe240079f" } in
   let sync = Database.inspect_sync database |> T.require_ok ~behavior in
   let accepted, _ =
     Database.begin_outbox_transition
@@ -2667,7 +3106,7 @@ let accepted_member_rejects_wrong_payload database =
       ~transactions:
         [ authoritative_transaction ~cursor:(server_cursor 1) ~transaction:wire ]
       ~through:(server_cursor 1)
-      ~checksum:(Some (checksum "1111111111111111"))
+      ~checksum:(Some (checksum "f244e62fe240079f"))
     |> T.require_ok ~behavior
   in
   let sync = Database.inspect_sync database |> T.require_ok ~behavior in
@@ -2719,7 +3158,7 @@ let accepted_member_rejects_extra_touched_fact database =
     | Local_existing _ -> Alcotest.fail "fresh touched-footprint fixture already existed"
   in
   let submitted = submit_one database local behavior in
-  let barrier = { through = server_cursor 1; checksum = checksum "1111111111111111" } in
+  let barrier = { through = server_cursor 1; checksum = checksum "0ad260ea46ced2ec" } in
   let sync = Database.inspect_sync database |> T.require_ok ~behavior in
   let accepted, _ =
     Database.begin_outbox_transition
@@ -2764,7 +3203,7 @@ let accepted_member_rejects_extra_touched_fact database =
       ~transactions:
         [ authoritative_transaction ~cursor:(server_cursor 1) ~transaction:wire ]
       ~through:(server_cursor 1)
-      ~checksum:(Some (checksum "1111111111111111"))
+      ~checksum:(Some (checksum "0ad260ea46ced2ec"))
     |> T.require_ok ~behavior
   in
   let sync = Database.inspect_sync database |> T.require_ok ~behavior in
@@ -2904,7 +3343,8 @@ let accepted_member_uses_intermediate_barrier_root database =
    | _ -> Alcotest.fail "intermediate barrier did not earn Applied receipt");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+     |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -2949,7 +3389,7 @@ let covered_acceptance_uses_combined_group_requirements database =
     |> fun commit -> Option.get commit.submission_batch
   in
   let wires = submission_batch_wires submitted in
-  let group_checksum = checksum "4141414141414141" in
+  let group_checksum = checksum "84be9968a909845a" in
   let batch =
     authoritative_batch
       ~maximum_count:16
@@ -3038,7 +3478,7 @@ let accepted_delete_rejects_missing_own_incorporation database =
     | Local_existing _ -> Alcotest.fail "fresh mismatch fixture already existed"
   in
   let submitted = submit_one database local behavior in
-  let barrier = { through = server_cursor 1; checksum = checksum "2222222222222222" } in
+  let barrier = { through = server_cursor 1; checksum = checksum "03feca6686fda40c" } in
   let sync = Database.inspect_sync database |> T.require_ok ~behavior in
   let accepted, _crypto =
     Database.begin_outbox_transition
@@ -3074,7 +3514,7 @@ let accepted_delete_rejects_missing_own_incorporation database =
       ~transactions:
         [ authoritative_transaction ~cursor:(server_cursor 1) ~transaction:wire ]
       ~through:(server_cursor 1)
-      ~checksum:(Some (checksum "2222222222222222"))
+      ~checksum:(Some (checksum "03feca6686fda40c"))
     |> T.require_ok ~behavior
   in
   let sync = Database.inspect_sync database |> T.require_ok ~behavior in
@@ -3088,7 +3528,8 @@ let accepted_delete_rejects_missing_own_incorporation database =
    | Ok _ -> Alcotest.fail "accepted delete tolerated missing own incorporation");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+     |> T.require_ok ~behavior
    with
    | [ Missing_block _ ] -> ()
    | _ -> Alcotest.fail "failed integrity preparation changed the logical delete");
@@ -3121,7 +3562,7 @@ let accepted_delete_allows_server_normalized_order database =
     | Local_existing _ -> Alcotest.fail "fresh normalized delete fixture already existed"
   in
   let submitted = submit_one database local behavior in
-  let barrier = { through = server_cursor 1; checksum = checksum "2323232323232323" } in
+  let barrier = { through = server_cursor 1; checksum = checksum "aa5ce131b706db6b" } in
   let sync = Database.inspect_sync database |> T.require_ok ~behavior in
   let accepted, _crypto =
     Database.begin_outbox_transition
@@ -3261,7 +3702,8 @@ let queued_delete_yields_to_remote_change_before_submission database =
    | _ -> Alcotest.fail "queued delete conflict omitted Remote_won receipt");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+     |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -3700,7 +4142,9 @@ let partial_rejection_blocks_suffix_dependent_on_failed_insert database =
     (states = [ Blocked; Blocked ])
     "failed member and dependent suffix did not become atomically Blocked";
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
-  (match Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
+  (match
+     Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior
+   with
    | [ Missing_block _ ] -> ()
    | _ -> Alcotest.fail "dependent suffix remained in the logical projection");
   Database.release_snapshot snapshot
@@ -3773,7 +4217,7 @@ let reopened_submission_does_not_reuse_terminal_batch () =
                     { batch_id = old_id
                     ; barrier =
                         { through = server_cursor 1
-                        ; checksum = checksum "1111111111111111"
+                        ; checksum = checksum "87d0b4e319dbf287"
                         }
                     })
                |> T.require_ok ~behavior
@@ -3860,7 +4304,9 @@ let stale_remote_wire uuid attribute value =
 let stale_commit database mutation behavior =
   let expected =
     match mutation with
-    | Append_journal _ -> Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior
+    | Append_journal _ ->
+      Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[]
+      |> T.require_ok ~behavior
     | Insert_blocks { parent; _ } -> T.insert_precondition database ~parent ~behavior
     | Create_journal_page { page; _ } ->
       let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
@@ -4196,7 +4642,9 @@ let stale_insert_collision_blocks_intent database =
      = [ Blocked ])
     "replanning a conflicting insertion overwrote the authoritative UUID";
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
-  (match Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
+  (match
+     Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior
+   with
    | [ Present_block { value; _ } ] ->
      T.require
        (value.block.title = "Peer owns this UUID")
@@ -4697,102 +5145,253 @@ let database_cases =
 
 (* Sync's pure reducer carries opaque transactions and cannot execute this
    retirement/rebase decision. Exercise its owning public Database boundary. *)
-let queued_delete_survives_own_append_echo ?(existing_block=false) ?(remote_later=false) ~remote_change db =
- let behavior="queued delete follows own append echo" in
- let root=if existing_block then T.authoritative_block_uuid else T.mutation_uuid 9001 in
- let append=Types.Append_journal {mutation_id=T.mutation_uuid 9002;page=T.mutation_uuid 9003;
- title="2026-11-07";journal_day=20261107;
- root={uuid=root;title="Synthetic capture";task_status=None;children=Rrbvec.empty}} in
- let mutation = if existing_block then
-   Types.Save_block {mutation_id=T.mutation_uuid 9002;block=root;title="Own saved title"}
-   else append in
- let expected = if existing_block then T.delete_precondition db ~block:root ~behavior
-   else T.empty_precondition ~behavior in
- let intent=Database.persist_local_intent db ~namespace:(String.make 64 'a') ~payload:"append"
- ~expected mutation |> T.require_ok ~behavior in
- let proof=Database.commit_local_intent db intent |> T.require_ok ~behavior in
- let local=Database.intent_commit_outcome proof in
- let deletion=Types.Delete_blocks{mutation_id=T.mutation_uuid 9004;root} in
- ignore(T.commit_mutation db ~expected:(T.delete_precondition db ~block:root ~behavior) deletion ~behavior);
- let submitted=submit_one db local behavior in
- let wire=server_transaction ~mutation_id:local.mutation_id ~operation:"append-journal" submitted in
- let barrier={through=server_cursor 1;checksum=checksum "1111111111111111"} in
- let sync=Database.inspect_sync db |> T.require_ok ~behavior in
- let prepared,_=Database.begin_outbox_transition db ~expected:(sync_view_token sync)
- (Accept_group{batch_id=submission_batch_id submitted;barrier}) |> T.require_ok ~behavior in
- ignore(Database.apply_outbox_transition db prepared ~encrypted:None |> T.require_ok ~behavior);
- let transactions = [authoritative_transaction ~cursor:(server_cursor 1)
-   ~transaction:(encoded ~maximum_bytes:65536 wire)] in
- let transactions = if not remote_change then transactions else
-   transactions @ [authoritative_transaction ~cursor:(server_cursor 2)
-     ~transaction:(encoded (Printf.sprintf
-       "[[\"~:db/add\",[\"~:block/uuid\",\"~u%s\"],\"~:block/updated-at\",1704067200999]]"
-       (Graph.Uuid.to_string root)))] in
- let batch=authoritative_batch ~maximum_count:16 ~maximum_bytes:65536
- ~transactions
- ~through:(server_cursor (if remote_change then 2 else 1)) ~checksum:(Some barrier.checksum) |> T.require_ok ~behavior in
- let sync=Database.inspect_sync db |> T.require_ok ~behavior in
- let prepared,crypto=Database.begin_authoritative db ~expected:(sync_view_token sync) batch |> T.require_ok ~behavior in
- let decrypted=Option.map(fun req->decrypt_submitted_request req behavior)crypto in
- let commit=match Database.apply_authoritative db prepared ~decrypted |> T.require_ok ~behavior with
- |Authoritative_applied c->c|_->failwith "deferred" in
- let remote_won = List.exists (fun terminal -> match terminal.receipt with
-   | Remote_won_receipt r -> Graph.Uuid.equal r.mutation_id (T.mutation_uuid 9004)
-   | _ -> false) commit.terminal_receipts in
- T.require (remote_won = remote_change) "own echo was mistaken for a remote delete conflict";
- let sync=Database.inspect_sync db |> T.require_ok ~behavior in
- T.require (List.length (sync_view_submissions sync) = if remote_change then 0 else 1)
-   "queued delete was lost or genuine remote conflict was ignored";
- let snapshot=Database.current_snapshot db |> T.require_ok ~behavior in
- let present=match Database.get_outline_blocks snapshot [root] |> T.require_ok ~behavior with
-   | [Present_block _] -> true | _ -> false in
- Database.release_snapshot snapshot;
- T.require (present = remote_change) "own echo resurrected locally deleted block";
- if remote_later then (
-   let remote = Printf.sprintf
-     "[[\"~:db/add\",[\"~:block/uuid\",\"~u%s\"],\"~:block/updated-at\",1704067200999]]"
-     (Graph.Uuid.to_string root) in
-   let later = commit_plain_authoritative db ~cursor:(server_cursor 2) remote behavior in
-   T.require (List.exists (fun terminal -> match terminal.receipt with
-     | Remote_won_receipt r -> Graph.Uuid.equal r.mutation_id (T.mutation_uuid 9004)
-     | _ -> false) later.terminal_receipts)
-     "real remote change in a later batch did not win")
- else if not remote_change then (
-   let prepared, request, _ = prepare_submit db [T.mutation_uuid 9004] behavior in
-   let protected = protect request behavior in
-   let sent = Database.apply_outbox_transition db prepared ~encrypted:(Some protected)
-     |> T.require_ok ~behavior in
-   T.require (Option.is_some sent.submission_batch) "preserved delete cannot submit")
+let queued_delete_survives_own_append_echo
+      ?(existing_block = false)
+      ?(remote_later = false)
+      ~remote_change
+      db
+  =
+  let behavior = "queued delete follows own append echo" in
+  let root =
+    if existing_block then T.authoritative_block_uuid else T.mutation_uuid 9001
+  in
+  let append =
+    Types.Append_journal
+      { mutation_id = T.mutation_uuid 9002
+      ; page = T.mutation_uuid 9003
+      ; title = "2026-11-07"
+      ; journal_day = 20261107
+      ; root =
+          { uuid = root
+          ; title = "Synthetic capture"
+          ; task_status = None
+          ; children = Rrbvec.empty
+          }
+      }
+  in
+  let mutation =
+    if existing_block
+    then
+      Types.Save_block
+        { mutation_id = T.mutation_uuid 9002; block = root; title = "Own saved title" }
+    else append
+  in
+  let expected =
+    if existing_block
+    then T.delete_precondition db ~block:root ~behavior
+    else T.empty_precondition ~behavior
+  in
+  let intent =
+    Database.persist_local_intent
+      db
+      ~namespace:(String.make 64 'a')
+      ~payload:"append"
+      ~expected
+      mutation
+    |> T.require_ok ~behavior
+  in
+  let proof = Database.commit_local_intent db intent |> T.require_ok ~behavior in
+  let local = Database.intent_commit_outcome proof in
+  let deletion = Types.Delete_blocks { mutation_id = T.mutation_uuid 9004; root } in
+  ignore
+    (T.commit_mutation
+       db
+       ~expected:(T.delete_precondition db ~block:root ~behavior)
+       deletion
+       ~behavior);
+  let submitted = submit_one db local behavior in
+  let wire =
+    server_transaction
+      ~mutation_id:local.mutation_id
+      ~operation:"append-journal"
+      submitted
+  in
+  let barrier =
+    { through = server_cursor 1
+    ; checksum =
+        checksum (if existing_block then "873bc63b0d8eb9a1" else "d47bafa0dd760364")
+    }
+  in
+  let sync = Database.inspect_sync db |> T.require_ok ~behavior in
+  let prepared, _ =
+    Database.begin_outbox_transition
+      db
+      ~expected:(sync_view_token sync)
+      (Accept_group { batch_id = submission_batch_id submitted; barrier })
+    |> T.require_ok ~behavior
+  in
+  ignore
+    (Database.apply_outbox_transition db prepared ~encrypted:None
+     |> T.require_ok ~behavior);
+  let transactions =
+    [ authoritative_transaction
+        ~cursor:(server_cursor 1)
+        ~transaction:(encoded ~maximum_bytes:65536 wire)
+    ]
+  in
+  let transactions =
+    if not remote_change
+    then transactions
+    else
+      transactions
+      @ [ authoritative_transaction
+            ~cursor:(server_cursor 2)
+            ~transaction:
+              (encoded
+                 (Printf.sprintf
+                    "[[\"~:db/add\",[\"~:block/uuid\",\"~u%s\"],\"~:block/updated-at\",1704067200999]]"
+                    (Graph.Uuid.to_string root)))
+        ]
+  in
+  let batch =
+    authoritative_batch
+      ~maximum_count:16
+      ~maximum_bytes:65536
+      ~transactions
+      ~through:(server_cursor (if remote_change then 2 else 1))
+      ~checksum:(Some barrier.checksum)
+    |> T.require_ok ~behavior
+  in
+  let sync = Database.inspect_sync db |> T.require_ok ~behavior in
+  let prepared, crypto =
+    Database.begin_authoritative db ~expected:(sync_view_token sync) batch
+    |> T.require_ok ~behavior
+  in
+  let decrypted = Option.map (fun req -> decrypt_submitted_request req behavior) crypto in
+  let commit =
+    match
+      Database.apply_authoritative db prepared ~decrypted |> T.require_ok ~behavior
+    with
+    | Authoritative_applied c -> c
+    | _ -> failwith "deferred"
+  in
+  let remote_won =
+    List.exists
+      (fun terminal ->
+         match terminal.receipt with
+         | Remote_won_receipt r -> Graph.Uuid.equal r.mutation_id (T.mutation_uuid 9004)
+         | _ -> false)
+      commit.terminal_receipts
+  in
+  T.require
+    (remote_won = remote_change)
+    "own echo was mistaken for a remote delete conflict";
+  let sync = Database.inspect_sync db |> T.require_ok ~behavior in
+  T.require
+    (List.length (sync_view_submissions sync) = if remote_change then 0 else 1)
+    "queued delete was lost or genuine remote conflict was ignored";
+  let snapshot = Database.current_snapshot db |> T.require_ok ~behavior in
+  let present =
+    match Database.get_outline_blocks snapshot [ root ] |> T.require_ok ~behavior with
+    | [ Present_block _ ] -> true
+    | _ -> false
+  in
+  Database.release_snapshot snapshot;
+  T.require (present = remote_change) "own echo resurrected locally deleted block";
+  if remote_later
+  then (
+    let remote =
+      Printf.sprintf
+        "[[\"~:db/add\",[\"~:block/uuid\",\"~u%s\"],\"~:block/updated-at\",1704067200999]]"
+        (Graph.Uuid.to_string root)
+    in
+    let later = commit_plain_authoritative db ~cursor:(server_cursor 2) remote behavior in
+    T.require
+      (List.exists
+         (fun terminal ->
+            match terminal.receipt with
+            | Remote_won_receipt r ->
+              Graph.Uuid.equal r.mutation_id (T.mutation_uuid 9004)
+            | _ -> false)
+         later.terminal_receipts)
+      "real remote change in a later batch did not win")
+  else if not remote_change
+  then (
+    let prepared, request, _ = prepare_submit db [ T.mutation_uuid 9004 ] behavior in
+    let protected = protect request behavior in
+    let sent =
+      Database.apply_outbox_transition db prepared ~encrypted:(Some protected)
+      |> T.require_ok ~behavior
+    in
+    T.require (Option.is_some sent.submission_batch) "preserved delete cannot submit")
 ;;
 
 let () =
   Alcotest.run
     "logseq_overlay_db sync"
-    [ "atomic append",[T.database_case "tail survives later submitted shadow" atomic_append_tail_includes_later_submitted_shadow;
-      T.database_case "mixed-day queued prefix uses incremental owners" atomic_append_queue_replans_actual_owners;
-      T.database_case "complete protected transaction echoes atomically" (atomic_append_submits_and_replays_complete_tree ~remote_day:false);
-      T.database_case "queued append adopts remote day and follows its tail" (atomic_append_submits_and_replays_complete_tree ~remote_day:true);
-      T.database_case "journal catalog keeps submitted page shadow" submitted_append_page_shadow_stays_in_journal_index]
-    ; "empty authoritative compatibility",
-      [ T.database_case "empty array advances only sync state" (empty_authoritative_preserves_logical_state "[]")
-      ; T.database_case "empty Transit list advances only sync state" (empty_authoritative_preserves_logical_state
-          (Transit_native.Transit.Json.to_string (Transit_core.Json.List [])))
-      ; T.database_case "mixed batch preserves empty cursor slots" empty_authoritative_mixed_batch
-      ; Alcotest.test_case "empty cursor and revision survive reopen" `Quick empty_authoritative_survives_reopen
-      ; Alcotest.test_case "late decode failure rolls back mixed batch" `Quick (empty_authoritative_failure_is_atomic ~storage:false)
-      ; Alcotest.test_case "storage failure rolls back mixed batch" `Quick (empty_authoritative_failure_is_atomic ~storage:true)
-      ; T.database_case "empty payload keeps both token guards" empty_authoritative_keeps_token_guards
-      ; T.database_case "malformed neighbours and empty outer batch reject" empty_authoritative_keeps_invalid_input_rejection ]
-    ; "queued delete own echoes", [
-        T.database_case "queued delete survives own append echo"
-          (queued_delete_survives_own_append_echo ~remote_change:false);
-        T.database_case "queued delete still yields to remote edit after own echo"
-          (queued_delete_survives_own_append_echo ~remote_change:true);
-        T.database_case "queued delete yields to later remote batch after own echo"
-          (queued_delete_survives_own_append_echo ~remote_later:true ~remote_change:false);
-        T.database_case "queued delete survives earlier local save echo"
-          (queued_delete_survives_own_append_echo ~existing_block:true ~remote_change:false)]
+    [ ( "atomic append"
+      , [ T.database_case
+            "tail survives later submitted shadow"
+            atomic_append_tail_includes_later_submitted_shadow
+        ; T.database_case
+            "mixed-day queued prefix uses incremental owners"
+            atomic_append_queue_replans_actual_owners
+        ; T.database_case
+            "complete protected transaction echoes atomically"
+            (atomic_append_submits_and_replays_complete_tree ~remote_day:false)
+        ; T.database_case
+            "server-reordered append keeps UUID identities"
+            (atomic_append_submits_and_replays_complete_tree ~reverse_operations:true)
+        ; T.database_case
+            "reordered echo still rejects changed UUID"
+            reordered_echo_rejects_changed_uuid
+        ; T.database_case
+            "queued append adopts remote day and follows its tail"
+            (atomic_append_submits_and_replays_complete_tree ~remote_day:true)
+        ; T.database_case
+            "journal catalog keeps submitted page shadow"
+            submitted_append_page_shadow_stays_in_journal_index
+        ] )
+    ; ( "empty authoritative compatibility"
+      , [ T.database_case
+            "empty array advances only sync state"
+            (empty_authoritative_preserves_logical_state "[]")
+        ; T.database_case
+            "empty Transit list advances only sync state"
+            (empty_authoritative_preserves_logical_state
+               (Transit_native.Transit.Json.to_string (Transit_core.Json.List [])))
+        ; T.database_case
+            "mixed batch preserves empty cursor slots"
+            empty_authoritative_mixed_batch
+        ; Alcotest.test_case
+            "empty cursor and revision survive reopen"
+            `Quick
+            empty_authoritative_survives_reopen
+        ; Alcotest.test_case
+            "late decode failure rolls back mixed batch"
+            `Quick
+            (empty_authoritative_failure_is_atomic ~storage:false)
+        ; Alcotest.test_case
+            "storage failure rolls back mixed batch"
+            `Quick
+            (empty_authoritative_failure_is_atomic ~storage:true)
+        ; T.database_case
+            "empty payload keeps both token guards"
+            empty_authoritative_keeps_token_guards
+        ; T.database_case
+            "malformed neighbours and empty outer batch reject"
+            empty_authoritative_keeps_invalid_input_rejection
+        ] )
+    ; ( "queued delete own echoes"
+      , [ T.database_case
+            "queued delete survives own append echo"
+            (queued_delete_survives_own_append_echo ~remote_change:false)
+        ; T.database_case
+            "queued delete still yields to remote edit after own echo"
+            (queued_delete_survives_own_append_echo ~remote_change:true)
+        ; T.database_case
+            "queued delete yields to later remote batch after own echo"
+            (queued_delete_survives_own_append_echo
+               ~remote_later:true
+               ~remote_change:false)
+        ; T.database_case
+            "queued delete survives earlier local save echo"
+            (queued_delete_survives_own_append_echo
+               ~existing_block:true
+               ~remote_change:false)
+        ] )
     ; "validated wire inputs", pure_cases
     ; "protected same-value rewrites", protected_retraction_cases
-    ; "durable sync view", database_cases ]
+    ; "durable sync view", database_cases
+    ]
 ;;

@@ -1,18 +1,18 @@
 module Core = Logseq_db_worker_pure_reducer.Core
-module Sync = Logseq_sync_pure_reducer.Core
+module Sync = Logseq_sync_domain.Core
 module Config = Logseq_db_worker.Config
 
 let uuid value = Logseq_db_types.Graph_types.Uuid.of_string value |> Result.get_ok
 
 module Read=Worker_pure_read
-let observation_read (scope:Logseq_sync_pure_reducer.Core.graph_scope) registration query maximum_bytes =
+let observation_read (scope:Logseq_sync_domain.Core.graph_scope) registration query maximum_bytes =
   let module F=Read.For_worker in
   let limits:Worker_pure_data.capability_limits={response_budget_bytes=Worker_pure_data.maximum_response_bytes;
     outbox_max_records=10000;outbox_max_bytes=10485760;change_max_items=256;change_max_bytes=1048576;dispatcher_capacity=256;wire_batch_max_bytes=1048576}in
   let binding=F.binding ~serial:registration ~incarnation:(Read.worker_incarnation
     ~runtime_epoch:(Journal_worker_ids.Runtime.Epoch.of_int64 1L) ~worker_generation:(Journal_worker_ids.Worker.Generation.of_int64 1L))
     ~origin:(Uri.to_string scope.account.managed_sync_origin) ~user:scope.account.user_id in
-  let owner:Logseq_sync_pure_reducer.Core.timeline_scope={startup={account_generation=scope.account.account_generation;
+  let owner:Logseq_sync_domain.Core.timeline_scope={startup={account_generation=scope.account.account_generation;
     presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;graph_generation=scope.graph_generation}in
   let session=F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation ~lifecycle:scope.account.lifecycle_generation
     ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits in
@@ -59,6 +59,36 @@ let initial () = let s=raw_initial () in
   (Core.step s (Sync_event (Sync.Sign_in_requested (startup_scope s)))).next
 ;;
 
+let test_worker_does_not_coordinate_accounts () =
+  let state = raw_initial () in
+  let transition = Core.step state (Sync_event (Sync.Account_authenticated {user_id=Some "app-owned"})) in
+  Alcotest.check Alcotest.bool "account projection belongs to App" true
+    ((Core.view transition.next).sync = (Core.view state).sync);
+  Alcotest.check Alcotest.bool "intent is forwarded, not executed" true
+    (List.map Core.instruction_diagnostic transition.effects = ["forward-lifecycle"])
+;;
+
+let test_production_lifecycle_projection () =
+  let state = raw_initial () in
+  let scope : Sync.graph_scope =
+    { account = { managed_sync_origin=Uri.of_string "https://api.logseq.io"; user_id="production";
+        account_generation=7; presentation_generation=9; lifecycle_generation=1L }
+    ; graph_id=uuid "10000000-0000-4000-8000-000000000001"; graph_generation=11 } in
+  let sync = (Core.view state).sync in
+  let snapshot = { sync.snapshot with selected_graph=Some scope.graph_id; resident_graphs=[scope.graph_id];
+    startup={sync.snapshot.startup with authenticated=true;account_generation=7;graph_generation=11;presentation_generation=9} } in
+  let coordination : Sync.coordination_state =
+    { account=Some scope.account; selected=Some {startup={account_generation=7;presentation_generation=9};graph_id=scope.graph_id;graph_generation=11}; residents=[scope, {sync with snapshot}]; desired_residents=[scope.graph_id]; deletion=None } in
+  let state = Core.install_lifecycle state ~sync:{sync with snapshot} ~coordination
+    ~attachments:[scope,Core.database_opened ~database_id:"borrowed" ~graph_id:scope.graph_id] in
+  Alcotest.check Alcotest.bool "external authority is visible" true
+    ((Core.coordination_state state).sync.account=Some scope.account);
+  Alcotest.check Alcotest.bool "external graph is open" true
+    (Option.map (fun graph -> graph.Core.phase) (Core.graph_state_for_scope state scope)=Some Core.Graph_open);
+  let retired = Core.install_lifecycle state ~sync ~coordination:{coordination with selected=None;residents=[]} ~attachments:[] in
+  Alcotest.check Alcotest.bool "retired scope is unavailable" true (Core.graph_state_for_scope retired scope=None)
+;;
+
 let test_managed_worker_starts_without_local_open () =
   let transition = Core.step (initial ()) Core.Start in
   Alcotest.check Alcotest.int "no local open effects" 0 (List.length transition.effects);
@@ -80,36 +110,20 @@ let test_closed_graph_request_replies_once () =
     List.filter
       (function
         | Core.Publish (Core.Reply (actual, _)) -> Core.equal_request_id actual id
-        | Run_worker _
-        | Run_sync _
-        | Run_asset _
-        | Run_upload _
-        | Read_uploads _
-        | Close_asset_scope _
-        | Deliver_asset_result _
-        | Deliver_protected_result _
-        | Sync_io_fence_reached _
-        | Asset_cleanup_barrier_reached _
-        | Publish _ -> false)
+        | _ -> false)
       transition.effects
   in
   Alcotest.check Alcotest.int "one terminal reply" 1 (List.length replies)
 ;;
 
 let test_sync_instructions_are_translated_in_order () =
-  let transition =
-    Core.step
-      (initial ())
-      (Sync_event (Sync.Restore_local_account { user_id = "user-1" }))
-  in
-  match List.map Core.instruction_diagnostic transition.effects with
-  | [ "publish:sync-output"; run ] ->
-    Alcotest.check
-      Alcotest.bool
-      "load catalog follows state publication"
-      true
-      (String.starts_with ~prefix:"run-sync:request:" run)
-  | values -> Alcotest.failf "unexpected child order: %s" (String.concat ", " values)
+  let event = Sync.Restore_local_account { user_id = "user-1" } in
+  let state = initial () in
+  let transition = Core.step state (Sync_event event) in
+  Alcotest.(check bool) "exact lifecycle intent is forwarded once" true
+    (transition.effects = [Core.Publish (Lifecycle_intent (Sync_intent event))]);
+  Alcotest.(check bool) "Worker does not run account IO" true
+    (Core.equal_view (Core.view state) (Core.view transition.next))
 ;;
 
 let test_replay_is_deterministic () =
@@ -133,90 +147,27 @@ let test_replay_is_deterministic () =
 
 let worker_open_graph_transition () =
   let graph : Sync.graph =
-    { graph_id = uuid "11111111-1111-4111-8111-111111111111"
-    ; name = "Journal"
-    ; schema = { major = 1; minor = 0; exact = true }
-    ; encrypted = false
-    }
-  in
-  let auth =
-    Core.step
-      (initial ())
-      (Sync_event (Sync.Account_authenticated { user_id = Some "user" }))
-  in
-  let fetched =
-    List.find_map
-      (function
-        | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_catalog _)) ->
-          Some
-            (Core.Sync_event
-               (Sync.Runner_completed (Sync.Completion (ticket, Ok [ graph ]))))
-        | _ -> None)
-      auth.effects
-    |> Option.get
-  in
-  let catalog = Core.step auth.next fetched in
-  let selected =
-    Core.step catalog.next (Sync_event (Sync.Graph_selected graph.graph_id))
-  in
-  let inspected =
-    List.find_map
-      (function
-        | Core.Run_worker
-            (Core.Request
-               (ticket, Core.Handle_sync_worker_effect (Sync.Inspect_mirror request))) ->
-          Some
-            (Core.Runner_completed
-               (Core.Sync_worker_effect_completed
-                  ( ticket
-                  , Ok
-                      { Core.event =
-                          Some (Sync.Mirror_inspected (Sync.Mirror_available request))
-                      ; lifecycle = Core.Lifecycle_unchanged
-                      } )))
-        | _ -> None)
-      selected.effects
-    |> Option.get
-  in
-  let attaching = Core.step selected.next inspected in
-  let attached, scope =
-    List.find_map
-      (function
-        | Core.Run_worker
-            (Core.Request
-               (ticket, Core.Handle_sync_worker_effect (Sync.Attach_graph request))) ->
-          let token =
-            Logseq_overlay_db.Types.sync_token_of_string "sync-token:v1:worker-delete"
-            |> Result.get_ok
-          in
-          let checkpoint =
-            Logseq_overlay_db.Types.Server_cursor.of_int64 0L
-            |> Result.map_error (fun `Negative_cursor -> "negative cursor")
-            |> Result.get_ok
-          in
-          let sync =
-            Logseq_overlay_db.Types.sync_view ~token ~checkpoint ~submissions:[]
-          in
-          let opened =
-            Core.database_opened ~database_id:"db-delete" ~graph_id:graph.graph_id
-          in
-          Some
-            ( Core.Runner_completed
-                (Core.Sync_worker_effect_completed
-                   ( ticket
-                   , Ok
-                       { Core.event =
-                           Some (Sync.Graph_attached { scope = request.scope; sync })
-                       ; lifecycle =
-                           Core.Lifecycle_opened (opened, request.scope.graph_generation)
-                       } ))
-            , request.scope )
-        | _ -> None)
-      attaching.effects
-    |> Option.get
-  in
-  let ready = Core.step attaching.next attached in
-  ready, scope
+    {graph_id=uuid "11111111-1111-4111-8111-111111111111";name="Journal";
+     schema={major=1;minor=0;exact=true};encrypted=false} in
+  let state=raw_initial () in
+  let scope : Sync.graph_scope =
+    {account={managed_sync_origin=Uri.of_string "https://api.logseq.io";user_id="user";
+      account_generation=1;presentation_generation=1;lifecycle_generation=0L};
+     graph_id=graph.graph_id;graph_generation=1} in
+  let initial=(Core.view state).sync in
+  let sync : Sync.state =
+    {initial with snapshot={initial.snapshot with sync_phase=Sync.Current;catalog=[graph];
+      selected_graph=Some graph.graph_id;resident_graphs=[graph.graph_id];
+      startup={initial.snapshot.startup with authenticated=true;local_access=Sync.Local_available;
+        network_phase=Sync.Online_by_user;account_generation=1;graph_generation=1;presentation_generation=1}}} in
+  let coordination : Sync.coordination_state =
+    {account=Some scope.account;selected=Some {startup={account_generation=1;presentation_generation=1};
+      graph_id=scope.graph_id;graph_generation=scope.graph_generation};
+     residents=[scope,sync];desired_residents=[graph.graph_id];deletion=None} in
+  let projected=Core.step state (Lifecycle_snapshot(sync,coordination,
+    [scope,Core.database_opened ~database_id:"db-delete" ~graph_id:graph.graph_id])) in
+  let started = Core.step projected.next Start in
+  {started with effects=projected.effects @ started.effects},scope
 ;;
 
 let worker_open_graph () =
@@ -224,154 +175,47 @@ let worker_open_graph () =
   ready.Core.next, scope
 ;;
 
+let retire_projected_graph state =
+  let sync=(Core.view state).sync in
+  let sync={sync with snapshot={sync.snapshot with selected_graph=None;resident_graphs=[]}} in
+  let coordination=(Core.coordination_state state).sync in
+  Core.step state (Lifecycle_snapshot(sync,{coordination with selected=None;residents=[];desired_residents=[]},[]))
+;;
+
 let test_current_deletion_preserves_work_until_retirement () =
   let ready, scope = worker_open_graph () in
-  let read=observation_read scope 71L Read.Graph_info 16384 in
-  let executing =
-    Core.step ready (Core.Graph_request { id = Core.request_id_of_int64 11L; read })
-  in
-  let completion =
-    List.find_map
-      (function
-        | Core.Run_worker instruction ->
-          Core.complete_execute
-            instruction
-            (Error
-               (Logseq_db_worker.Error.create
-                  ~code:Closed_session
-                  ~message:"Request finished."
-                  ~details:[]
-                |> Result.get_ok))
-        | _ -> None)
-      executing.effects
-    |> Option.get
-  in
-  let inspecting = Core.step executing.next (Sync_event Sync.Local_outbox_changed) in
-  let inspection_completion =
-    List.find_map
-      (function
-        | Core.Run_worker
-            (Core.Request (ticket, Core.Handle_sync_worker_effect (Sync.Inspect_sync _)))
-          ->
-          Some
-            (Core.Runner_completed
-               (Core.Sync_worker_effect_completed
-                  ( ticket
-                  , Error
-                      (Logseq_db_worker.Error.create
-                         ~code:Closed_session
-                         ~message:"Inspection finished."
-                         ~details:[]
-                       |> Result.get_ok) )))
-        | _ -> None)
-      inspecting.effects
-    |> Option.get
-  in
-  let protected =
-    Core.step
-      inspecting.next
-      (Sync_event (Sync.Local_cache_deletion_requested scope.graph_id))
-  in
-  Alcotest.(check bool)
-    "current-copy deletion preserves the open graph and executing work"
-    true
-    ((Core.view protected.next).graph.phase = Core.Graph_open
-     && (Core.view protected.next).sync.snapshot.local_deletion = None
-     && protected.effects = []);
-  let retiring =
-    Core.step protected.next (Sync_event Sync.Graph_picker_requested)
-  in
-  Alcotest.(check bool)
-    "actual graph retirement closes admission immediately"
-    true
-    ((Core.view retiring.next).graph.phase = Core.Graph_closing);
-  let has_close effects =
-    List.exists
-      (function
-        | Core.Run_worker
-            (Core.Request (_, Core.Handle_sync_worker_effect (Sync.Detach_graph _))) ->
-          true
-        | _ -> false)
-      effects
-  in
-  Alcotest.(check bool)
-    "close waits for executing work"
-    false
-    (has_close retiring.effects);
-  let rejected =
-    Core.step
-      retiring.next
-      (Core.Graph_request { id = Core.request_id_of_int64 12L; read })
-  in
-  Alcotest.(check bool)
-    "new reading receives a terminal reply and no execution"
-    true
-    (List.exists
-       (function
-         | Core.Publish (Core.Reply _) -> true
-         | _ -> false)
-       rejected.effects
-     && not
-          (List.exists
-             (function
-               | Core.Run_worker _ -> true
-               | _ -> false)
-             rejected.effects));
-  let one_finished = Core.step rejected.next completion in
-  Alcotest.(check bool)
-    "close still waits for sync DB operation"
-    false
-    (has_close one_finished.effects);
-  let drained = Core.step one_finished.next inspection_completion in
-  Alcotest.(check bool)
-    "all DB completions release one close"
-    true
-    (has_close drained.effects);
-  let duplicate = Core.step drained.next inspection_completion in
-  Alcotest.(check bool)
-    "duplicate completion cannot release another close"
-    true
-    (duplicate.effects = []);
-  let close_failure =
-    List.find_map
-      (function
-        | Core.Run_worker
-            (Core.Request (ticket, Core.Handle_sync_worker_effect (Sync.Detach_graph _)))
-          ->
-          Some
-            (Core.Runner_completed
-               (Core.Sync_worker_effect_completed
-                  ( ticket
-                  , Error
-                      (Logseq_db_worker.Error.create
-                         ~code:Closed_session
-                         ~message:"private close details"
-                         ~details:[]
-                       |> Result.get_ok) )))
-        | _ -> None)
-      drained.effects
-    |> Option.get
-  in
-  let failed = Core.step drained.next close_failure in
-  Alcotest.(check bool)
-    "ordinary retirement failure cannot authorize local deletion"
-    true
-    ((Core.view failed.next).sync.snapshot.local_deletion
-     = None);
-  Alcotest.(check bool)
-    "close failure never deletes"
-    false
-    (List.exists
-       (function
-         | Core.Run_worker
-             (Core.Request (_, Core.Handle_sync_worker_effect (Sync.Delete_mirror _))) ->
-           true
-         | _ -> false)
-       failed.effects)
+  let read = observation_read scope 71L Read.Graph_info 16384 in
+  let executing = Core.step ready (Graph_request_for_scope
+    {scope; id=Core.request_id_of_int64 11L; read}) in
+  let execution = List.find_map (function Core.Run_worker request -> Some request | _ -> None)
+    executing.effects |> Option.get in
+  let event = Sync.Local_cache_deletion_requested scope.graph_id in
+  let protected = Core.step executing.next (Sync_event event) in
+  Alcotest.(check bool) "delete intent preserves admitted work" true
+    ((Core.view protected.next).graph.phase=Core.Graph_open
+     && (Core.view protected.next).pending_requests=1
+     && protected.effects=[Core.Publish (Lifecycle_intent (Sync_intent event))]);
+  let retiring = retire_projected_graph protected.next in
+  let rejected = Core.step retiring.next (Graph_request_for_scope
+    {scope; id=Core.request_id_of_int64 12L; read}) in
+  Alcotest.(check bool) "withdrawal closes new admission with one reply" true
+    (match rejected.effects with [Core.Publish (Reply (id,_))] ->
+       Core.request_id_to_int64 id=12L | _ -> false);
+  let error = Logseq_db_worker.Error.create ~code:Closed_session
+    ~message:"Request finished." ~details:[] |> Result.get_ok in
+  let completion = Core.complete_execute execution (Error error) |> Option.get in
+  let drained = Core.step rejected.next completion in
+  Alcotest.(check bool) "withdrawal retains the original terminal reply" true
+    (match drained.effects with [Core.Publish (Reply (id,_))] ->
+       Core.request_id_to_int64 id=11L | _ -> false);
+  Alcotest.(check int) "duplicate completion is inert" 0
+    (List.length (Core.step drained.next completion).effects);
+  Alcotest.(check bool) "Worker never owns physical graph deletion" true
+    (List.for_all (function Core.Run_worker _ -> false | _ -> true) retiring.effects)
 ;;
 
 module Asset = Logseq_db_types.Asset_descriptor
-module Transfer = Logseq_sync_pure_reducer.Asset_transfer
+module Transfer = Logseq_sync_asset_transfer.Core
 
 let asset_demand (scope : Sync.graph_scope) =
   let version =
@@ -426,7 +270,7 @@ let test_asset_demand_lifecycle () =
            -> true
          | _ -> false)
        completed.effects);
-  let switched = Core.step completed.next (Sync_event Sync.Graph_picker_requested) in
+  let switched = retire_projected_graph completed.next in
   Alcotest.(check bool)
     "scope retired"
     false
@@ -591,116 +435,28 @@ let test_asset_manual_retry_is_unlimited () =
 let test_asset_execution_completion_is_delivered () =
   let state, scope = worker_open_graph () in
   let request : Sync.asset_request =
-    { scope
-    ; operation = "worker-bridge:stage"
-    ; action =
-        Sync.Stage_asset_file
-          { operation = uuid "77000000-0000-4000-8000-000000000001"
-          ; file_type = "png"
-          ; source_file = "picker-reference"
-          }
-    }
-  in
-  let requested = Core.step state (Core.Sync_event (Sync.Asset_requested request)) in
-  let ticket =
-    List.find_map
-      (function
-        | Core.Run_sync (Sync.Asset_io (ticket, io)) ->
-          Alcotest.(check bool)
-            "worker preserves asset request"
-            true
-            (io.context.scope = request.scope && io.action = request.action);
-          Some ticket
-        | _ -> None)
-      requested.effects
-    |> Option.get
-  in
-  Alcotest.(check bool)
-    "request does not resolve its own waiter"
-    false
-    (List.exists
-       (function
-         | Core.Deliver_asset_result _ -> true
-         | _ -> false)
-       requested.effects);
-  let result =
-    Ok
-      (Sync.Asset_staged { file = "staging-reference"; checksum = "checksum"; size = 4L })
-  in
-  let completed =
-    Core.step
-      requested.next
-      (Core.Sync_event (Sync.Runner_completed (Sync.Asset_completion (ticket, result))))
-  in
-  Alcotest.(check bool)
-    "accepted completion resolves worker waiter"
-    true
-    (match completed.effects with
-     | [ Core.Deliver_asset_result output ] ->
-       output.request = request && output.result = result
-     | _ -> false)
+    {scope; operation="worker-stage"; action=Stage_asset_file
+      {operation=uuid "77000000-0000-4000-8000-000000000001";
+       file_type="png"; source_file="picker-reference"}} in
+  let requested = Core.step state (Sync_event (Sync.Asset_requested request)) in
+  Alcotest.(check bool) "asset service receives the exact lifecycle request" true
+    (requested.effects=[Core.Publish (Lifecycle_intent (Sync_intent (Sync.Asset_requested request)))]);
+  Alcotest.(check int) "Worker allocates no legacy asset ticket" 0
+    (Core.view requested.next).pending_effects
 ;;
 
 let test_worker_shutdown_forwards_late_resource_cleanup () =
   let state, scope = worker_open_graph () in
+  let stopped = Core.step state Shutdown in
+  Alcotest.(check bool) "shutdown forwards lifecycle stop once" true
+    (List.filter (function Core.Publish (Lifecycle_intent Stop_intent) -> true | _ -> false)
+      stopped.effects = [Core.Publish (Lifecycle_intent Stop_intent)]);
   let request : Sync.asset_request =
-    { scope
-    ; operation = "worker-shutdown:stage"
-    ; action =
-        Sync.Stage_asset_file
-          { operation = uuid "77000000-0000-4000-8000-000000000007"
-          ; file_type = "bin"
-          ; source_file = "picker-reference"
-          }
-    }
-  in
-  let requested = Core.step state (Core.Sync_event (Sync.Asset_requested request)) in
-  let ticket =
-    List.find_map
-      (function
-        | Core.Run_sync (Sync.Asset_io (ticket, _)) -> Some ticket
-        | _ -> None)
-      requested.effects
-    |> Option.get
-  in
-  let stopped = Core.step requested.next Core.Shutdown in
-  Alcotest.(check bool)
-    "worker shutdown cancels pending requester"
-    true
-    (List.exists
-       (function
-         | Core.Deliver_asset_result output ->
-           output.request = request && output.result = Error Sync.Asset_cancelled
-         | _ -> false)
-       stopped.effects);
-  let late =
-    Core.step
-      stopped.next
-      (Core.Sync_event
-         (Sync.Runner_completed
-            (Sync.Asset_completion
-               ( ticket
-               , Ok
-                   (Sync.Asset_staged
-                      { file = "late-staging-reference"
-                      ; checksum = "checksum"
-                      ; size = 4L
-                      }) ))))
-  in
-  Alcotest.(check bool)
-    "stopped worker keeps accepting cleanup completions"
-    true
-    (Core.view late.next).shutdown;
-  Alcotest.(check bool)
-    "late resource cleanup is forwarded to sync runner"
-    true
-    (List.exists
-       (function
-         | Core.Run_sync (Sync.Asset_io (_, io)) ->
-           io.context.scope = scope
-           && io.action = Sync.Release_staged_file "late-staging-reference"
-         | _ -> false)
-       late.effects)
+    {scope; operation="late-release"; action=Release_asset_file "late-staging-reference"} in
+  let late = Core.step stopped.next (Sync_event (Sync.Asset_requested request)) in
+  Alcotest.(check bool) "shutdown retains cleanup intent delivery without reopening" true
+    ((Core.view late.next).shutdown
+     && late.effects=[Core.Publish (Lifecycle_intent (Sync_intent (Sync.Asset_requested request)))])
 ;;
 
 let test_upload_session () =
@@ -790,7 +546,7 @@ let test_upload_session () =
             | Core.Publish (Asset_notice (_, Upload_status _)) -> true
             | _ -> false)
           duplicate.effects));
-  let switched = Core.step completed.next (Sync_event Sync.Graph_picker_requested) in
+  let switched = retire_projected_graph completed.next in
   Alcotest.(check bool)
     "graph switch cancels upload"
     true
@@ -829,7 +585,7 @@ let test_upload_recovery () =
     "duplicate recovery completion ignored"
     true
     (duplicate.effects = []);
-  let switched = Core.step opened.next (Sync_event Sync.Graph_picker_requested) in
+  let switched = retire_projected_graph opened.next in
   let stale = Core.step switched.next (Uploads_loaded (ticket, Error "obsolete")) in
   Alcotest.(check bool) "old graph recovery ignored" true (stale.effects = [])
 ;;
@@ -856,6 +612,43 @@ let recovery_intent (scope : Sync.graph_scope) n =
     ~local_mutation:(id (n + 200))
     ~metadata_mutation:(id (n + 300))
   |> Result.get_ok
+;;
+
+let test_projection_withdrawal_cancels_upload () =
+  let module U = Logseq_db_worker_pure_reducer.Asset_upload in
+  let state, scope = worker_open_graph () in
+  let intent = recovery_intent scope 1 in
+  let started = Core.step state (Upload_requested_for_scope (scope, intent.operation_id, U.Start intent)) in
+  let ticket = List.find_map (function
+    | Core.Run_upload (_, U.Persist (ticket, _, _)) -> Some ticket
+    | _ -> None) started.effects |> Option.get in
+  let retired = retire_projected_graph started.next in
+  Alcotest.(check bool) "withdrawal cancels the original upload ticket" true
+    (List.exists (function
+      | Core.Run_upload (context, U.Cancel_operation actual) -> context.scope = scope && actual = ticket
+      | _ -> false) retired.effects);
+  Alcotest.(check bool) "withdrawal closes the original upload scope" true
+    (List.mem (Core.Close_asset_scope scope) retired.effects);
+  Alcotest.(check bool) "withdrawn upload cannot complete" false
+    (Core.upload_ticket_current retired.next ticket)
+;;
+
+let test_projection_withdrawal_cancels_asset_lookup () =
+  let state, scope = worker_open_graph () in
+  let requested = Core.step state (asset_demand scope) in
+  let ticket = lookup requested.effects in
+  let retired = retire_projected_graph requested.next in
+  Alcotest.(check bool) "withdrawal cancels the original lookup ticket" true
+    (List.exists (function
+      | Core.Run_asset (context, Transfer.Cancel (Transfer.Lookup actual)) -> context.scope = scope && actual = ticket
+      | _ -> false) retired.effects);
+  Alcotest.(check bool) "withdrawal closes the original lookup scope" true
+    (List.mem (Core.Close_asset_scope scope) retired.effects);
+  Alcotest.(check bool) "withdrawn lookup cannot complete" false
+    (Core.asset_ticket_current retired.next (Transfer.Lookup ticket));
+  let repeated = retire_projected_graph retired.next in
+  Alcotest.(check bool) "withdrawal cleanup is emitted only once" false
+    (List.mem (Core.Close_asset_scope scope) repeated.effects)
 ;;
 
 let test_upload_recovery_backpressure () =
@@ -1006,225 +799,153 @@ let test_upload_recovery_failure () =
     (Core.upload_recovery_current stale.next fresh)
 ;;
 
-(* The worker owns translating its runner's terminal result into Sync state.
-   Drive a complete cold bootstrap using only public events and issued tickets. *)
-let snapshot_activation () =
-  let graph : Sync.graph =
-    { graph_id = uuid "71111111-1111-4111-8111-111111111111"
-    ; name = "Synthetic schema fixture"
-    ; schema = { major = 65; minor = 29; exact = true }
-    ; encrypted = false
-    }
-  in
-  let auth = Core.step (initial ())
-      (Sync_event (Sync.Account_authenticated { user_id = Some "synthetic" })) in
-  let catalog = List.find_map (function
-    | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_catalog _)) ->
-      Some (Core.step auth.next (Sync_event
-        (Sync.Runner_completed (Sync.Completion (ticket, Ok [graph])))))
-    | _ -> None) auth.effects |> Option.get in
-  let selected = Core.step catalog.next (Sync_event (Sync.Graph_selected graph.graph_id)) in
-  let missing, _scope = List.find_map (function
-    | Core.Run_worker (Core.Request (ticket,
-        Core.Handle_sync_worker_effect (Sync.Inspect_mirror request))) ->
-      Some (Core.step selected.next (Runner_completed
-        (Sync_worker_effect_completed (ticket, Ok
-          { event = Some (Sync.Mirror_inspected (Mirror_absent request.scope))
-          ; lifecycle = Lifecycle_unchanged }))), request.scope)
-    | _ -> None) selected.effects |> Option.get in
-  let download = List.find_map (function
-    | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_snapshot_metadata _)) ->
-      Some (Core.step missing.next (Sync_event (Sync.Runner_completed
-        (Sync.Completion (ticket, Ok {|{"ok":true,"t":42,"url":"https://example.invalid/snapshot"}|})))))
-    | _ -> None) missing.effects |> Option.get in
-  let activation = List.find_map (function
-    | Core.Run_sync (Sync.Request (ticket, Sync.Download_snapshot download_request)) ->
-      let artifact = Sync.stage_snapshot_download download_request ~path:"/tmp/synthetic-schema.snapshot" ~expected_rows:1 |> Result.get_ok in
-      Some (Core.step download.next (Sync_event (Sync.Runner_completed
-        (Sync.Completion (ticket, Ok artifact)))))
-    | _ -> None) download.effects |> Option.get in
-  let error = Logseq_db_worker.Error.create ~code:Closed_session
-      ~message:"Graph schema 65.29 is not supported. Journal requires schema 65.33 or later."
-      ~details:[] |> Result.get_ok in
-  let failure, success = List.find_map (function
-    | Core.Run_worker (Core.Request (ticket,
-        Core.Handle_sync_worker_effect (Sync.Activate_snapshot request))) ->
-      Some (Core.Runner_completed (Sync_worker_effect_completed (ticket, Error error)),
-        Core.Runner_completed (Sync_worker_effect_completed (ticket, Ok
-          { event = Some (Sync.Snapshot_activated (Sync.snapshot_activation_completed request))
-          ; lifecycle = Lifecycle_unchanged })))
-    | _ -> None) activation.effects |> Option.get in
-  activation, failure, success, Logseq_db_worker.Error.message error
-;;
-
 let test_snapshot_failure_is_terminal_and_retryable () =
-  let activation, failure, _, message = snapshot_activation () in
-  let failed = Core.step activation.next failure in
-  let snapshot = (Core.view failed.next).sync.snapshot in
-  Alcotest.(check bool) "failure terminates bootstrap" true
-    (snapshot.startup.failure = Some Sync.During_bootstrap && snapshot.sync_phase = Sync.Failed);
-  Alcotest.(check (option string)) "specific reason retained" (Some message) snapshot.last_error;
-  Alcotest.(check bool) "failure published to UI" true
+  let ready, scope = worker_open_graph () in
+  let sync = (Core.view ready).sync in
+  let message = "Graph schema 65.29 is not supported." in
+  let failed = {sync with snapshot={sync.snapshot with sync_phase=Sync.Failed;
+    last_error=Some message; startup={sync.snapshot.startup with failure=Some Sync.During_bootstrap}}} in
+  let coordination = (Core.coordination_state ready).sync in
+  let project state sync = Core.step state (Lifecycle_snapshot (sync,
+    {coordination with residents=[scope,sync]},
+    [scope,Core.database_opened ~database_id:"db-delete" ~graph_id:scope.graph_id])) in
+  let failure = project ready failed in
+  Alcotest.(check bool) "App failure projection reaches UI unchanged" true
     (List.exists (function Core.Publish (Sync_output (Sync.State_changed state)) ->
-      state.snapshot.last_error = Some message | _ -> false) failed.effects);
-  let duplicate = Core.step failed.next failure in
-  Alcotest.(check bool) "duplicate completion inert" true
-    (Core.equal_view (Core.view failed.next) (Core.view duplicate.next) && duplicate.effects = []);
-  let retry = Core.step failed.next (Sync_event (Sync.Online_recovery_requested (timeline_scope failed.next))) in
-  Alcotest.(check (option string)) "explicit retry clears failure" None
-    (Core.view retry.next).sync.snapshot.last_error;
-  let late = Core.step retry.next failure in
-  Alcotest.(check bool) "old failure cannot poison retry" true
-    (Core.equal_view (Core.view retry.next) (Core.view late.next) && late.effects = [])
+      state=failed | _ -> false) failure.effects);
+  let intent = Sync.Online_recovery_requested (timeline_scope failure.next) in
+  let retry = Core.step failure.next (Sync_event intent) in
+  Alcotest.(check bool) "only App may clear bootstrap failure" true
+    ((Core.view retry.next).sync=failed
+     && List.exists ((=) (Core.Publish (Lifecycle_intent (Sync_intent intent)))) retry.effects);
+  let recovered = project retry.next sync in
+  Alcotest.(check (option string)) "App recovery clears projected failure" None
+    (Core.view recovered.next).sync.snapshot.last_error
 ;;
 
 let test_snapshot_success_and_late_switch_completions () =
-  let activation, failure, success, _ = snapshot_activation () in
-  let succeeded = Core.step activation.next success in
-  let attaching = List.find_map (function
-    | Core.Run_worker (Core.Request (ticket,
-        Core.Handle_sync_worker_effect (Sync.Inspect_mirror request))) ->
-      Some (Core.step succeeded.next (Runner_completed (Sync_worker_effect_completed
-        (ticket, Ok { event = Some (Sync.Mirror_inspected (Mirror_available request))
-                   ; lifecycle = Lifecycle_unchanged }))))
-    | _ -> None) succeeded.effects |> Option.get in
-  Alcotest.(check bool) "success proceeds to attachment" true
-    (List.exists (function Core.Run_worker (Core.Request (_,
-      Core.Handle_sync_worker_effect (Sync.Attach_graph _))) -> true | _ -> false) attaching.effects);
-  Alcotest.(check (option string)) "success has no failure" None
-    (Core.view succeeded.next).sync.snapshot.last_error;
-  let switched = Core.step activation.next (Sync_event Sync.Graph_picker_requested) in
-  List.iter (fun completion ->
-    let late = Core.step switched.next completion in
-    Alcotest.(check bool) "retired graph keeps selected state" true
-      ((Core.view switched.next).sync = (Core.view late.next).sync);
-    Alcotest.(check bool) "retired graph keeps lifecycle" true
-      ((Core.view switched.next).graph = (Core.view late.next).graph);
-    let work = List.filter (function
-      | Core.Run_worker (Core.Request (_, Core.Handle_sync_worker_effect (Sync.Detach_graph _))) -> false
-      | _ -> true) late.effects in
-    Alcotest.(check (list string)) "retired graph emits only pending close cleanup" []
-      (List.map Core.instruction_diagnostic work))
-    [failure; success]
+  let ready, scope = worker_open_graph () in
+  let requested = Core.step ready (Graph_request_for_scope
+    {scope; id=Core.request_id_of_int64 81L; read=observation_read scope 71L Read.Graph_info 16384}) in
+  let ticket = List.find_map (function Core.Run_worker (Core.Request (ticket,Execute_request _)) ->
+    Some ticket | _ -> None) requested.effects |> Option.get in
+  let completion = Core.Runner_completed (Sync_worker_effect_completed
+    (ticket,Ok {event=None;lifecycle=Lifecycle_closed scope.graph_generation})) in
+  let late = Core.step requested.next completion in
+  Alcotest.(check bool) "unissued lifecycle completion cannot retire an open graph" true
+    (Core.equal_view (Core.view requested.next) (Core.view late.next) && late.effects=[])
 ;;
 
 let test_local_restore_worker_failures_are_terminal () =
-  let error = Logseq_db_worker_contract.Error.create
-    ~code:Logseq_db_worker_contract.Error.Closed_session ~message:"synthetic local IO failure" ~details:[] |> Result.get_ok in
-  let make () =
-    let restored = Core.step (initial ()) (Sync_event (Sync.Restore_local_account {user_id="local-user"})) in
-    let graph : Sync.graph = {graph_id=uuid "11111111-1111-4111-8111-111111111111";
-      name="Synthetic";schema={major=1;minor=0;exact=true};encrypted=false} in
-    let cache = Sync.catalog_cache ~user_id:"local-user" ~graphs:[graph] ~selected_graph:(Some graph.graph_id) in
-    let event = List.find_map (function
-      | Core.Run_sync (Sync.Request (ticket, Sync.Load_catalog _)) ->
-        Some (Core.Sync_event (Sync.Runner_completed (Sync.Completion(ticket,Ok (Some cache)))))
-      | _ -> None) restored.effects |> Option.get in
-    Core.step restored.next event in
-  List.iter (fun attach ->
-    let selected = make () in
-    let ticket,request = List.find_map (function
-      | Core.Run_worker (Core.Request(ticket,Core.Handle_sync_worker_effect(Sync.Inspect_mirror request))) ->Some(ticket,request)
-      | _->None) selected.effects |> Option.get in
-    let flight,ticket = if not attach then selected,ticket else
-      let attaching = Core.step selected.next (Runner_completed (Sync_worker_effect_completed(ticket,
-        Ok {Core.event=Some(Sync.Mirror_inspected(Mirror_available request));lifecycle=Lifecycle_unchanged}))) in
-      let ticket = List.find_map (function
-        | Core.Run_worker (Core.Request(ticket,Core.Handle_sync_worker_effect(Sync.Attach_graph _)))->Some ticket
-        | _->None) attaching.effects |> Option.get in attaching,ticket in
-    let failed = Core.step flight.next (Runner_completed (Sync_worker_effect_completed(ticket,Error error))) in
-    let f = (Core.view failed.next).sync.snapshot.startup in
-    Alcotest.(check bool) "worker IO failure releases startup loading" true
-      (not f.restoring_local && f.failure=Some Sync.During_local_restore);
-    let duplicate = Core.step failed.next (Runner_completed (Sync_worker_effect_completed(ticket,Error error))) in
-    Alcotest.(check int) "duplicate failure is inert" 0 (List.length duplicate.effects);
-    let retired=Core.step flight.next (Sync_event Sync.Graph_picker_requested) in
-    let late=Core.step retired.next (Runner_completed(Sync_worker_effect_completed(ticket,Error error))) in
-    Alcotest.(check bool) "retired local restore keeps sync state" true
-      ((Core.view late.next).sync=(Core.view retired.next).sync);
-    Alcotest.(check bool) "retired local restore cannot report into another graph" false
-      (List.exists(function Core.Publish(Diagnostic _)->true | _->false)late.effects)
-  ) [false;true]
+  let ready, scope = worker_open_graph () in
+  let requested = Core.step ready (Graph_request_for_scope
+    {scope; id=Core.request_id_of_int64 82L; read=observation_read scope 71L Read.Graph_info 16384}) in
+  let ticket = List.find_map (function Core.Run_worker (Core.Request (ticket,Execute_request _)) ->
+    Some ticket | _ -> None) requested.effects |> Option.get in
+  let error = Logseq_db_worker.Error.create ~code:Closed_session
+    ~message:"unissued local restore failure" ~details:[] |> Result.get_ok in
+  let failed = Core.step requested.next (Runner_completed (Sync_worker_effect_completed (ticket,Error error))) in
+  Alcotest.(check bool) "foreign completion cannot consume an executing read" true
+    (Core.equal_view (Core.view requested.next) (Core.view failed.next) && failed.effects=[])
 ;;
 
-(* This tests downstream propagation only: the runner owns producer classification.
-   Closed/version preparation races have no deterministic public runner hook. *)
 let test_authoritative_failure_categories_reach_diagnostics () =
   let module Error = Logseq_db_worker.Error in
-  List.iter (fun (code, category, message) ->
-    let ready, graph = worker_open_graph_transition () in
-    let connection = List.find_map (function
-      | Core.Run_sync (Sync.Start_websocket request) -> Some request.scope
-      | _ -> None) ready.effects |> Option.get in
-    let opened = Core.step ready.next (Sync_event (Sync.Websocket_opened connection)) in
-    let cursor = Logseq_db_types.Server_cursor.of_int64 1L |> Result.get_ok in
-    let tx : Logseq_sync_pure_reducer.Sync_protocol.Server.pull_transaction =
-      {t=cursor;tx="[[\"~:db/retractEntity\",99999]]";outliner_op=None} in
-    let pending = Core.step opened.next (Sync_event (Sync.Websocket_message
-      (connection, Pull_ok {t=cursor;checksum=None;txs=[tx]}))) in
-    let ticket = List.find_map (function
-      | Core.Run_worker (Core.Request (ticket, Handle_sync_worker_effect (Sync.Apply_authoritative_batch _))) -> Some ticket
-      | _ -> None) pending.effects |> Option.get in
-    let origin = Error.create_cause ~component:Managed_sync ~operation:"applyAuthoritative"
+  List.iter (fun (code,category,message) ->
+    let ready,scope=worker_open_graph () in
+    let requested=Core.step ready (Graph_request_for_scope
+      {scope;id=Core.request_id_of_int64 83L;read=observation_read scope 71L Read.Graph_info 16384}) in
+    let execution=List.find_map(function Core.Run_worker request->Some request|_->None)
+      requested.effects |> Option.get in
+    let origin=Error.create_cause ~component:Managed_sync ~operation:"applyAuthoritative"
       ~code:(Some category) ~message |> Result.get_ok in
-    let error = Error.create_with_origin ~code ~message ~details:[] ~origin |> Result.get_ok in
-    let failure = Core.Runner_completed (Sync_worker_effect_completed (ticket, Error error)) in
-    let failed = Core.step pending.next failure in
-    Alcotest.(check (option string)) "Last error retains category" (Some message)
-      (Core.view failed.next).sync.snapshot.last_error;
-    Alcotest.(check bool) "Worker diagnostics retain category" true
-      (List.exists (function Core.Publish (Diagnostic signal) ->
-        signal="worker.applyAuthoritative." ^ category | _ -> false) failed.effects);
-    Alcotest.(check bool) "local graph remains open" true
-      ((Core.view failed.next).graph.phase=Graph_open && graph.graph_generation=(Core.view failed.next).graph.generation);
+    let error=Error.create_with_origin ~code ~message ~details:[] ~origin |> Result.get_ok in
+    let completion=Core.complete_execute execution (Error error) |> Option.get in
+    let failed=Core.step requested.next completion in
+    Alcotest.(check bool) "typed read retains the original error category" true
+      (List.exists(function Core.Publish(Reply(_,Read.Query_answer(_,_,Error(Read.Db_error actual)))) ->
+        actual=error|_->false) failed.effects);
+    Alcotest.(check bool) "read failure cannot change App sync ownership" true
+      ((Core.view failed.next).sync=(Core.view requested.next).sync
+       && (Core.view failed.next).graph.phase=Core.Graph_open);
     Alcotest.(check int) "duplicate completion is inert" 0
-      (List.length (Core.step failed.next failure).effects);
-    let retired=Core.step pending.next (Sync_event Sync.Graph_picker_requested) in
-    let late=Core.step retired.next failure in
-    Alcotest.(check bool) "retired authoritative completion keeps sync state" true
-      ((Core.view late.next).sync=(Core.view retired.next).sync);
-    Alcotest.(check bool) "retired authoritative completion cannot report into another graph" false
-      (List.exists(function Core.Publish(Diagnostic _)->true | _->false)late.effects))
-    [ Error.Closed_session, "authoritativeDatabaseClosed", "Authoritative database is closed."
-    ; Conflict, "authoritativeSyncTokenConflict", "Authoritative sync version changed."
-    ; Ambiguous_sync_state, "authoritativeCursorDiscontinuous", "Authoritative transaction cursors are not continuous."
-    ; Unsupported_semantics, "authoritativeDecodeFailed", "Authoritative transaction format is unsupported." ]
+      (List.length(Core.step failed.next completion).effects))
+    [Error.Closed_session,"authoritativeDatabaseClosed","Authoritative database is closed."
+    ;Conflict,"authoritativeSyncTokenConflict","Authoritative sync version changed."
+    ;Ambiguous_sync_state,"authoritativeCursorDiscontinuous","Authoritative transaction cursors are not continuous."
+    ;Unsupported_semantics,"authoritativeDecodeFailed","Authoritative transaction format is unsupported."]
 ;;
 
+let project_residents state (sync:Sync.state) (coordination:Sync.coordination_state) =
+  let attachments=List.map (fun ((scope:Sync.graph_scope),_) ->
+    let database_id=if scope.graph_id=uuid "11111111-1111-4111-8111-111111111111"
+      then "db-delete" else "resident-" ^ Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id in
+    scope,Core.database_opened ~database_id ~graph_id:scope.graph_id) coordination.residents in
+  Core.step state (Lifecycle_snapshot(sync,coordination,attachments))
+;;
+
+let test_lifecycle_snapshot_restores_uploads () =
+  let module U = Logseq_db_worker_pure_reducer.Asset_upload in
+  let module I = Logseq_db_types.Asset_upload_intent in
+  let ready, scope = worker_open_graph () in
+  let sync = (Core.view ready).sync in
+  let coordination = (Core.coordination_state ready).sync in
+  let background = {scope with graph_id=uuid "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"; graph_generation=2} in
+  let coordination = {coordination with residents=[scope,sync;background,sync];
+    desired_residents=[scope.graph_id;background.graph_id]} in
+  let restored = project_residents (raw_initial ()) sync coordination in
+  let reads = List.filter_map (function Core.Read_uploads ticket -> Some ticket | _ -> None) restored.effects in
+  Alcotest.(check int) "snapshot alone starts every resident's bounded recovery" 2 (List.length reads);
+  let repeated = project_residents restored.next sync coordination in
+  Alcotest.(check bool) "repeated snapshot does not duplicate pending reads" true
+    (List.for_all (function Core.Read_uploads _ -> false | _ -> true) repeated.effects);
+  let ticket = List.find (fun ticket -> ticket.Core.scope=background) reads in
+  let prepared = recovery_intent background 1 in
+  let pending = List.fold_left (fun intent phase -> I.advance intent phase |> Result.get_ok)
+    prepared [I.Local_committed;Uploading;Remote_stored;Metadata_pending] in
+  let loaded = Core.step repeated.next (Uploads_loaded (ticket, Ok [pending])) in
+  let inspect = List.find_map (function
+    | Core.Run_upload (context,U.Inspect (ticket,intent)) when context.scope=background && intent=pending -> Some ticket
+    | _ -> None) loaded.effects |> Option.get in
+  let observed = Core.step loaded.next (Upload_completed (inspect,U.Inspected U.Publication_acknowledged)) in
+  let save = List.find_map (function
+    | Core.Run_upload (_,U.Persist (ticket,intent,Some 4)) when intent.phase=I.Complete -> Some ticket
+    | _ -> None) observed.effects |> Option.get in
+  let completed = Core.step observed.next (Upload_completed (save,U.Persisted)) in
+  Alcotest.(check bool) "exact original ACK releases staging after durable Complete" true
+    (List.exists (function Core.Run_upload (_,U.Release_staging intent) -> intent.operation_id=pending.operation_id | _ -> false) completed.effects);
+  Alcotest.(check bool) "replay never stages, inserts, uploads or republishes metadata" true
+    (List.for_all (function
+      | Core.Run_upload (_, (U.Apply_local _ | Put _ | Apply_metadata _)) -> false
+      | _ -> true) (loaded.effects @ observed.effects @ completed.effects))
+;;
+
+let project_selection state graph_id =
+  let coordination=(Core.coordination_state state).sync in
+  let scope,_=List.find(fun((scope:Sync.graph_scope),_)->scope.graph_id=graph_id)coordination.residents in
+  let selected : Sync.timeline_scope =
+    {startup={account_generation=scope.account.account_generation;
+      presentation_generation=scope.account.presentation_generation};
+     graph_id;graph_generation=scope.graph_generation} in
+  let sync=(Core.view state).sync in
+  project_residents state {sync with snapshot={sync.snapshot with selected_graph=Some graph_id}}
+    {coordination with selected=Some selected}
+;;
 
 let resident_worker_fixture () =
-  let ready, first_scope = worker_open_graph () in
-  let first_id=first_scope.Sync.graph_id in
+  let ready,first_scope=worker_open_graph () in
   let second_id=uuid "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" in
-  let snapshot=(Core.view ready).sync.snapshot in
-  let second : Sync.graph = {(List.hd snapshot.catalog) with graph_id=second_id;name="Second synthetic graph"} in
-  let requested=Core.step ready (Sync_event (Sync.Catalog_refresh_requested (startup_scope ready))) in
-  let fetched=List.find_map (function
-    | Core.Run_sync (Sync.Request (ticket,Sync.Fetch_catalog _)) ->
-      Some (Core.Sync_event (Sync.Runner_completed (Sync.Completion (ticket,Ok (snapshot.catalog @ [second])))))
-    | _ -> None) requested.effects |> Option.get in
-  let catalog=Core.step requested.next fetched in
-  let configured=Core.step catalog.next (Sync_event (Sync.Resident_graphs_changed [first_id;second_id])) in
-  let rec open_requests core = function
-    | [] -> core
-    | Core.Run_worker (Core.Request (ticket,Core.Handle_sync_worker_effect (Sync.Inspect_mirror request))) :: rest ->
-      let next=Core.step core (Runner_completed (Sync_worker_effect_completed (ticket,
-        Ok {event=Some (Sync.Mirror_inspected (Mirror_available request));lifecycle=Lifecycle_unchanged}))) in
-      open_requests next.next (next.effects @ rest)
-    | Core.Run_worker (Core.Request (ticket,Core.Handle_sync_worker_effect (Sync.Attach_graph request))) :: rest ->
-      let database_id="resident-" ^ Logseq_db_types.Graph_types.Uuid.to_string request.scope.graph_id in
-      let database=Core.database_opened ~database_id ~graph_id:request.scope.graph_id in
-      let module O=Logseq_overlay_db.Types in
-      let sync=O.sync_view ~token:(O.sync_token_of_string "sync-token:v1:resident" |> Result.get_ok)
-        ~checkpoint:(O.Server_cursor.of_int64 0L |> Result.get_ok) ~submissions:[] in
-      let next=Core.step core (Runner_completed (Sync_worker_effect_completed (ticket,
-        Ok {event=Some (Sync.Graph_attached {scope=request.scope;sync});
-          lifecycle=Lifecycle_opened (database,request.scope.graph_generation)}))) in
-      open_requests next.next rest
-    | _ :: rest -> open_requests core rest in
-  let opened=open_requests configured.next configured.effects in
-  opened,first_scope,second_id
+  let sync=(Core.view ready).sync in
+  let second : Sync.graph = {(List.hd sync.snapshot.catalog) with graph_id=second_id;name="Second synthetic graph"} in
+  let second_scope={first_scope with graph_id=second_id;graph_generation=2} in
+  let sync={sync with snapshot={sync.snapshot with catalog=sync.snapshot.catalog @ [second];
+    resident_graphs=[first_scope.graph_id;second_id]}} in
+  let coordination=(Core.coordination_state ready).sync in
+  let opened=project_residents ready sync {coordination with residents=[first_scope,sync;second_scope,sync];
+    desired_residents=[first_scope.graph_id;second_id]} in
+  opened.next,first_scope,second_id
 ;;
+
 let test_resident_worker_routes_by_scope () =
   let opened,first_scope,second_id=resident_worker_fixture () in
   Alcotest.(check int) "two independent DB scopes remain open" 2 (List.length (Core.graph_scopes opened));
@@ -1232,7 +953,7 @@ let test_resident_worker_routes_by_scope () =
   let read scope=observation_read scope 71L Read.Graph_info 16384 in
   let started=Core.step opened (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 101L;read=read first_scope}) in
   let execution=List.find_map (function Core.Run_worker ((Core.Request (_,Execute_request _)) as instruction)->Some instruction | _->None) started.effects |> Option.get in
-  let focused=Core.step started.next (Sync_event (Sync.Visible_graph_changed second_id)) in
+  let focused=project_selection started.next second_id in
   let hidden=Core.step focused.next (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 102L;read=read first_scope}) in
   Alcotest.(check bool) "hidden request still targets first database" true
     (List.exists (function Core.Run_worker (Core.Request (_,Execute_request {database;_}))->
@@ -1252,63 +973,93 @@ let test_resident_worker_routes_by_scope () =
 ;;
 
 let test_resident_worker_closes_every_scope () =
-  List.iter (fun event ->
+  List.iter (fun intent ->
     let opened,_,_=resident_worker_fixture () in
-    let closing=Core.step opened event in
-    let detached=List.filter_map (function
-      | Core.Run_worker (Core.Request (ticket,Handle_sync_worker_effect (Sync.Detach_graph scope))) -> Some(ticket,scope)
-      | _->None) closing.effects in
-    Alcotest.(check int) "every removed DB independently drains and detaches" 2 (List.length detached);
-    let terminal=List.fold_left (fun state (ticket,scope)->
-      (Core.step state (Runner_completed (Sync_worker_effect_completed (ticket,
-        Ok {event=Some(Sync.Graph_detached(scope,Ok()));lifecycle=Lifecycle_closed scope.graph_generation})))).next)
-      closing.next detached in
-    Alcotest.(check int) "no removed graph remains admitted" 0 (List.length(Core.graph_scopes terminal)))
-    [Core.Sync_event(Sync.Resident_graphs_changed []);Core.Sync_event(Sync.Account_authenticated{user_id=None})]
+    let forwarded=Core.step opened (Sync_event intent) in
+    Alcotest.(check int) "intent alone cannot revoke App residents" 2
+      (List.length(Core.graph_scopes forwarded.next));
+    Alcotest.(check bool) "retirement request reaches App exactly once" true
+      (forwarded.effects=[Core.Publish(Lifecycle_intent(Sync_intent intent))]);
+    let retired=retire_projected_graph forwarded.next in
+    Alcotest.(check int) "App withdrawal removes every scope" 0
+      (List.length(Core.graph_scopes retired.next)))
+    [Sync.Resident_graphs_changed [];Sync.Account_authenticated{user_id=None}]
+;;
+
 let test_resident_worker_shutdown_closes_all_databases () =
   let opened,_,_=resident_worker_fixture () in
   let stopped=Core.step opened Shutdown in
-  let databases=List.filter_map (function
-    | Core.Run_worker(Core.Request(_,Close_database database))->Some(Core.database_handle_id database)
-    | _->None) stopped.effects in
-  Alcotest.(check int) "shutdown closes both resident databases" 2 (List.length(List.sort_uniq String.compare databases))
-;;
-let test_resident_worker_cold_restore_keeps_open_tickets () =
- List.iter(fun count->
-  let graphs=List.init count(fun n->({graph_id=uuid(Printf.sprintf "65000000-0000-4000-8000-%012d" (n+1));name="Cached synthetic";
-    schema={major=65;minor=33;exact=true};encrypted=false}:Sync.graph)) in
-  let ids=List.map(fun(g:Sync.graph)->g.graph_id) graphs in
-  let selected=List.nth ids (count-1) in
-  let cache=Sync.catalog_cache ~user_id:"cached-resident" ~graphs ~selected_graph:(Some selected)
-    |> Sync.encode_catalog_cache |> Yojson.Safe.from_string |> Yojson.Safe.Util.to_assoc in
-  let cache=`Assoc(("cache_resident_graphs",`List(List.map(fun id->`String(Logseq_db_types.Graph_types.Uuid.to_string id)) ids))::cache)
-    |> Yojson.Safe.to_string |> Sync.decode_catalog_cache |> Result.get_ok in
-  let restoring=Core.step (raw_initial ()) (Sync_event(Sync.Restore_local_account{user_id="cached-resident"})) in
-  let completion=List.find_map(function Core.Run_sync(Sync.Request(ticket,Sync.Load_catalog _))->
-    Some(Core.Sync_event(Sync.Runner_completed(Sync.Completion(ticket,Ok(Some cache)))))|_->None) restoring.effects |> Option.get in
-  let restored=Core.step restoring.next completion in
-  let inspections=List.filter_map(function Core.Run_worker(Core.Request(ticket,Handle_sync_worker_effect(Sync.Inspect_mirror request)))->Some(ticket,request)|_->None) restored.effects in
-  Alcotest.(check int) "one cold local inspection per resident" count (List.length inspections);
-  let opened=List.fold_left(fun state (ticket,(request:Sync.mirror_request))->
-    let attaching=Core.step state (Runner_completed(Sync_worker_effect_completed(ticket,
-      Ok{event=Some(Sync.Mirror_inspected(Mirror_available request));lifecycle=Lifecycle_unchanged}))) in
-    let attachment=List.find_map(function Core.Run_worker(Core.Request(ticket,Handle_sync_worker_effect(Sync.Attach_graph _)))->Some ticket|_->None) attaching.effects in
-    Alcotest.(check bool) "cached inspection ticket survives session restore" true (Option.is_some attachment);
-    let database=Core.database_opened ~database_id:("cached-" ^ Logseq_db_types.Graph_types.Uuid.to_string request.scope.graph_id) ~graph_id:request.scope.graph_id in
-    let module O=Logseq_overlay_db.Types in
-    let sync=O.sync_view ~token:(O.sync_token_of_string "sync-token:v1:cached" |> Result.get_ok)
-      ~checkpoint:(O.Server_cursor.of_int64 0L |> Result.get_ok) ~submissions:[] in
-    (Core.step attaching.next (Runner_completed(Sync_worker_effect_completed(Option.get attachment,
-      Ok{event=Some(Sync.Graph_attached{scope=request.scope;sync});lifecycle=Lifecycle_opened(database,request.scope.graph_generation)})))).next)
-    restored.next (List.rev inspections) in
-  Alcotest.(check bool) "cold restore preserves last focused graph" true ((Core.view opened).sync.snapshot.selected_graph=Some selected);
+  Alcotest.(check bool) "Worker borrows rather than closes App databases" false
+    (List.exists(function Core.Run_worker(Core.Request(_,Close_database _))->true|_->false)stopped.effects);
+  Alcotest.(check int) "stop intent is account-wide, not once per graph" 1
+    (List.length(List.filter(function Core.Publish(Lifecycle_intent Stop_intent)->true|_->false)stopped.effects));
   List.iter(fun scope->
-    Alcotest.(check bool) "each restored graph really opens" true
-      (Option.fold ~none:false ~some:(fun(g:Core.graph_state)->g.phase=Core.Graph_open) (Core.graph_state_for_scope opened scope));
-    let read=Core.step opened (Graph_request_for_scope{scope;id=Core.request_id_of_int64 901L;read=observation_read scope 71L Read.Graph_info 16384}) in
-    Alcotest.(check bool) "restored scope executes against its own DB" true
-      (List.exists(function Core.Run_worker(Core.Request(_,Execute_request{database;_}))->
-        Core.database_handle_id database="cached-" ^ Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id|_->false) read.effects)) (Core.graph_scopes opened)) [1;2;3]
+    let rejected=Core.step stopped.next(Graph_request_for_scope{scope;id=Core.request_id_of_int64 904L;
+      read=observation_read scope 71L Read.Graph_info 16384})in
+    Alcotest.(check bool) "shutdown replies once without executing" true
+      (match rejected.effects with [Core.Publish(Reply _)]->true|_->false)) (Core.graph_scopes opened)
+;;
+
+let test_resident_worker_cold_restore_keeps_open_tickets () =
+  List.iter(fun count->
+    let ready,first=worker_open_graph () in
+    let scopes=List.init count(fun index->{first with graph_id=uuid(Printf.sprintf
+      "65000000-0000-4000-8000-%012d" (index+1));graph_generation=index+1})in
+    let selected=List.nth scopes(count-1)in
+    let sync=(Core.view ready).sync in
+    let catalog=List.map(fun(scope:Sync.graph_scope)->
+      ({graph_id=scope.graph_id;name="Cached synthetic";schema={major=65;minor=33;exact=true};encrypted=false}:Sync.graph))scopes in
+    let sync={sync with snapshot={sync.snapshot with catalog;selected_graph=Some selected.graph_id;
+      resident_graphs=List.map(fun(scope:Sync.graph_scope)->scope.graph_id)scopes;
+      startup={sync.snapshot.startup with graph_generation=selected.graph_generation}}}in
+    let coordination=(Core.coordination_state ready).sync in
+    let opened=project_residents ready sync {coordination with residents=List.map(fun scope->scope,sync)scopes;
+      desired_residents=List.map(fun(scope:Sync.graph_scope)->scope.graph_id)scopes;
+      selected=Some{startup=startup_scope ready;graph_id=selected.graph_id;graph_generation=selected.graph_generation}}in
+    Alcotest.(check bool) "restored focus follows App projection" true
+      ((Core.view opened.next).sync.snapshot.selected_graph=Some selected.graph_id);
+    List.iter(fun scope->
+      let read=Core.step opened.next(Graph_request_for_scope{scope;id=Core.request_id_of_int64 901L;
+        read=observation_read scope 71L Read.Graph_info 16384})in
+      Alcotest.(check bool) "each projected resident executes its own database" true
+        (List.exists(function Core.Run_worker(Core.Request(_,Execute_request{database;_}))->
+          Core.database_handle_id database="resident-" ^ Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id|_->false)read.effects))scopes)
+    [1;2;3]
+;;
+
+let test_hidden_read_survives_withdrawal () =
+  let opened,first,second=resident_worker_fixture () in
+  let executing=Core.step opened(Graph_request_for_scope{scope=first;
+    id=Core.request_id_of_int64 910L;read=observation_read first 71L Read.Graph_info 16384})in
+  let execution=List.find_map(function Core.Run_worker request->Some request|_->None)executing.effects |> Option.get in
+  let focused=project_selection executing.next second in
+  let retired=retire_projected_graph focused.next in
+  let error=Logseq_db_worker.Error.create ~code:Closed_session ~message:"hidden read finished" ~details:[] |> Result.get_ok in
+  let completion=Core.complete_execute execution(Error error) |> Option.get in
+  let completed=Core.step retired.next completion in
+  Alcotest.(check bool) "withdrawn hidden read keeps its one terminal reply" true
+    (match completed.effects with [Core.Publish(Reply(id,_))]->Core.request_id_to_int64 id=910L|_->false);
+  Alcotest.(check int) "duplicate hidden completion cannot reply twice" 0
+    (List.length(Core.step completed.next completion).effects)
+;;
+
+let test_read_cannot_borrow_another_scope () =
+  let opened,first,second=resident_worker_fixture ()in
+  let other=List.find(fun(scope:Sync.graph_scope)->scope.graph_id=second)(Core.graph_scopes opened)in
+  List.iter(fun event->
+    let transition=Core.step opened event in
+    Alcotest.(check bool) "foreign read budget receives a terminal error without execution" true
+      (match transition.effects with [Core.Publish(Reply(_,Read.Query_answer(_,_,Error _)))]->true|_->false))
+    [Core.Graph_request_for_scope{scope=first;id=Core.request_id_of_int64 911L;
+       read=observation_read other 71L Read.Graph_info 16384};
+     Core.Graph_request{id=Core.request_id_of_int64 912L;read=observation_read other 71L Read.Graph_info 16384}]
+;;
+
+let test_foreground_intent_is_account_wide () =
+  let opened,_,_=resident_worker_fixture ()in
+  let transition=Core.step opened(Set_foreground false)in
+  Alcotest.(check int) "foreground intent is forwarded once across all residents" 1
+    (List.length(List.filter(function Core.Publish(Lifecycle_intent(Foreground_intent false))->true|_->false)transition.effects))
 ;;
 
 let test_coordination_owner_snapshot () =
@@ -1319,8 +1070,8 @@ let test_coordination_owner_snapshot () =
   List.iter (fun ((scope:Sync.graph_scope),state) ->
     Alcotest.(check bool) "exact open lifetime" true
       (state.Core.phase=Graph_open && state.generation=scope.Sync.graph_generation)) before.residents;
-  let switched=(Core.step opened (Sync_event (Sync.Visible_graph_changed second))).next in
-  let back=(Core.step switched (Sync_event (Sync.Visible_graph_changed first.graph_id))).next in
+  let switched=(project_selection opened second).next in
+  let back=(project_selection switched first.graph_id).next in
   let after=Core.coordination_state back in
   Alcotest.(check bool) "focus preserves execution scopes" true
     (List.map fst before.residents=List.map fst after.residents);
@@ -1329,10 +1080,16 @@ let test_coordination_owner_snapshot () =
        (Core.coordination_state switched).sync.selected=Some second
      && Option.map (fun (owner:Sync.timeline_scope)->owner.graph_id)
        after.sync.selected=Some first.graph_id);
-  let removed=(Core.step back (Sync_event (Sync.Resident_graphs_changed [first.graph_id]))).next in
-  let deleting=Core.step removed (Sync_event (Sync.Local_cache_deletion_requested second)) in
+  let sync=(Core.view back).sync in
+  let coordination=(Core.coordination_state back).sync in
+  let removed=(project_residents back sync {coordination with
+    residents=List.filter(fun((scope:Sync.graph_scope),_)->scope=first)coordination.residents;
+    desired_residents=[first.graph_id]}).next in
+  let deletion_scope=List.find(fun(scope:Sync.graph_scope)->scope.graph_id=second)(Core.graph_scopes back) in
+  let coordination=(Core.coordination_state removed).sync in
+  let deleting=project_residents removed sync {coordination with deletion=Some(deletion_scope,Sync.Deletion_in_progress Sync.Deleting_mirror)} in
   let current=Core.coordination_state deleting.next in
-  Alcotest.(check bool) "exact deletion target is visible" true
+  Alcotest.(check bool) "App deletion target is visible" true
     (Option.fold ~none:false ~some:(fun ((scope:Sync.graph_scope),_) ->
       scope.graph_id=second) current.sync.deletion);
   let empty=Core.coordination_state (raw_initial ()) in
@@ -1679,7 +1436,7 @@ let test_changefeed_owner_properties () =
 let test_unallocated_observation_fence () =
   let module O = Core.Observation_registry in
   let _, scope = worker_open_graph () in
-  let owner : Logseq_sync_pure_reducer.Core.timeline_scope =
+  let owner : Logseq_sync_domain.Core.timeline_scope =
     { startup =
         { account_generation = scope.account.account_generation
         ; presentation_generation = 0
@@ -1885,7 +1642,7 @@ let test_demand_registry_retirement_requires_physical_settlement () =
 let test_resource_registry_finalization () =
   let module O=Core.Observation_registry in let module D=Core.Demand_registry in
   let _,scope=worker_open_graph() in
-  let timeline:Logseq_sync_pure_reducer.Core.timeline_scope={
+  let timeline:Logseq_sync_domain.Core.timeline_scope={
     startup={account_generation=scope.account.account_generation;presentation_generation=scope.account.presentation_generation};
     graph_id=scope.graph_id;graph_generation=scope.graph_generation} in
   let observation=ref O.empty and demand=ref D.empty in
@@ -2042,7 +1799,30 @@ let test_writer_fence_properties () =
   done
 ;;
 
+let test_lifecycle_host_gate () =
+  let opened,first,second=resident_worker_fixture() in
+  let sync=(Core.view opened).sync and coordination=(Core.coordination_state opened).sync in
+  let external_state=(Core.step opened (Core.Lifecycle_snapshot(sync,coordination,[]))).next in
+  let id=uuid "10000000-0000-4000-8000-000000079081" in
+  let owner=Option.get coordination.account in
+  let fence:Sync.host_fence={id;owner;target=One_graph first.graph_id;captured_scopes=Rrbvec.singleton first;previous=None} in
+  let fenced=(Core.step external_state (Sync_event(Sync.Host_fence_started fence))).next in
+  Alcotest.(check bool) "external host gate withdraws target" false
+    (List.mem first (Core.graph_scopes fenced));
+  Alcotest.(check bool) "external host gate keeps unrelated graph" true
+    (List.exists(fun(scope:Sync.graph_scope)->scope.graph_id=second)(Core.graph_scopes fenced));
+  let republished=(Core.step fenced (Core.Lifecycle_snapshot(sync,coordination,[]))).next in
+  Alcotest.(check bool) "stale projection cannot reopen fenced target" false
+    (List.mem first (Core.graph_scopes republished));
+  let foreign=(Core.step republished (Sync_event(Sync.Host_fence_released(uuid "10000000-0000-4000-8000-000000079082")))).next in
+  Alcotest.(check bool) "external fence requires exact release" true (Core.host_fence_blocks foreign first.graph_id);
+  let released=(Core.step foreign (Sync_event(Sync.Host_fence_released id))).next in
+  Alcotest.(check bool) "exact release clears external fence" false (Core.host_fence_blocks released first.graph_id)
+;;
+
 let test_host_gate_keeps_other_graph_live () =
+  test_lifecycle_host_gate ();
+
   let opened,first,second=resident_worker_fixture() in
   let id=uuid "10000000-0000-4000-8000-000000079001" in
   let owner=Option.get(Core.coordination_state opened).sync.account in
@@ -2060,54 +1840,67 @@ let test_host_gate_keeps_other_graph_live () =
   let wrong=Core.step configured.next(Sync_event(Sync.Host_fence_released(uuid "10000000-0000-4000-8000-000000079099"))) in
   Alcotest.(check bool) "foreign release cannot open target" true(Core.host_fence_blocks wrong.next first.graph_id);
   let released=Core.step wrong.next(Sync_event(Sync.Host_fence_released id)) in
-  let reopened=Core.step released.next(Sync_event(Sync.Resident_graphs_changed[first.graph_id;second])) in
+  let sync=(Core.view opened).sync and coordination=(Core.coordination_state opened).sync in
+  let fresh={first with graph_generation=first.graph_generation+1}in
+  let reopened=project_residents released.next sync {coordination with
+    residents=List.map(fun(scope,state)->(if scope=first then fresh else scope),state)coordination.residents}in
   Alcotest.(check bool) "fresh execution only after exact fence release" true
     (List.exists(fun(scope:Sync.graph_scope)->scope.graph_id=first.graph_id && scope.graph_generation>first.graph_generation)
       (Core.graph_scopes reopened.next))
 ;;
 
 let test_revoked_account_keeps_hidden_cleanup_owner () =
-  let opened,_,second=resident_worker_fixture() in
+  let opened,_,second=resident_worker_fixture () in
   let hidden=List.find(fun(scope:Sync.graph_scope)->scope.graph_id=second)(Core.graph_scopes opened) in
-  let revoked=Core.step opened(Sync_event(Sync.Account_authenticated{user_id=None})) in
-  let release scope operation=Core.step revoked.next(Sync_event(Sync.Asset_requested
-    {scope;operation;action=Release_asset_file "original-hidden-preview"})) in
-  let released=release hidden "revoked-hidden-release" in
-  Alcotest.(check bool) "old hidden owner retains cleanup-only IO authority after auth revocation" true
-    (List.exists(function Core.Run_sync(Sync.Asset_io(_,{context;action=Release_asset_file "original-hidden-preview";_}))->
-      context.scope=hidden|_->false)released.effects);
-  let forged=release {hidden with graph_generation=hidden.graph_generation+100} "foreign-hidden-release" in
-  Alcotest.(check bool) "revocation never creates implicit authority for an unknown execution" false
-    (List.exists(function Core.Run_sync(Sync.Asset_io _)->true|_->false)forged.effects);
-  let acquire=Core.step revoked.next(Sync_event(Sync.Asset_requested
-    {scope=hidden;operation="revoked-hidden-acquire";action=Retain_asset_file "original-hidden-preview"})) in
-  Alcotest.(check bool) "retaining cleanup ownership does not restore old data/acquisition authority" false
-    (List.exists(function Core.Run_sync(Sync.Asset_io _)->true|_->false)acquire.effects)
+  let revoked=retire_projected_graph opened in
+  List.iter(fun scope->
+    let request : Sync.asset_request = {scope;operation="revoked-hidden-release";
+      action=Release_asset_file "original-hidden-preview"}in
+    let released=Core.step revoked.next(Sync_event(Sync.Asset_requested request))in
+    Alcotest.(check bool) "Worker forwards cleanup identity without granting authority" true
+      (released.effects=[Core.Publish(Lifecycle_intent(Sync_intent(Sync.Asset_requested request)))]);
+    Alcotest.(check int) "forwarding cannot create a graph owner" 0
+      (List.length(Core.graph_scopes released.next)))
+    [hidden;{hidden with graph_generation=hidden.graph_generation+100}]
 ;;
 
 let test_host_deletion_private_resource_owner () =
-  let opened,first,_=resident_worker_fixture() in
+  let opened,first,_=resident_worker_fixture () in
   let owner=Option.get(Core.coordination_state opened).sync.account in
   let id=uuid "10000000-0000-4000-8000-000000079003" in
-  let fenced=Core.step opened(Sync_event(Sync.Host_fence_started{id;owner;target=One_graph first.graph_id;captured_scopes=Rrbvec.singleton first;previous=None})) in
-  let deleting=Core.step fenced.next(Sync_event(Sync.Local_cache_deletion_requested first.graph_id)) in
-  let request=List.find_map(function
-    |Core.Run_worker(Core.Request(_,Core.Handle_sync_worker_effect(Sync.Delete_mirror request)))->Some request|_->None)deleting.effects
-    |> Option.get in
-  let scope:Sync.graph_scope={account=request.account;graph_id=request.graph_id;graph_generation=0} in
+  let fenced=Core.step opened(Sync_event(Sync.Host_fence_started{id;owner;target=One_graph first.graph_id;
+    captured_scopes=Rrbvec.singleton first;previous=None})) in
   let retirement=Sync.retirement_id_of_string "10000000-0000-4000-8000-000000079004" |> Result.get_ok in
-  let started=Core.step deleting.next(Sync_event(Sync.Asset_requested
-    {scope;operation="host-private-delete";action=Prepare_graph_asset_deletion retirement})) in
-  let ticket=List.find_map(function
-    |Core.Run_sync(Sync.Asset_io(ticket,{context;action=Prepare_graph_asset_deletion actual;_}))
-      when context.scope=scope && actual=retirement->Some ticket|_->None)started.effects in
-  Alcotest.(check bool) "private deletion resource request reaches its actual owner" true(Option.is_some ticket);
-  let deletion=Sync.asset_deletion_reference ~scope ~retirement in
-  let completed=Core.step started.next(Sync_event(Sync.Runner_completed(Sync.Asset_completion
-    (Option.get ticket,Ok(Sync.Asset_deletion_prepared deletion))))) in
-  Alcotest.(check bool) "private deletion result reaches original Worker waiter" true
-    (List.exists(function Core.Deliver_asset_result output->output.request.operation="host-private-delete"
-      && output.result=Ok(Sync.Asset_deletion_prepared deletion)|_->false)completed.effects)
+  let request : Sync.asset_request = {scope={first with graph_generation=0};operation="host-private-delete";
+    action=Prepare_graph_asset_deletion retirement} in
+  let started=Core.step fenced.next(Sync_event(Sync.Asset_requested request)) in
+  Alcotest.(check bool) "private resource request preserves identity for App validation" true
+    (started.effects=[Core.Publish(Lifecycle_intent(Sync_intent(Sync.Asset_requested request)))]);
+  Alcotest.(check bool) "resource forwarding never reopens fenced execution" false
+    (List.mem first(Core.graph_scopes started.next))
+;;
+
+let test_host_gate_defers_physical_close_to_settlement () =
+  let opened,first,_=resident_worker_fixture() in
+  let opened=(Core.step opened(asset_demand first)).next in
+  let closes effects=List.filter_map(function Core.Close_asset_scope scope->Some scope|_->None)effects in
+  let ordinary=retire_projected_graph opened in
+  Alcotest.(check bool) "ordinary withdrawal still closes the resource owner" true
+    (List.mem first (closes ordinary.effects));
+  List.iter(fun target->
+    let sync=(Core.view opened).sync and coordination=(Core.coordination_state opened).sync in
+    let owner=Option.get coordination.account in
+    let fence:Sync.host_fence={id=uuid "10000000-0000-4000-8000-000000079005";owner;target;
+      captured_scopes=Rrbvec.of_list(Core.graph_scopes opened);previous=None} in
+    let fenced=Core.step opened(Sync_event(Sync.Host_fence_started fence)) in
+    Alcotest.(check bool) "host fence withdraws execution before physical settlement" false
+      (List.mem first(Core.graph_scopes fenced.next));
+    Alcotest.(check int) "host settlement alone may close its fenced resource owner" 0
+      (List.length(closes fenced.effects));
+    let republished=project_residents fenced.next sync coordination in
+    Alcotest.(check int) "late lifecycle projection cannot start a competing close" 0
+      (List.length(closes republished.effects)))
+    [Sync.One_graph first.graph_id;All_graphs]
 ;;
 
 let test_account_host_gate_blocks_new_catalog_producer () =
@@ -2118,8 +1911,10 @@ let test_account_host_gate_blocks_new_catalog_producer () =
   let startup=(Core.view closed.next).sync.snapshot.startup in
   let refresh=Core.step closed.next(Sync_event(Sync.Catalog_refresh_requested
     {account_generation=startup.account_generation;presentation_generation=startup.presentation_generation})) in
-  Alcotest.(check bool) "account handoff cannot start another catalog producer" false
-    (List.exists(function Core.Run_sync(Sync.Request(_,Sync.Fetch_catalog _))->true|_->false)refresh.effects)
+  Alcotest.(check bool) "Worker forwards catalog intent without opening a producer" true
+    (refresh.effects=[Core.Publish(Lifecycle_intent(Sync_intent(Sync.Catalog_refresh_requested
+       {account_generation=startup.account_generation;presentation_generation=startup.presentation_generation})))]
+     && Core.graph_scopes refresh.next=[])
 ;;
 
 let test_host_handoff_single_use_and_reopen () =
@@ -2344,6 +2139,47 @@ let test_registration_retirement_properties () =
   done
 ;;
 
+let test_external_lifecycle_retirement () =
+  let module L = Core.Lifecycle in
+  let scope : Sync.graph_scope =
+    { account = { managed_sync_origin = Uri.of_string "https://api.logseq.io";
+        user_id = "external"; account_generation = 1; presentation_generation = 1;
+        lifecycle_generation = 1L };
+      graph_id = uuid "10000000-0000-4000-8000-000000000001"; graph_generation = 1 }
+  in
+  let opened = Core.database_opened ~database_id:"service-owned" ~graph_id:scope.graph_id in
+  let snapshot : L.snapshot = { revision = 1L; scopes = [scope]; selected = Some scope } in
+  let state = (L.step L.empty (L.Projection snapshot)).next in
+  let state = (L.step state (L.Attach (scope, opened))).next in
+  let read = observation_read scope 71L Read.Graph_info 16384 in
+  let request = L.step state (L.Read {scope; id = Core.request_id_of_int64 91L; read}) in
+  let ticket = match request.effects with
+    | [L.Worker (Core.Request (ticket, Core.Execute_request _))] -> ticket
+    | _ -> Alcotest.fail "external attachment must execute a read"
+  in
+  let foreign = {scope with graph_generation = 2} in
+  let foreign_read = observation_read foreign 72L Read.Graph_info 16384 in
+  let rejected = L.step request.next (L.Read {scope; id = Core.request_id_of_int64 93L; read = foreign_read}) in
+  Alcotest.check Alcotest.bool "foreign read budget never reaches the database" true
+    (match rejected.effects with [L.Publish (Core.Reply _)] -> true | _ -> false);
+  let retiring = L.step request.next (L.Retire scope) in
+  Alcotest.check Alcotest.int "retirement waits for physical reads" 0 (List.length retiring.effects);
+  let denied = L.step retiring.next (L.Read {scope; id = Core.request_id_of_int64 92L; read}) in
+  Alcotest.check Alcotest.bool "retiring graph rejects new reads" true
+    (match denied.effects with [L.Publish (Core.Reply _)] -> true | _ -> false);
+  let Read.Read_query (budget, query) = read in
+  let answer = Read.For_worker.answer budget query (Error (Read.Service_failed "test")) in
+  let completed = L.step denied.next (L.Completed (Core.Execute_request_completed (ticket, Ok answer))) in
+  Alcotest.check Alcotest.bool "reply precedes retirement ACK" true
+    (match completed.effects with [L.Publish (Core.Reply _); L.Retired actual] -> actual = scope | _ -> false);
+  Alcotest.check Alcotest.int "duplicate completion ignored" 0
+    (List.length (L.step completed.next (L.Completed (Core.Execute_request_completed (ticket, Ok answer)))).effects);
+  let revoked = L.step completed.next (L.Projection {revision = 2L; scopes = []; selected = None}) in
+  let stale = L.step revoked.next (L.Projection snapshot) in
+  Alcotest.check Alcotest.int "stale snapshot cannot re-admit attachment" 0
+    (List.length (L.step stale.next (L.Attach (scope, opened))).effects)
+;;
+
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
@@ -2356,14 +2192,17 @@ let () =
         Alcotest.test_case "coordination owner snapshot" `Quick test_coordination_owner_snapshot;
         Alcotest.test_case "cold cached membership opens every DB" `Quick test_resident_worker_cold_restore_keeps_open_tickets;
         Alcotest.test_case "scope routes and delayed replies survive focus" `Quick test_resident_worker_routes_by_scope;
-        Alcotest.test_case "all removals and logout detach each graph" `Quick test_resident_worker_closes_every_scope;
-        Alcotest.test_case "shutdown closes every resident database" `Quick test_resident_worker_shutdown_closes_all_databases])
-    ; ( "authoritative diagnostics", [Alcotest.test_case "four categories propagate without closing graph" `Quick test_authoritative_failure_categories_reach_diagnostics])
+        Alcotest.test_case "App removal projection withdraws each graph" `Quick test_resident_worker_closes_every_scope;
+        Alcotest.test_case "shutdown borrows DBs and forwards one stop" `Quick test_resident_worker_shutdown_closes_all_databases])
+    ; ( "authoritative diagnostics", [Alcotest.test_case "typed read errors preserve four original causes" `Quick test_authoritative_failure_categories_reach_diagnostics])
     ; ( "snapshot failure", [
-        Alcotest.test_case "terminal failure and explicit retry" `Quick test_snapshot_failure_is_terminal_and_retryable;
-        Alcotest.test_case "success and late graph switch completions" `Quick test_snapshot_success_and_late_switch_completions ])
+        Alcotest.test_case "App failure and recovery projections" `Quick test_snapshot_failure_is_terminal_and_retryable;
+        Alcotest.test_case "unissued lifecycle success cannot retire graph" `Quick test_snapshot_success_and_late_switch_completions ])
     ; ( "asset session"
-      , [ Alcotest.test_case "bounded upload recovery" `Quick test_upload_recovery
+      , [ Alcotest.test_case "projection withdrawal cancels upload" `Quick test_projection_withdrawal_cancels_upload
+        ; Alcotest.test_case "projection withdrawal closes lookup scope" `Quick test_projection_withdrawal_cancels_asset_lookup
+        ; Alcotest.test_case "lifecycle snapshot restores acknowledged uploads" `Quick test_lifecycle_snapshot_restores_uploads
+        ; Alcotest.test_case "bounded upload recovery" `Quick test_upload_recovery
         ; Alcotest.test_case
             "upload recovery backpressure"
             `Quick
@@ -2375,7 +2214,7 @@ let () =
         ; Alcotest.test_case "upload recovery failure" `Quick test_upload_recovery_failure
         ; Alcotest.test_case "durable upload session" `Quick test_upload_session
         ; Alcotest.test_case
-            "asset execution completion delivery"
+            "asset lifecycle intent forwarding"
             `Quick
             test_asset_execution_completion_is_delivered
         ; Alcotest.test_case
@@ -2396,7 +2235,7 @@ let () =
             `Quick
             test_asset_manual_retry_is_unlimited
         ] )
-    ; ( "host handoff",[Alcotest.test_case "revoked hidden resource cleanup owner" `Quick test_revoked_account_keeps_hidden_cleanup_owner; Alcotest.test_case "private deletion resource owner" `Quick test_host_deletion_private_resource_owner; Alcotest.test_case "account gate blocks catalog producer" `Quick test_account_host_gate_blocks_new_catalog_producer; Alcotest.test_case "target gate preserves other execution" `Quick test_host_gate_keeps_other_graph_live; Alcotest.test_case "single-use and reopen witness" `Quick test_host_handoff_single_use_and_reopen; Alcotest.test_case "generated owner/late result traces" `Quick test_host_handoff_properties])
+    ; ( "host handoff",[Alcotest.test_case "host gate defers physical resource close" `Quick test_host_gate_defers_physical_close_to_settlement; Alcotest.test_case "revoked hidden resource cleanup owner" `Quick test_revoked_account_keeps_hidden_cleanup_owner; Alcotest.test_case "private deletion resource owner" `Quick test_host_deletion_private_resource_owner; Alcotest.test_case "account gate blocks catalog producer" `Quick test_account_host_gate_blocks_new_catalog_producer; Alcotest.test_case "target gate preserves other execution" `Quick test_host_gate_keeps_other_graph_live; Alcotest.test_case "single-use and reopen witness" `Quick test_host_handoff_single_use_and_reopen; Alcotest.test_case "generated owner/late result traces" `Quick test_host_handoff_properties])
     ; ( "writer fence",[Alcotest.test_case "only physical completion drains" `Quick test_writer_fence_physical_completion; Alcotest.test_case "generated scoped fence traces" `Quick test_writer_fence_properties])
     ; ( "typed demand registry",[Alcotest.test_case "generated owner retirement traces" `Quick test_demand_registry_properties; Alcotest.test_case "retirement and exact settlement" `Quick test_demand_registry_retirement_requires_physical_settlement; Alcotest.test_case "resource history finalization" `Quick test_resource_registry_finalization])
     ; ( "orphan resource cleanup",[Alcotest.test_case "failed release and stale attempt ACK" `Quick test_orphan_cleanup_retains_failed_release])
@@ -2405,8 +2244,9 @@ let () =
           Alcotest.test_case "active ACK and tombstone capacities" `Quick test_observation_registry_capacity] )
     ; ( "read budget", [Alcotest.test_case "scoped byte budget" `Quick test_scoped_read_byte_budget;
           Alcotest.test_case "pure bounded page planning" `Quick test_pure_read_page_bounds])
+    ; ( "external lifecycle", [Alcotest.test_case "hidden read withdrawal" `Quick test_hidden_read_survives_withdrawal; Alcotest.test_case "read scope authority" `Quick test_read_cannot_borrow_another_scope; Alcotest.test_case "account-wide foreground" `Quick test_foreground_intent_is_account_wide; Alcotest.test_case "account intent forwarding" `Quick test_worker_does_not_coordinate_accounts; Alcotest.test_case "production projection" `Quick test_production_lifecycle_projection; Alcotest.test_case "physical retirement and stale snapshots" `Quick test_external_lifecycle_retirement])
     ; ( "managed lifecycle"
-      , [ Alcotest.test_case "local restore IO failures terminate loading" `Quick test_local_restore_worker_failures_are_terminal
+      , [ Alcotest.test_case "unissued lifecycle failure cannot consume read" `Quick test_local_restore_worker_failures_are_terminal
         ; Alcotest.test_case
             "start has no local open"
             `Quick
@@ -2416,7 +2256,7 @@ let () =
             `Quick
             test_closed_graph_request_replies_once
         ; Alcotest.test_case
-            "sync instruction order"
+            "exact lifecycle forwarding"
             `Quick
             test_sync_instructions_are_translated_in_order
         ; Alcotest.test_case

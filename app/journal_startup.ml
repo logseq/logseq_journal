@@ -52,8 +52,10 @@ let startup_error ~awaiting_e2ee_password stage message =
     | During_local_restore -> Local_restore, Some Begin_online_recovery
     | During_bootstrap -> Bootstrap, Some Begin_online_recovery
     | During_e2ee ->
-      E2ee, Some (if awaiting_e2ee_password then Submit_e2ee_password
-                  else Begin_online_recovery)
+      ( E2ee
+      , Some
+          (if awaiting_e2ee_password then Submit_e2ee_password else Begin_online_recovery)
+      )
   in
   { owner; message; recovery }
 ;;
@@ -70,7 +72,7 @@ let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
   let facts = snapshot.Graph_service.startup in
   let graph_is_current = graph_matches snapshot graph in
   let ready =
-    (facts.authenticated || facts.local_access=Graph_service.Local_available)
+    (facts.authenticated || facts.local_access = Graph_service.Local_available)
     && graph_is_current
     && graph.phase = Logseq_db_worker.Graph_open
     && not snapshot.timeline_presentation_pending
@@ -93,29 +95,57 @@ let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
     | None -> assert false)
   else if ready
   then { phase = Ready; error = None }
-  else if facts.local_access=Graph_service.Local_unavailable Graph_service.No_local_account
-  then {phase=Signed_out;error=None}
-  else if facts.awaiting_selection then {phase=Awaiting_selection;error=None}
-  else if facts.awaiting_e2ee_password then
-    (match facts.failure with
-     | None -> {phase=Awaiting_e2ee_password;error=None}
-     | Some stage -> {phase=Failed;error=Some(startup_error ~awaiting_e2ee_password:true stage
-         (Option.value snapshot.last_error ~default:"Unable to unlock the graph."))})
-  else if (match facts.local_access with Graph_service.Local_unavailable _ -> true | _ -> false)
-  then
-    let error=startup_error ~awaiting_e2ee_password:false
-      (Option.value facts.failure ~default:Graph_service.During_local_restore)
-      (Option.value snapshot.last_error ~default:"Local graph data is unavailable.") in
-    let error=if facts.local_access=Graph_service.Local_unavailable Graph_service.Local_restore_failed
-      then {error with recovery=Some Retry_graph_open} else error in
-    {phase=Failed;error=Some error}
+  else if
+    facts.local_access = Graph_service.Local_unavailable Graph_service.No_local_account
+  then { phase = Signed_out; error = None }
+  else if facts.awaiting_selection
+  then { phase = Awaiting_selection; error = None }
+  else if facts.awaiting_e2ee_password
+  then (
+    match facts.failure with
+    | None -> { phase = Awaiting_e2ee_password; error = None }
+    | Some stage ->
+      { phase = Failed
+      ; error =
+          Some
+            (startup_error
+               ~awaiting_e2ee_password:true
+               stage
+               (Option.value snapshot.last_error ~default:"Unable to unlock the graph."))
+      })
+  else if
+    match facts.local_access with
+    | Graph_service.Local_unavailable _ -> true
+    | _ -> false
+  then (
+    let error =
+      startup_error
+        ~awaiting_e2ee_password:false
+        (Option.value facts.failure ~default:Graph_service.During_local_restore)
+        (Option.value snapshot.last_error ~default:"Local graph data is unavailable.")
+    in
+    let error =
+      if
+        facts.local_access
+        = Graph_service.Local_unavailable Graph_service.Local_restore_failed
+      then { error with recovery = Some Retry_graph_open }
+      else error
+    in
+    { phase = Failed; error = Some error })
   else if not facts.authenticated
-  then
-    (match facts.failure with
-     | Some stage -> { phase = Failed; error = Some (startup_error ~awaiting_e2ee_password:facts.awaiting_e2ee_password stage
-         (Option.value snapshot.last_error ~default:"Startup failed.")) }
-     | None when facts.restoring_local -> { phase = Restoring_local; error = None }
-     | None -> { phase = Signed_out; error = None })
+  then (
+    match facts.failure with
+    | Some stage ->
+      { phase = Failed
+      ; error =
+          Some
+            (startup_error
+               ~awaiting_e2ee_password:facts.awaiting_e2ee_password
+               stage
+               (Option.value snapshot.last_error ~default:"Startup failed."))
+      }
+    | None when facts.restoring_local -> { phase = Restoring_local; error = None }
+    | None -> { phase = Signed_out; error = None })
   else if graph_is_current && graph.phase = Graph_failed
   then
     { phase = Failed
@@ -145,6 +175,15 @@ let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
     | None when facts.awaiting_selection -> { phase = Awaiting_selection; error = None }
     | None when facts.awaiting_e2ee_password ->
       { phase = Awaiting_e2ee_password; error = None }
+    | None when facts.bootstrapping && snapshot.sync_phase = Graph_service.Failed ->
+      { phase = Failed
+      ; error =
+          Some
+            (startup_error
+               ~awaiting_e2ee_password:false
+               During_bootstrap
+               (Option.value snapshot.last_error ~default:"Graph bootstrap failed."))
+      }
     | None when facts.bootstrapping -> { phase = Bootstrapping; error = None }
     | None -> { phase = Restoring_local; error = None })
 ;;
@@ -195,6 +234,7 @@ let decode bytes =
 
 module Presentation = struct
   type ticket = int64
+
   type observation =
     { manager : Graph_service.snapshot option
     ; graph : Logseq_db_worker.graph_state
@@ -203,9 +243,25 @@ module Presentation = struct
     ; password_pending : bool
     ; graph_error : bool
     }
-  type account_result = Local | No_local | User | No_user
-  type screen = Waiting | Timeline | Interaction of startup_state | Account_failure
-  type account = Discovering | Local_available | User_available | User_required
+
+  type account_result =
+    | Local
+    | No_local
+    | User
+    | No_user
+
+  type screen =
+    | Waiting
+    | Timeline
+    | Interaction of startup_state
+    | Account_failure
+
+  type account =
+    | Discovering
+    | Local_available
+    | User_available
+    | User_required
+
   type t =
     { screen : screen
     ; serial : int64
@@ -217,6 +273,7 @@ module Presentation = struct
     ; account_failed : bool
     ; observed : observation option
     }
+
   type event =
     | Observe of observation
     | Account of ticket * account_result
@@ -227,86 +284,159 @@ module Presentation = struct
     | Elapsed of ticket * float
 
   let create () =
-    { screen = Waiting; serial = 0L; account_serial = 0L; indicator = false
-    ; foreground = true; account = Discovering; local_available = false
-    ; account_failed = false; observed = None }
+    { screen = Waiting
+    ; serial = 0L
+    ; account_serial = 0L
+    ; indicator = false
+    ; foreground = true
+    ; account = Discovering
+    ; local_available = false
+    ; account_failed = false
+    ; observed = None
+    }
+  ;;
+
   let foreground t = t.foreground
   let screen t = t.screen
   let loading_indicator t = t.foreground && t.screen = Waiting && t.indicator
+
   let loading_request t =
     if t.foreground && t.screen = Waiting && not t.indicator then Some t.serial else None
+  ;;
+
   let account_ticket t = t.account_serial
   let initial_attempt t = t.serial = 0L
+
   let equal_presentation left right =
     left.screen = right.screen
-    && (left.screen <> Waiting ||
-        (loading_indicator left = loading_indicator right
-         && initial_attempt left = initial_attempt right
-         && left.foreground = right.foreground))
+    && (left.screen <> Waiting
+        || (loading_indicator left = loading_indicator right
+            && initial_attempt left = initial_attempt right
+            && left.foreground = right.foreground))
+  ;;
 
-  let required phase = Interaction {phase;error=None}
+  let required phase = Interaction { phase; error = None }
+
   let classify t =
-    if t.account = User_required then required Signed_out
-    else match t.observed with
-    | Some o when o.password_pending -> required Awaiting_e2ee_password
-    | Some o ->
-      (match o.manager with
-       | Some manager when o.graph_ready && o.feed_loaded && not o.graph_error
-           && (manager.startup.authenticated || manager.startup.local_access=Graph_service.Local_available)
-           && o.graph.phase = Logseq_db_worker.Graph_open && graph_matches manager o.graph -> Timeline
-       | Some manager ->
-         let startup = derive ~snapshot:manager ~graph:o.graph in
-         (match startup.phase with
-          | Signed_out when manager.startup.local_access=Graph_service.Local_unavailable Graph_service.No_local_account -> Interaction startup
-          | Awaiting_selection | Awaiting_e2ee_password | Failed -> Interaction startup
-          | _ when o.graph_error -> required Failed
-          | _ when t.account_failed && not t.local_available -> Account_failure
-          | _ -> Waiting)
-       | None -> if t.account_failed && not t.local_available then Account_failure else Waiting)
-    | None -> if t.account_failed && not t.local_available then Account_failure else Waiting
+    if t.account = User_required
+    then required Signed_out
+    else (
+      match t.observed with
+      | Some o when o.password_pending -> required Awaiting_e2ee_password
+      | Some o ->
+        (match o.manager with
+         | Some manager
+           when o.graph_ready
+                && o.feed_loaded
+                && (not o.graph_error)
+                && (manager.startup.authenticated
+                    || manager.startup.local_access = Graph_service.Local_available)
+                && o.graph.phase = Logseq_db_worker.Graph_open
+                && graph_matches manager o.graph -> Timeline
+         | Some manager ->
+           let startup = derive ~snapshot:manager ~graph:o.graph in
+           (match startup.phase with
+            | Signed_out
+              when manager.startup.local_access
+                   = Graph_service.Local_unavailable Graph_service.No_local_account ->
+              Interaction startup
+            | Awaiting_selection | Awaiting_e2ee_password | Failed -> Interaction startup
+            | _ when o.graph_error -> required Failed
+            | _ when t.account_failed && not t.local_available -> Account_failure
+            | _ -> Waiting)
+         | None ->
+           if t.account_failed && not t.local_available then Account_failure else Waiting)
+      | None ->
+        if t.account_failed && not t.local_available then Account_failure else Waiting)
+  ;;
 
   let project t =
     let next = classify t in
-    if next = t.screen then t
-    else if next = Waiting then
-      {t with screen=next;serial=Int64.succ t.serial;indicator=false}
-    else {t with screen=next;indicator=false}
+    if next = t.screen
+    then t
+    else if next = Waiting
+    then { t with screen = next; serial = Int64.succ t.serial; indicator = false }
+    else { t with screen = next; indicator = false }
+  ;;
 
   let step t event =
-    let next = match event with
-    | Observe o ->
-      let previous = Option.bind t.observed (fun o -> o.manager) in
-      let changed_account = match previous,o.manager with
-        | Some previous,Some next -> previous.startup.account_generation <> 0
-          && previous.startup.account_generation <> next.startup.account_generation
-        | _ -> false in
-      let account = match o.manager with
-        | Some manager when changed_account && not manager.startup.authenticated
-            && not manager.startup.restoring_local && manager.startup.local_access=Graph_service.Local_pending -> User_required
-        | Some manager when manager.startup.authenticated && t.account <> User_required -> User_available
-        | _ -> t.account in
-      project {t with observed=Some o;account;
-        account_serial=(if changed_account then Int64.succ t.account_serial else t.account_serial)}
-    | Account (key,result) when key=t.account_serial ->
-      let account,local_available=match result with
-        | Local -> Local_available,true
-        | No_local -> (if t.account=Local_available then Discovering else t.account),false
-        | User -> User_available,t.local_available
-        | No_user -> User_required,false in
-      project {t with account;local_available;account_failed=false}
-    | Account_error key when key=t.account_serial -> project {t with account_failed=true}
-    | Retry ->
-      {t with screen=Waiting;serial=Int64.succ t.serial;account_serial=Int64.succ t.account_serial;
-        indicator=false;account=Discovering;local_available=false;account_failed=false;observed=None}
-    | Signed_out ->
-      {t with screen=required Signed_out;indicator=false;account=User_required;
-        account_serial=Int64.succ t.account_serial;local_available=false;account_failed=false}
-    | Foreground active when active<>t.foreground ->
-      {t with foreground=active;indicator=false;
-        serial=(if active && t.screen=Waiting then Int64.succ t.serial else t.serial)}
-    | Elapsed (key,elapsed) when key=t.serial && t.foreground && t.screen=Waiting
-        && elapsed>=0.1 && not t.indicator -> {t with indicator=true}
-    | Account _ | Account_error _ | Foreground _ | Elapsed _ -> t
+    let next =
+      match event with
+      | Observe o ->
+        let previous = Option.bind t.observed (fun o -> o.manager) in
+        let changed_account =
+          match previous, o.manager with
+          | Some previous, Some next ->
+            previous.startup.account_generation <> 0
+            && previous.startup.account_generation <> next.startup.account_generation
+          | _ -> false
+        in
+        let account =
+          match o.manager with
+          | Some manager
+            when changed_account
+                 && (not manager.startup.authenticated)
+                 && (not manager.startup.restoring_local)
+                 && manager.startup.local_access = Graph_service.Local_pending ->
+            User_required
+          | Some manager when manager.startup.authenticated && t.account <> User_required
+            -> User_available
+          | _ -> t.account
+        in
+        project
+          { t with
+            observed = Some o
+          ; account
+          ; account_serial =
+              (if changed_account then Int64.succ t.account_serial else t.account_serial)
+          }
+      | Account (key, result) when key = t.account_serial ->
+        let account, local_available =
+          match result with
+          | Local -> Local_available, true
+          | No_local ->
+            (if t.account = Local_available then Discovering else t.account), false
+          | User -> User_available, t.local_available
+          | No_user -> User_required, false
+        in
+        project { t with account; local_available; account_failed = false }
+      | Account_error key when key = t.account_serial ->
+        project { t with account_failed = true }
+      | Retry ->
+        { t with
+          screen = Waiting
+        ; serial = Int64.succ t.serial
+        ; account_serial = Int64.succ t.account_serial
+        ; indicator = false
+        ; account = Discovering
+        ; local_available = false
+        ; account_failed = false
+        ; observed = None
+        }
+      | Signed_out ->
+        { t with
+          screen = required Signed_out
+        ; indicator = false
+        ; account = User_required
+        ; account_serial = Int64.succ t.account_serial
+        ; local_available = false
+        ; account_failed = false
+        }
+      | Foreground active when active <> t.foreground ->
+        { t with
+          foreground = active
+        ; indicator = false
+        ; serial =
+            (if active && t.screen = Waiting then Int64.succ t.serial else t.serial)
+        }
+      | Elapsed (key, elapsed)
+        when key = t.serial
+             && t.foreground
+             && t.screen = Waiting
+             && elapsed >= 0.1
+             && not t.indicator -> { t with indicator = true }
+      | Account _ | Account_error _ | Foreground _ | Elapsed _ -> t
     in
-    if next=t then t else next
+    if next = t then t else next
+  ;;
 end

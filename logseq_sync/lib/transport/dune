@@ -1,0 +1,5 @@
+(library
+ (name logseq_sync_transport)
+ (public_name logseq_sync.transport)
+ (modules core wire http_client snapshot)
+ (libraries unix yojson eio execute sync_dsl logseq_sync.native_transport logseq_sync.protocol logseq_overlay_db logseq_db_types rrbvec uri x509))

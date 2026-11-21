@@ -106,10 +106,18 @@ let test_package_metadata root =
 ;;
 
 let test_durable_intent_owner root =
-  require_text root "logseq_overlay_db/spec/database.mli"
-    ["type local_intent";"type intent_resolution";"val persist_local_intent";
-     "val commit_local_intent";"val inspect_local_intent";"val pending_local_intents";
-     "val acknowledge_local_intent";"val acknowledge_rejected_local_intent"]
+  require_text
+    root
+    "logseq_overlay_db/spec/database.mli"
+    [ "type local_intent"
+    ; "type intent_resolution"
+    ; "val persist_local_intent"
+    ; "val commit_local_intent"
+    ; "val inspect_local_intent"
+    ; "val pending_local_intents"
+    ; "val acknowledge_local_intent"
+    ; "val acknowledge_rejected_local_intent"
+    ]
 ;;
 
 let test_canonical_modules root =
@@ -368,6 +376,37 @@ let test_persistence_codec_ownership root =
     (files_with_suffixes root "logseq_overlay_db/spec" [ ".mli"; "dune" ])
 ;;
 
+let test_checkpoint_checksum_reads_only_memory root =
+  let source = read_file (path root "logseq_overlay_db/lib/database.ml") in
+  let lines = String.split_on_char '\n' source in
+  let rec find = function
+    | [] -> fail "checkpoint checksum implementation is missing"
+    | line :: rest ->
+      if String.starts_with ~prefix:"let check_checkpoint_checksum " line
+      then check rest
+      else find rest
+  and check = function
+    | [] -> fail "checkpoint checksum implementation is unterminated"
+    | ";;" :: _ -> ()
+    | line :: rest ->
+      List.iter
+        (fun forbidden ->
+           if contains line forbidden
+           then fail "checkpoint checksum must not read the graph: %s" forbidden)
+        [ "Datascript."
+        ; "Storage."
+        ; "Session."
+        ; "authoritative_database"
+        ; "authoritative_connection"
+        ; "Authoritative_checksum.initialize"
+        ; "Authoritative_checksum.recompute"
+        ; "Authoritative_checksum.advance"
+        ];
+      check rest
+  in
+  find lines
+;;
+
 let test_install_manifest root install_manifest =
   let filename =
     if (not (Filename.is_relative install_manifest)) || Sys.file_exists install_manifest
@@ -400,6 +439,7 @@ let () =
   then failwith "usage: logseq_overlay_db_boundary_test REPOSITORY_ROOT INSTALL_MANIFEST";
   let root = Sys.argv.(1) in
   test_package_metadata root;
+  test_checkpoint_checksum_reads_only_memory root;
   test_durable_intent_owner root;
   test_canonical_modules root;
   test_public_boundary root;

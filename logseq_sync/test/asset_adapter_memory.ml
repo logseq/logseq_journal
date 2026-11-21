@@ -1,250 +1,162 @@
-(* Exercise the public runner with its production Apple adapter and synthetic keys. *)
-module R = Logseq_sync_effect_runner.Effect_runner
-module C = Logseq_sync_pure_reducer.Core
-module A = Logseq_db_types.Asset_descriptor
-module Codec = Logseq_sync_effect_runner.Asset_codec
+module D = Sync_dsl.Core
+module Codec = Logseq_sync_native_crypto.Asset_codec
+module Native = Logseq_sync_native_crypto.Platform_crypto
+module Owner = Logseq_sync_assets.Core
+module Intent = Logseq_db_types.Asset_upload_intent
 
 let get = Result.get_ok
-let uuid = Logseq_db_types.Graph_types.Uuid.of_string
-let graph_id = get (uuid "11111111-1111-4111-8111-111111111111")
+let ok = get
 
-let key_request () =
-  let limits =
-    get
-      (C.limits
-         ~maximum_response_bytes:Logseq_db_types.Limits.maximum_response_bytes
-         ~maximum_artifact_bytes:1073741824
-         ~submission_batch_size:32)
-  in
-  let config =
-    get
-      (C.config ~managed_sync_origin:(Uri.of_string "https://asset-test.invalid") ~limits)
-  in
-  let initial = get (C.initial config) in
-  let initial = (C.step initial (C.Sign_in_requested {account_generation=0; presentation_generation=0})).next in
-  let authenticated =
-    C.step initial (C.Account_authenticated { user_id = Some "fixture" })
-  in
-  let graph : C.graph =
-    { graph_id
-    ; name = "Fixture"
-    ; encrypted = true
-    ; schema = { major = 1; minor = 0; exact = true }
-    }
-  in
-  let catalog =
-    List.find_map
-      (function
-        | C.Run (C.Request (ticket, C.Fetch_catalog _)) ->
-          Some
-            (C.step
-               authenticated.next
-               (C.Runner_completed (C.Completion (ticket, Ok [ graph ]))))
-        | _ -> None)
-      authenticated.effects
-    |> Option.get
-  in
-  let selected = C.step catalog.next (C.Graph_selected graph_id) in
-  let scope =
-    List.find_map
-      (function
-        | C.Delegate (C.Inspect_mirror request) -> Some request.scope
-        | _ -> None)
-      selected.effects
-    |> Option.get
-  in
-  let missing = C.step selected.next (C.Mirror_inspected (C.Mirror_absent scope)) in
-  let instruction =
-    List.find_map
-      (function
-        | C.Run (C.Request (_, C.Load_and_unlock_graph_key _) as runnable) ->
-          Some runnable
-        | _ -> None)
-      missing.effects
-    |> Option.get
-  in
-  missing.next, instruction
+let identity =
+  get
+    (D.identity
+       ~origin:"https://asset-test.invalid"
+       ~account:"fixture"
+       ~graph:"11111111-1111-4111-8111-111111111111"
+       ~account_generation:0L
+       ~graph_generation:0L)
+;;
+
+let limits =
+  ok
+    (D.limits
+       ~maximum_items:8
+       ~maximum_bytes:1024
+       ~maximum_pending:8
+       ~maximum_resources:8
+       ~steps_per_turn:8
+       ~maximum_tasks:8
+       ~maximum_messages:8
+       ~maximum_message_bytes:1024
+       ~maximum_demands:8
+       ~maximum_active_assets:2
+       ~foreground_reserve:1
+       ~foreground_demand_reserve:1
+       ~foreground_descriptor_reserve_bytes:128
+       ~asset_cache_budget_bytes:16777216L
+       ~asset_maximum_file_bytes:(8 * 1024 * 1024)
+       ~asset_pending_budget_bytes:16777216L
+       ~snapshot_maximum_artifact_bytes:4096L
+       ~snapshot_staging_budget_bytes:4096L
+       ~snapshot_scratch_budget_bytes:4096L)
 ;;
 
 let () =
-  let support = Sys.argv.(1) in
-  Eio_main.run (fun env ->
-    Eio.Switch.run (fun sw ->
-      let key = String.init 32 Char.chr in
-      let secrets =
-        get
-          (R.secrets
-             ~unlock_private_key:
-               (fun
-                 ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
-               Error "unused")
-             ~unlock_graph_key:
-               (fun
-                 ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ -> Ok key)
-             ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
-               Ok "synthetic")
-             ~verify_and_save_wrapped_graph_key:
-               (fun
-                 ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
-               Error "unused")
-             ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ()))
-      in
-      let auth_calls = ref 0 in
-      let dependencies =
-        get
-          (R.dependencies
-             ~runtime:(get (R.runtime ~fork:(fun ~sw:_ f -> f ()) ~sleep:(fun _ -> ())))
-             ~transport:
-               (get
-                  (R.transport
-                     ~tls_authenticator:(get (R.system_tls_authenticator ()))
-                     ~network:(Eio.Stdenv.net env)
-                     ~clock:(Eio.Stdenv.clock env)
-                     ~websocket_liveness:R.Disabled))
-             ~local_store:(get (R.local_store ~application_support_directory:support ()))
-             ~artifact_store:
-               (get
-                  (R.artifact_store
-                     ~staging_directory:(Filename.concat support "staging")))
-             ~secrets
-             ~crypto:(get (R.apple_crypto ()))
-             ~id_token_provider:
-               (R.id_token_provider
-                  ~acquire:(fun _ ->
-                    incr auth_calls;
-                    Error "fixture stops before network")
-                  ~invalidate:(fun _ ~token:_ -> ())))
-      in
-      let posted = ref [] in
-      let runner =
-        get (R.create ~sw dependencies ~post:(fun e -> posted := e :: !posted))
-      in
-      let before_key, instruction = key_request () in
-      R.submit runner instruction;
-      let unlocked =
-        match !posted with
-        | [ event ] -> (C.step before_key event).next
-        | _ -> failwith "expected one key completion"
-      in
-      let context = C.asset_context unlocked |> Option.get in
-      let handle = context.key |> Option.get in
-      let owner = ref unlocked in
-      let protected operation action =
-        posted := [];
-        let requested =
-          C.step
-            !owner
-            (C.Protected_requested
-               { protected_operation = operation
-               ; protected_scope = context.scope
-               ; protected_action = action
-               })
-        in
-        List.iter
-          (function
-            | C.Run runnable -> R.submit runner runnable
-            | _ -> ())
-          requested.effects;
-        let completed = C.step requested.next (List.hd !posted) in
-        owner := completed.next;
-        List.find_map
-          (function
-            | C.Publish (C.Protected_finished output) -> Some output.protected_result
-            | _ -> None)
-          completed.effects
-        |> Option.get
-        |> get
-      in
-      List.iter
-        (fun size ->
-           let value = String.init size (fun i -> Char.chr (i mod 128)) in
-           let plaintext =
-             Transit_native.Transit.Json.to_string (Transit_core.Json.String value)
-           in
-           let iv, ciphertext =
-             match
-               protected
-                 ("encrypt-" ^ string_of_int size)
-                 (C.Encrypt_values (handle, [ plaintext ]))
-             with
-             | C.Encrypted_values [ pair ] -> pair
-             | _ -> failwith "missing encrypted value"
-           in
-           let wire =
-             Transit_native.Transit.Json.to_string
-               (Transit_core.Json.Array [ Binary iv; Binary ciphertext ])
-           in
-           if
-             protected ("decrypt-" ^ string_of_int size) (C.Decrypt_value (handle, wire))
-             <> C.Decrypted_value value
-           then failwith "production adapter roundtrip changed bytes")
-        [ 0; 1; 256; 4097; 131057 ];
-      let size = 8 * 1024 * 1024 in
-      let plaintext = String.init size (fun i -> Char.chr (i mod 256)) in
-      let source_file = Filename.concat support "source.bin" in
-      Out_channel.with_open_bin source_file (fun out -> output_string out plaintext);
-      let version =
-        get (A.version ~checksum:(Codec.checksum plaintext) ~file_type:"bin")
-      in
-      Gc.full_major ();
-      let staged =
-        C.step
-          !owner
-          (C.Asset_requested
-             { scope = context.scope
-             ; operation = "stage"
-             ; action =
-                 C.Stage_asset_file
-                   { operation = graph_id; file_type = "bin"; source_file }
-             })
-      in
-      posted := [];
-      List.iter
-        (function
-          | C.Run runnable -> R.submit runner runnable
-          | _ -> ())
-        staged.effects;
-      let staged_done = C.step staged.next (List.hd !posted) in
-      let file =
-        List.find_map
-          (function
-            | C.Publish (C.Asset_finished { result = Ok (C.Asset_staged { file; _ }); _ })
-              -> Some file
-            | _ -> None)
-          staged_done.effects
-        |> Option.get
-      in
-      let before = Gc.allocated_bytes () in
-      let upload =
-        C.step
-          staged_done.next
-          (C.Asset_requested
-             { scope = context.scope
-             ; operation = "upload"
-             ; action =
-                 C.Put_asset_file
-                   { asset = graph_id; version; file; maximum_plaintext_bytes = size }
-             })
-      in
-      posted := [];
-      List.iter
-        (function
-          | C.Run runnable -> R.submit runner runnable
-          | _ -> ())
-        upload.effects;
-      let finished = C.step upload.next (List.hd !posted) in
-      let outcome =
-        List.find_map
-          (function
-            | C.Publish (C.Asset_finished output) -> Some output.result
-            | _ -> None)
-          finished.effects
-        |> Option.get
-      in
-      let allocated = Gc.allocated_bytes () -. before in
-      if Result.map_error C.asset_failure_kind outcome <> Error C.Asset_authentication || !auth_calls <> 1
-      then failwith "production adapter did not encode the maximum-size asset";
-      Printf.printf "Production upload OCaml allocation bytes: %.0f\n%!" allocated;
-      if allocated > 128. *. 1024. *. 1024.
-      then failwith "asset adapter allocation exceeds 128 MiB"))
+  Eio_main.run (fun _ ->
+    let support = Sys.argv.(1) in
+    let key = String.init 32 Char.chr in
+    let crypto = Native.crypto in
+    List.iter
+      (fun size ->
+         let bytes = String.init size (fun index -> Char.chr (index mod 256)) in
+         let iv, ciphertext = get (crypto.encrypt_aes_gcm ~key ~plaintext:bytes) in
+         if get (crypto.decrypt_aes_gcm ~key ~iv ~ciphertext) <> bytes
+         then failwith "Production adapter roundtrip changed bytes")
+      [ 0; 1; 256; 4097; 131057 ];
+    let crypto_owner =
+      Logseq_sync_crypto.Core.create
+        ~identity
+        ~limits
+        ~encrypted:true
+        ~backend:{ crypto; unlock = (fun ~identity:_ ~wrapped_graph_key:_ -> Ok key) }
+    in
+    ignore
+      (get
+         (Logseq_sync_crypto.Core.run
+            crypto_owner
+            ~check_current:(fun () -> Ok ())
+            ~identity
+            (D.Unlock (get (D.unlock_input ~wrapped_graph_key:"synthetic")))));
+    let auth_calls = ref 0 in
+    let network : Owner.network =
+      { get =
+          (fun ~identity:_ ~asset:_ ~version:_ ~maximum_wire_bytes:_ ->
+            Error (D.Invalid_input "Unexpected GET"))
+      ; put =
+          (fun ~identity:_ ~asset:_ ~version:_ ~wire:_ ->
+            incr auth_calls;
+            Error (D.Authentication_failure "synthetic authorization failure"))
+      }
+    in
+    let owner =
+      get
+        (Owner.create
+           ~root:support
+           ~identity
+           ~limits
+           ~crypto:crypto_owner
+           ~key:(Owner.native_key ~identity ~crypto:crypto_owner)
+           ~network)
+    in
+    Fun.protect
+      ~finally:(fun () ->
+        ignore (get (Owner.close owner));
+        Logseq_sync_crypto.Core.retire crypto_owner)
+      (fun () ->
+         let size = 8 * 1024 * 1024 in
+         let bytes = String.init size (fun index -> Char.chr (index mod 256)) in
+         let source_file = Filename.concat support "source.bin" in
+         Out_channel.with_open_bin source_file (fun output -> output_string output bytes);
+         let uuid =
+           get
+             (Logseq_db_types.Graph_types.Uuid.of_string
+                "11111111-1111-4111-8111-111111111111")
+         in
+         let input : Logseq_db_types.Asset_import.t =
+           { operation = uuid
+           ; asset = uuid
+           ; replace_reference = None
+           ; target = uuid
+           ; local_mutation = uuid
+           ; metadata_mutation = uuid
+           ; source_file
+           ; title = "fixture"
+           ; file_type = "bin"
+           }
+         in
+         let staged = get (Owner.stage owner ~check_current:(fun () -> Ok ()) input) in
+         let version =
+           get
+             (Logseq_db_types.Asset_descriptor.version
+                ~checksum:(Codec.checksum bytes)
+                ~file_type:"bin")
+         in
+         let intent =
+           get
+             (Intent.prepare
+                ~operation_id:uuid
+                ~origin:"https://asset-test.invalid"
+                ~account:"fixture"
+                ~graph:uuid
+                ~asset:uuid
+                ~version
+                ~title:"fixture"
+                ~size:staged.size
+                ~staged_file:staged.file
+                ~replace_reference:None
+                ~target:uuid
+                ~local_mutation:uuid
+                ~metadata_mutation:
+                  (get
+                     (Logseq_db_types.Graph_types.Uuid.of_string
+                        "11111111-1111-4111-8111-111111111112")))
+         in
+         Gc.full_major ();
+         let before = Gc.allocated_bytes () in
+         let network : Execute.Core.worker_network =
+           { with_admission = (fun run -> run ()) }
+         in
+         let result =
+           Owner.put_staged owner ~check_current:(fun () -> Ok ()) ~network intent
+         in
+         let allocated = Gc.allocated_bytes () -. before in
+         if
+           result <> Error (D.Authentication_failure "synthetic authorization failure")
+           || !auth_calls <> 1
+         then failwith "Production adapter did not encode the maximum-size asset";
+         Printf.printf "Production upload OCaml allocation bytes: %.0f\n%!" allocated;
+         if allocated > 128. *. 1024. *. 1024.
+         then failwith "Asset adapter allocation exceeds 128 MiB";
+         get
+           (Logseq_sync_assets.Cache.release_staged (Owner.cache owner) ~file:staged.file)))
 ;;

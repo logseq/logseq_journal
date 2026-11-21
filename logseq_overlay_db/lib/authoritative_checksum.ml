@@ -49,12 +49,10 @@ let tuple_digest (entity_uuid, attr, value) =
   hash_code state field_separator |> fun state -> digest_string state value
 ;;
 
-let datoms db ~e ~a = Datascript.datoms db Datascript.Eavt ~e ~a () |> List.of_seq
-
 let first_value db entity attr =
-  match datoms db ~e:entity ~a:attr with
-  | datom :: _ -> Some datom.Datascript.v
-  | [] -> None
+  Datascript.datoms db Datascript.Eavt ~e:entity ~a:attr ()
+  |> Seq.uncons
+  |> Option.map (fun (datom, _) -> datom.Datascript.v)
 ;;
 
 let uuid db entity =
@@ -69,39 +67,12 @@ let boolean db entity attr =
   | _ -> None
 ;;
 
-let has_value db entity attr = not (List.is_empty (datoms db ~e:entity ~a:attr))
-
-let ident db entity =
-  match first_value db entity "db/ident" with
-  | Some (Datascript.Keyword value) -> Some value
-  | _ -> None
-;;
-
 let page_tag_idents =
   [ "logseq.class/Journal"
   ; "logseq.class/Tag"
   ; "logseq.class/Property"
   ; "logseq.class/Page"
   ]
-;;
-
-let page_entity db entity =
-  datoms db ~e:entity ~a:"block/tags"
-  |> List.exists (fun datom ->
-    match datom.Datascript.v with
-    | Datascript.Ref target ->
-      (match ident db target with
-       | Some value -> List.mem value page_tag_idents
-       | None -> false)
-    | _ -> false)
-;;
-
-let eligible db entity =
-  Option.is_some (uuid db entity)
-  && boolean db entity "logseq.property/built-in?" <> Some true
-  && (has_value db entity "block/name"
-      || has_value db entity "block/page"
-      || page_entity db entity)
 ;;
 
 let normalized_value db attr value =
@@ -113,69 +84,86 @@ let normalized_value db attr value =
   | _ -> ""
 ;;
 
-let tuples db ~e2ee entity =
-  match uuid db entity with
-  | None -> Tuple_set.empty
-  | Some entity_uuid ->
-    let relevant =
-      if e2ee
-      then [ "block/uuid"; "block/parent"; "block/page"; "block/order" ]
-      else
-        [ "block/uuid"
-        ; "block/parent"
-        ; "block/page"
-        ; "block/order"
-        ; "block/title"
-        ; "block/name"
-        ]
-    in
+let tuples ?(visit = fun () -> ()) db ~e2ee entity =
+  let facts =
+    Datascript.datoms db Datascript.Eavt ~e:entity ()
+    |> Seq.map (fun (datom : Datascript.datom) ->
+      visit ();
+      datom.a, datom.v)
+    |> List.of_seq
+  in
+  let first attr = List.assoc_opt attr facts in
+  let page_tag = function
+    | "block/tags", Datascript.Ref target ->
+      (match first_value db target "db/ident" with
+       | Some (Datascript.Keyword value) -> List.mem value page_tag_idents
+       | _ -> false)
+    | _ -> false
+  in
+  match first "block/uuid" with
+  | Some (Datascript.Uuid entity_uuid)
+    when first "logseq.property/built-in?" <> Some (Datascript.Bool true)
+         && (Option.is_some (first "block/name")
+             || Option.is_some (first "block/page")
+             || List.exists page_tag facts) ->
     List.fold_left
-      (fun tuples attr ->
-         datoms db ~e:entity ~a:attr
-         |> List.fold_left
-              (fun tuples datom ->
-                 Tuple_set.add
-                   (entity_uuid, attr, normalized_value db attr datom.Datascript.v)
-                   tuples)
-              tuples)
+      (fun tuples (attr, value) ->
+         if
+           List.mem
+             attr
+             (if e2ee
+              then [ "block/uuid"; "block/parent"; "block/page"; "block/order" ]
+              else
+                [ "block/uuid"
+                ; "block/parent"
+                ; "block/page"
+                ; "block/order"
+                ; "block/title"
+                ; "block/name"
+                ])
+         then Tuple_set.add (entity_uuid, attr, normalized_value db attr value) tuples
+         else tuples)
       Tuple_set.empty
-      relevant
+      facts
+  | _ -> Tuple_set.empty
 ;;
 
 let entities_with_uuid db =
-  let _, entities =
-    Datascript.datoms db Datascript.Aevt ~a:"block/uuid" ()
-    |> Seq.fold_left
-         (fun (previous, entities) (datom : Datascript.datom) ->
-            match previous with
-            | Some entity when Int.equal entity datom.e -> previous, entities
-            | _ -> Some datom.e, datom.e :: entities)
-         (None, [])
-  in
-  entities
+  Datascript.datoms db Datascript.Aevt ~a:"block/uuid" ()
+  |> Seq.map (fun (datom : Datascript.datom) -> datom.e)
+  |> Seq.group Int.equal
+  |> Seq.filter_map (fun group -> Seq.uncons group |> Option.map fst)
 ;;
 
 let hex32 value = Printf.sprintf "%08lx" value
 
-let recompute ~e2ee db =
+type t =
+  { e2ee : bool
+  ; fnv : int32
+  ; djb : int32
+  }
+
+let to_string state = hex32 state.fnv ^ hex32 state.djb
+
+let initialize ?(check_current = fun () -> ()) ~e2ee db =
   let state =
     entities_with_uuid db
-    |> List.fold_left
+    |> Seq.fold_left
          (fun state entity ->
-            if not (eligible db entity)
-            then state
-            else
-              Tuple_set.fold
-                (fun tuple (sum_fnv, sum_djb) ->
-                   let fnv, djb = tuple_digest tuple in
-                   Int32.add sum_fnv fnv, Int32.add sum_djb djb)
-                (tuples db ~e2ee entity)
-                state)
+            check_current ();
+            Tuple_set.fold
+              (fun tuple (sum_fnv, sum_djb) ->
+                 let fnv, djb = tuple_digest tuple in
+                 Int32.add sum_fnv fnv, Int32.add sum_djb djb)
+              (tuples ~visit:check_current db ~e2ee entity)
+              state)
          (0l, 0l)
   in
   let fnv, djb = state in
-  hex32 fnv ^ hex32 djb
+  { e2ee; fnv; djb }
 ;;
+
+let recompute ?check_current ~e2ee db = initialize ?check_current ~e2ee db |> to_string
 
 let graph_e2ee db =
   match
@@ -189,4 +177,79 @@ let graph_e2ee db =
   with
   | Some (datom, _) -> boolean db datom.Datascript.e "kv/value" = Some true
   | None -> false
+;;
+
+let advance ~maximum ~before ~after ~changes state =
+  let exception Limit in
+  let remaining = ref maximum in
+  let visit () =
+    if !remaining <= 0 then raise Limit;
+    decr remaining
+  in
+  let entities = Hashtbl.create 32 in
+  let add entity = Hashtbl.replace entities entity () in
+  let dependents db attr entity =
+    Datascript.datoms db Datascript.Avet ~a:attr ~v:(Datascript.Ref entity) ()
+    |> Seq.iter (fun (datom : Datascript.datom) ->
+      visit ();
+      add datom.e)
+  in
+  try
+    if graph_e2ee before <> state.e2ee || graph_e2ee after <> state.e2ee
+    then Error "checksum mode change requires snapshot"
+    else (
+      List.iter
+        (List.iter (fun (datom : Datascript.datom) ->
+           visit ();
+           if
+             List.mem
+               datom.a
+               [ "block/uuid"
+               ; "block/parent"
+               ; "block/page"
+               ; "block/order"
+               ; "block/title"
+               ; "block/name"
+               ; "block/tags"
+               ; "logseq.property/built-in?"
+               ]
+           then add datom.e;
+           let attributes =
+             match datom.a with
+             | "block/uuid" -> [ "block/parent"; "block/page" ]
+             | "db/ident" -> [ "block/tags" ]
+             | _ -> []
+           in
+           List.iter
+             (fun attr ->
+                dependents before attr datom.e;
+                dependents after attr datom.e)
+             attributes))
+        changes;
+      let contribution db entity = tuples ~visit db ~e2ee:state.e2ee entity in
+      let fnv, djb =
+        Hashtbl.fold
+          (fun entity () (fnv, djb) ->
+             let subtract = contribution before entity
+             and add = contribution after entity in
+             let fnv, djb =
+               Tuple_set.fold
+                 (fun tuple (fnv, djb) ->
+                    let a, b = tuple_digest tuple in
+                    Int32.sub fnv a, Int32.sub djb b)
+                 subtract
+                 (fnv, djb)
+             in
+             Tuple_set.fold
+               (fun tuple (fnv, djb) ->
+                  let a, b = tuple_digest tuple in
+                  Int32.add fnv a, Int32.add djb b)
+               add
+               (fnv, djb))
+          entities
+          (state.fnv, state.djb)
+      in
+      Ok { state with fnv; djb })
+  with
+  | Limit -> Error "checksum delta exceeds change budget"
 ;;

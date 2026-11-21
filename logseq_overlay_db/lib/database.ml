@@ -1,6 +1,10 @@
 (* Warning output is secondary to committed operations and resource cleanup. *)
 let report_warning message =
-  try output_string stderr message; flush stderr with _ -> ()
+  try
+    output_string stderr message;
+    flush stderr
+  with
+  | _ -> ()
 ;;
 
 module Graph = Logseq_db_types.Graph_types
@@ -8,6 +12,40 @@ module Storage = Logseq_db_storage.Logseq_sqlite_storage
 open Types
 open Authoritative_store
 open Overlay_effect
+
+let inspect_snapshot_storage ~check_current ~scratch_bytes ~encrypted ~path =
+  match Storage.open_database path with
+  | Error _ -> Error "Snapshot storage is invalid"
+  | Ok connection ->
+    let callbacks = Storage.connection_callbacks connection in
+    let closed = ref (Ok ()) in
+    let result =
+      Fun.protect
+        ~finally:(fun () -> closed := Storage.close callbacks)
+        (fun () ->
+           check_current ();
+           match
+             Storage.startup_metadata connection, Storage.restore_database connection
+           with
+           | Ok _, Ok database ->
+             if Authoritative_checksum.graph_e2ee database <> encrypted
+             then Error "Snapshot encryption metadata mismatch"
+             else if Int64.of_int (Unix.stat path).st_size > scratch_bytes
+             then Error "Snapshot scratch bound"
+             else
+               Types.Checksum.of_string
+                 ("checksum:v1:"
+                  ^ Authoritative_checksum.recompute
+                      ~check_current
+                      ~e2ee:encrypted
+                      database)
+           | _ -> Error "Snapshot storage is invalid")
+    in
+    (match !closed, result with
+     | Error _, _ -> Error "Snapshot verification storage close failed"
+     | Ok (), result -> result)
+;;
+
 module Uuid_map = Map.Make (String)
 
 type effect_footprint = footprint
@@ -29,6 +67,7 @@ type mirror_inspection =
   }
 
 type retirement_id = Graph.Retirement_id.t
+
 let retirement_id_of_string = Graph.Retirement_id.of_string
 let retirement_id_to_string = Graph.Retirement_id.to_string
 
@@ -68,9 +107,16 @@ type write_precondition = Mutation_pure_intent.precondition =
 
 type local_intent = Mutation_pure_intent.t
 type intent_commit = Mutation_pure_intent.commit
-type intent_resolution = Intent_pending | Intent_committed of intent_commit
+
+type intent_resolution =
+  | Intent_pending
+  | Intent_committed of intent_commit
   | Intent_rejected of Types.local_commit_error
-type local_intent_page = { items : local_intent list; next : int64 option }
+
+type local_intent_page =
+  { items : local_intent list
+  ; next : int64 option
+  }
 
 type outbox_record = Persistence_outbox_v16.t =
   { mutation_id : Graph.Uuid.t
@@ -135,7 +181,11 @@ type task_catalog_cache =
   ; catalog_items : Graph.task_status_definition array
   }
 
-type timeline_scope = Journal_index | Page_roots of Graph.page_uuid | Parent_children of Graph.block_uuid
+type timeline_scope =
+  | Journal_index
+  | Page_roots of Graph.page_uuid
+  | Parent_children of Graph.block_uuid
+
 type timeline_scope_version = string
 type journal_position = string
 type member_position = string
@@ -144,17 +194,24 @@ let equal_timeline_scope_version = String.equal
 let timeline_scope_version_to_string value = value
 let journal_position_to_string value = value
 let member_position_to_string value = value
+
 let journal_position_of_string value =
-  if String.length value <= 512 then Ok value
+  if String.length value <= 512
+  then Ok value
   else Error (Types.Invalid_read_request "oversized timeline journal position")
+;;
+
 let member_position_of_string value =
-  if String.length value <= 512 then Ok value
+  if String.length value <= 512
+  then Ok value
   else Error (Types.Invalid_read_request "oversized timeline member position")
+;;
 
 let timeline_scope_key = function
   | Journal_index -> "journal"
   | Page_roots uuid -> "roots:" ^ Graph.Uuid.to_string uuid
   | Parent_children uuid -> "children:" ^ Graph.Uuid.to_string uuid
+;;
 
 type timeline_history =
   { versions : int Uuid_map.t
@@ -164,6 +221,7 @@ type timeline_history =
 
 let empty_timeline_history () =
   Array.make 64 { versions = Uuid_map.empty; count = 0; retirement = 0 }
+;;
 
 let timeline_bucket key = Hashtbl.hash key mod 64
 
@@ -190,6 +248,7 @@ type t =
   ; mutable timeline_serial : int
   ; mutable timeline_proof_available : bool
   ; mutable timeline_authoritative : Datascript.db
+  ; mutable authoritative_checksum : Authoritative_checksum.t
   ; authoritative_connection : Datascript.conn
   ; authoritative_listener : string
   ; authoritative_reports : Datascript.tx_report list ref
@@ -199,11 +258,11 @@ type t =
   ; mutable queryable_block_effects : outbox_record Rrbvec.t Uuid_map.t
   ; mutable queryable_page_effects : outbox_record Rrbvec.t Uuid_map.t
   ; mutable queryable_children_effects : outbox_record list Uuid_map.t
+  ; sync_changed : Eio.Condition.t
   ; mutable sync_revision : int
   ; mutable durable_sync_revision : int
   ; mutable durable_outbox : Logseq_db_storage.Sync_outbox_store.row Uuid_map.t
   ; mutable checkpoint : Types.server_cursor
-  ; mutable checkpoint_metadata : Logseq_db_types.Sync_checkpoint.t
   ; mutable subscriptions : subscription list
   ; mutable snapshots : snapshot list
   }
@@ -268,6 +327,8 @@ type prepared_outbox_transition =
 
 type authoritative_preparation =
   { authoritative_owner : t
+  ; authoritative_base : Datascript.db
+  ; authoritative_digest : Authoritative_checksum.t
   ; authoritative_revision : int
   ; authoritative_batch : Types.authoritative_batch
   ; authoritative_wires : string list
@@ -306,6 +367,7 @@ and authoritative_candidate =
         list
   ; stale_no_change : (Graph.Uuid.t * Types.submission_batch_id) list
   ; stale_blocked : (Graph.Uuid.t * Types.submission_batch_id) list
+  ; authoritative_digest_after : Authoritative_checksum.t
   ; authoritative_db_after : Datascript.db
   }
 
@@ -343,7 +405,8 @@ let mirror_generation value =
 let mirror_generation_for_path path =
   let stat = Unix.stat path in
   mirror_generation
-    (Digestif.SHA256.digest_string (Printf.sprintf "%s:%d:%d" path stat.st_dev stat.st_ino)
+    (Digestif.SHA256.digest_string
+       (Printf.sprintf "%s:%d:%d" path stat.st_dev stat.st_ino)
      |> Digestif.SHA256.to_hex)
 ;;
 
@@ -456,6 +519,30 @@ let checksum_value checksum =
   | _ -> value
 ;;
 
+let report_checksum_mismatch ~phase ~through ~expected ~actual =
+  let safe value =
+    if
+      String.length value > 0
+      && String.length value <= 64
+      && String.for_all
+           (function
+             | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true
+             | _ -> false)
+           value
+    then value
+    else "redacted"
+  in
+  if not (String.equal expected actual)
+  then
+    report_warning
+      (Printf.sprintf
+         "journal-sync: checksum mismatch [phase=%s expected=%s actual=%s cursor=%Ld]\n"
+         phase
+         (safe expected)
+         (safe actual)
+         (Types.Server_cursor.to_int64 through))
+;;
+
 (* Submission ordinals are small local offsets, not server cursors. Keep the
    checked interval arithmetic here; authoritative progress never narrows to int. *)
 let advance_cursor cursor count =
@@ -515,37 +602,34 @@ let prepare_snapshot_activation
           | Error message -> Error (Types.Snapshot_parse_error message)
           | Ok staging ->
             let database = Mirror.database staging in
-            let checksum_matches =
-              match expected_checksum with
-              | None -> true
-              | Some expected ->
-                let digest =
-                  Authoritative_checksum.recompute
-                    ~e2ee:(Authoritative_checksum.graph_e2ee database)
-                    database
-                in
-                String.equal (checksum_value expected) digest
-            in
-            if not checksum_matches
-            then (
-              Mirror.cancel staging;
-              Error (Types.Snapshot_parse_error "snapshot checksum mismatch"))
-            else
-              Ok
-                { snapshot_dependencies = dependencies
-                ; snapshot_inspection = inspection
-                ; snapshot_cursor = applied_server_cursor
-                ; snapshot_staging = staging
-                ; snapshot_remaining_protected_datoms = protected_snapshot_datoms database
-                ; snapshot_current_protected_datoms = []
-                ; snapshot_next_crypto_index = 0
-                ; snapshot_crypto_revision = 0
-                ; snapshot_awaiting_crypto = false
-                ; snapshot_crypto_complete = false
-                ; snapshot_persisted = None
-                ; snapshot_committed = false
-                ; snapshot_canceled = false
-                })))
+            Option.iter
+              (fun expected ->
+                 let digest =
+                   Authoritative_checksum.recompute
+                     ~e2ee:(Authoritative_checksum.graph_e2ee database)
+                     database
+                 in
+                 report_checksum_mismatch
+                   ~phase:"snapshot-activation"
+                   ~through:applied_server_cursor
+                   ~expected:(checksum_value expected)
+                   ~actual:digest)
+              expected_checksum;
+            Ok
+              { snapshot_dependencies = dependencies
+              ; snapshot_inspection = inspection
+              ; snapshot_cursor = applied_server_cursor
+              ; snapshot_staging = staging
+              ; snapshot_remaining_protected_datoms = protected_snapshot_datoms database
+              ; snapshot_current_protected_datoms = []
+              ; snapshot_next_crypto_index = 0
+              ; snapshot_crypto_revision = 0
+              ; snapshot_awaiting_crypto = false
+              ; snapshot_crypto_complete = false
+              ; snapshot_persisted = None
+              ; snapshot_committed = false
+              ; snapshot_canceled = false
+              })))
 ;;
 
 let snapshot_crypto_id preparation index =
@@ -557,34 +641,49 @@ let snapshot_crypto_id preparation index =
        index)
 ;;
 
-let next_snapshot_unprotection_batch preparation =
-  if preparation.snapshot_canceled
+let next_snapshot_unprotection_batch ?maximum_items ?maximum_bytes preparation =
+  let maximum_items =
+    min
+      preparation.snapshot_dependencies.limits.change_max_items
+      (Option.value maximum_items ~default:max_int)
+  in
+  let maximum_bytes =
+    min
+      preparation.snapshot_dependencies.limits.wire_batch_max_bytes
+      (Option.value maximum_bytes ~default:max_int)
+  in
+  if maximum_items <= 0 || maximum_bytes <= 0
+  then Error Types.Snapshot_limit_exceeded
+  else if preparation.snapshot_canceled
   then Error Types.Snapshot_preparation_canceled
   else if preparation.snapshot_committed || Option.is_some preparation.snapshot_persisted
   then Error (Types.Snapshot_state_error Types.Snapshot_next_after_persist_or_commit)
   else if preparation.snapshot_awaiting_crypto
   then Error (Types.Snapshot_state_error Types.Snapshot_crypto_batch_pending)
   else (
-    let maximum = preparation.snapshot_dependencies.limits.wire_batch_max_bytes in
-    let rec take bytes reversed sequence =
-      match sequence () with
-      | Seq.Nil -> Ok (List.rev reversed, Seq.empty)
-      | Seq.Cons (datom, rest) ->
-        let value =
-          match datom.Datascript.v with
-          | Datascript.String value -> value
-          | _ -> assert false
-        in
-        let next = bytes + String.length value in
-        if next > maximum
-        then
-          if reversed = []
-          then Error Types.Snapshot_limit_exceeded
-          else Ok (List.rev reversed, fun () -> Seq.Cons (datom, rest))
-        else take next (datom :: reversed) rest
+    let maximum = maximum_bytes in
+    let rec take count bytes reversed sequence =
+      if count = maximum_items
+      then Ok (List.rev reversed, sequence)
+      else (
+        match sequence () with
+        | Seq.Nil -> Ok (List.rev reversed, Seq.empty)
+        | Seq.Cons (datom, rest) ->
+          let value =
+            match datom.Datascript.v with
+            | Datascript.String value -> value
+            | _ -> assert false
+          in
+          let next = bytes + String.length value in
+          if next > maximum
+          then
+            if reversed = []
+            then Error Types.Snapshot_limit_exceeded
+            else Ok (List.rev reversed, fun () -> Seq.Cons (datom, rest))
+          else take (count + 1) next (datom :: reversed) rest)
     in
     Result.bind
-      (take 0 [] preparation.snapshot_remaining_protected_datoms)
+      (take 0 0 [] preparation.snapshot_remaining_protected_datoms)
       (fun (datoms, remaining) ->
          preparation.snapshot_remaining_protected_datoms <- remaining;
          match datoms with
@@ -699,10 +798,13 @@ let persist_snapshot_activation preparation =
                 ~applied_server_t:preparation.snapshot_cursor
                 ~checksum:digest
               |> Result.map_error (fun message ->
-                let reason = match message with
+                let reason =
+                  match message with
                   | "sync schema version must be non-negative" -> `Schema_negative
-                  | "sync checksum must be 16 lowercase hexadecimal characters" -> `Checksum_invalid
-                  | _ -> `Unknown in
+                  | "sync checksum must be 16 lowercase hexadecimal characters" ->
+                    `Checksum_invalid
+                  | _ -> `Unknown
+                in
                 Types.Snapshot_state_error (Types.Snapshot_checkpoint_invalid reason))
             in
             Result.bind metadata (fun metadata ->
@@ -784,7 +886,8 @@ let sync_deletion_directory directory =
 
 let directory_stat path =
   let stat = Unix.lstat path in
-  if stat.st_kind <> Unix.S_DIR then failwith "Local copy path is not a physical directory";
+  if stat.st_kind <> Unix.S_DIR
+  then failwith "Local copy path is not a physical directory";
   stat
 ;;
 
@@ -796,47 +899,69 @@ let same_directory path expected =
 let deletion_ancestors (location : durable_mirror_location) =
   let mirrors = Filename.dirname (Filename.dirname location.database_path) in
   let worker = Filename.dirname mirrors in
-  List.map (fun path -> path, directory_stat path) [Filename.dirname worker; worker; mirrors]
+  List.map
+    (fun path -> path, directory_stat path)
+    [ Filename.dirname worker; worker; mirrors ]
 ;;
 
 let validate_deletion_ancestors ancestors =
-  List.iter (fun (path, expected) ->
-    if not (same_directory path expected) then failwith "Local copy parent directory changed") ancestors
+  List.iter
+    (fun (path, expected) ->
+       if not (same_directory path expected)
+       then failwith "Local copy parent directory changed")
+    ancestors
 ;;
 
 let validate_deletion_lease directory =
-  List.iter (fun suffix ->
-    let path = Filename.concat directory (".logseq-overlay-owner.sqlite" ^ suffix) in
-    match Unix.lstat path with
-    | { st_kind = Unix.S_REG; st_nlink = 1; _ } -> ()
-    | _ -> failwith "Local copy lease path is unsafe"
-    | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ()) [""; "-journal"; "-wal"; "-shm"]
+  List.iter
+    (fun suffix ->
+       let path = Filename.concat directory (".logseq-overlay-owner.sqlite" ^ suffix) in
+       match Unix.lstat path with
+       | { st_kind = Unix.S_REG; st_nlink = 1; _ } -> ()
+       | _ -> failwith "Local copy lease path is unsafe"
+       | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ())
+    [ ""; "-journal"; "-wal"; "-shm" ]
 ;;
 
 let directory_generation_as ~identity_path directory =
   let stat = directory_stat directory in
   let lease = Unix.lstat (Filename.concat directory ".logseq-overlay-owner.sqlite") in
-  if lease.st_kind <> Unix.S_REG || lease.st_nlink <> 1 then failwith "Local copy lease path is unsafe";
+  if lease.st_kind <> Unix.S_REG || lease.st_nlink <> 1
+  then failwith "Local copy lease path is unsafe";
   (* The held lease inode cannot be reused while this preparation is alive. Its
      identity fences directory-inode reuse without a new persisted marker. *)
-  mirror_generation (Digestif.SHA256.digest_string
-    (Printf.sprintf "directory:%s:%d:%d:%d:%d" identity_path stat.st_dev stat.st_ino lease.st_dev lease.st_ino)
-    |> Digestif.SHA256.to_hex)
+  mirror_generation
+    (Digestif.SHA256.digest_string
+       (Printf.sprintf
+          "directory:%s:%d:%d:%d:%d"
+          identity_path
+          stat.st_dev
+          stat.st_ino
+          lease.st_dev
+          lease.st_ino)
+     |> Digestif.SHA256.to_hex)
 ;;
 
 let mirror_deletion_directory (location : durable_mirror_location) =
   Filename.concat
-    (Filename.concat (Filename.dirname (Filename.dirname location.database_path)) ".mirror-deletions")
+    (Filename.concat
+       (Filename.dirname (Filename.dirname location.database_path))
+       ".mirror-deletions")
     (Graph.Uuid.to_string location.graph_id)
 ;;
 
 let validate_retirement_directories (location : durable_mirror_location) =
   let root = mirror_deletion_directory location in
-  List.iter (fun path ->
-    match directory_stat path with
-    | _ -> ()
-    | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ())
-    [Filename.dirname root; root; Filename.concat root "states"; Filename.concat root "pending"]
+  List.iter
+    (fun path ->
+       match directory_stat path with
+       | _ -> ()
+       | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ())
+    [ Filename.dirname root
+    ; root
+    ; Filename.concat root "states"
+    ; Filename.concat root "pending"
+    ]
 ;;
 
 let rec ensure_retirement_directory path =
@@ -857,21 +982,32 @@ let mirror_deletion_paths (location : durable_mirror_location) retirement =
 ;;
 
 let write_deletion_receipt path (result : Types.mirror_delete) committed =
-  let data = Yojson.Safe.to_string (`Assoc
-    [ "version", `Int 2
-    ; "graph", Graph.Uuid.to_yojson (Option.get result.graph_uuid)
-    ; "retirement", `String (Filename.chop_suffix (Filename.basename path) ".json")
+  let data =
+    Yojson.Safe.to_string
+      (`Assoc
+          [ "version", `Int 2
+          ; "graph", Graph.Uuid.to_yojson (Option.get result.graph_uuid)
+          ; "retirement", `String (Filename.chop_suffix (Filename.basename path) ".json")
           ; ( "previous"
             , `String (Types.Mirror_generation.to_string result.previous_generation) )
-    ; "absent", `String (Types.Mirror_generation.to_string result.absent_generation)
-    ; "committed", `Bool committed ]) in
-  let temporary, output = Filename.open_temp_file ~temp_dir:(Filename.dirname path) ".retirement-" ".part" in
-  Fun.protect ~finally:(fun () -> close_out_noerr output;
-    if Sys.file_exists temporary then Sys.remove temporary) (fun () ->
-    output_string output data; flush output;
-    Unix.fsync (Unix.descr_of_out_channel output); close_out output;
-    Unix.rename temporary path;
-    sync_deletion_directory (Filename.dirname path))
+          ; "absent", `String (Types.Mirror_generation.to_string result.absent_generation)
+          ; "committed", `Bool committed
+          ])
+  in
+  let temporary, output =
+    Filename.open_temp_file ~temp_dir:(Filename.dirname path) ".retirement-" ".part"
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      close_out_noerr output;
+      if Sys.file_exists temporary then Sys.remove temporary)
+    (fun () ->
+       output_string output data;
+       flush output;
+       Unix.fsync (Unix.descr_of_out_channel output);
+       close_out output;
+       Unix.rename temporary path;
+       sync_deletion_directory (Filename.dirname path))
 ;;
 
 let read_deletion_receipt (location : durable_mirror_location) receipt_path =
@@ -882,60 +1018,92 @@ let read_deletion_receipt (location : durable_mirror_location) receipt_path =
   let json = Yojson.Safe.from_file receipt_path in
   let version = json |> member "version" |> to_int in
   if version <> 1 && version <> 2 then failwith "unsupported retirement receipt";
-  if json |> member "graph" |> to_string <> Graph.Uuid.to_string location.graph_id
-     || json |> member "retirement" |> to_string <> Filename.chop_suffix (Filename.basename receipt_path) ".json"
+  if
+    json |> member "graph" |> to_string <> Graph.Uuid.to_string location.graph_id
+    || json
+       |> member "retirement"
+       |> to_string
+       <> Filename.chop_suffix (Filename.basename receipt_path) ".json"
   then failwith "retirement receipt identity mismatch";
-  let generation name = json |> member name |> to_string
-    |> Types.Mirror_generation.of_string |> Result.get_ok in
-  ({ Types.graph_uuid = Some location.graph_id
-   ; previous_generation = generation "previous"; absent_generation = generation "absent" },
-   json |> member "committed" |> to_bool, version)
+  let generation name =
+    json |> member name |> to_string |> Types.Mirror_generation.of_string |> Result.get_ok
+  in
+  ( { Types.graph_uuid = Some location.graph_id
+    ; previous_generation = generation "previous"
+    ; absent_generation = generation "absent"
+    }
+  , json |> member "committed" |> to_bool
+  , version )
 ;;
 
 let collect_retired_mirrors (location : durable_mirror_location) =
   ignore (deletion_ancestors location);
   validate_retirement_directories location;
   let root = Filename.concat (mirror_deletion_directory location) "pending" in
-  if Sys.file_exists root then
-    Sys.readdir root |> Array.iter (fun name ->
+  if Sys.file_exists root
+  then
+    Sys.readdir root
+    |> Array.iter (fun name ->
       if Filename.check_suffix name ".data"
       then (
         try
-          let id = String.sub name 0 (String.length name - 5) |> retirement_id_of_string |> Result.get_ok in
+          let id =
+            String.sub name 0 (String.length name - 5)
+            |> retirement_id_of_string
+            |> Result.get_ok
+          in
           let _, receipt, data = mirror_deletion_paths location id in
           let _, committed, _ = read_deletion_receipt location receipt in
-          if committed && Sys.file_exists data then (
+          if committed && Sys.file_exists data
+          then (
             ignore (directory_stat data);
             validate_deletion_lease data;
             match Ownership.acquire ~graph_directory:data with
             | Error Ownership.Already_owned -> ()
             | Error (Ownership.Unavailable _) ->
-              report_warning "journal: phase=cleanup operation=collectRetiredMirrors code=ownershipUnavailable\n"
-            | Ok owner -> Fun.protect ~finally:(fun () -> ignore (Ownership.release owner))
-                (fun () -> remove_mirror_tree data; sync_deletion_directory root))
+              report_warning
+                "journal: phase=cleanup operation=collectRetiredMirrors \
+                 code=ownershipUnavailable\n"
+            | Ok owner ->
+              Fun.protect
+                ~finally:(fun () -> ignore (Ownership.release owner))
+                (fun () ->
+                   remove_mirror_tree data;
+                   sync_deletion_directory root))
         with
-        | _ -> report_warning "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n"))
+        | _ ->
+          report_warning
+            "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n"))
 ;;
 
 let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement =
   let ( let* ) = Result.bind in
-  let* location = durable_mirror_location ~application_support_directory ~graph_id
-    |> Result.map_error (fun _ -> Types.Mirror_delete_failed "Invalid local copy directory") in
+  let* location =
+    durable_mirror_location ~application_support_directory ~graph_id
+    |> Result.map_error (fun _ ->
+      Types.Mirror_delete_failed "Invalid local copy directory")
+  in
   try
     let ancestors = deletion_ancestors location in
     validate_retirement_directories location;
     let _root, receipt, data = mirror_deletion_paths location retirement in
     let graph_directory = Filename.dirname location.database_path in
-    let exists path = match Unix.lstat path with
+    let exists path =
+      match Unix.lstat path with
       | _ -> true
-      | exception Unix.Unix_error (Unix.ENOENT, _, _) -> false in
-    let read_existing () = if exists receipt then Some (read_deletion_receipt location receipt) else None in
+      | exception Unix.Unix_error (Unix.ENOENT, _, _) -> false
+    in
+    let read_existing () =
+      if exists receipt then Some (read_deletion_receipt location receipt) else None
+    in
     let existing = read_existing () in
     let preparation ?ownership ?committed ~durable generation =
       ( { deletion_location = location
         ; deletion_generation = generation
         ; deletion_ancestors = ancestors
-      ; deletion_retirement = retirement; deletion_ownership = ownership; deletion_committed = committed
+        ; deletion_retirement = retirement
+        ; deletion_ownership = ownership
+        ; deletion_committed = committed
         ; deletion_cancelled = false
         ; deletion_durable = durable
         }
@@ -947,25 +1115,35 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
         sync_deletion_directory (Filename.dirname data);
         sync_deletion_directory (Filename.dirname graph_directory);
         write_deletion_receipt receipt result true;
-        Ok (preparation ~committed:result ~durable:true result.previous_generation) in
-      if committed then persist_commit () else (
+        Ok (preparation ~committed:result ~durable:true result.previous_generation)
+      in
+      if committed
+      then persist_commit ()
+      else (
         let observed = directory_stat data in
         validate_deletion_lease data;
         match Ownership.acquire ~graph_directory:data with
         | Error Ownership.Already_owned -> Error Types.Mirror_delete_busy
         | Error (Unavailable message) -> Error (Types.Mirror_delete_failed message)
-        | Ok owner -> Fun.protect ~finally:(fun () -> ignore (Ownership.release owner)) (fun () ->
-          validate_deletion_ancestors ancestors;
-          validate_retirement_directories location;
+        | Ok owner ->
+          Fun.protect
+            ~finally:(fun () -> ignore (Ownership.release owner))
+            (fun () ->
+               validate_deletion_ancestors ancestors;
+               validate_retirement_directories location;
                if (not (same_directory data observed)) || read_existing () <> existing
-          then failwith "retired mirror changed while acquiring ownership";
-          (* An obsolete transaction can only finish its already-retired namespace;
+               then failwith "retired mirror changed while acquiring ownership";
+               (* An obsolete transaction can only finish its already-retired namespace;
              it never receives a new canonical rename capability. Its generation
              is only the existing coordinator's opaque identity. *)
-          if version = 2 && not (Types.Mirror_generation.equal result.previous_generation
-            (directory_generation_as ~identity_path:graph_directory data))
-          then failwith "retired mirror identity mismatch";
-          persist_commit ()))
+               if
+                 version = 2
+                 && not
+                      (Types.Mirror_generation.equal
+                         result.previous_generation
+                         (directory_generation_as ~identity_path:graph_directory data))
+               then failwith "retired mirror identity mismatch";
+               persist_commit ()))
     | Some (old, false, 1) when not (exists graph_directory) ->
       (* With neither namespace present there is nothing to commit. Recheck the
          receipt and destination rather than inferring commit from absence. *)
@@ -973,7 +1151,7 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
       if exists data || read_existing () <> existing
       then Error Types.Mirror_delete_stale
       else (
-      let canceled, _ = preparation ~durable:false old.previous_generation in
+        let canceled, _ = preparation ~durable:false old.previous_generation in
         Ok ({ canceled with deletion_cancelled = true }, old.previous_generation))
     | _ ->
       let observed = directory_stat graph_directory in
@@ -987,31 +1165,39 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
            Error error
          in
          (try
-           validate_deletion_ancestors ancestors;
+            validate_deletion_ancestors ancestors;
             if
               (not (same_directory graph_directory observed))
               || exists data
               || read_existing () <> existing
             then fail Types.Mirror_delete_stale
             else (
-           let generation = directory_generation_as ~identity_path:graph_directory graph_directory in
-           let result = { Types.graph_uuid = Some graph_id; previous_generation = generation
+              let generation =
+                directory_generation_as ~identity_path:graph_directory graph_directory
+              in
+              let result =
+                { Types.graph_uuid = Some graph_id
+                ; previous_generation = generation
                 ; absent_generation = absent_mirror_generation location.database_path
                 }
               in
               match existing with
-            | Some (old, false, 1) ->
-              (* A pre-rename V1 preparation can only be canceled after acquiring
+              | Some (old, false, 1) ->
+                (* A pre-rename V1 preparation can only be canceled after acquiring
                  the live lease. Never grant it a fresh rename capability. *)
-              let canceled, _ = preparation ~ownership:owner ~durable:false generation in
-              Ok ({ canceled with deletion_cancelled = true }, old.previous_generation)
-            | Some (old, _, _) when not (Types.Mirror_generation.equal old.previous_generation generation) ->
-              fail Types.Mirror_delete_stale
-            | _ ->
-              ensure_retirement_directory (Filename.dirname receipt);
-              ensure_retirement_directory (Filename.dirname data);
-              write_deletion_receipt receipt result false;
-              Ok (preparation ~ownership:owner ~durable:false generation))
+                let canceled, _ =
+                  preparation ~ownership:owner ~durable:false generation
+                in
+                Ok ({ canceled with deletion_cancelled = true }, old.previous_generation)
+              | Some (old, _, _)
+                when not
+                       (Types.Mirror_generation.equal old.previous_generation generation)
+                -> fail Types.Mirror_delete_stale
+              | _ ->
+                ensure_retirement_directory (Filename.dirname receipt);
+                ensure_retirement_directory (Filename.dirname data);
+                write_deletion_receipt receipt result false;
+                Ok (preparation ~ownership:owner ~durable:false generation))
           with
           | exn -> fail (Types.Mirror_delete_failed (Printexc.to_string exn))))
   with
@@ -1022,18 +1208,28 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
 let mirror_deletion_committed preparation = preparation.deletion_durable
 
 let cancel_mirror_deletion_checked preparation =
-  let released=match preparation.deletion_ownership with None->Ok()|Some owner->Ownership.release owner in
-  Result.map(fun()->
-    preparation.deletion_ownership<-None;
-    if preparation.deletion_committed=None then preparation.deletion_cancelled<-true)released
+  let released =
+    match preparation.deletion_ownership with
+    | None -> Ok ()
+    | Some owner -> Ownership.release owner
+  in
+  Result.map
+    (fun () ->
+       preparation.deletion_ownership <- None;
+       if preparation.deletion_committed = None
+       then preparation.deletion_cancelled <- true)
+    released
 ;;
 
-let cancel_mirror_deletion preparation = ignore(cancel_mirror_deletion_checked preparation)
+let cancel_mirror_deletion preparation =
+  ignore (cancel_mirror_deletion_checked preparation)
 ;;
 
 let commit_mirror_deletion preparation =
   let location = preparation.deletion_location in
-  let _root, receipt, data = mirror_deletion_paths location preparation.deletion_retirement in
+  let _root, receipt, data =
+    mirror_deletion_paths location preparation.deletion_retirement
+  in
   let durable =
     try
       validate_deletion_ancestors preparation.deletion_ancestors;
@@ -1050,55 +1246,68 @@ let commit_mirror_deletion preparation =
        validate_deletion_ancestors preparation.deletion_ancestors;
        validate_retirement_directories location;
        sync_deletion_directory (Filename.dirname data);
-       sync_deletion_directory (Filename.dirname (Filename.dirname location.database_path));
+       sync_deletion_directory
+         (Filename.dirname (Filename.dirname location.database_path));
        write_deletion_receipt receipt result true;
        preparation.deletion_durable <- true;
        collect_retired_mirrors location
-     with _ -> report_warning "journal: phase=retirement operation=confirmMirrorRetirement code=confirmationPending\n");
+     with
+     | _ ->
+       report_warning
+         "journal: phase=retirement operation=confirmMirrorRetirement \
+          code=confirmationPending\n");
     Ok result
-  | None, None when preparation.deletion_cancelled || preparation.deletion_ownership = None -> Error Types.Mirror_delete_stale
+  | None, None
+    when preparation.deletion_cancelled || preparation.deletion_ownership = None ->
+    Error Types.Mirror_delete_stale
   | None, None ->
     let graph_directory = Filename.dirname location.database_path in
-    let unchanged = try
-      validate_deletion_ancestors preparation.deletion_ancestors;
-      validate_retirement_directories location;
-      validate_deletion_lease graph_directory;
-      Types.Mirror_generation.equal preparation.deletion_generation
-        (directory_generation_as ~identity_path:graph_directory graph_directory)
+    let unchanged =
+      try
+        validate_deletion_ancestors preparation.deletion_ancestors;
+        validate_retirement_directories location;
+        validate_deletion_lease graph_directory;
+        Types.Mirror_generation.equal
+          preparation.deletion_generation
+          (directory_generation_as ~identity_path:graph_directory graph_directory)
       with
       | _ -> false
     in
     if not unchanged
     then Error Types.Mirror_delete_stale
     else (
-    let renamed =
-      try
-        if Sys.file_exists data then failwith "retirement destination is occupied";
-        let result, _, _ = read_deletion_receipt location receipt in
-        Unix.rename graph_directory data;
-        Ok result
+      let renamed =
+        try
+          if Sys.file_exists data then failwith "retirement destination is occupied";
+          let result, _, _ = read_deletion_receipt location receipt in
+          Unix.rename graph_directory data;
+          Ok result
         with
         | exn -> Error (Types.Mirror_delete_failed (Printexc.to_string exn))
       in
       match renamed with
-     | Error _ as error -> error
-     | Ok result ->
-       preparation.deletion_committed <- Some result;
+      | Error _ as error -> error
+      | Ok result ->
+        preparation.deletion_committed <- Some result;
         (try
            Option.iter
              (fun owner -> ignore (Ownership.release owner))
              preparation.deletion_ownership
          with
          | _ -> ());
-       preparation.deletion_ownership <- None;
-       (try
-          sync_deletion_directory (Filename.dirname data);
-          sync_deletion_directory (Filename.dirname graph_directory);
-          write_deletion_receipt receipt result true;
-          preparation.deletion_durable <- true;
-          collect_retired_mirrors location
-        with _ -> report_warning "journal: phase=retirement operation=confirmMirrorRetirement code=confirmationPending\n");
-       Ok result)
+        preparation.deletion_ownership <- None;
+        (try
+           sync_deletion_directory (Filename.dirname data);
+           sync_deletion_directory (Filename.dirname graph_directory);
+           write_deletion_receipt receipt result true;
+           preparation.deletion_durable <- true;
+           collect_retired_mirrors location
+         with
+         | _ ->
+           report_warning
+             "journal: phase=retirement operation=confirmMirrorRetirement \
+              code=confirmationPending\n");
+        Ok result)
 ;;
 
 let validate_receipts sqlite =
@@ -1160,7 +1369,11 @@ let collect_garbage inspection =
           in
           Fun.protect
             ~finally:(fun () ->
-              (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" );
+              if not (Sqlite3.db_close sqlite)
+              then
+                report_warning
+                  "journal: phase=cleanup operation=closeSqlite \
+                   scope=temporaryStorageHandle code=closePending recovery=reopen\n";
               ignore (Ownership.release ownership))
             (fun () ->
                match
@@ -2011,7 +2224,12 @@ let decode_outbox records =
 let read_outbox path =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
   Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
+    ~finally:(fun () ->
+      if not (Sqlite3.db_close sqlite)
+      then
+        report_warning
+          "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle \
+           code=closePending recovery=reopen\n")
     (fun () ->
        let exec sql =
          let rc = Sqlite3.exec sqlite sql in
@@ -2020,7 +2238,8 @@ let read_outbox path =
        Result.bind (exec "BEGIN") (fun () ->
          let result =
            try
-             Result.bind (Logseq_db_storage.Sync_outbox_store.read_database sqlite)
+             Result.bind
+               (Logseq_db_storage.Sync_outbox_store.read_database sqlite)
                (fun records ->
                   Result.map
                     (fun revision -> records, revision)
@@ -2029,11 +2248,15 @@ let read_outbox path =
            | exn -> Error (Printexc.to_string exn)
          in
          match result with
-         | Error _ as error -> ignore (exec "ROLLBACK"); error
+         | Error _ as error ->
+           ignore (exec "ROLLBACK");
+           error
          | Ok _ ->
            (match exec "COMMIT" with
             | Ok () -> result
-            | Error _ as error -> ignore (exec "ROLLBACK"); error)))
+            | Error _ as error ->
+              ignore (exec "ROLLBACK");
+              error)))
 ;;
 
 (* Global revision belongs to metadata. Frozen encodings are independent of it
@@ -2042,21 +2265,23 @@ let durable_outbox_rows records =
   List.fold_left
     (fun rows (record : outbox_record) ->
        let mutation_id = Graph.Uuid.to_string record.mutation_id in
-       Uuid_map.add mutation_id
+       Uuid_map.add
+         mutation_id
          Logseq_db_storage.Sync_outbox_store.
            { mutation_id
            ; sequence = record.sequence
            ; record = Persistence_outbox_v16.encode ~sync_revision:0 record
            }
          rows)
-    Uuid_map.empty records
+    Uuid_map.empty
+    records
 ;;
 
 let ordered_durable_rows rows =
-  Uuid_map.bindings rows |> List.map snd
-  |> List.sort
-       (fun (left : Logseq_db_storage.Sync_outbox_store.row) right ->
-          Int.compare left.sequence right.sequence)
+  Uuid_map.bindings rows
+  |> List.map snd
+  |> List.sort (fun (left : Logseq_db_storage.Sync_outbox_store.row) right ->
+    Int.compare left.sequence right.sequence)
 ;;
 
 let outbox_write_set database ~revision records =
@@ -2067,15 +2292,16 @@ let outbox_write_set database ~revision records =
          match Uuid_map.find_opt id database.durable_outbox with
          | Some before when before = row -> changed
          | _ -> row :: changed)
-      rows []
-    |> List.sort
-         (fun (left : Logseq_db_storage.Sync_outbox_store.row) right ->
-            Int.compare left.sequence right.sequence)
+      rows
+      []
+    |> List.sort (fun (left : Logseq_db_storage.Sync_outbox_store.row) right ->
+      Int.compare left.sequence right.sequence)
   in
   let deletes =
     Uuid_map.fold
       (fun id _ deleted -> if Uuid_map.mem id rows then deleted else id :: deleted)
-      database.durable_outbox []
+      database.durable_outbox
+      []
   in
   ( Logseq_db_storage.Sync_outbox_store.
       { expected_revision = database.durable_sync_revision; revision; upserts; deletes }
@@ -2084,24 +2310,43 @@ let outbox_write_set database ~revision records =
 
 let migrate_outbox path ~revision ~expected_records rows =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
-  Fun.protect ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" )) (fun () ->
-    Logseq_db_storage.Sync_outbox_store.migrate_database sqlite ~revision ~expected_records
-      (ordered_durable_rows rows))
+  Fun.protect
+    ~finally:(fun () ->
+      if not (Sqlite3.db_close sqlite)
+      then
+        report_warning
+          "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle \
+           code=closePending recovery=reopen\n")
+    (fun () ->
+       Logseq_db_storage.Sync_outbox_store.migrate_database
+         sqlite
+         ~revision
+         ~expected_records
+         (ordered_durable_rows rows))
 ;;
 
 let initialize_durable_receipts path =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
   Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
-    (fun () ->
-       Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite)
+    ~finally:(fun () ->
+      if not (Sqlite3.db_close sqlite)
+      then
+        report_warning
+          "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle \
+           code=closePending recovery=reopen\n")
+    (fun () -> Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite)
 ;;
 
 let with_receipt_database path read =
   try
     let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
     Fun.protect
-      ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
+      ~finally:(fun () ->
+        if not (Sqlite3.db_close sqlite)
+        then
+          report_warning
+            "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle \
+             code=closePending recovery=reopen\n")
       (fun () -> read sqlite)
   with
   | exn -> Error (Printexc.to_string exn)
@@ -2110,30 +2355,30 @@ let with_receipt_database path read =
 let read_durable_receipt path mutation_id =
   let key = Persistence_receipt_v1.receipt_key mutation_id in
   with_receipt_database path (fun sqlite ->
-       Result.bind
-         (Logseq_db_storage.Mutation_receipt_store.read_mutation sqlite key)
-         (function
-         | None -> Ok None
-         | Some source ->
-           Result.map
-             Option.some
-             (Persistence_receipt_v1.decode_mutation
-                ~startup_generation
-                ~projection_revision:(projection_revision 0)
-                (key, source))))
+    Result.bind
+      (Logseq_db_storage.Mutation_receipt_store.read_mutation sqlite key)
+      (function
+      | None -> Ok None
+      | Some source ->
+        Result.map
+          Option.some
+          (Persistence_receipt_v1.decode_mutation
+             ~startup_generation
+             ~projection_revision:(projection_revision 0)
+             (key, source))))
 ;;
 
 let read_terminal_batch database batch_id =
   let key = Persistence_receipt_v1.terminal_batch_key batch_id in
   with_receipt_database database.database_path (fun sqlite ->
-       Result.bind
-         (Logseq_db_storage.Mutation_receipt_store.read_terminal_batch sqlite key)
-         (function
-         | None -> Ok None
-         | Some source ->
-           Result.map
-             Option.some
-             (Persistence_receipt_v1.decode_terminal_batch (key, source))))
+    Result.bind
+      (Logseq_db_storage.Mutation_receipt_store.read_terminal_batch sqlite key)
+      (function
+      | None -> Ok None
+      | Some source ->
+        Result.map
+          Option.some
+          (Persistence_receipt_v1.decode_terminal_batch (key, source))))
 ;;
 
 let record_is_logically_active (record : outbox_record) =
@@ -2161,6 +2406,7 @@ let close database =
       then false, [], [], []
       else (
         database.closed <- true;
+        Eio.Condition.broadcast database.sync_changed;
         database.timeline_versions <- empty_timeline_history ();
         database.release_slot := None;
         let callback_waiters =
@@ -2233,14 +2479,21 @@ let close database =
     match storage_result, ownership_result with
     | Ok (), Ok () -> Ok ()
     | Error error, _ ->
-      let reason,source=match error with
-        | Logseq_db_storage.Storage_session.Closed -> "databaseClosed",None
-        | Fatal s -> "fatalState",Some s | Stage_failed s -> "storageWriteFailed",Some s
-        | Persistence_failed s -> "closeFailed",Some s | Already_consumed -> "preparationConsumed",None in
-      let module D=Logseq_db_types.Failure_diagnostic in
-      let diagnostic=match source with None->D.create ~operation:"closeDatabase" ~reason ()
-        | Some source->D.of_source ~operation:"closeDatabase" ~reason source in
-      Error (Types.Close_failed(D.encode diagnostic))
+      let reason, source =
+        match error with
+        | Logseq_db_storage.Storage_session.Closed -> "databaseClosed", None
+        | Fatal s -> "fatalState", Some s
+        | Stage_failed s -> "storageWriteFailed", Some s
+        | Persistence_failed s -> "closeFailed", Some s
+        | Already_consumed -> "preparationConsumed", None
+      in
+      let module D = Logseq_db_types.Failure_diagnostic in
+      let diagnostic =
+        match source with
+        | None -> D.create ~operation:"closeDatabase" ~reason ()
+        | Some source -> D.of_source ~operation:"closeDatabase" ~reason source
+      in
+      Error (Types.Close_failed (D.encode diagnostic))
     | Ok (), Error message -> Error (Types.Close_failed message))
   else Ok ()
 ;;
@@ -2287,7 +2540,7 @@ let frozen_outbox (records : outbox_record list) =
     records
 ;;
 
-let page_projection_effects (record:outbox_record) =
+let page_projection_effects (record : outbox_record) =
   match record.mutation with
   | Types.Append_journal _ when not record.append_create -> []
   | _ -> record.effect_footprint.page_uuids
@@ -2519,17 +2772,21 @@ let assigned_orders (record : outbox_record) =
 
 let assigned_order orders uuid = Uuid_map.find (Graph.Uuid.to_string uuid) orders
 
-let cached_insert_orders cache (record:outbox_record) =
-  memoized cache.insert_orders (Graph.Uuid.to_string record.mutation_id)(fun()->assigned_orders record)
+let cached_insert_orders cache (record : outbox_record) =
+  memoized cache.insert_orders (Graph.Uuid.to_string record.mutation_id) (fun () ->
+    assigned_orders record)
 ;;
 
-let cached_append_node cache (record:outbox_record) root uuid =
-  let nodes=memoized cache.append_nodes (Graph.Uuid.to_string record.mutation_id)(fun()->
-    let rec index parent found (node:Types.append_node) =
-      let found=Uuid_map.add(Graph.Uuid.to_string node.uuid)(node,parent)found in
-      Rrbvec.fold_left(index node.uuid)found node.children in
-    index(List.hd record.effect_footprint.page_uuids)Uuid_map.empty root) in
-  Uuid_map.find_opt(Graph.Uuid.to_string uuid)nodes
+let cached_append_node cache (record : outbox_record) root uuid =
+  let nodes =
+    memoized cache.append_nodes (Graph.Uuid.to_string record.mutation_id) (fun () ->
+      let rec index parent found (node : Types.append_node) =
+        let found = Uuid_map.add (Graph.Uuid.to_string node.uuid) (node, parent) found in
+        Rrbvec.fold_left (index node.uuid) found node.children
+      in
+      index (List.hd record.effect_footprint.page_uuids) Uuid_map.empty root)
+  in
+  Uuid_map.find_opt (Graph.Uuid.to_string uuid) nodes
 ;;
 
 let rec tree_children parent (tree : Types.block_tree) =
@@ -2546,13 +2803,17 @@ let rec tree_children_interests (tree : Types.block_tree) =
 ;;
 
 let append_uuids root =
-  Overlay_planner.append_nodes root |> Rrbvec.map(fun(node:Types.append_node)->node.uuid)
+  Overlay_planner.append_nodes root
+  |> Rrbvec.map (fun (node : Types.append_node) -> node.uuid)
   |> Rrbvec.to_list
 ;;
 
 let append_interests root =
-  Overlay_planner.append_nodes root |> Rrbvec.filter_map(fun(node:Types.append_node)->
-    if Rrbvec.is_empty node.children then None else Some(Types.Children_interest node.uuid))
+  Overlay_planner.append_nodes root
+  |> Rrbvec.filter_map (fun (node : Types.append_node) ->
+    if Rrbvec.is_empty node.children
+    then None
+    else Some (Types.Children_interest node.uuid))
   |> Rrbvec.to_list
 ;;
 
@@ -2674,8 +2935,8 @@ let logical_page_at ?cache ?initial (snapshot : snapshot) uuid =
        else (
          match record.mutation with
          | Types.Append_journal { title; journal_day; _ }
-           when record.append_create && record.effect_footprint.page_uuids=[uuid] ->
-           let page=uuid in
+           when record.append_create && record.effect_footprint.page_uuids = [ uuid ] ->
+           let page = uuid in
            let properties =
              []
              |> set_property_values
@@ -2931,23 +3192,54 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                           }
                     })
                current
-           | Append_journal {root;_} ->
-             let page=List.hd record.effect_footprint.page_uuids in
-             let node=match cache with
-               | Some cache->cached_append_node cache record root uuid
-               | None->Overlay_planner.append_parent ~parent:page ~target:uuid root in
+           | Append_journal { root; _ } ->
+             let page = List.hd record.effect_footprint.page_uuids in
+             let node =
+               match cache with
+               | Some cache -> cached_append_node cache record root uuid
+               | None -> Overlay_planner.append_parent ~parent:page ~target:uuid root
+             in
              (match node with
-              | None->current
-              | Some(node,parent)->
-                let leaf:Types.block_tree={uuid=node.uuid;title=node.title;children=[]} in
-                let inserted=inserted_block ?cache authoritative ~target:uuid ~parent ~page
-                  ~orders:(match cache with Some cache->cached_insert_orders cache record|None->assigned_orders record)
-                  ~now:record.intent_time_ms leaf |> Option.get in
-                let properties=match node.task_status with None->inserted.block.properties
-                  |Some status->(match status_entity authoritative (Types.Status_uuid status) with None->inserted.block.properties
-                    |Some entity->set_property_values ?cache authoritative "logseq.property/status"
-                      [Datascript.Ref entity] inserted.block.properties) in
-                Some{inserted with block={inserted.block with properties};task_status=Option.map(fun id->Types.Status_uuid id)node.task_status})
+              | None -> current
+              | Some (node, parent) ->
+                let leaf : Types.block_tree =
+                  { uuid = node.uuid; title = node.title; children = [] }
+                in
+                let inserted =
+                  inserted_block
+                    ?cache
+                    authoritative
+                    ~target:uuid
+                    ~parent
+                    ~page
+                    ~orders:
+                      (match cache with
+                       | Some cache -> cached_insert_orders cache record
+                       | None -> assigned_orders record)
+                    ~now:record.intent_time_ms
+                    leaf
+                  |> Option.get
+                in
+                let properties =
+                  match node.task_status with
+                  | None -> inserted.block.properties
+                  | Some status ->
+                    (match status_entity authoritative (Types.Status_uuid status) with
+                     | None -> inserted.block.properties
+                     | Some entity ->
+                       set_property_values
+                         ?cache
+                         authoritative
+                         "logseq.property/status"
+                         [ Datascript.Ref entity ]
+                         inserted.block.properties)
+                in
+                Some
+                  { inserted with
+                    block = { inserted.block with properties }
+                  ; task_status =
+                      Option.map (fun id -> Types.Status_uuid id) node.task_status
+                  })
            | Insert_blocks { parent; tree; asset; _ } ->
              let page =
                match record.effect_footprint.page_uuids with
@@ -3397,11 +3689,18 @@ let local_child_facts ?cache (snapshot : snapshot) parent =
     else (
       let inserted =
         match record.mutation with
-        | Types.Append_journal{root;_} ->
-          let children=if record.effect_footprint.page_uuids=[parent] then Rrbvec.singleton root
-            else Overlay_planner.append_children root parent in
-          let orders=assigned_orders record in
-          Rrbvec.map(fun(child:Types.append_node)->assigned_order orders child.uuid,child.uuid)children |> Rrbvec.to_list
+        | Types.Append_journal { root; _ } ->
+          let children =
+            if record.effect_footprint.page_uuids = [ parent ]
+            then Rrbvec.singleton root
+            else Overlay_planner.append_children root parent
+          in
+          let orders = assigned_orders record in
+          Rrbvec.map
+            (fun (child : Types.append_node) ->
+               assigned_order orders child.uuid, child.uuid)
+            children
+          |> Rrbvec.to_list
         | Types.Insert_blocks { parent = candidate; tree; _ } ->
           let children =
             if Graph.Uuid.equal parent candidate
@@ -3546,9 +3845,12 @@ let local_journal_candidates (snapshot : snapshot) =
   List.fold_left
     (fun candidates (record : outbox_record) ->
        match record.mutation with
-       | Types.Append_journal{journal_day;_} when record_is_logically_active record ->
-         let page=List.hd record.effect_footprint.page_uuids in
-         Uuid_map.add(Graph.Uuid.to_string page){day=journal_day;uuid=page;entity=None} candidates
+       | Types.Append_journal { journal_day; _ } when record_is_logically_active record ->
+         let page = List.hd record.effect_footprint.page_uuids in
+         Uuid_map.add
+           (Graph.Uuid.to_string page)
+           { day = journal_day; uuid = page; entity = None }
+           candidates
        | Types.Create_journal_page { page; journal_day; _ }
          when record_is_logically_active record ->
          Uuid_map.add
@@ -4040,7 +4342,8 @@ let get_journals snapshot ~from_day ~through_day ~limit ~cursor =
                       retain logical_page_at's existing fallback. *)
                    let value =
                      match initial with
-                     | Some page -> logical_page_at ~cache ~initial:(Some page) snapshot candidate.uuid
+                     | Some page ->
+                       logical_page_at ~cache ~initial:(Some page) snapshot candidate.uuid
                      | None -> logical_page_at ~cache snapshot candidate.uuid
                    in
                    Option.get value
@@ -4178,7 +4481,6 @@ let authoritative_tree_candidate snapshot cache uuid =
 ;;
 
 let tree_insert_orders cache record = cached_insert_orders cache.hydration record
-;;
 
 let logical_tree_candidate snapshot cache uuid =
   let key = Graph.Uuid.to_string uuid in
@@ -4215,10 +4517,15 @@ let logical_tree_candidate snapshot cache uuid =
            then current
            else (
              match record.mutation with
-             | Types.Append_journal{root;_} ->
+             | Types.Append_journal { root; _ } ->
                (match cached_append_node cache.hydration record root uuid with
-                | Some(_,parent)->Some{tree_uuid=uuid;tree_parent=parent;tree_order=assigned_order(tree_insert_orders cache record)uuid}
-                | None->current)
+                | Some (_, parent) ->
+                  Some
+                    { tree_uuid = uuid
+                    ; tree_parent = parent
+                    ; tree_order = assigned_order (tree_insert_orders cache record) uuid
+                    }
+                | None -> current)
              | Types.Insert_blocks { parent; tree; _ } ->
                let rec find parent (tree : Types.block_tree) =
                  if Graph.Uuid.equal tree.uuid uuid
@@ -4277,10 +4584,12 @@ let ordered_tree_children snapshot cache parent =
       else (
         let inserted =
           match record.mutation with
-          | Types.Append_journal{root;_} ->
-            (if record.effect_footprint.page_uuids=[parent] then Rrbvec.singleton root
+          | Types.Append_journal { root; _ } ->
+            (if record.effect_footprint.page_uuids = [ parent ]
+             then Rrbvec.singleton root
              else Overlay_planner.append_children root parent)
-            |> Rrbvec.map(fun(tree:Types.append_node)->tree.uuid) |> Rrbvec.to_list
+            |> Rrbvec.map (fun (tree : Types.append_node) -> tree.uuid)
+            |> Rrbvec.to_list
           | Types.Insert_blocks { parent = candidate; tree; _ } ->
             (if Graph.Uuid.equal parent candidate
              then [ tree ]
@@ -4502,15 +4811,22 @@ let get_structure snapshot request =
 ;;
 
 let timeline_version_at (snapshot : snapshot) scope =
-  if not snapshot.timeline_proof_available then Error Types.Read_limit_exceeded
-  else
+  if not snapshot.timeline_proof_available
+  then Error Types.Read_limit_exceeded
+  else (
     let key = timeline_scope_key scope in
     let history = snapshot.timeline_versions.(timeline_bucket key) in
-    let kind, serial = match Uuid_map.find_opt key history.versions with
+    let kind, serial =
+      match Uuid_map.find_opt key history.versions with
       | Some serial -> "written", serial
-      | None -> "retained", history.retirement in
-    Ok (Printf.sprintf "timeline:v2:%s:%s:%d"
-      (Types.Generation.to_string snapshot.version.generation) kind serial)
+      | None -> "retained", history.retirement
+    in
+    Ok
+      (Printf.sprintf
+         "timeline:v2:%s:%s:%d"
+         (Types.Generation.to_string snapshot.version.generation)
+         kind
+         serial))
 ;;
 
 let timeline_scope_version snapshot scope =
@@ -4519,29 +4835,51 @@ let timeline_scope_version snapshot scope =
 
 let get_timeline_journals snapshot ~from_day ~through_day ~limit ~after =
   Result.bind (timeline_scope_version snapshot Journal_index) (fun version ->
-    let cursor = match after with
+    let cursor =
+      match after with
       | None -> Ok None
       | Some position ->
         (match String.split_on_char '|' position with
-         | ["tj1"; previous; lower; upper; day; uuid]
-           when int_of_string_opt lower = Some from_day && int_of_string_opt upper = Some through_day ->
-           if previous <> version then Error Types.Stale_read_cursor
-           else (match int_of_string_opt day, Graph.Uuid.of_string uuid with
+         | [ "tj1"; previous; lower; upper; day; uuid ]
+           when int_of_string_opt lower = Some from_day
+                && int_of_string_opt upper = Some through_day ->
+           if previous <> version
+           then Error Types.Stale_read_cursor
+           else (
+             match int_of_string_opt day, Graph.Uuid.of_string uuid with
              | Some day, Ok uuid when day >= from_day && day <= through_day ->
-               Ok (Some (journal_cursor snapshot ~from_day ~through_day {day; uuid; entity=None}))
+               Ok
+                 (Some
+                    (journal_cursor
+                       snapshot
+                       ~from_day
+                       ~through_day
+                       { day; uuid; entity = None }))
              | _ -> Error (Types.Invalid_read_request "invalid timeline date position"))
-         | _ -> Error (Types.Invalid_read_request "timeline date position belongs to another query"))
+         | _ ->
+           Error
+             (Types.Invalid_read_request "timeline date position belongs to another query"))
     in
     Result.bind cursor (fun cursor ->
-      Result.map (fun (result : Types.journal_list_result) ->
-        let next = match result.next_cursor with
-          | None -> None
-          | Some cursor ->
-            (match journal_cursor_position snapshot ~from_day ~through_day cursor with
-             | Ok (Some position) -> Some (Printf.sprintf "tj1|%s|%d|%d|%d|%s"
-                 version from_day through_day position.day (Graph.Uuid.to_string position.uuid))
-             | _ -> assert false)
-        in result.items, next)
+      Result.map
+        (fun (result : Types.journal_list_result) ->
+           let next =
+             match result.next_cursor with
+             | None -> None
+             | Some cursor ->
+               (match journal_cursor_position snapshot ~from_day ~through_day cursor with
+                | Ok (Some position) ->
+                  Some
+                    (Printf.sprintf
+                       "tj1|%s|%d|%d|%d|%s"
+                       version
+                       from_day
+                       through_day
+                       position.day
+                       (Graph.Uuid.to_string position.uuid))
+                | _ -> assert false)
+           in
+           result.items, next)
         (get_journals snapshot ~from_day ~through_day ~limit ~cursor)))
 ;;
 
@@ -4549,72 +4887,128 @@ let timeline_member_offset scope version = function
   | None -> Ok 0
   | Some position ->
     (match String.split_on_char '|' position with
-     | ["tm1"; key; previous; offset] when key = timeline_scope_key scope ->
-       if previous <> version then Error Types.Stale_read_cursor
-       else (match int_of_string_opt offset with
+     | [ "tm1"; key; previous; offset ] when key = timeline_scope_key scope ->
+       if previous <> version
+       then Error Types.Stale_read_cursor
+       else (
+         match int_of_string_opt offset with
          | Some offset when offset >= 0 && offset <= maximum_cursor_offset -> Ok offset
          | _ -> Error (Types.Invalid_read_request "invalid timeline member offset"))
-     | _ -> Error (Types.Invalid_read_request "timeline member position belongs to another query"))
+     | _ ->
+       Error
+         (Types.Invalid_read_request "timeline member position belongs to another query"))
 ;;
 
 let timeline_direct_members snapshot scope ~parent ~limit ~after =
   with_snapshot_read snapshot (fun snapshot ->
-    if not (valid_page_limit limit) then Error (Types.Invalid_read_request "limit must be between 1 and 200")
-    else Result.bind (timeline_version_at snapshot scope) (fun version ->
-      Result.bind (timeline_member_offset scope version after) (fun offset ->
-        let database = Option.get snapshot.authoritative_database in
-        let cache =
-          { hydration = hydration_cache ~index_idents:false database
-          ; entities = Hashtbl.create 64; fields = Hashtbl.create 64
-          ; authoritative_candidates = Hashtbl.create 64; logical_candidates = Hashtbl.create 64 }
-        in
-        let identities = Hashtbl.create 64 in
-        let examined = ref 0 in
-        let add uuid =
-          incr examined;
-          if !examined > maximum_cursor_offset * 2 then raise Exit;
-          Hashtbl.replace identities (Graph.Uuid.to_string uuid) uuid
-        in
-        let candidates = try
-          (match tree_entity snapshot cache parent with
-           | None -> ()
-           | Some entity ->
-             Datascript.datoms database Datascript.Avet ~a:"block/parent" ~v:(Datascript.Ref entity) ()
-             |> Seq.iter (fun (datom : Datascript.datom) ->
-               incr examined;
-               if !examined > maximum_cursor_offset then raise Exit;
-               Option.iter (fun uuid -> Hashtbl.replace identities (Graph.Uuid.to_string uuid) uuid)
-                 (cached_uuid_of_entity database cache.hydration datom.e)));
-          Uuid_map.find_opt (Graph.Uuid.to_string parent) (Option.get snapshot.children_effects)
-          |> Option.value ~default:[]
-          |> List.iter (fun (record : outbox_record) ->
-            if record_is_logically_active record then List.iter add record.effect_footprint.block_uuids;
-            if record_has_active_dependency_shadows record then
-              List.iter (fun shadow -> if Graph.Uuid.equal shadow.shadow_parent parent then add shadow.shadow_block_uuid)
-                record.dependency_shadows.shadow_blocks);
-          if Hashtbl.length identities > maximum_cursor_offset then raise Exit;
-          Some (Hashtbl.to_seq_values identities |> Rrbvec.of_seq
-            |> Rrbvec.sort Graph.Uuid.compare
-            |> Rrbvec.filter_map (fun uuid -> match logical_tree_candidate snapshot cache uuid with
-              | Some candidate when Graph.Uuid.equal candidate.tree_parent parent -> Some candidate
-              | _ -> None)
-            |> Rrbvec.sort (fun left right -> String.compare left.tree_order right.tree_order))
-          with Exit -> None
-        in
-        match candidates with
-        | None -> Error Types.Read_limit_exceeded
-        | Some candidates ->
-          let total = Rrbvec.length candidates in
-          if offset > total then Error (Types.Invalid_read_request "timeline offset exceeds scope")
-          else
-            let selected = Rrbvec.to_seq candidates |> Seq.drop offset |> Seq.take limit |> List.of_seq in
-            let context = read_context snapshot in
-            let items = List.filter_map (fun candidate ->
-              Option.map (fun block -> Types.{block; revision=logical_block_revision candidate.tree_uuid (Some block)})
-                (read_block context candidate.tree_uuid)) selected in
-            let consumed = offset + List.length selected in
-            let next = if consumed < total then Some (Printf.sprintf "tm1|%s|%s|%d" (timeline_scope_key scope) version consumed) else None in
-            Ok (items,next))))
+    if not (valid_page_limit limit)
+    then Error (Types.Invalid_read_request "limit must be between 1 and 200")
+    else
+      Result.bind (timeline_version_at snapshot scope) (fun version ->
+        Result.bind (timeline_member_offset scope version after) (fun offset ->
+          let database = Option.get snapshot.authoritative_database in
+          let cache =
+            { hydration = hydration_cache ~index_idents:false database
+            ; entities = Hashtbl.create 64
+            ; fields = Hashtbl.create 64
+            ; authoritative_candidates = Hashtbl.create 64
+            ; logical_candidates = Hashtbl.create 64
+            }
+          in
+          let identities = Hashtbl.create 64 in
+          let examined = ref 0 in
+          let add uuid =
+            incr examined;
+            if !examined > maximum_cursor_offset * 2 then raise Exit;
+            Hashtbl.replace identities (Graph.Uuid.to_string uuid) uuid
+          in
+          let candidates =
+            try
+              (match tree_entity snapshot cache parent with
+               | None -> ()
+               | Some entity ->
+                 Datascript.datoms
+                   database
+                   Datascript.Avet
+                   ~a:"block/parent"
+                   ~v:(Datascript.Ref entity)
+                   ()
+                 |> Seq.iter (fun (datom : Datascript.datom) ->
+                   incr examined;
+                   if !examined > maximum_cursor_offset then raise Exit;
+                   Option.iter
+                     (fun uuid ->
+                        Hashtbl.replace identities (Graph.Uuid.to_string uuid) uuid)
+                     (cached_uuid_of_entity database cache.hydration datom.e)));
+              Uuid_map.find_opt
+                (Graph.Uuid.to_string parent)
+                (Option.get snapshot.children_effects)
+              |> Option.value ~default:[]
+              |> List.iter (fun (record : outbox_record) ->
+                if record_is_logically_active record
+                then List.iter add record.effect_footprint.block_uuids;
+                if record_has_active_dependency_shadows record
+                then
+                  List.iter
+                    (fun shadow ->
+                       if Graph.Uuid.equal shadow.shadow_parent parent
+                       then add shadow.shadow_block_uuid)
+                    record.dependency_shadows.shadow_blocks);
+              if Hashtbl.length identities > maximum_cursor_offset then raise Exit;
+              Some
+                (Hashtbl.to_seq_values identities
+                 |> Rrbvec.of_seq
+                 |> Rrbvec.sort Graph.Uuid.compare
+                 |> Rrbvec.filter_map (fun uuid ->
+                   match logical_tree_candidate snapshot cache uuid with
+                   | Some candidate when Graph.Uuid.equal candidate.tree_parent parent ->
+                     Some candidate
+                   | _ -> None)
+                 |> Rrbvec.sort (fun left right ->
+                   String.compare left.tree_order right.tree_order))
+            with
+            | Exit -> None
+          in
+          match candidates with
+          | None -> Error Types.Read_limit_exceeded
+          | Some candidates ->
+            let total = Rrbvec.length candidates in
+            if offset > total
+            then Error (Types.Invalid_read_request "timeline offset exceeds scope")
+            else (
+              let selected =
+                Rrbvec.to_seq candidates
+                |> Seq.drop offset
+                |> Seq.take limit
+                |> List.of_seq
+              in
+              let context = read_context snapshot in
+              let items =
+                List.filter_map
+                  (fun candidate ->
+                     Option.map
+                       (fun block ->
+                          Types.
+                            { block
+                            ; revision =
+                                logical_block_revision candidate.tree_uuid (Some block)
+                            })
+                       (read_block context candidate.tree_uuid))
+                  selected
+              in
+              let consumed = offset + List.length selected in
+              let next =
+                if consumed < total
+                then
+                  Some
+                    (Printf.sprintf
+                       "tm1|%s|%s|%d"
+                       (timeline_scope_key scope)
+                       version
+                       consumed)
+                else None
+              in
+              Ok (items, next)))))
 ;;
 
 let get_timeline_children snapshot ~parent ~limit ~after =
@@ -4622,8 +5016,14 @@ let get_timeline_children snapshot ~parent ~limit ~after =
 ;;
 
 let get_timeline_roots snapshot ~page ~limit ~after =
-  Result.map (fun (items,next) ->
-    List.map (fun (item : Types.child_member) -> Types.{block=item.block; revision=item.revision;depth=0;parent=page}) items,next)
+  Result.map
+    (fun (items, next) ->
+       ( List.map
+           (fun (item : Types.child_member) ->
+              Types.
+                { block = item.block; revision = item.revision; depth = 0; parent = page })
+           items
+       , next ))
     (timeline_direct_members snapshot (Page_roots page) ~parent:page ~limit ~after)
 ;;
 
@@ -4633,7 +5033,8 @@ let get_timeline_roots snapshot ~page ~limit ~after =
 exception Timeline_proof_limit
 
 let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
-  if database.timeline_proof_available then (
+  if database.timeline_proof_available
+  then (
     let old_db = Option.get before.authoritative_database in
     let new_db = Option.get after.authoritative_database in
     let visited = Hashtbl.create 64 in
@@ -4641,55 +5042,95 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
     let pending = ref [] in
     let enqueue sequence = pending := sequence :: !pending in
     let entity_jobs db datoms forced =
-      Seq.filter_map (fun (datom : Datascript.datom) ->
-        Option.map (fun uuid -> uuid, forced) (uuid_of_entity db datom.e)) datoms
+      Seq.filter_map
+        (fun (datom : Datascript.datom) ->
+           Option.map (fun uuid -> uuid, forced) (uuid_of_entity db datom.e))
+        datoms
     in
     let changed_datoms =
-      if old_db == new_db then Seq.empty
-      else !(database.authoritative_reports) |> List.to_seq
-        |> Seq.filter (fun (report : Datascript.tx_report) -> report.db_after.max_tx > old_db.max_tx)
-        |> Seq.flat_map (fun (report : Datascript.tx_report) -> List.to_seq report.tx_data)
+      if old_db == new_db
+      then Seq.empty
+      else
+        !(database.authoritative_reports)
+        |> List.to_seq
+        |> Seq.filter (fun (report : Datascript.tx_report) ->
+          report.db_after.max_tx > old_db.max_tx)
+        |> Seq.flat_map (fun (report : Datascript.tx_report) ->
+          List.to_seq report.tx_data)
     in
     let revoked_identities = Hashtbl.create 16 in
-    Seq.iter (fun (datom : Datascript.datom) ->
-      if datom.a = "block/uuid" && not datom.added then
-        Option.iter (fun uuid -> Hashtbl.replace revoked_identities (Graph.Uuid.to_string uuid) ())
-          (uuid_of_entity old_db datom.e)) changed_datoms;
+    Seq.iter
+      (fun (datom : Datascript.datom) ->
+         if datom.a = "block/uuid" && not datom.added
+         then
+           Option.iter
+             (fun uuid ->
+                Hashtbl.replace revoked_identities (Graph.Uuid.to_string uuid) ())
+             (uuid_of_entity old_db datom.e))
+      changed_datoms;
     enqueue (entity_jobs old_db changed_datoms false);
     enqueue (entity_jobs new_db changed_datoms false);
-    let index records = List.fold_left (fun map (record : outbox_record) ->
-      Uuid_map.add (Graph.Uuid.to_string record.mutation_id) record map) Uuid_map.empty records in
-    let old_records = index (Option.get before.outbox) and new_records = index (Option.get after.outbox) in
+    let index records =
+      List.fold_left
+        (fun map (record : outbox_record) ->
+           Uuid_map.add (Graph.Uuid.to_string record.mutation_id) record map)
+        Uuid_map.empty
+        records
+    in
+    let old_records = index (Option.get before.outbox)
+    and new_records = index (Option.get after.outbox) in
     let record_jobs (record : outbox_record) =
-      Seq.map (fun uuid -> uuid, false)
-        (Seq.append (List.to_seq record.effect_footprint.block_uuids)
+      Seq.map
+        (fun uuid -> uuid, false)
+        (Seq.append
+           (List.to_seq record.effect_footprint.block_uuids)
            (List.to_seq record.effect_footprint.page_uuids))
     in
-    Uuid_map.merge (fun _ old current ->
-      if old <> current then (
-        Option.iter (fun record -> enqueue (record_jobs record)) old;
-        Option.iter (fun record -> enqueue (record_jobs record)) current);
-      None) old_records new_records |> ignore;
-    if old_db != new_db then (
+    Uuid_map.merge
+      (fun _ old current ->
+         if old <> current
+         then (
+           Option.iter (fun record -> enqueue (record_jobs record)) old;
+           Option.iter (fun record -> enqueue (record_jobs record)) current);
+         None)
+      old_records
+      new_records
+    |> ignore;
+    if old_db != new_db
+    then (
       let add_logical_dependents _ (record : outbox_record) =
         if record_is_logically_active record then enqueue (record_jobs record);
-        if record_has_active_dependency_shadows record then (
-          enqueue (List.to_seq record.dependency_shadows.shadow_blocks
-            |> Seq.map (fun shadow -> shadow.shadow_block_uuid, false));
-          enqueue (List.to_seq record.dependency_shadows.shadow_pages
-            |> Seq.map (fun shadow -> shadow.shadow_page_uuid, false)))
+        if record_has_active_dependency_shadows record
+        then (
+          enqueue
+            (List.to_seq record.dependency_shadows.shadow_blocks
+             |> Seq.map (fun shadow -> shadow.shadow_block_uuid, false));
+          enqueue
+            (List.to_seq record.dependency_shadows.shadow_pages
+             |> Seq.map (fun shadow -> shadow.shadow_page_uuid, false)))
       in
       Uuid_map.iter add_logical_dependents old_records;
       Uuid_map.iter add_logical_dependents new_records);
-    let reference_attributes db = Datascript.schema db |> List.filter_map (fun (attribute,(schema : Datascript.schema_attr)) ->
-      if schema.value_type = Some Datascript.RefType && attribute <> "block/parent" && attribute <> "block/page"
-      then Some attribute else None) in
-    let databases = [old_db, reference_attributes old_db; new_db, reference_attributes new_db] in
-    let old_context = ref (read_context before) and new_context = ref (read_context after) in
+    let reference_attributes db =
+      Datascript.schema db
+      |> List.filter_map (fun (attribute, (schema : Datascript.schema_attr)) ->
+        if
+          schema.value_type = Some Datascript.RefType
+          && attribute <> "block/parent"
+          && attribute <> "block/page"
+        then Some attribute
+        else None)
+    in
+    let databases =
+      [ old_db, reference_attributes old_db; new_db, reference_attributes new_db ]
+    in
+    let old_context = ref (read_context before)
+    and new_context = ref (read_context after) in
     let batch_size = 128 in
     let in_batch = ref 0 in
     let next_contexts () =
-      if !in_batch = batch_size then (
+      if !in_batch = batch_size
+      then (
         old_context := read_context before;
         new_context := read_context after;
         in_batch := 0);
@@ -4704,33 +5145,60 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
         let key = timeline_scope_key scope in
         let bucket = timeline_bucket key in
         let history = versions.(bucket) in
-        if Uuid_map.find_opt key history.versions <> Some serial then (
+        if Uuid_map.find_opt key history.versions <> Some serial
+        then (
           let present = Uuid_map.mem key history.versions in
           let history =
-            if not present && history.count = 64 then
-              { versions = Uuid_map.empty; count = 0; retirement = serial }
-            else history in
-          versions.(bucket) <-
-            { history with
-              versions = Uuid_map.add key serial history.versions
-            ; count = history.count + if present then 0 else 1 })
+            if (not present) && history.count = 64
+            then { versions = Uuid_map.empty; count = 0; retirement = serial }
+            else history
+          in
+          versions.(bucket)
+          <- { history with
+               versions = Uuid_map.add key serial history.versions
+             ; count = (history.count + if present then 0 else 1)
+             })
       in
-      let mark_parent parent = mark (Parent_children parent); mark (Page_roots parent) in
-      let parent_of = function None -> None | Some (record : Types.block_record) -> Some record.block.parent in
-      let tag_titles context tags = List.filter_map (fun uuid ->
-        Option.map (fun (page : Types.page_record) -> uuid,page.page.title) (read_page context uuid)) tags in
-      let block_dto context value = Option.map (fun (record : Types.block_record) -> record,tag_titles context record.block.tags) value in
+      let mark_parent parent =
+        mark (Parent_children parent);
+        mark (Page_roots parent)
+      in
+      let parent_of = function
+        | None -> None
+        | Some (record : Types.block_record) -> Some record.block.parent
+      in
+      let tag_titles context tags =
+        List.filter_map
+          (fun uuid ->
+             Option.map
+               (fun (page : Types.page_record) -> uuid, page.page.title)
+               (read_page context uuid))
+          tags
+      in
+      let block_dto context value =
+        Option.map
+          (fun (record : Types.block_record) ->
+             record, tag_titles context record.block.tags)
+          value
+      in
       let journal_dto context = function
         | Some (page : Types.page_record) when not page.page.recycled ->
-          (match page.page.kind with Graph.Journal_page _ -> Some (page,tag_titles context page.page.tags) | _ -> None)
-        | _ -> None in
+          (match page.page.kind with
+           | Graph.Journal_page _ -> Some (page, tag_titles context page.page.tags)
+           | _ -> None)
+        | _ -> None
+      in
       let rec take () =
         match !pending with
         | [] -> None
         | sequence :: rest ->
           (match sequence () with
-           | Seq.Nil -> pending := rest; take ()
-           | Seq.Cons (job, tail) -> pending := tail :: rest; Some job)
+           | Seq.Nil ->
+             pending := rest;
+             take ()
+           | Seq.Cons (job, tail) ->
+             pending := tail :: rest;
+             Some job)
       in
       let rec drain () =
         match take () with
@@ -4739,61 +5207,134 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
           let key = Graph.Uuid.to_string uuid in
           let fresh = not (Hashtbl.mem visited key) in
           let fresh_ancestry = forced && not (Hashtbl.mem ancestry_visited key) in
-          if fresh || fresh_ancestry then (
+          if fresh || fresh_ancestry
+          then (
             let old_context, new_context = next_contexts () in
-            let old_block = read_block old_context uuid and new_block = read_block new_context uuid in
-            let old_page = read_page old_context uuid and new_page = read_page new_context uuid in
-            if fresh then (
+            let old_block = read_block old_context uuid
+            and new_block = read_block new_context uuid in
+            let old_page = read_page old_context uuid
+            and new_page = read_page new_context uuid in
+            if fresh
+            then (
               Hashtbl.add visited key ();
               let revoked = Hashtbl.mem revoked_identities key in
-              if revoked || block_dto old_context old_block <> block_dto new_context new_block then
-                List.iter mark_parent (List.filter_map Fun.id [parent_of old_block;parent_of new_block]);
+              if
+                revoked
+                || block_dto old_context old_block <> block_dto new_context new_block
+              then
+                List.iter
+                  mark_parent
+                  (List.filter_map Fun.id [ parent_of old_block; parent_of new_block ]);
               let old_journal = journal_dto old_context old_page
               and new_journal = journal_dto new_context new_page in
-              if old_journal <> new_journal
-                 || (revoked && (Option.is_some old_journal || Option.is_some new_journal))
+              if
+                old_journal <> new_journal
+                || (revoked && (Option.is_some old_journal || Option.is_some new_journal))
               then mark Journal_index);
-            let rendered_title = function None -> None | Some (page : Types.page_record) -> Some page.page.title in
+            let rendered_title = function
+              | None -> None
+              | Some (page : Types.page_record) -> Some page.page.title
+            in
             let title_changed = rendered_title old_page <> rendered_title new_page in
-            let deleted db = Option.bind (entity_of_uuid db uuid) (fun entity -> one db entity "logseq.property/deleted-at") in
-            let ancestry block = Option.map (fun (record : Types.block_record) -> record.block.parent,record.block.page) block in
-            let ancestor_changed = deleted old_db <> deleted new_db || ancestry old_block <> ancestry new_block in
-            let expand_ancestry = (forced || ancestor_changed) && not (Hashtbl.mem ancestry_visited key) in
+            let deleted db =
+              Option.bind (entity_of_uuid db uuid) (fun entity ->
+                one db entity "logseq.property/deleted-at")
+            in
+            let ancestry block =
+              Option.map
+                (fun (record : Types.block_record) ->
+                   record.block.parent, record.block.page)
+                block
+            in
+            let ancestor_changed =
+              deleted old_db <> deleted new_db || ancestry old_block <> ancestry new_block
+            in
+            let expand_ancestry =
+              (forced || ancestor_changed) && not (Hashtbl.mem ancestry_visited key)
+            in
             if expand_ancestry then Hashtbl.add ancestry_visited key ();
-            let entity_payload db = Option.map (entity_datoms db) (entity_of_uuid db uuid) in
-            let expand_references = fresh && (old_block <> new_block || old_page <> new_page
-              || (Option.is_none old_block && Option.is_none new_block
-                  && Option.is_none old_page && Option.is_none new_page)
-              || Hashtbl.mem revoked_identities key || entity_payload old_db <> entity_payload new_db) in
-            List.iter (fun (db, attributes) ->
-              match entity_of_uuid db uuid with None -> () | Some entity ->
-                if expand_references then (
-                  let inspect_refs attribute = enqueue (entity_jobs db
-                    (Datascript.datoms db Datascript.Avet ~a:attribute ~v:(Datascript.Ref entity) ()) false) in
-                  List.iter inspect_refs attributes;
-                  if title_changed then inspect_refs "block/page";
-                  Option.iter (fun ident -> enqueue (entity_jobs db
-                    (Datascript.datoms db Datascript.Aevt ~a:ident ()) false))
-                    (Option.bind (one db entity "db/ident") ident_of_value));
-                if expand_ancestry then (
-                  let children = Datascript.datoms db Datascript.Avet ~a:"block/parent" ~v:(Datascript.Ref entity) () in
-                  (match children () with
-                   | Seq.Nil -> ()
-                   | Seq.Cons _ ->
-                     mark_parent uuid;
-                     List.iter mark_parent (List.filter_map Fun.id [parent_of old_block;parent_of new_block]));
-                  enqueue (entity_jobs db children true))) databases);
+            let entity_payload db =
+              Option.map (entity_datoms db) (entity_of_uuid db uuid)
+            in
+            let expand_references =
+              fresh
+              && (old_block <> new_block
+                  || old_page <> new_page
+                  || (Option.is_none old_block
+                      && Option.is_none new_block
+                      && Option.is_none old_page
+                      && Option.is_none new_page)
+                  || Hashtbl.mem revoked_identities key
+                  || entity_payload old_db <> entity_payload new_db)
+            in
+            List.iter
+              (fun (db, attributes) ->
+                 match entity_of_uuid db uuid with
+                 | None -> ()
+                 | Some entity ->
+                   if expand_references
+                   then (
+                     let inspect_refs attribute =
+                       enqueue
+                         (entity_jobs
+                            db
+                            (Datascript.datoms
+                               db
+                               Datascript.Avet
+                               ~a:attribute
+                               ~v:(Datascript.Ref entity)
+                               ())
+                            false)
+                     in
+                     List.iter inspect_refs attributes;
+                     if title_changed then inspect_refs "block/page";
+                     Option.iter
+                       (fun ident ->
+                          enqueue
+                            (entity_jobs
+                               db
+                               (Datascript.datoms db Datascript.Aevt ~a:ident ())
+                               false))
+                       (Option.bind (one db entity "db/ident") ident_of_value));
+                   if expand_ancestry
+                   then (
+                     let children =
+                       Datascript.datoms
+                         db
+                         Datascript.Avet
+                         ~a:"block/parent"
+                         ~v:(Datascript.Ref entity)
+                         ()
+                     in
+                     (match children () with
+                      | Seq.Nil -> ()
+                      | Seq.Cons _ ->
+                        mark_parent uuid;
+                        List.iter
+                          mark_parent
+                          (List.filter_map
+                             Fun.id
+                             [ parent_of old_block; parent_of new_block ]));
+                     enqueue (entity_jobs db children true)))
+              databases);
           drain ()
       in
       drain ();
       database.timeline_versions <- versions;
       database.timeline_serial <- serial
-    with Timeline_proof_limit -> database.timeline_proof_available <- false)
+    with
+    | Timeline_proof_limit -> database.timeline_proof_available <- false)
 ;;
 
 let refresh_queryable_outbox database =
-  let before = { (snapshot_of_database database) with authoritative_database = Some database.timeline_authoritative } in
-  let outbox, block_effects, page_effects, children_effects = queryable_outbox_root database.outbox in
+  let before =
+    { (snapshot_of_database database) with
+      authoritative_database = Some database.timeline_authoritative
+    }
+  in
+  let outbox, block_effects, page_effects, children_effects =
+    queryable_outbox_root database.outbox
+  in
   database.queryable_outbox <- outbox;
   database.queryable_block_effects <- block_effects;
   database.queryable_page_effects <- page_effects;
@@ -4932,10 +5473,11 @@ let write_precondition ~blocks ~pages ~scopes =
         | None -> Ok { blocks; pages; scopes }))
 ;;
 
-let mutation_introduced_uuids (record:outbox_record) = match record.mutation with
-  | Types.Append_journal{root;_}->
+let mutation_introduced_uuids (record : outbox_record) =
+  match record.mutation with
+  | Types.Append_journal { root; _ } ->
     (if record.append_create then record.effect_footprint.page_uuids else [])
-    @ (append_uuids root)
+    @ append_uuids root
   | Types.Insert_blocks { tree; _ } -> Outliner.Tree.uuids tree
   | Create_journal_page { page; _ } -> [ page ]
   | Save_block _
@@ -4946,38 +5488,63 @@ let mutation_introduced_uuids (record:outbox_record) = match record.mutation wit
   | Clear_task_status _ -> []
 ;;
 
-let append_identity_present (snapshot:snapshot) uuid =
+let append_identity_present (snapshot : snapshot) uuid =
   let introduced index =
-    Uuid_map.find_opt(Graph.Uuid.to_string uuid)index |> Option.value ~default:Rrbvec.empty
-    |> Rrbvec.exists(fun(record:outbox_record)->record_is_logically_active record
-      && List.exists(Graph.Uuid.equal uuid)(mutation_introduced_uuids record)) in
-  entity_of_uuid (Option.get snapshot.authoritative_database)uuid<>None
-  || introduced(Option.get snapshot.block_effects) || introduced(Option.get snapshot.page_effects)
+    Uuid_map.find_opt (Graph.Uuid.to_string uuid) index
+    |> Option.value ~default:Rrbvec.empty
+    |> Rrbvec.exists (fun (record : outbox_record) ->
+      record_is_logically_active record
+      && List.exists (Graph.Uuid.equal uuid) (mutation_introduced_uuids record))
+  in
+  entity_of_uuid (Option.get snapshot.authoritative_database) uuid <> None
+  || introduced (Option.get snapshot.block_effects)
+  || introduced (Option.get snapshot.page_effects)
 ;;
 
 let authoritative_append_page snapshot day =
   indexed_journal_candidates snapshot ~from_day:day ~upper_day:day ~locals:Uuid_map.empty
-  |> Seq.find_map(fun candidate->
-    match page_of_database (Option.get snapshot.authoritative_database)candidate.uuid with
-    | Some page when not page.page.recycled ->Some candidate.uuid
-    | _->None)
+  |> Seq.find_map (fun candidate ->
+    match
+      page_of_database (Option.get snapshot.authoritative_database) candidate.uuid
+    with
+    | Some page when not page.page.recycled -> Some candidate.uuid
+    | _ -> None)
 ;;
 
 let resolve_append_page snapshot ~candidate ~day =
   match authoritative_append_page snapshot day with
-  | Some page->page
-  | None->
-    let chosen=Uuid_map.fold(fun _ effects chosen->
-      Rrbvec.fold_left(fun chosen (record:outbox_record)->
-        let page=match record.mutation with
-          | Types.Create_journal_page{page;journal_day;_} when record_is_logically_active record && journal_day=day ->Some page
-          | Append_journal{journal_day;_} when record_is_logically_active record && journal_day=day ->
-            Some(List.hd record.effect_footprint.page_uuids)
-          | _->None in
-        match page with
-        | Some page when Option.exists(fun(value:Types.page_record)->not value.page.recycled)(logical_page_at snapshot page)->
-          (match chosen with None->Some page|Some old->Some(if Graph.Uuid.compare old page<0 then old else page))
-        | _->chosen) chosen effects) (Option.get snapshot.page_effects) None in
+  | Some page -> page
+  | None ->
+    let chosen =
+      Uuid_map.fold
+        (fun _ effects chosen ->
+           Rrbvec.fold_left
+             (fun chosen (record : outbox_record) ->
+                let page =
+                  match record.mutation with
+                  | Types.Create_journal_page { page; journal_day; _ }
+                    when record_is_logically_active record && journal_day = day ->
+                    Some page
+                  | Append_journal { journal_day; _ }
+                    when record_is_logically_active record && journal_day = day ->
+                    Some (List.hd record.effect_footprint.page_uuids)
+                  | _ -> None
+                in
+                match page with
+                | Some page
+                  when Option.exists
+                         (fun (value : Types.page_record) -> not value.page.recycled)
+                         (logical_page_at snapshot page) ->
+                  (match chosen with
+                   | None -> Some page
+                   | Some old ->
+                     Some (if Graph.Uuid.compare old page < 0 then old else page))
+                | _ -> chosen)
+             chosen
+             effects)
+        (Option.get snapshot.page_effects)
+        None
+    in
     Option.value chosen ~default:candidate
 ;;
 
@@ -4991,30 +5558,46 @@ let uuid_lookup uuid =
 let uuid_temp prefix uuid = Datascript.Temp_id (prefix ^ ":" ^ Graph.Uuid.to_string uuid)
 
 let tree_orders lower tree =
-  let rec assign orders order (tree:Types.block_tree) =
-    let orders=Uuid_map.add(Graph.Uuid.to_string tree.uuid)order orders in
-    List.fold_left2 assign orders
-      (Outliner_order.generate_n ~lower:None ~upper:None(List.length tree.children))tree.children in
-  assign Uuid_map.empty(Outliner_order.generate ~lower ~upper:None)tree
+  let rec assign orders order (tree : Types.block_tree) =
+    let orders = Uuid_map.add (Graph.Uuid.to_string tree.uuid) order orders in
+    List.fold_left2
+      assign
+      orders
+      (Outliner_order.generate_n ~lower:None ~upper:None (List.length tree.children))
+      tree.children
+  in
+  assign Uuid_map.empty (Outliner_order.generate ~lower ~upper:None) tree
 ;;
 
 let append_orders lower root =
-  let rec assign orders order (node:Types.append_node) =
-    let orders=Uuid_map.add(Graph.Uuid.to_string node.uuid)order orders in
-    fst(Rrbvec.fold_left(fun(orders,lower)child->
-      let order=Outliner_order.generate ~lower ~upper:None in assign orders order child,Some order)
-      (orders,None)node.children) in
-  assign Uuid_map.empty(Outliner_order.generate ~lower ~upper:None)root
+  let rec assign orders order (node : Types.append_node) =
+    let orders = Uuid_map.add (Graph.Uuid.to_string node.uuid) order orders in
+    fst
+      (Rrbvec.fold_left
+         (fun (orders, lower) child ->
+            let order = Outliner_order.generate ~lower ~upper:None in
+            assign orders order child, Some order)
+         (orders, None)
+         node.children)
+  in
+  assign Uuid_map.empty (Outliner_order.generate ~lower ~upper:None) root
 ;;
 
 let insertion_orders ?append_parent context = function
-  | Types.Append_journal{page;journal_day;root;_}->
-    let lower=match append_parent with Some(_,lower)->lower|None->
-      let parent=resolve_append_page context.read_snapshot ~candidate:page ~day:journal_day in
-      snd(read_siblings context parent) in
+  | Types.Append_journal { page; journal_day; root; _ } ->
+    let lower =
+      match append_parent with
+      | Some (_, lower) -> lower
+      | None ->
+        let parent =
+          resolve_append_page context.read_snapshot ~candidate:page ~day:journal_day
+        in
+        snd (read_siblings context parent)
+    in
     append_orders lower root
-  | Types.Insert_blocks{parent;tree;_}->tree_orders(snd(read_siblings context parent))tree
-  | _->Uuid_map.empty
+  | Types.Insert_blocks { parent; tree; _ } ->
+    tree_orders (snd (read_siblings context parent)) tree
+  | _ -> Uuid_map.empty
 ;;
 
 module Asset_descriptor = Logseq_db_types.Asset_descriptor
@@ -5145,14 +5728,14 @@ let published_asset_matches descriptor version =
 ;;
 
 let rec local_operations
-      ~append_create
-      ~fingerprint:_
-      ~intent_time_ms
-      ~next_tx
-      ~orders
-      ~(effect_footprint : effect_footprint)
-      ~delete_artifacts
-      mutation
+          ~append_create
+          ~fingerprint:_
+          ~intent_time_ms
+          ~next_tx
+          ~orders
+          ~(effect_footprint : effect_footprint)
+          ~delete_artifacts
+          mutation
   =
   let now = Int64.to_int intent_time_ms in
   let operations =
@@ -5174,33 +5757,68 @@ let rec local_operations
       ; Add (uuid_lookup block, "block/updated-at", Int64 (Int64.of_int now))
       ; Add (uuid_lookup block, "block/tx-id", Int64 (Int64.of_int next_tx))
       ]
-    | Types.Append_journal{mutation_id;page=_;title;journal_day;root}->
-      let page=List.hd effect_footprint.page_uuids in
-      let run mutation=local_operations ~append_create:false ~fingerprint:""
-        ~intent_time_ms ~next_tx ~orders ~effect_footprint ~delete_artifacts:None mutation in
-      let creation=if append_create then run(Types.Create_journal_page{mutation_id;page;title;journal_day}) else [] in
-      let rec add_tree parent_ref (node:Types.append_node) =
-        let node_ref=uuid_temp "overlay-insert" node.uuid in
-        let fields=Datascript.[
-          Add(node_ref,"block/uuid",Uuid(Graph.Uuid.to_string node.uuid));Add(node_ref,"block/title",String node.title);
-          Add(node_ref,"block/parent",Ref_to parent_ref);Add(node_ref,"block/page",Ref_to(uuid_lookup page));
-          Add(node_ref,"block/order",String(assigned_order orders node.uuid));
-          Add(node_ref,"block/created-at",Int64 intent_time_ms);Add(node_ref,"block/updated-at",Int64 intent_time_ms);
-          Add(node_ref,"block/tx-id",Int64(Int64.of_int next_tx))] in
-        Seq.append(List.to_seq fields)(Rrbvec.to_seq node.children |> Seq.flat_map(add_tree node_ref)) in
-      let insertion=add_tree(uuid_lookup page)root |> List.of_seq in
-      let statuses=Overlay_planner.append_nodes root |> Rrbvec.to_seq
-        |> Seq.flat_map(fun(node:Types.append_node)->match node.task_status with
-          |None->Seq.empty
-          |Some status->run(Types.Set_task_status{mutation_id;block=node.uuid;status=Types.Status_uuid status}) |> List.to_seq)
-        |> List.of_seq in
-      let operations=creation@insertion@statuses in
-      if not append_create then operations else
-        let page_ref=uuid_temp "overlay-page" page in
-        List.map(function
-          | Datascript.Add(entity,attribute,Ref_to reference) when reference=uuid_lookup page ->
-            Datascript.Add(entity,attribute,Ref_to page_ref)
-          | operation->operation)operations
+    | Types.Append_journal { mutation_id; page = _; title; journal_day; root } ->
+      let page = List.hd effect_footprint.page_uuids in
+      let run mutation =
+        local_operations
+          ~append_create:false
+          ~fingerprint:""
+          ~intent_time_ms
+          ~next_tx
+          ~orders
+          ~effect_footprint
+          ~delete_artifacts:None
+          mutation
+      in
+      let creation =
+        if append_create
+        then run (Types.Create_journal_page { mutation_id; page; title; journal_day })
+        else []
+      in
+      let rec add_tree parent_ref (node : Types.append_node) =
+        let node_ref = uuid_temp "overlay-insert" node.uuid in
+        let fields =
+          Datascript.
+            [ Add (node_ref, "block/uuid", Uuid (Graph.Uuid.to_string node.uuid))
+            ; Add (node_ref, "block/title", String node.title)
+            ; Add (node_ref, "block/parent", Ref_to parent_ref)
+            ; Add (node_ref, "block/page", Ref_to (uuid_lookup page))
+            ; Add (node_ref, "block/order", String (assigned_order orders node.uuid))
+            ; Add (node_ref, "block/created-at", Int64 intent_time_ms)
+            ; Add (node_ref, "block/updated-at", Int64 intent_time_ms)
+            ; Add (node_ref, "block/tx-id", Int64 (Int64.of_int next_tx))
+            ]
+        in
+        Seq.append
+          (List.to_seq fields)
+          (Rrbvec.to_seq node.children |> Seq.flat_map (add_tree node_ref))
+      in
+      let insertion = add_tree (uuid_lookup page) root |> List.of_seq in
+      let statuses =
+        Overlay_planner.append_nodes root
+        |> Rrbvec.to_seq
+        |> Seq.flat_map (fun (node : Types.append_node) ->
+          match node.task_status with
+          | None -> Seq.empty
+          | Some status ->
+            run
+              (Types.Set_task_status
+                 { mutation_id; block = node.uuid; status = Types.Status_uuid status })
+            |> List.to_seq)
+        |> List.of_seq
+      in
+      let operations = creation @ insertion @ statuses in
+      if not append_create
+      then operations
+      else (
+        let page_ref = uuid_temp "overlay-page" page in
+        List.map
+          (function
+            | Datascript.Add (entity, attribute, Ref_to reference)
+              when reference = uuid_lookup page ->
+              Datascript.Add (entity, attribute, Ref_to page_ref)
+            | operation -> operation)
+          operations)
     | Types.Save_block { block; title; _ } ->
       let entity = uuid_lookup block in
       [ Datascript.Add (entity, "block/title", String title)
@@ -5398,10 +6016,16 @@ let dependency_shadows_are_canonical ~effect_footprint mutation shadows =
     | Types.Save_block { block; _ }
     | Set_task_status { block; _ }
     | Clear_task_status { block; _ } -> add_block [] [] block
-    | Append_journal{journal_day;_} ->
-      if List.length effect_footprint.page_uuids=1 && List.for_all(fun shadow->
-        not shadow.shadow_recycled && shadow.shadow_page_kind=Graph.Journal_page{journal_day})shadows.shadow_pages
-      then Some([],effect_footprint.page_uuids) else None
+    | Append_journal { journal_day; _ } ->
+      if
+        List.length effect_footprint.page_uuids = 1
+        && List.for_all
+             (fun shadow ->
+                (not shadow.shadow_recycled)
+                && shadow.shadow_page_kind = Graph.Journal_page { journal_day })
+             shadows.shadow_pages
+      then Some ([], effect_footprint.page_uuids)
+      else None
     | Insert_blocks { parent; _ } -> add_parent [] [] parent
     | Delete_blocks _ | Create_journal_page _ -> Some ([], [])
   in
@@ -5473,7 +6097,10 @@ let outbox_record_is_canonical (record : outbox_record) =
     | Submitted _
     | Accepted_pending_authoritative _
     | Stale_rejected_pending_authoritative _ ->
-      dependency_shadows_are_canonical ~effect_footprint:record.effect_footprint record.mutation record.dependency_shadows
+      dependency_shadows_are_canonical
+        ~effect_footprint:record.effect_footprint
+        record.mutation
+        record.dependency_shadows
   in
   Result.is_ok (Sync_tx_codec.protected_values record.normalized_transaction)
   && String.equal record.fingerprint (fingerprint record.mutation)
@@ -5950,21 +6577,42 @@ let delete_artifacts database context ~now root =
 ;;
 
 let planned_effect database context ~now = function
-  | Types.Append_journal{page;root;journal_day;_}->
-    let resolved=resolve_append_page context.read_snapshot ~candidate:page ~day:journal_day in
-    let nodes=Overlay_planner.append_nodes root in
-    let invalid=Rrbvec.find_map(fun(node:Types.append_node)->
-      if append_identity_present context.read_snapshot node.uuid then Some "An append block UUID is already present."
-      else match node.task_status with
-        |Some status when task_status_at context.read_snapshot status=None ->Some "Append status is missing or recycled."
-        |_->None) nodes in
-    (match invalid,read_page context resolved with
-     | Some message,_->Error(Types.Invalid_local_mutation message)
-     | _,Some page when page.page.recycled || page.page.kind<>Graph.Journal_page{journal_day}->
-       Error(Types.Invalid_local_mutation "Append candidate belongs to another page.")
-     | _,None when append_identity_present context.read_snapshot resolved ->Error(Types.Invalid_local_mutation "Append candidate UUID is already occupied.")
-     | _->Ok({block_uuids=append_uuids root;page_uuids=[resolved];structure_interests=
-         [Types.Children_interest resolved;Page_tree_interest resolved;Journal_index_interest]@append_interests root},None))
+  | Types.Append_journal { page; root; journal_day; _ } ->
+    let resolved =
+      resolve_append_page context.read_snapshot ~candidate:page ~day:journal_day
+    in
+    let nodes = Overlay_planner.append_nodes root in
+    let invalid =
+      Rrbvec.find_map
+        (fun (node : Types.append_node) ->
+           if append_identity_present context.read_snapshot node.uuid
+           then Some "An append block UUID is already present."
+           else (
+             match node.task_status with
+             | Some status when task_status_at context.read_snapshot status = None ->
+               Some "Append status is missing or recycled."
+             | _ -> None))
+        nodes
+    in
+    (match invalid, read_page context resolved with
+     | Some message, _ -> Error (Types.Invalid_local_mutation message)
+     | _, Some page
+       when page.page.recycled || page.page.kind <> Graph.Journal_page { journal_day } ->
+       Error (Types.Invalid_local_mutation "Append candidate belongs to another page.")
+     | _, None when append_identity_present context.read_snapshot resolved ->
+       Error (Types.Invalid_local_mutation "Append candidate UUID is already occupied.")
+     | _ ->
+       Ok
+         ( { block_uuids = append_uuids root
+           ; page_uuids = [ resolved ]
+           ; structure_interests =
+               [ Types.Children_interest resolved
+               ; Page_tree_interest resolved
+               ; Journal_index_interest
+               ]
+               @ append_interests root
+           }
+         , None ))
   | Types.Set_asset_reference { block; previous; asset; _ } ->
     (match read_block context block, asset_descriptor_at context.read_snapshot asset with
      | Some holder, Ok (Some _) when asset_reference_matches holder previous ->
@@ -6121,7 +6769,11 @@ let dependency_shadows_for_snapshot ?append_page snapshot mutation =
    | Types.Save_block { block; _ }
    | Set_task_status { block; _ }
    | Clear_task_status { block; _ } -> add_block block
-   | Append_journal{page;journal_day;_}->add_page(match append_page with Some page->page|None->resolve_append_page snapshot ~candidate:page ~day:journal_day)
+   | Append_journal { page; journal_day; _ } ->
+     add_page
+       (match append_page with
+        | Some page -> page
+        | None -> resolve_append_page snapshot ~candidate:page ~day:journal_day)
    | Insert_blocks { parent; _ } -> add_block parent
    | Delete_blocks _ | Create_journal_page _ -> ());
   { shadow_blocks =
@@ -6137,10 +6789,16 @@ let dependency_shadows_for_snapshot ?append_page snapshot mutation =
   }
 ;;
 
-let dependency_shadows_for database (record:outbox_record) =
-  let append_page=match record.mutation,record.effect_footprint.page_uuids with
-    | Types.Append_journal _,[page]->Some page|_->None in
-  dependency_shadows_for_snapshot ?append_page (snapshot_of_database database) record.mutation
+let dependency_shadows_for database (record : outbox_record) =
+  let append_page =
+    match record.mutation, record.effect_footprint.page_uuids with
+    | Types.Append_journal _, [ page ] -> Some page
+    | _ -> None
+  in
+  dependency_shadows_for_snapshot
+    ?append_page
+    (snapshot_of_database database)
+    record.mutation
 ;;
 
 let local_candidate_record
@@ -6161,9 +6819,11 @@ let local_candidate_record
     + 1
   in
   let planned_tx = (authoritative_database database).Datascript.max_tx + 1 in
-  let append_create=match mutation,effect_footprint.page_uuids with
-    | Types.Append_journal _,[page]->read_page context page=None
-    | _->false in
+  let append_create =
+    match mutation, effect_footprint.page_uuids with
+    | Types.Append_journal _, [ page ] -> read_page context page = None
+    | _ -> false
+  in
   { mutation_id
   ; append_create
   ; fingerprint
@@ -6232,7 +6892,8 @@ let bounded_logical_summary database ~block_uuids ~page_uuids ~structure_interes
 ;;
 
 let logical_change_for_effects database ~before ~after effects =
-  let before_context=read_context before and after_context=read_context after in
+  let before_context = read_context before
+  and after_context = read_context after in
   let block_candidates, page_candidates, structure_interests =
     List.fold_left
       (fun (blocks, pages, interests) footprint ->
@@ -6252,7 +6913,8 @@ let logical_change_for_effects database ~before ~after effects =
   let page_uuids =
     page_candidates
     |> List.sort_uniq Graph.Uuid.compare
-    |> List.filter (fun uuid -> read_page before_context uuid <> read_page after_context uuid)
+    |> List.filter (fun uuid ->
+      read_page before_context uuid <> read_page after_context uuid)
   in
   if block_uuids = [] && page_uuids = []
   then Types.No_logical_change
@@ -6293,177 +6955,197 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
        | Ok (outbox, legacy_revision) ->
          let sync_revision = Option.value durable_revision ~default:legacy_revision in
          let durable_outbox = durable_outbox_rows outbox in
-         (match migrate_outbox path ~revision:sync_revision ~expected_records:encoded durable_outbox with
+         (match
+            migrate_outbox
+              path
+              ~revision:sync_revision
+              ~expected_records:encoded
+              durable_outbox
+          with
           | Error message -> Error (Types.Corrupt_outbox message)
           | Ok () ->
-         (match Storage.open_database path with
-          | Error error -> Error (Types.Restore_failed (Storage.diagnostic_error ~operation:"attachGraph" error))
-          | Ok connection ->
-            let callbacks = Storage.connection_callbacks connection in
-            let transferred = ref false in
-            let installed_listener = ref None in
-            Fun.protect
-              ~finally:(fun () ->
-                if not !transferred
-                then (
-                  Option.iter
-                    (fun (connection, listener) ->
-                       Datascript.unlisten connection listener)
-                    !installed_listener;
-                  ignore (Storage.close callbacks)))
-              (fun () ->
-                 match Storage.restore_database connection with
-                 | Error error ->
-                   Error (Types.Restore_failed (Storage.diagnostic_error ~operation:"attachGraph" error))
-                 | Ok authoritative_database ->
-                   let authoritative_connection =
-                     Datascript.Conn.from_db
-                       { empty_db = Datascript.empty_db
-                       ; init_db = Datascript.init_db
-                       ; store = (fun ?storage:_ database -> database)
-                       }
-                       authoritative_database
-                   in
-                   let authoritative_reports = ref [] in
-                   let authoritative_listener =
-                     Datascript.listen
-                       authoritative_connection
-                       "logseq-overlay-authoritative"
-                       (fun report ->
-                          authoritative_reports := report :: !authoritative_reports)
-                   in
-                   installed_listener
-                   := Some (authoritative_connection, authoritative_listener);
-                   let storage_session =
-                     Logseq_db_storage.Storage_session.create
-                       ~tail:
-                         (Datascript.Storage.restore_tail_groups
-                            (Storage.datascript_storage connection))
-                       ~callbacks
-                   in
-                   let release_slot = ref None in
-                   let checkpoint_metadata =
-                     Storage.sync_metadata connection |> Result.get_ok
-                   in
-                   let checkpoint =
-                     match inspection.presence with
-                     | Types.Available { checkpoint; _ } -> checkpoint
-                     | Absent _ -> Types.Server_cursor.zero
-                   in
-                   let ( queryable_outbox
-                       , queryable_block_effects
-                       , queryable_page_effects
-                       , queryable_children_effects )
-                     =
-                     queryable_outbox_root outbox
-                   in
-                   let database =
-                     { lock = Eio.Mutex.create ()
+            (match Storage.open_database path with
+             | Error error ->
+               Error
+                 (Types.Restore_failed
+                    (Storage.diagnostic_error ~operation:"attachGraph" error))
+             | Ok connection ->
+               let callbacks = Storage.connection_callbacks connection in
+               let transferred = ref false in
+               let installed_listener = ref None in
+               Fun.protect
+                 ~finally:(fun () ->
+                   if not !transferred
+                   then (
+                     Option.iter
+                       (fun (connection, listener) ->
+                          Datascript.unlisten connection listener)
+                       !installed_listener;
+                     ignore (Storage.close callbacks)))
+                 (fun () ->
+                    match Storage.restore_database connection with
+                    | Error error ->
+                      Error
+                        (Types.Restore_failed
+                           (Storage.diagnostic_error ~operation:"attachGraph" error))
+                    | Ok authoritative_database ->
+                      let restored_entities = ref 0 in
+                      let authoritative_checksum =
+                        Authoritative_checksum.initialize
+                          ~check_current:(fun () ->
+                            restored_entities := (!restored_entities + 1) mod 256;
+                            if !restored_entities = 0 then Eio.Fiber.yield ())
+                          ~e2ee:(Authoritative_checksum.graph_e2ee authoritative_database)
+                          authoritative_database
+                      in
+                      let authoritative_connection =
+                        Datascript.Conn.from_db
+                          { empty_db = Datascript.empty_db
+                          ; init_db = Datascript.init_db
+                          ; store = (fun ?storage:_ database -> database)
+                          }
+                          authoritative_database
+                      in
+                      let authoritative_reports = ref [] in
+                      let authoritative_listener =
+                        Datascript.listen
+                          authoritative_connection
+                          "logseq-overlay-authoritative"
+                          (fun report ->
+                             authoritative_reports := report :: !authoritative_reports)
+                      in
+                      installed_listener
+                      := Some (authoritative_connection, authoritative_listener);
+                      let storage_session =
+                        Logseq_db_storage.Storage_session.create
+                          ~tail:
+                            (Datascript.Storage.restore_tail_groups
+                               (Storage.datascript_storage connection))
+                          ~callbacks
+                      in
+                      let release_slot = ref None in
+                      let checkpoint =
+                        match inspection.presence with
+                        | Types.Available { checkpoint; _ } -> checkpoint
+                        | Absent _ -> Types.Server_cursor.zero
+                      in
+                      let ( queryable_outbox
+                          , queryable_block_effects
+                          , queryable_page_effects
+                          , queryable_children_effects )
+                        =
+                        queryable_outbox_root outbox
+                      in
+                      let database =
+                        { lock = Eio.Mutex.create ()
                         ; task_catalog_cache = Atomic.make None
                         ; notification_lock = Eio.Mutex.create ()
-                     ; sw
-                     ; dispatch_stream =
-                         Eio.Stream.create dependencies.limits.dispatcher_capacity
-                     ; dispatch_slots =
-                         Eio.Semaphore.make dependencies.limits.dispatcher_capacity
-                     ; dependencies
-                     ; database_path = path
-                     ; graph_uuid = inspection.location.graph_id
-                     ; graph_name
-                     ; schema = Graph.{ major = 65; minor = 33 }
-                     ; admission_facts =
-                         [ Graph.Remote_flag_true
-                         ; Synced_graph_identity inspection.location.graph_id
-                         ; Lossless_codec
-                         ; Ownership_verified
-                         ]
-                     ; storage_session
-                     ; ownership
-                     ; release_slot
-                     ; closed = false
-                     ; generation = current_generation
-                     ; projection = 0
-                     ; timeline_versions = empty_timeline_history ()
-                     ; timeline_serial = 0
-                     ; timeline_proof_available = true
-                     ; timeline_authoritative = authoritative_database
-                     ; authoritative_connection
-                     ; authoritative_listener
-                     ; authoritative_reports
-                     ; receipts = []
-                     ; outbox
-                     ; queryable_outbox
-                     ; queryable_block_effects
-                     ; queryable_page_effects
-                     ; queryable_children_effects
-                     ; sync_revision
-                     ; durable_sync_revision = sync_revision
-                     ; durable_outbox
-                     ; checkpoint
-                     ; checkpoint_metadata
-                     ; subscriptions = []
-                     ; snapshots = []
-                     }
-                   in
-                   release_slot := Some database;
-                   Eio.Switch.on_release sw (fun () ->
-                     match !release_slot with
-                     | None -> ()
-                     | Some database -> ignore (close database));
-                   Eio.Fiber.fork_daemon ~sw (fun () ->
-                     let rec dispatch () =
-                       match Eio.Stream.take database.dispatch_stream with
-                       | Stop_dispatch -> ()
-                       | Dispatch_change (change, queued) ->
-                         Eio.Semaphore.release database.dispatch_slots;
-                         let subscriptions =
-                           Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
-                             List.filter
-                               (fun (subscription : subscription) ->
-                                  subscription.lifecycle = Active)
-                               database.subscriptions)
-                         in
-                         let after_revision =
-                           match change with
-                           | Types.Exact { after_revision; _ }
-                           | Projection_resync_required { after_revision; _ } ->
-                             after_revision
-                         in
-                         List.iter
-                           (fun (subscription : subscription) ->
-                              if
-                                Eio.Stream.length subscription.events
-                                >= dependencies.limits.dispatcher_capacity
-                              then (
-                                while
-                                  Option.is_some
-                                    (Eio.Stream.take_nonblocking subscription.events)
-                                do
-                                  ()
-                                done;
-                                Eio.Stream.add
-                                  subscription.events
-                                  (Some
-                                     (Types.Projection_resync_required
-                                        { generation = database.generation
-                                        ; after_revision
-                                        ; reason = Dispatcher_retention_exceeded
-                                        })))
-                              else Eio.Stream.add subscription.events (Some change))
-                           subscriptions;
-                         Eio.Promise.resolve queued ();
-                         dispatch ()
-                     in
-                     dispatch ();
-                     `Stop_daemon);
-                   transferred := true;
-                   installed_listener := None;
-                   Ok database)))))
+                        ; sw
+                        ; dispatch_stream =
+                            Eio.Stream.create dependencies.limits.dispatcher_capacity
+                        ; dispatch_slots =
+                            Eio.Semaphore.make dependencies.limits.dispatcher_capacity
+                        ; dependencies
+                        ; database_path = path
+                        ; graph_uuid = inspection.location.graph_id
+                        ; graph_name
+                        ; schema = Graph.{ major = 65; minor = 33 }
+                        ; admission_facts =
+                            [ Graph.Remote_flag_true
+                            ; Synced_graph_identity inspection.location.graph_id
+                            ; Lossless_codec
+                            ; Ownership_verified
+                            ]
+                        ; storage_session
+                        ; ownership
+                        ; release_slot
+                        ; closed = false
+                        ; generation = current_generation
+                        ; projection = 0
+                        ; timeline_versions = empty_timeline_history ()
+                        ; timeline_serial = 0
+                        ; timeline_proof_available = true
+                        ; timeline_authoritative = authoritative_database
+                        ; authoritative_checksum
+                        ; authoritative_connection
+                        ; authoritative_listener
+                        ; authoritative_reports
+                        ; receipts = []
+                        ; outbox
+                        ; queryable_outbox
+                        ; queryable_block_effects
+                        ; queryable_page_effects
+                        ; queryable_children_effects
+                        ; sync_changed = Eio.Condition.create ()
+                        ; sync_revision
+                        ; durable_sync_revision = sync_revision
+                        ; durable_outbox
+                        ; checkpoint
+                        ; subscriptions = []
+                        ; snapshots = []
+                        }
+                      in
+                      release_slot := Some database;
+                      Eio.Switch.on_release sw (fun () ->
+                        match !release_slot with
+                        | None -> ()
+                        | Some database -> ignore (close database));
+                      Eio.Fiber.fork_daemon ~sw (fun () ->
+                        let rec dispatch () =
+                          match Eio.Stream.take database.dispatch_stream with
+                          | Stop_dispatch -> ()
+                          | Dispatch_change (change, queued) ->
+                            Eio.Semaphore.release database.dispatch_slots;
+                            let subscriptions =
+                              Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
+                                List.filter
+                                  (fun (subscription : subscription) ->
+                                     subscription.lifecycle = Active)
+                                  database.subscriptions)
+                            in
+                            let after_revision =
+                              match change with
+                              | Types.Exact { after_revision; _ }
+                              | Projection_resync_required { after_revision; _ } ->
+                                after_revision
+                            in
+                            List.iter
+                              (fun (subscription : subscription) ->
+                                 if
+                                   Eio.Stream.length subscription.events
+                                   >= dependencies.limits.dispatcher_capacity
+                                 then (
+                                   while
+                                     Option.is_some
+                                       (Eio.Stream.take_nonblocking subscription.events)
+                                   do
+                                     ()
+                                   done;
+                                   Eio.Stream.add
+                                     subscription.events
+                                     (Some
+                                        (Types.Projection_resync_required
+                                           { generation = database.generation
+                                           ; after_revision
+                                           ; reason = Dispatcher_retention_exceeded
+                                           })))
+                                 else Eio.Stream.add subscription.events (Some change))
+                              subscriptions;
+                            Eio.Promise.resolve queued ();
+                            dispatch ()
+                        in
+                        dispatch ();
+                        `Stop_daemon);
+                      transferred := true;
+                      installed_listener := None;
+                      Ok database)))))
 ;;
 
 let open_ ~sw dependencies inspection ~graph_name =
-  (try collect_retired_mirrors inspection.location with _ ->
-     report_warning "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n");
+  (try collect_retired_mirrors inspection.location with
+   | _ ->
+     report_warning
+       "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n");
   if String.trim graph_name = ""
   then Error Types.Invalid_graph_name
   else (
@@ -6613,6 +7295,7 @@ let persist_outbox ?(terminal_batches = []) ?intent_commit database =
                         | Ok () ->
                           database.durable_outbox <- durable_outbox;
                           database.durable_sync_revision <- database.sync_revision;
+                          Eio.Condition.broadcast database.sync_changed;
                           Ok ()
                         | Error message -> rollback message))))))
 ;;
@@ -7125,6 +7808,31 @@ let inspect_sync database =
            ~submissions:(List.map descriptor database.outbox)))
 ;;
 
+let await_sync_change database ~after =
+  Eio.Condition.loop_no_mutex database.sync_changed (fun () ->
+    match inspect_sync database with
+    | Error _ as error -> Some error
+    | Ok view when not (Types.sync_token_equal after (Types.sync_view_token view)) ->
+      Some (Ok view)
+    | Ok _ -> None)
+;;
+
+let check_checkpoint_checksum database ~through ~expected =
+  Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
+    if database.closed
+    then Error Types.Sync_database_closed
+    else if not (Types.Server_cursor.equal database.checkpoint through)
+    then Ok None
+    else (
+      let digest = Authoritative_checksum.to_string database.authoritative_checksum in
+      report_checksum_mismatch
+        ~phase:"checkpoint"
+        ~through
+        ~expected:(checksum_value expected)
+        ~actual:digest;
+      Ok (Some (String.equal (checksum_value expected) digest))))
+;;
+
 let find_outbox database id =
   List.find_opt
     (fun (record : outbox_record) -> Graph.Uuid.equal record.mutation_id id)
@@ -7158,11 +7866,13 @@ let records_for_ids records ids =
     ids
 ;;
 
-let mutation_required_uuids (record:outbox_record) = match record.mutation with
-  | Types.Append_journal{root;_}->
+let mutation_required_uuids (record : outbox_record) =
+  match record.mutation with
+  | Types.Append_journal { root; _ } ->
     (if record.append_create then [] else record.effect_footprint.page_uuids)
     @ (Overlay_planner.append_nodes root
-       |> Rrbvec.filter_map(fun(node:Types.append_node)->node.task_status) |> Rrbvec.to_list)
+       |> Rrbvec.filter_map (fun (node : Types.append_node) -> node.task_status)
+       |> Rrbvec.to_list)
   | Types.Set_asset_reference { block; asset; _ } -> [ block; asset ]
   | Types.Publish_asset { block; _ }
   | Types.Save_block { block; _ }
@@ -7201,8 +7911,7 @@ let ineligible_submission_dependency database selected =
                 (fun (candidate : outbox_record) -> candidate == owner)
                 selected)
        in
-       if
-         List.exists has_unselected_queued_owner (mutation_required_uuids record)
+       if List.exists has_unselected_queued_owner (mutation_required_uuids record)
        then Some record.mutation_id
        else None)
     selected
@@ -7241,22 +7950,6 @@ let expected_origin_cursor (record : outbox_record) =
   | Some t_before, Some ordinal, Some count when ordinal >= 0 && ordinal < count ->
     advance_cursor t_before (ordinal + 1)
   | _ -> Error "own transaction omitted its frozen submission interval"
-;;
-
-let strip_versioned_prefix prefix value =
-  let prefix = prefix ^ ":v1:" in
-  if
-    String.length value >= String.length prefix
-    && String.sub value 0 (String.length prefix) = prefix
-  then String.sub value (String.length prefix) (String.length value - String.length prefix)
-  else value
-;;
-
-let acceptance_barrier_is_current database (barrier : Types.acceptance_barrier) =
-  Types.Server_cursor.equal barrier.through database.checkpoint
-  && String.equal
-       (strip_versioned_prefix "checksum" (Types.Checksum.to_string barrier.checksum))
-       (strip_versioned_prefix "checksum" database.checkpoint_metadata.checksum)
 ;;
 
 let rec authoritative_tree_is_present database ~parent (tree : Types.block_tree) =
@@ -7301,17 +7994,30 @@ let authoritative_import_matches
 ;;
 
 let authoritative_satisfies_mutation_in database = function
-  | Types.Append_journal{root;journal_day;_}->
-    let rec matches parent (node:Types.append_node)=match block_of_database database node.uuid with
-      | Some value->(match parent with None->true|Some parent->value.block.parent=parent)
-        && value.block.title=node.title && value.task_status=Option.map(fun id->Types.Status_uuid id)node.task_status
-        && Rrbvec.for_all(matches(Some node.uuid))node.children
-      | None->false in
-    matches None root && (match block_of_database database root.uuid with
-      | Some value->(match page_of_database database value.block.page with
-        |Some page->not page.page.recycled && page.page.kind=Graph.Journal_page{journal_day}
-          && value.block.parent=page.page.uuid|None->false)
-      |None->false)
+  | Types.Append_journal { root; journal_day; _ } ->
+    let rec matches parent (node : Types.append_node) =
+      match block_of_database database node.uuid with
+      | Some value ->
+        (match parent with
+         | None -> true
+         | Some parent -> value.block.parent = parent)
+        && value.block.title = node.title
+        && value.task_status
+           = Option.map (fun id -> Types.Status_uuid id) node.task_status
+        && Rrbvec.for_all (matches (Some node.uuid)) node.children
+      | None -> false
+    in
+    matches None root
+    &&
+      (match block_of_database database root.uuid with
+      | Some value ->
+        (match page_of_database database value.block.page with
+         | Some page ->
+           (not page.page.recycled)
+           && page.page.kind = Graph.Journal_page { journal_day }
+           && value.block.parent = page.page.uuid
+         | None -> false)
+      | None -> false)
   | Types.Set_asset_reference { block; asset; _ } ->
     block_of_database database block
     |> option_satisfies (fun holder -> asset_reference_matches holder (Some asset))
@@ -7543,6 +8249,11 @@ let begin_outbox_transition database ~expected transition =
                    "acceptance contradicts settled Stale evidence"))
          | Ok (Some { terminal_outcome = Terminal_accepted accepted; _ })
            when Transition.acceptance_barriers_equal accepted barrier ->
+           report_checksum_mismatch
+             ~phase:"acceptance-duplicate"
+             ~through:barrier.through
+             ~expected:(checksum_value barrier.checksum)
+             ~actual:(checksum_value accepted.checksum);
            make Duplicate_plan None
          | Ok (Some { terminal_outcome = Terminal_accepted _; _ }) ->
            Error (Types.Outbox_transition_invalid "terminal acceptance mismatch")
@@ -7571,11 +8282,15 @@ let begin_outbox_transition database ~expected transition =
            (match List.fold_left validate (Ok ()) records with
             | Error message -> Error (Types.Outbox_transition_invalid message)
             | Ok () ->
-              if
-                Types.Server_cursor.equal through database.checkpoint
-                && not (acceptance_barrier_is_current database barrier)
-              then Error (Types.Outbox_transition_invalid "acceptance checksum mismatch")
-              else make (Accept_plan (id, barrier)) None))
+              if Types.Server_cursor.equal through database.checkpoint
+              then
+                report_checksum_mismatch
+                  ~phase:"acceptance"
+                  ~through
+                  ~expected:(checksum_value barrier.checksum)
+                  ~actual:
+                    (Authoritative_checksum.to_string database.authoritative_checksum);
+              make (Accept_plan (id, barrier)) None))
       | Reject_group { batch_id = id; resolution } ->
         (match read_terminal_batch database id with
          | Error message -> Error (Types.Outbox_transition_invalid message)
@@ -7709,7 +8424,7 @@ let make_batch preparation encrypted =
           let expected =
             local_operations
               ~append_create:record.append_create
-                      ~fingerprint:record.fingerprint
+              ~fingerprint:record.fingerprint
               ~intent_time_ms:record.intent_time_ms
               ~next_tx:record.planned_tx
               ~orders:(assigned_orders record)
@@ -7724,7 +8439,7 @@ let make_batch preparation encrypted =
           let operations =
             local_operations
               ~append_create:record.append_create
-                      ~fingerprint:record.fingerprint
+              ~fingerprint:record.fingerprint
               ~intent_time_ms:record.intent_time_ms
               ~next_tx:record.planned_tx
               ~orders:(assigned_orders record)
@@ -7994,6 +8709,8 @@ let begin_authoritative database ~expected batch =
           in
           Ok
             ( { authoritative_owner = database
+              ; authoritative_base = authoritative_database database
+              ; authoritative_digest = database.authoritative_checksum
               ; authoritative_revision = database.sync_revision
               ; authoritative_batch = batch
               ; authoritative_wires = wires
@@ -8018,7 +8735,7 @@ let split_prefix count values =
 let synchronized_record_operations (record : outbox_record) =
   local_operations
     ~append_create:record.append_create
-                      ~fingerprint:record.fingerprint
+    ~fingerprint:record.fingerprint
     ~intent_time_ms:record.intent_time_ms
     ~next_tx:record.planned_tx
     ~orders:(assigned_orders record)
@@ -8036,7 +8753,8 @@ let authoritative_exception_kind = function
 ;;
 
 let simulation_failure_context exn =
-  let cause = match exn with
+  let cause =
+    match exn with
     | Invalid_argument message ->
       let prefixes =
         [ "Nothing found for entity id [", "lookup-ref-missing"
@@ -8050,19 +8768,25 @@ let simulation_failure_context exn =
         ; "instant attribute requires instant value:", "value-type-mismatch"
         ; "tuple attribute element type mismatch:", "value-type-mismatch"
         ; "tuple attribute requires tuple value:", "value-type-mismatch"
-        ] in
+        ]
+      in
       (match message with
        | "unique constraint" -> "unique-constraint"
        | "Cannot store nil as a value" -> "nil-value"
        | "cannot modify tuple attributes directly" -> "tuple-write"
-       | _ -> Option.value ~default:"unknown"
-           (List.find_map (fun (prefix,cause) ->
-             if String.starts_with ~prefix message then Some cause else None) prefixes))
-    | _ -> "unknown" in
+       | _ ->
+         Option.value
+           ~default:"unknown"
+           (List.find_map
+              (fun (prefix, cause) ->
+                 if String.starts_with ~prefix message then Some cause else None)
+              prefixes))
+    | _ -> "unknown"
+  in
   [ "exception", authoritative_exception_kind exn; "simulationCause", cause ]
 ;;
 
-let expected_record_transaction_data database record =
+let expected_record_transaction database record =
   try
     Ok
       (Datascript.transact
@@ -8070,23 +8794,77 @@ let expected_record_transaction_data database record =
          database
          (synchronized_record_operations record)
        : Datascript.tx_report)
-        .tx_data
   with
   | exn -> Error (simulation_failure_context exn)
 ;;
 
-let equal_transaction_data left right = List.sort compare left = List.sort compare right
+let expected_record_transaction_data database record =
+  Result.map
+    (fun (report : Datascript.tx_report) -> report.tx_data)
+    (expected_record_transaction database record)
+;;
 
-let transaction_matches_record_at_cursor record cursor root_before transaction_data =
+let canonical_transaction_data root_before root_after transaction_data =
+  let identities = Hashtbl.create 16 in
+  let identity entity =
+    match Hashtbl.find_opt identities entity with
+    | Some reference -> reference
+    | None ->
+      let find database =
+        match uuid_of_entity database entity with
+        | Some uuid ->
+          Some
+            (Datascript.Lookup_ref
+               ("block/uuid", Datascript.Uuid (Graph.Uuid.to_string uuid)))
+        | None ->
+          (match one database entity "db/ident" with
+           | Some (Datascript.Keyword ident) ->
+             Some (Datascript.Lookup_ref ("db/ident", Datascript.Keyword ident))
+           | _ -> None)
+      in
+      let reference =
+        match find root_after with
+        | Some reference -> reference
+        | None -> Option.value (find root_before) ~default:(Datascript.Entity_id entity)
+      in
+      Hashtbl.add identities entity reference;
+      reference
+  in
+  let rec value = function
+    | Datascript.Ref entity -> Datascript.Ref_to (identity entity)
+    | List values -> Datascript.List (List.map value values)
+    | Vector values -> Datascript.Vector (List.map value values)
+    | Set values -> Datascript.Set (List.map value values)
+    | Map entries ->
+      Datascript.Map (List.map (fun (key, item) -> value key, value item) entries)
+    | Tuple values -> Datascript.Tuple (List.map (Option.map value) values)
+    | value -> value
+  in
+  List.map
+    (fun (datom : Datascript.datom) ->
+       identity datom.e, datom.a, value datom.v, datom.tx, datom.added)
+    transaction_data
+  |> List.sort compare
+;;
+
+let transaction_matches_record_at_cursor
+      record
+      cursor
+      root_before
+      root_after
+      transaction_data
+  =
   match expected_origin_cursor record with
   | Error _ -> false
   | Ok expected_cursor ->
     if not (Types.Server_cursor.equal cursor expected_cursor)
     then false
     else (
-      match expected_record_transaction_data root_before record with
+      match expected_record_transaction root_before record with
       | Error _ -> false
-      | Ok expected -> equal_transaction_data expected transaction_data)
+      | Ok expected ->
+        canonical_transaction_data root_before expected.db_after expected.tx_data
+        = canonical_transaction_data root_before root_after transaction_data)
 ;;
 
 let integrity_record_context (record : outbox_record) =
@@ -8138,11 +8916,22 @@ let integrity_batch_source owner batch source =
   |> Authoritative_diagnostic.encode
 ;;
 
-let validate_active_transaction_origin owner cursor root_before transaction_data =
+let validate_active_transaction_origin
+      owner
+      cursor
+      root_before
+      root_after
+      transaction_data
+  =
   let matches =
     List.filter
       (fun record ->
-         transaction_matches_record_at_cursor record cursor root_before transaction_data)
+         transaction_matches_record_at_cursor
+           record
+           cursor
+           root_before
+           root_after
+           transaction_data)
       owner.outbox
   in
   match matches with
@@ -8162,9 +8951,18 @@ let validate_active_transaction_origin owner cursor root_before transaction_data
 (* Only schema identifiers in this list may leave the database in evidence.
    Values, arbitrary attribute names and wire payloads must never be emitted. *)
 let integrity_evidence_attributes =
-  [ "block/uuid"; "block/title"; "block/name"; "block/journal-day"
-  ; "block/created-at"; "block/updated-at"; "block/tags"; "block/parent"
-  ; "block/page"; "block/order"; "block/refs"; "block/tx-id"
+  [ "block/uuid"
+  ; "block/title"
+  ; "block/name"
+  ; "block/journal-day"
+  ; "block/created-at"
+  ; "block/updated-at"
+  ; "block/tags"
+  ; "block/parent"
+  ; "block/page"
+  ; "block/order"
+  ; "block/refs"
+  ; "block/tx-id"
   ]
 ;;
 
@@ -8188,17 +8986,28 @@ let integrity_evidence_value_type = function
   | TxRef -> "transaction-reference"
 ;;
 
-let report_integrity_evidence owner batch record cursor root_before expected actual operations =
+let report_integrity_evidence
+      owner
+      batch
+      record
+      cursor
+      root_before
+      expected
+      actual
+      operations
+  =
   (* This best-effort observation must not affect validation or publication. *)
   try
     let target, day =
       match record.mutation with
       | Types.Create_journal_page { page; journal_day; _ } -> page, Some journal_day
-      | Append_journal {root;journal_day;_}->root.uuid,Some journal_day
+      | Append_journal { root; journal_day; _ } -> root.uuid, Some journal_day
       | Insert_blocks { tree; _ } -> tree.uuid, None
       | Delete_blocks { root; _ } -> root, None
-      | Save_block { block; _ } | Set_task_status { block; _ }
-      | Clear_task_status { block; _ } | Publish_asset { block; _ }
+      | Save_block { block; _ }
+      | Set_task_status { block; _ }
+      | Clear_task_status { block; _ }
+      | Publish_asset { block; _ }
       | Set_asset_reference { block; _ } -> block, None
     in
     let entity = entity_of_uuid root_before target in
@@ -8210,10 +9019,13 @@ let report_integrity_evidence owner batch record cursor root_before expected act
              | None -> []
              | Some entity ->
                Datascript.datoms root_before Datascript.Eavt ~e:entity ~a:attribute ()
-               |> Seq.take 4 |> List.of_seq
+               |> Seq.take 4
+               |> List.of_seq
            in
            let values = List.map (fun (d : Datascript.datom) -> d.v) sample in
-           let types = List.map integrity_evidence_value_type values |> List.sort_uniq compare in
+           let types =
+             List.map integrity_evidence_value_type values |> List.sort_uniq compare
+           in
            `Assoc
              [ "attribute", `String attribute
              ; "datoms", `Int (min 3 (List.length sample))
@@ -8229,21 +9041,28 @@ let report_integrity_evidence owner batch record cursor root_before expected act
          let attribute =
            if List.mem datom.a integrity_evidence_attributes then datom.a else "other"
          in
-         let added, retracted = Option.value ~default:(0, 0) (Hashtbl.find_opt delta attribute) in
-         Hashtbl.replace delta attribute
-           (added + (if datom.added then 1 else 0), retracted + (if datom.added then 0 else 1)))
+         let added, retracted =
+           Option.value ~default:(0, 0) (Hashtbl.find_opt delta attribute)
+         in
+         Hashtbl.replace
+           delta
+           attribute
+           ( (added + if datom.added then 1 else 0)
+           , retracted + if datom.added then 0 else 1 ))
       actual;
     let pairs = Hashtbl.create 4 in
     List.iter
       (fun operation ->
          let item =
            match operation with
-           | Datascript.Add (entity, attribute, value) -> Some (entity, attribute, value, true)
-           | Retract (entity, attribute, Some value) -> Some (entity, attribute, value, false)
+           | Datascript.Add (entity, attribute, value) ->
+             Some (entity, attribute, value, true)
+           | Retract (entity, attribute, Some value) ->
+             Some (entity, attribute, value, false)
            | _ -> None
          in
          match item with
-         | Some (entity, ("block/title" | "block/name" as attribute), value, added) ->
+         | Some (entity, (("block/title" | "block/name") as attribute), value, added) ->
            let key = entity, attribute, value in
            let a, r = Option.value ~default:(false, false) (Hashtbl.find_opt pairs key) in
            Hashtbl.replace pairs key (a || added, r || not added)
@@ -8253,7 +9072,8 @@ let report_integrity_evidence owner batch record cursor root_before expected act
       Hashtbl.fold
         (fun (_, a, _) (added, retracted) count ->
            if String.equal a attribute && added && retracted then count + 1 else count)
-        pairs 0
+        pairs
+        0
     in
     let str s = `String s in
     let evidence =
@@ -8263,20 +9083,37 @@ let report_integrity_evidence owner batch record cursor root_before expected act
          ; "target", str (Graph.Uuid.to_string target)
          ; "graph", str (Graph.Uuid.to_string owner.graph_uuid)
          ; "generation", str (Types.Generation.to_string owner.generation)
-         ; "projection", str (Types.Projection_revision.to_string (projection_revision owner.projection))
-         ; "checkpoint", str (Int64.to_string (Types.Server_cursor.to_int64 owner.checkpoint))
-         ; "through", str (Int64.to_string (Types.Server_cursor.to_int64 (Types.authoritative_batch_through batch)))
+         ; ( "projection"
+           , str
+               (Types.Projection_revision.to_string
+                  (projection_revision owner.projection)) )
+         ; ( "checkpoint"
+           , str (Int64.to_string (Types.Server_cursor.to_int64 owner.checkpoint)) )
+         ; ( "through"
+           , str
+               (Int64.to_string
+                  (Types.Server_cursor.to_int64 (Types.authoritative_batch_through batch)))
+           )
          ; "expectedCursor", str (Int64.to_string (Types.Server_cursor.to_int64 cursor))
          ; "expectedDatoms", `Int (List.length expected)
          ; "actualDatoms", `Int (List.length actual)
          ; "beforeFields", `List before_fields
-         ; "actualDelta", `List
-             (Hashtbl.to_seq delta |> List.of_seq |> List.sort compare
-              |> List.map (fun (attribute, (added, retracted)) ->
-                `Assoc [ "attribute", str attribute; "added", `Int added; "retracted", `Int retracted ]))
-         ; "protectedPairs", `Assoc
-             [ "block/title", `Int (pair_count "block/title")
-             ; "block/name", `Int (pair_count "block/name") ]
+         ; ( "actualDelta"
+           , `List
+               (Hashtbl.to_seq delta
+                |> List.of_seq
+                |> List.sort compare
+                |> List.map (fun (attribute, (added, retracted)) ->
+                  `Assoc
+                    [ "attribute", str attribute
+                    ; "added", `Int added
+                    ; "retracted", `Int retracted
+                    ])) )
+         ; ( "protectedPairs"
+           , `Assoc
+               [ "block/title", `Int (pair_count "block/title")
+               ; "block/name", `Int (pair_count "block/name")
+               ] )
          ]
          @ List.map (fun (k, v) -> k, str v) (integrity_record_context record)
          @ Option.fold ~none:[] ~some:(fun day -> [ "day", `Int day ]) day)
@@ -8284,10 +9121,17 @@ let report_integrity_evidence owner batch record cursor root_before expected act
     let encoded = Yojson.Safe.to_string evidence in
     if String.length encoded <= 8192
     then report_warning ("journal-integrity: " ^ encoded ^ "\n")
-  with _ -> report_warning "journal-integrity: {\"reason\":\"evidence-unavailable\"}\n"
+  with
+  | _ -> report_warning "journal-integrity: {\"reason\":\"evidence-unavailable\"}\n"
 ;;
 
-let validate_active_transaction_origins owner batch transaction_data roots_after decoded_transactions =
+let validate_active_transaction_origins
+      owner
+      batch
+      transaction_data
+      roots_after
+      decoded_transactions
+  =
   let cursors =
     Types.authoritative_batch_transactions batch
     |> List.map Types.authoritative_transaction_cursor
@@ -8314,7 +9158,7 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
           cursor_rest
           data_rest
           root_rest
-          ((cursor, data, previous) :: reversed)
+          ((cursor, data, previous, root_after) :: reversed)
       | [], [], [] -> List.rev reversed
       | _ -> invalid_arg "authoritative transaction origin context mismatch"
     in
@@ -8323,7 +9167,7 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
     in
     let validated =
       List.fold_left
-        (fun result (cursor, data, root_before) ->
+        (fun result (cursor, data, root_before, root_after) ->
            Result.bind result (fun reversed ->
              Result.map
                (fun evidence ->
@@ -8331,7 +9175,12 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
                     ~none:reversed
                     ~some:(fun value -> value :: reversed)
                     evidence)
-               (validate_active_transaction_origin owner cursor root_before data)))
+               (validate_active_transaction_origin
+                  owner
+                  cursor
+                  root_before
+                  root_after
+                  data)))
         (Ok [])
         contexts
     in
@@ -8377,17 +9226,19 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
                    else (
                      let context =
                        List.find_opt
-                         (fun (cursor, _, _) -> Types.Server_cursor.equal cursor expected)
+                         (fun (cursor, _, _, _) ->
+                            Types.Server_cursor.equal cursor expected)
                          contexts
                      in
                      let reason, counts =
                        match context with
                        | None -> "expected-cursor-missing", []
-                       | Some (_, actual, root_before) ->
+                       | Some (_, actual, root_before, _) ->
                          (match expected_record_transaction_data root_before record with
                           | Error cause ->
                             ( "expected-simulation-failed"
-                            , ("actualDatoms", string_of_int (List.length actual)) :: cause )
+                            , ("actualDatoms", string_of_int (List.length actual))
+                              :: cause )
                           | Ok expected_data ->
                             let rec operations_at_cursor cursors transactions =
                               match cursors, transactions with
@@ -8397,11 +9248,18 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
                                 else operations_at_cursor rest more
                               | _ -> []
                             in
-                            report_integrity_evidence owner batch record expected
-                              root_before expected_data actual
+                            report_integrity_evidence
+                              owner
+                              batch
+                              record
+                              expected
+                              root_before
+                              expected_data
+                              actual
                               (operations_at_cursor cursors decoded_transactions);
                             ( "payload-mismatch"
-                            , [ "expectedDatoms", string_of_int (List.length expected_data)
+                            , [ ( "expectedDatoms"
+                                , string_of_int (List.length expected_data) )
                               ; "actualDatoms", string_of_int (List.length actual)
                               ] ))
                      in
@@ -8851,34 +9709,40 @@ let prepare_authoritative_candidate preparation ~decrypted =
                |> Authoritative_diagnostic.encode)
         | wire :: rest ->
           let current =
-            Result.bind (Sync_tx_codec.protected_values ~allow_empty:true wire) (fun protected ->
-              Result.bind
-                (split_prefix (List.length protected) remaining
-                 |> Result.map_error (fun _ ->
-                   Authoritative_diagnostic.create
-                     ~stage:Decode
-                     ~reason:Decrypted_value_count
-                     ()
-                   |> Authoritative_diagnostic.encode))
-                (fun (plain, remaining) ->
-                   Result.bind
-                     (Sync_tx_codec.decode ~allow_empty:true ~db:database ~decrypted_values:plain wire)
-                     (fun operations ->
-                        try
-                          let report =
-                            Datascript.with_tx
-                              ~tx_meta:[ "skip-store?", Datascript.Bool true ]
-                              database
-                              operations
-                          in
-                          Ok (report, operations, remaining)
-                        with
-                        | exn ->
-                          Error
-                            (authoritative_application_error
-                               ~transaction:index
-                               operations
-                               exn))))
+            Result.bind
+              (Sync_tx_codec.protected_values ~allow_empty:true wire)
+              (fun protected ->
+                 Result.bind
+                   (split_prefix (List.length protected) remaining
+                    |> Result.map_error (fun _ ->
+                      Authoritative_diagnostic.create
+                        ~stage:Decode
+                        ~reason:Decrypted_value_count
+                        ()
+                      |> Authoritative_diagnostic.encode))
+                   (fun (plain, remaining) ->
+                      Result.bind
+                        (Sync_tx_codec.decode
+                           ~allow_empty:true
+                           ~db:database
+                           ~decrypted_values:plain
+                           wire)
+                        (fun operations ->
+                           try
+                             let report =
+                               Datascript.with_tx
+                                 ~tx_meta:[ "skip-store?", Datascript.Bool true ]
+                                 database
+                                 operations
+                             in
+                             Ok (report, operations, remaining)
+                           with
+                           | exn ->
+                             Error
+                               (authoritative_application_error
+                                  ~transaction:index
+                                  operations
+                                  exn))))
             |> Result.map_error (fun source ->
               match Authoritative_diagnostic.decode source with
               | Some detail ->
@@ -8899,16 +9763,21 @@ let prepare_authoritative_candidate preparation ~decrypted =
                 (report.db_after :: roots_after)
                 remaining
                 rest
-            with exn ->
-              Error (Authoritative_diagnostic.create ~stage:Decode ~reason:Unknown
-                       ?transaction:(if rest=[] then None else Some(index+1))
-                       ~exception_kind:(authoritative_exception_kind exn) ()
-                     |> Authoritative_diagnostic.encode))
+            with
+            | exn ->
+              Error
+                (Authoritative_diagnostic.create
+                   ~stage:Decode
+                   ~reason:Unknown
+                   ?transaction:(if rest = [] then None else Some (index + 1))
+                   ~exception_kind:(authoritative_exception_kind exn)
+                   ()
+                 |> Authoritative_diagnostic.encode))
       in
       match
         decode
           1
-          (authoritative_database preparation.authoritative_owner)
+          preparation.authoritative_base
           []
           []
           []
@@ -8917,152 +9786,191 @@ let prepare_authoritative_candidate preparation ~decrypted =
       with
       | Error message -> Error (Types.Authoritative_decode_failed message)
       | Ok (transactions, expected_tx_data, roots_after, database) ->
-        (match
-           validate_active_transaction_origins
-             preparation.authoritative_owner
-             preparation.authoritative_batch
-             expected_tx_data
-             roots_after
-             transactions
-         with
-         | Error message -> Error (Types.Authoritative_integrity_failure
-             (integrity_batch_source preparation.authoritative_owner preparation.authoritative_batch message))
-         | Ok validated_origins ->
-           preparation.authoritative_state <- Authoritative_consumed;
-           Option.iter
-             (fun request -> request.unprotection_consumed <- true)
-             preparation.authoritative_unprotection;
-           let unresolved_submitted_deletes =
-             List.filter_map
-               (fun (record : outbox_record) ->
-                  match record.transport_state, record.mutation with
-                  | Types.Submitted batch_id, Types.Delete_blocks _ ->
-                    Some (record, batch_id)
-                  | ( Submitted _
-                    , ( Save_block _
-                      | Insert_blocks _
-                      | Append_journal _
-                      | Create_journal_page _
-                      | Set_task_status _
-                      | Clear_task_status _
-                      | Publish_asset _
-                      | Set_asset_reference _ ) ) -> None
-                  | ( ( Queued
-                      | Accepted_pending_authoritative _
-                      | Stale_rejected_pending_authoritative _
-                      | Blocked )
-                    , _ ) -> None)
-               preparation.authoritative_owner.outbox
-           in
-           (match
-              classify_stale_deletes
-                preparation.authoritative_owner
-                preparation.authoritative_batch
-                transactions
-                roots_after
-            with
-            | Error message -> Error (Types.Authoritative_integrity_failure
-             (integrity_batch_source preparation.authoritative_owner preparation.authoritative_batch message))
-            | Ok (stale_updates, stale_remote_won, stale_no_change, stale_blocked) ->
-              let rec transaction_contexts previous transactions transaction_data roots =
-                match transactions, transaction_data, roots with
-                | ( transaction :: transaction_rest
-                  , data :: data_rest
-                  , root_after :: root_rest ) ->
-                  ( Types.authoritative_transaction_cursor transaction
-                  , data
-                  , previous
-                  , root_after )
-                  :: transaction_contexts root_after transaction_rest data_rest root_rest
-                | [], [], [] -> []
-                | _ -> invalid_arg "authoritative transaction context mismatch"
-              in
-              let contexts =
-                transaction_contexts
-                  (authoritative_database preparation.authoritative_owner)
-                  (Types.authoritative_batch_transactions preparation.authoritative_batch)
-                  expected_tx_data
-                  roots_after
-              in
-              let classify_submitted_delete (record, batch_id) =
-                match record.submission_t_before with
-                | None ->
-                  Error
-                    (Types.Authoritative_integrity_failure
-                       (integrity_source ~reason:"submitted-delete-missing-t-before" ~record ()
-                        |> integrity_batch_source preparation.authoritative_owner preparation.authoritative_batch))
-                | Some t_before ->
-                  (match
-                     List.find_opt
-                       (fun (cursor, _, _, _) ->
-                          Types.Server_cursor.compare cursor t_before > 0)
-                       contexts
-                   with
-                   | None -> Ok (`Deferred batch_id)
-                   | Some (cursor, transaction_data, root_before, root_after) ->
-                     if
-                       transaction_matches_record_at_cursor
-                         record
-                         cursor
-                         root_before
-                         transaction_data
-                     then Ok (`Deferred batch_id)
-                     else (
-                       let conflicts =
-                         delete_conflict_kinds_between root_before root_after record
-                       in
-                       if conflicts = []
-                       then Ok (`Deferred batch_id)
-                       else
-                         Ok
-                           (`Remote_won (record.mutation_id, batch_id, cursor, conflicts))))
-              in
-              let classified =
-                List.fold_left
-                  (fun result submitted ->
-                     Result.bind result (fun outcomes ->
-                       Result.map
-                         (fun outcome -> outcome :: outcomes)
-                         (classify_submitted_delete submitted)))
-                  (Ok [])
-                  unresolved_submitted_deletes
-              in
-              Result.bind classified (fun classified ->
-                match
-                  List.find_map
-                    (function
-                      | `Deferred batch_id -> Some batch_id
-                      | `Remote_won _ -> None)
-                    (List.rev classified)
-                with
-                | Some batch_id ->
-                  preparation.authoritative_state <- Authoritative_deferred_state;
-                  Ok (`Deferred (Types.Await_submission_outcome batch_id))
-                | None ->
-                  let submitted_remote_won =
-                    List.filter_map
-                      (function
-                        | `Remote_won outcome -> Some outcome
-                        | `Deferred _ -> None)
-                      (List.rev classified)
-                  in
-                  let candidate =
-                    { authoritative_preparation = preparation
-                    ; authoritative_decrypted_input = decrypted
-                    ; authoritative_transactions = transactions
-                    ; authoritative_expected_tx_data = expected_tx_data
-                    ; authoritative_roots_after = roots_after
-                    ; validated_origins
-                    ; submitted_remote_won
-                    ; stale_updates
-                    ; stale_remote_won
-                    ; stale_no_change
-                    ; stale_blocked
-                    ; authoritative_db_after = database
-                    }
-                  in
-                  preparation.authoritative_state <- Authoritative_ready candidate;
-                  Ok (`Candidate candidate)))))
+        let digest =
+          Authoritative_checksum.advance
+            ~maximum:
+              preparation.authoritative_owner.dependencies.limits.wire_batch_max_bytes
+            ~before:preparation.authoritative_base
+            ~after:database
+            ~changes:expected_tx_data
+            preparation.authoritative_digest
+          |> Result.map_error (fun message ->
+            Types.Authoritative_integrity_failure message)
+        in
+        Result.bind digest (fun digest ->
+          Option.iter
+            (fun expected ->
+               report_checksum_mismatch
+                 ~phase:"pull-advance"
+                 ~through:
+                   (Types.authoritative_batch_through preparation.authoritative_batch)
+                 ~expected:(checksum_value expected)
+                 ~actual:(Authoritative_checksum.to_string digest))
+            (Types.authoritative_batch_checksum preparation.authoritative_batch);
+          match
+            validate_active_transaction_origins
+              preparation.authoritative_owner
+              preparation.authoritative_batch
+              expected_tx_data
+              roots_after
+              transactions
+          with
+          | Error message ->
+            Error
+              (Types.Authoritative_integrity_failure
+                 (integrity_batch_source
+                    preparation.authoritative_owner
+                    preparation.authoritative_batch
+                    message))
+          | Ok validated_origins ->
+            preparation.authoritative_state <- Authoritative_consumed;
+            Option.iter
+              (fun request -> request.unprotection_consumed <- true)
+              preparation.authoritative_unprotection;
+            let unresolved_submitted_deletes =
+              List.filter_map
+                (fun (record : outbox_record) ->
+                   match record.transport_state, record.mutation with
+                   | Types.Submitted batch_id, Types.Delete_blocks _ ->
+                     Some (record, batch_id)
+                   | ( Submitted _
+                     , ( Save_block _
+                       | Insert_blocks _
+                       | Append_journal _
+                       | Create_journal_page _
+                       | Set_task_status _
+                       | Clear_task_status _
+                       | Publish_asset _
+                       | Set_asset_reference _ ) ) -> None
+                   | ( ( Queued
+                       | Accepted_pending_authoritative _
+                       | Stale_rejected_pending_authoritative _
+                       | Blocked )
+                     , _ ) -> None)
+                preparation.authoritative_owner.outbox
+            in
+            (match
+               classify_stale_deletes
+                 preparation.authoritative_owner
+                 preparation.authoritative_batch
+                 transactions
+                 roots_after
+             with
+             | Error message ->
+               Error
+                 (Types.Authoritative_integrity_failure
+                    (integrity_batch_source
+                       preparation.authoritative_owner
+                       preparation.authoritative_batch
+                       message))
+             | Ok (stale_updates, stale_remote_won, stale_no_change, stale_blocked) ->
+               let rec transaction_contexts previous transactions transaction_data roots =
+                 match transactions, transaction_data, roots with
+                 | ( transaction :: transaction_rest
+                   , data :: data_rest
+                   , root_after :: root_rest ) ->
+                   ( Types.authoritative_transaction_cursor transaction
+                   , data
+                   , previous
+                   , root_after )
+                   :: transaction_contexts root_after transaction_rest data_rest root_rest
+                 | [], [], [] -> []
+                 | _ -> invalid_arg "authoritative transaction context mismatch"
+               in
+               let contexts =
+                 transaction_contexts
+                   (authoritative_database preparation.authoritative_owner)
+                   (Types.authoritative_batch_transactions
+                      preparation.authoritative_batch)
+                   expected_tx_data
+                   roots_after
+               in
+               let classify_submitted_delete (record, batch_id) =
+                 match record.submission_t_before with
+                 | None ->
+                   Error
+                     (Types.Authoritative_integrity_failure
+                        (integrity_source
+                           ~reason:"submitted-delete-missing-t-before"
+                           ~record
+                           ()
+                         |> integrity_batch_source
+                              preparation.authoritative_owner
+                              preparation.authoritative_batch))
+                 | Some t_before ->
+                   (match
+                      List.find_opt
+                        (fun (cursor, _, _, _) ->
+                           Types.Server_cursor.compare cursor t_before > 0)
+                        contexts
+                    with
+                    | None -> Ok (`Deferred batch_id)
+                    | Some (cursor, transaction_data, root_before, root_after) ->
+                      if
+                        transaction_matches_record_at_cursor
+                          record
+                          cursor
+                          root_before
+                          root_after
+                          transaction_data
+                      then Ok (`Deferred batch_id)
+                      else (
+                        let conflicts =
+                          delete_conflict_kinds_between root_before root_after record
+                        in
+                        if conflicts = []
+                        then Ok (`Deferred batch_id)
+                        else
+                          Ok
+                            (`Remote_won (record.mutation_id, batch_id, cursor, conflicts))))
+               in
+               let classified =
+                 List.fold_left
+                   (fun result submitted ->
+                      Result.bind result (fun outcomes ->
+                        Result.map
+                          (fun outcome -> outcome :: outcomes)
+                          (classify_submitted_delete submitted)))
+                   (Ok [])
+                   unresolved_submitted_deletes
+               in
+               Result.bind classified (fun classified ->
+                 match
+                   List.find_map
+                     (function
+                       | `Deferred batch_id -> Some batch_id
+                       | `Remote_won _ -> None)
+                     (List.rev classified)
+                 with
+                 | Some batch_id ->
+                   preparation.authoritative_state <- Authoritative_deferred_state;
+                   Ok (`Deferred (Types.Await_submission_outcome batch_id))
+                 | None ->
+                   let submitted_remote_won =
+                     List.filter_map
+                       (function
+                         | `Remote_won outcome -> Some outcome
+                         | `Deferred _ -> None)
+                       (List.rev classified)
+                   in
+                   let candidate =
+                     { authoritative_preparation = preparation
+                     ; authoritative_decrypted_input = decrypted
+                     ; authoritative_transactions = transactions
+                     ; authoritative_expected_tx_data = expected_tx_data
+                     ; authoritative_roots_after = roots_after
+                     ; validated_origins
+                     ; submitted_remote_won
+                     ; stale_updates
+                     ; stale_remote_won
+                     ; stale_no_change
+                     ; stale_blocked
+                     ; authoritative_digest_after = digest
+                     ; authoritative_db_after = database
+                     }
+                   in
+                   preparation.authoritative_state <- Authoritative_ready candidate;
+                   Ok (`Candidate candidate)))))
 ;;
 
 let rec logical_tree_is_present snapshot ~parent (tree : Types.block_tree) =
@@ -9075,17 +9983,30 @@ let rec logical_tree_is_present snapshot ~parent (tree : Types.block_tree) =
 ;;
 
 let logical_snapshot_satisfies_mutation snapshot = function
-  | Types.Append_journal{root;journal_day;_}->
-    let rec matches parent (node:Types.append_node)=match logical_block_at snapshot node.uuid with
-      | Some value->(match parent with None->true|Some parent->value.block.parent=parent)
-        && value.block.title=node.title && value.task_status=Option.map(fun id->Types.Status_uuid id)node.task_status
-        && Rrbvec.for_all(matches(Some node.uuid))node.children
-      | None->false in
-    matches None root && (match logical_block_at snapshot root.uuid with
-      | Some value->(match logical_page_at snapshot value.block.page with
-        |Some page->not page.page.recycled && page.page.kind=Graph.Journal_page{journal_day}
-          && value.block.parent=page.page.uuid|None->false)
-      |None->false)
+  | Types.Append_journal { root; journal_day; _ } ->
+    let rec matches parent (node : Types.append_node) =
+      match logical_block_at snapshot node.uuid with
+      | Some value ->
+        (match parent with
+         | None -> true
+         | Some parent -> value.block.parent = parent)
+        && value.block.title = node.title
+        && value.task_status
+           = Option.map (fun id -> Types.Status_uuid id) node.task_status
+        && Rrbvec.for_all (matches (Some node.uuid)) node.children
+      | None -> false
+    in
+    matches None root
+    &&
+      (match logical_block_at snapshot root.uuid with
+      | Some value ->
+        (match logical_page_at snapshot value.block.page with
+         | Some page ->
+           (not page.page.recycled)
+           && page.page.kind = Graph.Journal_page { journal_day }
+           && value.block.parent = page.page.uuid
+         | None -> false)
+      | None -> false)
   | Types.Set_asset_reference { block; asset; _ } ->
     logical_block_at snapshot block
     |> option_satisfies (fun holder -> asset_reference_matches holder (Some asset))
@@ -9133,10 +10054,18 @@ let logical_snapshot_satisfies_mutation snapshot = function
 ;;
 
 let ordinary_effect_footprint ?append_owner snapshot = function
-  | Types.Append_journal{page;root;journal_day;_}->
-    let page=match append_owner with Some(page,_)->page|None->resolve_append_page snapshot ~candidate:page ~day:journal_day in
-    {block_uuids=append_uuids root;page_uuids=[page];structure_interests=
-      [Types.Children_interest page;Page_tree_interest page;Journal_index_interest]@append_interests root}
+  | Types.Append_journal { page; root; journal_day; _ } ->
+    let page =
+      match append_owner with
+      | Some (page, _) -> page
+      | None -> resolve_append_page snapshot ~candidate:page ~day:journal_day
+    in
+    { block_uuids = append_uuids root
+    ; page_uuids = [ page ]
+    ; structure_interests =
+        [ Types.Children_interest page; Page_tree_interest page; Journal_index_interest ]
+        @ append_interests root
+    }
   | Types.Set_asset_reference { block; _ }
   | Types.Publish_asset { block; _ }
   | Types.Save_block { block; _ }
@@ -9164,7 +10093,6 @@ let ordinary_effect_footprint ?append_owner snapshot = function
 ;;
 
 let introduced_uuids = mutation_introduced_uuids
-;;
 
 let unavailable_dependency unavailable uuid =
   List.find_map
@@ -9176,16 +10104,31 @@ let unavailable_dependency unavailable uuid =
 let invalid_replan_dependency ?append_owner snapshot mutation =
   let missing uuid present = if present then None else Some uuid in
   match mutation with
-  | Types.Append_journal{page;root;journal_day;_}->
-    let page,value=match append_owner with Some value->value|None->
-      let page=resolve_append_page snapshot ~candidate:page ~day:journal_day in page,logical_page_at snapshot page in
-    let conflict=match value with
-      |Some value->value.page.recycled || value.page.kind<>Graph.Journal_page{journal_day}
-      |None->append_identity_present snapshot page in
-    if conflict then Some page else
-      Overlay_planner.append_nodes root |> Rrbvec.find_map(fun(node:Types.append_node)->
-        if append_identity_present snapshot node.uuid then Some node.uuid
-        else match node.task_status with Some status when task_status_at snapshot status=None->Some status|_->None)
+  | Types.Append_journal { page; root; journal_day; _ } ->
+    let page, value =
+      match append_owner with
+      | Some value -> value
+      | None ->
+        let page = resolve_append_page snapshot ~candidate:page ~day:journal_day in
+        page, logical_page_at snapshot page
+    in
+    let conflict =
+      match value with
+      | Some value ->
+        value.page.recycled || value.page.kind <> Graph.Journal_page { journal_day }
+      | None -> append_identity_present snapshot page
+    in
+    if conflict
+    then Some page
+    else
+      Overlay_planner.append_nodes root
+      |> Rrbvec.find_map (fun (node : Types.append_node) ->
+        if append_identity_present snapshot node.uuid
+        then Some node.uuid
+        else (
+          match node.task_status with
+          | Some status when task_status_at snapshot status = None -> Some status
+          | _ -> None))
   | Types.Set_asset_reference { block; previous; asset; _ } ->
     (match logical_block_at snapshot block, asset_descriptor_at snapshot asset with
      | Some holder, Ok (Some _) when asset_reference_matches holder previous -> None
@@ -9268,55 +10211,112 @@ let replan_queued_ordinary database authoritative_database records =
   (* An in-flight operation retains its dependency facts independently of
      sequence position. Sample those shadow tails once, before earlier queued
      Appends are replanned; a late ACK cannot make a visible sibling vanish. *)
-  let shadow_tails=Hashtbl.create 16 and shadow_presence=Hashtbl.create 16 in
-  let shadow_cache=hydration_cache ~index_idents:false authoritative_database in
-  let maximum_order lower order=Some(Option.fold ~none:order
-    ~some:(fun old->if String.compare old order>=0 then old else order)lower) in
-  List.iter(fun(record:outbox_record)->
-    if record_has_active_dependency_shadows record && record_is_logically_active record then
-      List.iter(fun shadow->
-        let key=Graph.Uuid.to_string shadow.shadow_block_uuid in
-        let present=match Hashtbl.find_opt shadow_presence key with Some present->present|None->
-          let present=authoritative_block_present authoritative_database shadow_cache shadow.shadow_block_uuid in
-          Hashtbl.add shadow_presence key present;present in
-        if not present then (
-          let parent=Graph.Uuid.to_string shadow.shadow_parent in
-          let lower=Hashtbl.find_opt shadow_tails parent |> Option.join in
-          Hashtbl.replace shadow_tails parent(maximum_order lower shadow.shadow_order)))
-        record.dependency_shadows.shadow_blocks)records;
-  let local_days=Hashtbl.create 16 and remote_days=Hashtbl.create 16
-  and day_owners=Hashtbl.create 16 and parent_tails=Hashtbl.create 16 in
+  let shadow_tails = Hashtbl.create 16
+  and shadow_presence = Hashtbl.create 16 in
+  let shadow_cache = hydration_cache ~index_idents:false authoritative_database in
+  let maximum_order lower order =
+    Some
+      (Option.fold
+         ~none:order
+         ~some:(fun old -> if String.compare old order >= 0 then old else order)
+         lower)
+  in
+  List.iter
+    (fun (record : outbox_record) ->
+       if record_has_active_dependency_shadows record && record_is_logically_active record
+       then
+         List.iter
+           (fun shadow ->
+              let key = Graph.Uuid.to_string shadow.shadow_block_uuid in
+              let present =
+                match Hashtbl.find_opt shadow_presence key with
+                | Some present -> present
+                | None ->
+                  let present =
+                    authoritative_block_present
+                      authoritative_database
+                      shadow_cache
+                      shadow.shadow_block_uuid
+                  in
+                  Hashtbl.add shadow_presence key present;
+                  present
+              in
+              if not present
+              then (
+                let parent = Graph.Uuid.to_string shadow.shadow_parent in
+                let lower = Hashtbl.find_opt shadow_tails parent |> Option.join in
+                Hashtbl.replace
+                  shadow_tails
+                  parent
+                  (maximum_order lower shadow.shadow_order)))
+           record.dependency_shadows.shadow_blocks)
+    records;
+  let local_days = Hashtbl.create 16
+  and remote_days = Hashtbl.create 16
+  and day_owners = Hashtbl.create 16
+  and parent_tails = Hashtbl.create 16 in
   let append_owner snapshot page day =
     match Hashtbl.find_opt day_owners day with
-    | Some owner->owner
-    | None->
-      let remote=match Hashtbl.find_opt remote_days day with Some value->value|None->
-        let value=authoritative_append_page snapshot day in Hashtbl.add remote_days day value;value in
-      let existing=match remote with Some _->remote|None->Hashtbl.find_opt local_days day in
-      let resolved=Option.value existing ~default:page in
-      let owner=resolved,logical_page_at snapshot resolved in
-      if existing<>None then Hashtbl.replace day_owners day owner;
-      owner in
-  let record_append_indexes (record:outbox_record) =
-    let day_page=match record.mutation with
-      | Types.Create_journal_page{page;journal_day;_}->Some(journal_day,page)
-      | Append_journal{journal_day;_}->Some(journal_day,List.hd record.effect_footprint.page_uuids)
-      | _->None in
-    Option.iter(fun(day,page)->
-      match Hashtbl.find_opt local_days day with
-      | Some old when Graph.Uuid.compare old page<=0->()
-      | _->Hashtbl.replace local_days day page;Hashtbl.remove day_owners day)day_page;
-    let inserted=match record.mutation with
-      | Types.Insert_blocks{parent;tree;_}->Some(parent,tree.uuid)
-      | Append_journal{root;_}->Some(List.hd record.effect_footprint.page_uuids,root.uuid)
-      | _->None in
-    Option.iter(fun(parent,root)->
-      let key=Graph.Uuid.to_string parent in
-      match Hashtbl.find_opt parent_tails key with
-      | None->()
-      | Some lower->let order=assigned_order(assigned_orders record)root in
-        Hashtbl.replace parent_tails key (Some(Option.fold ~none:order
-          ~some:(fun old->if String.compare old order>=0 then old else order)lower))) inserted in
+    | Some owner -> owner
+    | None ->
+      let remote =
+        match Hashtbl.find_opt remote_days day with
+        | Some value -> value
+        | None ->
+          let value = authoritative_append_page snapshot day in
+          Hashtbl.add remote_days day value;
+          value
+      in
+      let existing =
+        match remote with
+        | Some _ -> remote
+        | None -> Hashtbl.find_opt local_days day
+      in
+      let resolved = Option.value existing ~default:page in
+      let owner = resolved, logical_page_at snapshot resolved in
+      if existing <> None then Hashtbl.replace day_owners day owner;
+      owner
+  in
+  let record_append_indexes (record : outbox_record) =
+    let day_page =
+      match record.mutation with
+      | Types.Create_journal_page { page; journal_day; _ } -> Some (journal_day, page)
+      | Append_journal { journal_day; _ } ->
+        Some (journal_day, List.hd record.effect_footprint.page_uuids)
+      | _ -> None
+    in
+    Option.iter
+      (fun (day, page) ->
+         match Hashtbl.find_opt local_days day with
+         | Some old when Graph.Uuid.compare old page <= 0 -> ()
+         | _ ->
+           Hashtbl.replace local_days day page;
+           Hashtbl.remove day_owners day)
+      day_page;
+    let inserted =
+      match record.mutation with
+      | Types.Insert_blocks { parent; tree; _ } -> Some (parent, tree.uuid)
+      | Append_journal { root; _ } ->
+        Some (List.hd record.effect_footprint.page_uuids, root.uuid)
+      | _ -> None
+    in
+    Option.iter
+      (fun (parent, root) ->
+         let key = Graph.Uuid.to_string parent in
+         match Hashtbl.find_opt parent_tails key with
+         | None -> ()
+         | Some lower ->
+           let order = assigned_order (assigned_orders record) root in
+           Hashtbl.replace
+             parent_tails
+             key
+             (Some
+                (Option.fold
+                   ~none:order
+                   ~some:(fun old -> if String.compare old order >= 0 then old else order)
+                   lower)))
+      inserted
+  in
   let add_record records block_effects page_effects children_effects record =
     if not (record_is_logically_active record)
     then records, block_effects, page_effects, children_effects
@@ -9326,19 +10326,46 @@ let replan_queued_ordinary database authoritative_database records =
         add_indexed_record block_effects (fun value -> value.block_uuids) record
       in
       let page_effects =
-        let pages=page_projection_effects record @
-          (if record_has_active_dependency_shadows record then
-             List.map(fun shadow->shadow.shadow_page_uuid)record.dependency_shadows.shadow_pages else []) in
-        add_indexed_record page_effects (fun _->List.sort_uniq Graph.Uuid.compare pages)record
+        let pages =
+          page_projection_effects record
+          @
+          if record_has_active_dependency_shadows record
+          then
+            List.map
+              (fun shadow -> shadow.shadow_page_uuid)
+              record.dependency_shadows.shadow_pages
+          else []
+        in
+        add_indexed_record
+          page_effects
+          (fun _ -> List.sort_uniq Graph.Uuid.compare pages)
+          record
       in
-      let parents=List.filter_map(function Types.Children_interest parent->Some parent|_->None)
-        record.effect_footprint.structure_interests
-        @ (if record_has_active_dependency_shadows record then
-             List.map(fun shadow->shadow.shadow_parent)record.dependency_shadows.shadow_blocks else []) in
-      let children_effects=List.fold_left(fun index parent->
-        let key=Graph.Uuid.to_string parent in
-        Uuid_map.add key (record::Option.value(Uuid_map.find_opt key index) ~default:[]) index)
-        children_effects (List.sort_uniq Graph.Uuid.compare parents) in
+      let parents =
+        List.filter_map
+          (function
+            | Types.Children_interest parent -> Some parent
+            | _ -> None)
+          record.effect_footprint.structure_interests
+        @
+        if record_has_active_dependency_shadows record
+        then
+          List.map
+            (fun shadow -> shadow.shadow_parent)
+            record.dependency_shadows.shadow_blocks
+        else []
+      in
+      let children_effects =
+        List.fold_left
+          (fun index parent ->
+             let key = Graph.Uuid.to_string parent in
+             Uuid_map.add
+               key
+               (record :: Option.value (Uuid_map.find_opt key index) ~default:[])
+               index)
+          children_effects
+          (List.sort_uniq Graph.Uuid.compare parents)
+      in
       record :: records, block_effects, page_effects, children_effects)
   in
   let rec loop
@@ -9388,9 +10415,12 @@ let replan_queued_ordinary database authoritative_database records =
            ; drain_waiters = []
            }
          in
-         let append_owner=match mutation with
-           | Types.Append_journal{page;journal_day;_}->Some(append_owner snapshot page journal_day)
-           | _->None in
+         let append_owner =
+           match mutation with
+           | Types.Append_journal { page; journal_day; _ } ->
+             Some (append_owner snapshot page journal_day)
+           | _ -> None
+         in
          if logical_snapshot_satisfies_mutation snapshot mutation
          then
            loop
@@ -9429,28 +10459,45 @@ let replan_queued_ordinary database authoritative_database records =
                (record :: blocked)
                rest
            | None ->
-             let effect_footprint = ordinary_effect_footprint ?append_owner snapshot mutation in
+             let effect_footprint =
+               ordinary_effect_footprint ?append_owner snapshot mutation
+             in
              let planned_tx = authoritative_database.Datascript.max_tx + 1 in
-             let append_create=match mutation,effect_footprint.page_uuids with
-               | Types.Append_journal _,[_]->Option.bind append_owner snd=None
-               | _->false in
-             let orders=match mutation,append_owner with
-               | Types.Append_journal _,Some(parent,_)->
-                 let key=Graph.Uuid.to_string parent in
-                 let lower=match Hashtbl.find_opt parent_tails key with Some lower->lower|None->
-                   let lower=snd(read_siblings(read_context snapshot)parent) in
-                   let lower=match Hashtbl.find_opt shadow_tails key |> Option.join with
-                     |None->lower|Some shadow->maximum_order lower shadow in
-                   Hashtbl.replace parent_tails key lower;lower in
-                 insertion_orders ~append_parent:(parent,lower)(read_context snapshot)mutation
-               | _->assigned_orders record in
+             let append_create =
+               match mutation, effect_footprint.page_uuids with
+               | Types.Append_journal _, [ _ ] -> Option.bind append_owner snd = None
+               | _ -> false
+             in
+             let orders =
+               match mutation, append_owner with
+               | Types.Append_journal _, Some (parent, _) ->
+                 let key = Graph.Uuid.to_string parent in
+                 let lower =
+                   match Hashtbl.find_opt parent_tails key with
+                   | Some lower -> lower
+                   | None ->
+                     let lower = snd (read_siblings (read_context snapshot) parent) in
+                     let lower =
+                       match Hashtbl.find_opt shadow_tails key |> Option.join with
+                       | None -> lower
+                       | Some shadow -> maximum_order lower shadow
+                     in
+                     Hashtbl.replace parent_tails key lower;
+                     lower
+                 in
+                 insertion_orders
+                   ~append_parent:(parent, lower)
+                   (read_context snapshot)
+                   mutation
+               | _ -> assigned_orders record
+             in
              let record =
                { record with
                  normalized_transaction =
                    normalized_transaction_in
                      authoritative_database
                      ~append_create
-                      ~fingerprint:record.fingerprint
+                     ~fingerprint:record.fingerprint
                      ~intent_time_ms:record.intent_time_ms
                      ~planned_tx
                      ~orders
@@ -10221,7 +11268,8 @@ let logical_change_footprint
       ~transaction_data
       ~outbox_effects
   =
-  let before_context=read_context before and after_context=read_context after in
+  let before_context = read_context before
+  and after_context = read_context after in
   let direct =
     changed_entity_uuids authoritative_before authoritative_after transaction_data
   in
@@ -10415,636 +11463,713 @@ let replay_authoritative database prepared =
     | exn -> Error (Printexc.to_string exn))
 ;;
 
-let report_timeline_commit graph_uuid checkpoint_before (commit : Types.authoritative_commit) =
+let report_timeline_commit
+      graph_uuid
+      checkpoint_before
+      (commit : Types.authoritative_commit)
+  =
   try
-    let kind, blocks, pages, interests = match commit.logical_change_summary with
+    let kind, blocks, pages, interests =
+      match commit.logical_change_summary with
       | Types.No_logical_change -> "none", [], [], []
       | Logical_resync_required _ -> "resync", [], [], []
       | Exact_logical_change value ->
         "exact", value.block_uuids, value.page_uuids, value.structure_interests
     in
-    let uuids values = `List (List.take 16 values |> List.map (fun u -> `String (Graph.Uuid.to_string u))) in
+    let uuids values =
+      `List (List.take 16 values |> List.map (fun u -> `String (Graph.Uuid.to_string u)))
+    in
     let interest = function
-      | Types.Children_interest u -> `Assoc ["kind", `String "children"; "target", `String (Graph.Uuid.to_string u)]
-      | Page_tree_interest u -> `Assoc ["kind", `String "page-tree"; "target", `String (Graph.Uuid.to_string u)]
-      | Journal_index_interest -> `Assoc ["kind", `String "journal-index"]
+      | Types.Children_interest u ->
+        `Assoc [ "kind", `String "children"; "target", `String (Graph.Uuid.to_string u) ]
+      | Page_tree_interest u ->
+        `Assoc [ "kind", `String "page-tree"; "target", `String (Graph.Uuid.to_string u) ]
+      | Journal_index_interest -> `Assoc [ "kind", `String "journal-index" ]
     in
     let fields =
       [ "stage", `String "overlay-commit"
       ; "graph", `String (Graph.Uuid.to_string graph_uuid)
       ; "generation", `String (Types.Generation.to_string commit.generation)
-      ; "checkpointBefore", `String (Int64.to_string (Types.Server_cursor.to_int64 checkpoint_before))
-      ; "checkpoint", `String (Int64.to_string (Types.Server_cursor.to_int64 commit.checkpoint))
-      ; "beforeProjection", `String (Types.Projection_revision.to_string commit.before_projection_revision)
-      ; "projection", `String (Types.Projection_revision.to_string commit.after_projection_revision)
+      ; ( "checkpointBefore"
+        , `String (Int64.to_string (Types.Server_cursor.to_int64 checkpoint_before)) )
+      ; ( "checkpoint"
+        , `String (Int64.to_string (Types.Server_cursor.to_int64 commit.checkpoint)) )
+      ; ( "beforeProjection"
+        , `String (Types.Projection_revision.to_string commit.before_projection_revision)
+        )
+      ; ( "projection"
+        , `String (Types.Projection_revision.to_string commit.after_projection_revision) )
       ; "changeKind", `String kind
-      ; "blockCount", `Int (List.length blocks); "blocks", uuids blocks
-      ; "pageCount", `Int (List.length pages); "pages", uuids pages
+      ; "blockCount", `Int (List.length blocks)
+      ; "blocks", uuids blocks
+      ; "pageCount", `Int (List.length pages)
+      ; "pages", uuids pages
       ; "interestCount", `Int (List.length interests)
       ; "interests", `List (List.take 16 interests |> List.map interest)
-      ; "truncated", `Bool (List.length blocks > 16 || List.length pages > 16 || List.length interests > 16)
-      ] in
+      ; ( "truncated"
+        , `Bool
+            (List.length blocks > 16
+             || List.length pages > 16
+             || List.length interests > 16) )
+      ]
+    in
     let text = Yojson.Safe.to_string (`Assoc fields) in
     if String.length text <= 8192 then report_warning ("journal-timeline: " ^ text ^ "\n")
-  with _ -> ()
+  with
+  | _ -> ()
 ;;
 
 let commit_authoritative_candidate database prepared =
   let checkpoint_before = ref None in
-  let outcome = serialize_commit database (fun () ->
-    let change, outcome =
-      Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
-        let preparation = prepared.authoritative_preparation in
-        if preparation.authoritative_owner != database
-        then None, Error Types.Authoritative_commit_generation_invalidated
-        else if database.closed
-        then None, Error Types.Authoritative_commit_database_closed
-        else if database.sync_revision <> preparation.authoritative_revision
-        then None, Error Types.Authoritative_commit_token_conflict
-        else (
-          match
-            Logseq_db_storage.Storage_session.stage_transact_batch
-              database.storage_session
-              ~authoritative_before:(authoritative_database database)
-              prepared.authoritative_transactions
-          with
-          | Error error ->
-            ( None
-            , Error
-                (Types.Authoritative_commit_persistence_failed
-                   (storage_session_error error)) )
-          | Ok staged ->
-            let through =
-              Types.authoritative_batch_through preparation.authoritative_batch
-            in
-            let authoritative_after = prepared.authoritative_db_after in
-            let authoritative_before = authoritative_database database in
-            (* Origin validation compares complete transaction data at its expected
+  let outcome =
+    serialize_commit database (fun () ->
+      let change, outcome =
+        Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
+          let preparation = prepared.authoritative_preparation in
+          if preparation.authoritative_owner != database
+          then None, Error Types.Authoritative_commit_generation_invalidated
+          else if database.closed
+          then None, Error Types.Authoritative_commit_database_closed
+          else if database.sync_revision <> preparation.authoritative_revision
+          then None, Error Types.Authoritative_commit_token_conflict
+          else (
+            match
+              Logseq_db_storage.Storage_session.stage_transact_batch
+                database.storage_session
+                ~authoritative_before:(authoritative_database database)
+                prepared.authoritative_transactions
+            with
+            | Error error ->
+              ( None
+              , Error
+                  (Types.Authoritative_commit_persistence_failed
+                     (storage_session_error error)) )
+            | Ok staged ->
+              let through =
+                Types.authoritative_batch_through preparation.authoritative_batch
+              in
+              let authoritative_after = prepared.authoritative_db_after in
+              let authoritative_before = authoritative_database database in
+              (* Origin validation compares complete transaction data at its expected
                cursor. Earlier local effects were already visible when a queued
                delete was authored; their echoes are not competing remote edits. *)
-            let local_sequences = Hashtbl.create (List.length database.outbox) in
-            List.iter (fun (record : outbox_record) ->
-              Hashtbl.replace local_sequences (Graph.Uuid.to_string record.mutation_id)
-                record.sequence) database.outbox;
-            let origin_sequences = Hashtbl.create (List.length prepared.validated_origins) in
-            List.iter (fun (id, cursor) ->
-              Option.iter (fun sequence ->
-                Hashtbl.replace origin_sequences (Types.Server_cursor.to_int64 cursor) sequence)
-                (Hashtbl.find_opt local_sequences (Graph.Uuid.to_string id)))
-              prepared.validated_origins;
-            let _, conflict_contexts = List.fold_left2
-              (fun (before, contexts) transaction after ->
-                let origin = Hashtbl.find_opt origin_sequences
-                  (Types.Server_cursor.to_int64
-                    (Types.authoritative_transaction_cursor transaction)) in
-                after, Rrbvec.push_back contexts (before, after, origin))
-              (authoritative_before, Rrbvec.empty)
-              (Types.authoritative_batch_transactions preparation.authoritative_batch)
-              prepared.authoritative_roots_after in
-            let module Conflict_set = Set.Make (struct
-              type t = Types.delete_conflict_kind
-              let compare = Stdlib.compare
-            end) in
-            let queued_delete_conflicts (record : outbox_record) =
-              let earlier = function Some sequence -> sequence < record.sequence | None -> false in
-              if not (Rrbvec.exists (fun (_, _, origin) -> earlier origin) conflict_contexts)
-              then delete_conflict_kinds_between authoritative_before authoritative_after record
-              else
-                Rrbvec.fold_left
-                  (fun conflicts (before, after, origin) ->
-                    if earlier origin then conflicts
-                    else List.fold_left
-                      (fun conflicts kind -> Conflict_set.add kind conflicts)
-                      conflicts (delete_conflict_kinds_between before after record))
-                  Conflict_set.empty conflict_contexts
-                |> Conflict_set.elements
-            in
-            let remote_won_queued =
-              List.filter_map
+              let local_sequences = Hashtbl.create (List.length database.outbox) in
+              List.iter
                 (fun (record : outbox_record) ->
-                   match record.transport_state, record.mutation with
-                   | Queued, Types.Delete_blocks { root; _ } ->
-                     let after = block_of_database authoritative_after root in
-                     let conflicts =
-                       queued_delete_conflicts record
+                   Hashtbl.replace
+                     local_sequences
+                     (Graph.Uuid.to_string record.mutation_id)
+                     record.sequence)
+                database.outbox;
+              let origin_sequences =
+                Hashtbl.create (List.length prepared.validated_origins)
+              in
+              List.iter
+                (fun (id, cursor) ->
+                   Option.iter
+                     (fun sequence ->
+                        Hashtbl.replace
+                          origin_sequences
+                          (Types.Server_cursor.to_int64 cursor)
+                          sequence)
+                     (Hashtbl.find_opt local_sequences (Graph.Uuid.to_string id)))
+                prepared.validated_origins;
+              let _, conflict_contexts =
+                List.fold_left2
+                  (fun (before, contexts) transaction after ->
+                     let origin =
+                       Hashtbl.find_opt
+                         origin_sequences
+                         (Types.Server_cursor.to_int64
+                            (Types.authoritative_transaction_cursor transaction))
                      in
-                     if conflicts <> [] && Option.is_some after
-                     then Some (record, conflicts)
-                     else None
-                   | _ -> None)
-                database.outbox
-            in
-            let remote_won_submitted =
-              List.filter_map
-                (fun (mutation_id, batch_id, cursor, conflicts) ->
-                   List.find_opt
-                     (fun (record : outbox_record) ->
-                        Graph.Uuid.equal record.mutation_id mutation_id)
-                     database.outbox
-                   |> Option.map (fun record -> record, batch_id, cursor, conflicts))
-                prepared.submitted_remote_won
-            in
-            let record_for id =
-              List.find_opt
-                (fun (record : outbox_record) -> Graph.Uuid.equal record.mutation_id id)
-                database.outbox
-            in
-            let stale_remote_won =
-              List.filter_map
-                (fun (id, batch_id, earliest, rejection_through, conflicts) ->
-                   record_for id
-                   |> Option.map (fun record ->
-                     record, batch_id, earliest, rejection_through, conflicts))
-                prepared.stale_remote_won
-            in
-            let resolved_stale =
-              List.filter_map
-                (fun (id, batch_id) ->
-                   record_for id |> Option.map (fun record -> record, batch_id))
-                prepared.stale_no_change
-            in
-            let blocked_stale =
-              List.filter_map
-                (fun (id, batch_id) ->
-                   record_for id |> Option.map (fun record -> record, batch_id))
-                prepared.stale_blocked
-            in
-            let covered_accepted =
-              List.filter
-                (fun (record : outbox_record) ->
-                   match record.transport_state, record.acceptance_barrier with
-                   | Accepted_pending_authoritative _, Some barrier ->
-                     Types.Server_cursor.compare barrier.through through <= 0
-                   | _ -> false)
-                database.outbox
-            in
-            let authoritative_root_at barrier =
-              let target = barrier.Types.through in
-              if Types.Server_cursor.compare target database.checkpoint <= 0
-              then Some authoritative_before
-              else
-                List.combine
+                     after, Rrbvec.push_back contexts (before, after, origin))
+                  (authoritative_before, Rrbvec.empty)
                   (Types.authoritative_batch_transactions preparation.authoritative_batch)
                   prepared.authoritative_roots_after
-                |> List.find_map (fun (transaction, root) ->
-                  if
-                    Types.Server_cursor.equal
-                      (Types.authoritative_transaction_cursor transaction)
-                      target
-                  then Some root
-                  else None)
-            in
-            let accepted_requirement_satisfied (record : outbox_record) =
-              match record.acceptance_barrier with
-              | None -> false
-              | Some barrier ->
-                let barrier_cursor = barrier.through in
-                (match record.mutation with
-                 | Save_block _
-                 | Insert_blocks _
-                 | Append_journal _
-                 | Create_journal_page _
-                 | Set_task_status _
-                 | Clear_task_status _
-                   when Types.Server_cursor.compare barrier_cursor database.checkpoint < 0
-                   -> true
-                 | _ ->
-                   (match authoritative_root_at barrier, record.transport_state with
-                    | Some root, Accepted_pending_authoritative batch_id ->
-                      accepted_record_satisfied
-                        root
-                        (batch_records database batch_id)
-                        record
-                    | None, _ | Some _, _ -> false))
-            in
-            let resolved_accepted, mismatched_accepted =
-              List.partition accepted_requirement_satisfied covered_accepted
-            in
-            let resolved_records = List.map fst resolved_stale @ resolved_accepted in
-            let candidate_outbox =
-              List.filter_map
+              in
+              let module Conflict_set = Set.Make (struct
+                  type t = Types.delete_conflict_kind
+
+                  let compare = Stdlib.compare
+                end)
+              in
+              let queued_delete_conflicts (record : outbox_record) =
+                let earlier = function
+                  | Some sequence -> sequence < record.sequence
+                  | None -> false
+                in
+                if
+                  not
+                    (Rrbvec.exists
+                       (fun (_, _, origin) -> earlier origin)
+                       conflict_contexts)
+                then
+                  delete_conflict_kinds_between
+                    authoritative_before
+                    authoritative_after
+                    record
+                else
+                  Rrbvec.fold_left
+                    (fun conflicts (before, after, origin) ->
+                       if earlier origin
+                       then conflicts
+                       else
+                         List.fold_left
+                           (fun conflicts kind -> Conflict_set.add kind conflicts)
+                           conflicts
+                           (delete_conflict_kinds_between before after record))
+                    Conflict_set.empty
+                    conflict_contexts
+                  |> Conflict_set.elements
+              in
+              let remote_won_queued =
+                List.filter_map
+                  (fun (record : outbox_record) ->
+                     match record.transport_state, record.mutation with
+                     | Queued, Types.Delete_blocks { root; _ } ->
+                       let after = block_of_database authoritative_after root in
+                       let conflicts = queued_delete_conflicts record in
+                       if conflicts <> [] && Option.is_some after
+                       then Some (record, conflicts)
+                       else None
+                     | _ -> None)
+                  database.outbox
+              in
+              let remote_won_submitted =
+                List.filter_map
+                  (fun (mutation_id, batch_id, cursor, conflicts) ->
+                     List.find_opt
+                       (fun (record : outbox_record) ->
+                          Graph.Uuid.equal record.mutation_id mutation_id)
+                       database.outbox
+                     |> Option.map (fun record -> record, batch_id, cursor, conflicts))
+                  prepared.submitted_remote_won
+              in
+              let record_for id =
+                List.find_opt
+                  (fun (record : outbox_record) -> Graph.Uuid.equal record.mutation_id id)
+                  database.outbox
+              in
+              let stale_remote_won =
+                List.filter_map
+                  (fun (id, batch_id, earliest, rejection_through, conflicts) ->
+                     record_for id
+                     |> Option.map (fun record ->
+                       record, batch_id, earliest, rejection_through, conflicts))
+                  prepared.stale_remote_won
+              in
+              let resolved_stale =
+                List.filter_map
+                  (fun (id, batch_id) ->
+                     record_for id |> Option.map (fun record -> record, batch_id))
+                  prepared.stale_no_change
+              in
+              let blocked_stale =
+                List.filter_map
+                  (fun (id, batch_id) ->
+                     record_for id |> Option.map (fun record -> record, batch_id))
+                  prepared.stale_blocked
+              in
+              let covered_accepted =
+                List.filter
+                  (fun (record : outbox_record) ->
+                     match record.transport_state, record.acceptance_barrier with
+                     | Accepted_pending_authoritative _, Some barrier ->
+                       Types.Server_cursor.compare barrier.through through <= 0
+                     | _ -> false)
+                  database.outbox
+              in
+              List.iter
                 (fun (record : outbox_record) ->
-                   if
-                     List.exists (fun resolved -> resolved == record) resolved_records
-                     || List.exists
-                          (fun (remote_won, _) -> remote_won == record)
-                          remote_won_queued
-                     || List.exists
-                          (fun (remote_won, _, _, _) -> remote_won == record)
-                          remote_won_submitted
-                     || List.exists
-                          (fun (remote_won, _, _, _, _) -> remote_won == record)
-                          stale_remote_won
-                   then None
-                   else if
-                     List.exists
-                       (fun mismatched -> mismatched == record)
-                       mismatched_accepted
-                   then
-                     Some
-                       { record with
-                         transport_state = Blocked
-                       ; dependency_shadows = empty_dependency_shadows
-                       ; blocked_prior_state = Some record.transport_state
-                       ; blocked_reason = Some Authoritative_mismatch
-                       ; same_id_retry_eligible = false
-                       ; acceptance_barrier = None
-                       }
-                   else if
-                     List.exists (fun (blocked, _) -> blocked == record) blocked_stale
-                   then
-                     Some
-                       { record with
-                         transport_state = Blocked
-                       ; dependency_shadows = empty_dependency_shadows
-                       ; blocked_prior_state = Some record.transport_state
-                       ; blocked_reason = Some Stale_barrier
-                       ; same_id_retry_eligible = false
-                       ; acceptance_barrier = None
-                       }
-                   else (
-                     let record_with_origin_evidence () =
+                   Option.iter
+                     (fun (barrier : Types.acceptance_barrier) ->
+                        if Types.Server_cursor.equal barrier.through through
+                        then
+                          report_checksum_mismatch
+                            ~phase:"acceptance-barrier"
+                            ~through
+                            ~expected:(checksum_value barrier.checksum)
+                            ~actual:
+                              (Authoritative_checksum.to_string
+                                 prepared.authoritative_digest_after))
+                     record.acceptance_barrier)
+                covered_accepted;
+              let authoritative_root_at barrier =
+                let target = barrier.Types.through in
+                if Types.Server_cursor.compare target database.checkpoint <= 0
+                then Some authoritative_before
+                else
+                  List.combine
+                    (Types.authoritative_batch_transactions
+                       preparation.authoritative_batch)
+                    prepared.authoritative_roots_after
+                  |> List.find_map (fun (transaction, root) ->
+                    if
+                      Types.Server_cursor.equal
+                        (Types.authoritative_transaction_cursor transaction)
+                        target
+                    then Some root
+                    else None)
+              in
+              let accepted_requirement_satisfied (record : outbox_record) =
+                match record.acceptance_barrier with
+                | None -> false
+                | Some barrier ->
+                  let barrier_cursor = barrier.through in
+                  (match record.mutation with
+                   | Save_block _
+                   | Insert_blocks _
+                   | Append_journal _
+                   | Create_journal_page _
+                   | Set_task_status _
+                   | Clear_task_status _
+                     when Types.Server_cursor.compare barrier_cursor database.checkpoint
+                          < 0 -> true
+                   | _ ->
+                     (match authoritative_root_at barrier, record.transport_state with
+                      | Some root, Accepted_pending_authoritative batch_id ->
+                        accepted_record_satisfied
+                          root
+                          (batch_records database batch_id)
+                          record
+                      | None, _ | Some _, _ -> false))
+              in
+              let resolved_accepted, mismatched_accepted =
+                List.partition accepted_requirement_satisfied covered_accepted
+              in
+              let resolved_records = List.map fst resolved_stale @ resolved_accepted in
+              let candidate_outbox =
+                List.filter_map
+                  (fun (record : outbox_record) ->
+                     if
+                       List.exists (fun resolved -> resolved == record) resolved_records
+                       || List.exists
+                            (fun (remote_won, _) -> remote_won == record)
+                            remote_won_queued
+                       || List.exists
+                            (fun (remote_won, _, _, _) -> remote_won == record)
+                            remote_won_submitted
+                       || List.exists
+                            (fun (remote_won, _, _, _, _) -> remote_won == record)
+                            stale_remote_won
+                     then None
+                     else if
+                       List.exists
+                         (fun mismatched -> mismatched == record)
+                         mismatched_accepted
+                     then
+                       Some
+                         { record with
+                           transport_state = Blocked
+                         ; dependency_shadows = empty_dependency_shadows
+                         ; blocked_prior_state = Some record.transport_state
+                         ; blocked_reason = Some Authoritative_mismatch
+                         ; same_id_retry_eligible = false
+                         ; acceptance_barrier = None
+                         }
+                     else if
+                       List.exists (fun (blocked, _) -> blocked == record) blocked_stale
+                     then
+                       Some
+                         { record with
+                           transport_state = Blocked
+                         ; dependency_shadows = empty_dependency_shadows
+                         ; blocked_prior_state = Some record.transport_state
+                         ; blocked_reason = Some Stale_barrier
+                         ; same_id_retry_eligible = false
+                         ; acceptance_barrier = None
+                         }
+                     else (
+                       let record_with_origin_evidence () =
+                         match
+                           List.find_opt
+                             (fun (id, _) -> Graph.Uuid.equal id record.mutation_id)
+                             prepared.validated_origins
+                         with
+                         | None -> record
+                         | Some (_, cursor) ->
+                           { record with observed_origin_cursor = Some cursor }
+                       in
                        match
                          List.find_opt
-                           (fun (id, _) -> Graph.Uuid.equal id record.mutation_id)
-                           prepared.validated_origins
+                           (fun (id, _, _) -> Graph.Uuid.equal id record.mutation_id)
+                           prepared.stale_updates
                        with
-                       | None -> record
-                       | Some (_, cursor) ->
-                         { record with observed_origin_cursor = Some cursor }
+                       | None -> Some (record_with_origin_evidence ())
+                       | Some (_, earliest, conflicts) ->
+                         Some
+                           { (record_with_origin_evidence ()) with
+                             stale_earliest_conflict_cursor = earliest
+                           ; stale_conflicts = conflicts
+                           }))
+                  database.outbox
+              in
+              let candidate_outbox, stale_executed, stale_batches =
+                settle_stale_records
+                  ~checkpoint:through
+                  ~origins:prepared.validated_origins
+                  candidate_outbox
+              in
+              let resolved_records = resolved_records @ stale_executed in
+              let candidate_outbox, replanned_queued, no_change_queued, blocked_queued =
+                replan_queued_ordinary database authoritative_after candidate_outbox
+              in
+              let receipt_revision = projection_revision database.projection in
+              let candidate_receipts =
+                List.fold_left
+                  (fun receipts (record : outbox_record) ->
+                     let commit =
+                       { Types.mutation_id = record.mutation_id
+                       ; status =
+                           (if
+                              List.exists
+                                (fun (stale, _) -> stale == record)
+                                resolved_stale
+                            then No_change
+                            else Applied)
+                       ; generation = database.generation
+                       ; before_projection_revision = receipt_revision
+                       ; after_projection_revision = receipt_revision
+                       ; logical_change_summary = No_logical_change
+                       }
                      in
-                     match
-                       List.find_opt
-                         (fun (id, _, _) -> Graph.Uuid.equal id record.mutation_id)
-                         prepared.stale_updates
-                     with
-                     | None -> Some (record_with_origin_evidence ())
-                     | Some (_, earliest, conflicts) ->
-                       Some
-                         { (record_with_origin_evidence ()) with
-                           stale_earliest_conflict_cursor = earliest
-                         ; stale_conflicts = conflicts
-                         }))
-                database.outbox
-            in
-            let candidate_outbox, stale_executed, stale_batches =
-              settle_stale_records
-                ~checkpoint:through
-                ~origins:prepared.validated_origins
-                candidate_outbox
-            in
-            let resolved_records = resolved_records @ stale_executed in
-            let candidate_outbox, replanned_queued, no_change_queued, blocked_queued =
-              replan_queued_ordinary database authoritative_after candidate_outbox
-            in
-            let receipt_revision = projection_revision database.projection in
-            let candidate_receipts =
-              List.fold_left
-                (fun receipts (record : outbox_record) ->
-                   let commit =
-                     { Types.mutation_id = record.mutation_id
-                     ; status =
-                         (if
-                            List.exists (fun (stale, _) -> stale == record) resolved_stale
-                          then No_change
-                          else Applied)
-                     ; generation = database.generation
-                     ; before_projection_revision = receipt_revision
-                     ; after_projection_revision = receipt_revision
-                     ; logical_change_summary = No_logical_change
-                     }
-                   in
-                   (record.mutation_id, record.fingerprint, Commit_receipt commit)
-                   :: List.filter
-                        (fun (candidate, _, _) ->
-                           not (Graph.Uuid.equal candidate record.mutation_id))
-                        receipts)
-                database.receipts
-                resolved_records
-            in
-            let candidate_receipts =
-              List.fold_left
-                (fun receipts ((record : outbox_record), conflicts) ->
-                   ( record.mutation_id
-                   , record.fingerprint
-                   , Remote_won_entry
-                       (remote_won_before_submission ~conflict_kinds:conflicts record) )
-                   :: List.filter
-                        (fun (candidate, _, _) ->
-                           not (Graph.Uuid.equal candidate record.mutation_id))
-                        receipts)
-                candidate_receipts
-                remote_won_queued
-            in
-            let candidate_receipts =
-              List.fold_left
-                (fun receipts (record, batch_id, cursor, conflicts) ->
-                   ( record.mutation_id
-                   , record.fingerprint
-                   , Remote_won_entry
-                       (remote_won_proven_unexecuted
-                          ~conflict_kinds:conflicts
-                          record
-                          ~batch_id
-                          ~earliest_conflict_cursor:cursor) )
-                   :: List.filter
-                        (fun (candidate, _, _) ->
-                           not (Graph.Uuid.equal candidate record.mutation_id))
-                        receipts)
-                candidate_receipts
-                remote_won_submitted
-            in
-            let candidate_receipts =
-              List.fold_left
-                (fun receipts
-                  (record, batch_id, earliest, rejection_through, conflicts) ->
-                   ( record.mutation_id
-                   , record.fingerprint
-                   , Remote_won_entry
-                       (remote_won_proven_unexecuted
-                          ~rejection_through
-                          ~conflict_kinds:conflicts
-                          record
-                          ~batch_id
-                          ~earliest_conflict_cursor:earliest) )
-                   :: List.filter
-                        (fun (candidate, _, _) ->
-                           not (Graph.Uuid.equal candidate record.mutation_id))
-                        receipts)
-                candidate_receipts
-                stale_remote_won
-            in
-            let candidate_receipts =
-              List.fold_left
-                (fun receipts (record : outbox_record) ->
-                   let commit =
-                     { Types.mutation_id = record.mutation_id
-                     ; status = No_change
-                     ; generation = database.generation
-                     ; before_projection_revision = receipt_revision
-                     ; after_projection_revision = receipt_revision
-                     ; logical_change_summary = No_logical_change
-                     }
-                   in
-                   (record.mutation_id, record.fingerprint, Commit_receipt commit)
-                   :: List.filter
-                        (fun (candidate, _, _) ->
-                           not (Graph.Uuid.equal candidate record.mutation_id))
-                        receipts)
-                candidate_receipts
-                no_change_queued
-            in
-            let terminal_receipts =
-              List.map
-                (fun (record : outbox_record) ->
-                   let receipt =
-                     if List.exists (fun (stale, _) -> stale == record) resolved_stale
-                     then
-                       Types.No_change_receipt
-                         { mutation_id = record.mutation_id
-                         ; fingerprint = typed_mutation_fingerprint record.fingerprint
-                         }
-                     else
-                       Applied_receipt
-                         { mutation_id = record.mutation_id
-                         ; fingerprint = typed_mutation_fingerprint record.fingerprint
-                         }
-                   in
-                   Types.{ receipt; transport_disposition = Clear_transport_owner })
-                resolved_records
-            in
-            let terminal_receipts =
-              terminal_receipts
-              @ List.map
-                  (fun ((record : outbox_record), conflicts) ->
-                     Types.
-                       { receipt =
-                           Remote_won_receipt
-                             (remote_won_before_submission
-                                ~conflict_kinds:conflicts
-                                record)
-                       ; transport_disposition = No_transport_owner
-                       })
+                     (record.mutation_id, record.fingerprint, Commit_receipt commit)
+                     :: List.filter
+                          (fun (candidate, _, _) ->
+                             not (Graph.Uuid.equal candidate record.mutation_id))
+                          receipts)
+                  database.receipts
+                  resolved_records
+              in
+              let candidate_receipts =
+                List.fold_left
+                  (fun receipts ((record : outbox_record), conflicts) ->
+                     ( record.mutation_id
+                     , record.fingerprint
+                     , Remote_won_entry
+                         (remote_won_before_submission ~conflict_kinds:conflicts record)
+                     )
+                     :: List.filter
+                          (fun (candidate, _, _) ->
+                             not (Graph.Uuid.equal candidate record.mutation_id))
+                          receipts)
+                  candidate_receipts
                   remote_won_queued
-            in
-            let terminal_receipts =
-              terminal_receipts
-              @ List.map
-                  (fun (record, batch_id, cursor, conflicts) ->
-                     Types.
-                       { receipt =
-                           Remote_won_receipt
-                             (remote_won_proven_unexecuted
-                                ~conflict_kinds:conflicts
-                                record
-                                ~batch_id
-                                ~earliest_conflict_cursor:cursor)
-                       ; transport_disposition =
-                           Retain_terminal_owner_until_response batch_id
-                       })
+              in
+              let candidate_receipts =
+                List.fold_left
+                  (fun receipts (record, batch_id, cursor, conflicts) ->
+                     ( record.mutation_id
+                     , record.fingerprint
+                     , Remote_won_entry
+                         (remote_won_proven_unexecuted
+                            ~conflict_kinds:conflicts
+                            record
+                            ~batch_id
+                            ~earliest_conflict_cursor:cursor) )
+                     :: List.filter
+                          (fun (candidate, _, _) ->
+                             not (Graph.Uuid.equal candidate record.mutation_id))
+                          receipts)
+                  candidate_receipts
                   remote_won_submitted
-            in
-            let terminal_receipts =
-              terminal_receipts
-              @ List.map
-                  (fun (record, batch_id, earliest, rejection_through, conflicts) ->
-                     Types.
-                       { receipt =
-                           Remote_won_receipt
-                             (remote_won_proven_unexecuted
-                                ~rejection_through
-                                ~conflict_kinds:conflicts
-                                record
-                                ~batch_id
-                                ~earliest_conflict_cursor:earliest)
-                       ; transport_disposition = Clear_transport_owner
-                       })
+              in
+              let candidate_receipts =
+                List.fold_left
+                  (fun receipts
+                    (record, batch_id, earliest, rejection_through, conflicts) ->
+                     ( record.mutation_id
+                     , record.fingerprint
+                     , Remote_won_entry
+                         (remote_won_proven_unexecuted
+                            ~rejection_through
+                            ~conflict_kinds:conflicts
+                            record
+                            ~batch_id
+                            ~earliest_conflict_cursor:earliest) )
+                     :: List.filter
+                          (fun (candidate, _, _) ->
+                             not (Graph.Uuid.equal candidate record.mutation_id))
+                          receipts)
+                  candidate_receipts
                   stale_remote_won
-            in
-            let terminal_receipts =
-              terminal_receipts
-              @ List.map
-                  (fun (record : outbox_record) ->
-                     Types.
-                       { receipt =
-                           No_change_receipt
-                             { mutation_id = record.mutation_id
-                             ; fingerprint = typed_mutation_fingerprint record.fingerprint
-                             }
-                       ; transport_disposition = No_transport_owner
-                       })
+              in
+              let candidate_receipts =
+                List.fold_left
+                  (fun receipts (record : outbox_record) ->
+                     let commit =
+                       { Types.mutation_id = record.mutation_id
+                       ; status = No_change
+                       ; generation = database.generation
+                       ; before_projection_revision = receipt_revision
+                       ; after_projection_revision = receipt_revision
+                       ; logical_change_summary = No_logical_change
+                       }
+                     in
+                     (record.mutation_id, record.fingerprint, Commit_receipt commit)
+                     :: List.filter
+                          (fun (candidate, _, _) ->
+                             not (Graph.Uuid.equal candidate record.mutation_id))
+                          receipts)
+                  candidate_receipts
                   no_change_queued
-            in
-            let terminal_batches =
-              stale_batches
-              @ List.map
-                  (fun (record, batch_id, _cursor, _conflicts) ->
-                     { terminal_batch_id = batch_id
-                     ; terminal_outcome =
-                         Terminal_proven_unexecuted
+              in
+              let terminal_receipts =
+                List.map
+                  (fun (record : outbox_record) ->
+                     let receipt =
+                       if List.exists (fun (stale, _) -> stale == record) resolved_stale
+                       then
+                         Types.No_change_receipt
                            { mutation_id = record.mutation_id
-                           ; fingerprint = record.fingerprint
+                           ; fingerprint = typed_mutation_fingerprint record.fingerprint
                            }
-                     })
-                  remote_won_submitted
-              @ List.map
-                  (fun (record, batch_id, _, _, _) ->
-                     { terminal_batch_id = batch_id
-                     ; terminal_outcome =
-                         Terminal_proven_unexecuted
+                       else
+                         Applied_receipt
                            { mutation_id = record.mutation_id
-                           ; fingerprint = record.fingerprint
+                           ; fingerprint = typed_mutation_fingerprint record.fingerprint
                            }
-                     })
-                  stale_remote_won
-              @ List.map
-                  (fun (record, batch_id) ->
-                     { terminal_batch_id = batch_id
-                     ; terminal_outcome =
-                         Terminal_proven_unexecuted
-                           { mutation_id = record.mutation_id
-                           ; fingerprint = record.fingerprint
-                           }
-                     })
-                  (resolved_stale @ blocked_stale)
-            in
-            let checksum =
-              Types.authoritative_batch_checksum preparation.authoritative_batch
-              |> Option.map Types.Checksum.to_string
-              |> Option.map (strip_versioned_prefix "checksum")
-              |> Option.value ~default:database.checkpoint_metadata.checksum
-            in
-            let metadata =
-              Logseq_db_types.Sync_checkpoint.create
-                ~graph_id:database.graph_uuid
-                ~schema:database.schema
-                ~applied_server_t:through
-                ~checksum
-              |> Result.get_ok
-            in
-            let outbox_delta, durable_outbox =
-              outbox_write_set
-                database
-                ~revision:(database.sync_revision + 1)
-                candidate_outbox
-            in
-            let receipts =
-              List.filter_map Persistence_receipt_v1.encode_mutation candidate_receipts
-            in
-            (match
-               Logseq_db_storage.Storage_session
-               .commit_staged_with_sync_metadata_outbox_and_receipts
-                 ~outbox_delta
-                 database.storage_session
-                 staged
-                 metadata
-                 []
-                 receipts
-                 (List.map Persistence_receipt_v1.encode_terminal_batch terminal_batches)
-             with
-             | Error error ->
-               ( None
-               , Error
-                   (Types.Authoritative_commit_persistence_failed
-                      (storage_session_error error)) )
-             | Ok () ->
-               database.durable_outbox <- durable_outbox;
-               database.durable_sync_revision <- database.sync_revision + 1;
-               preparation.authoritative_state <- Authoritative_consumed;
-               checkpoint_before := Some database.checkpoint;
-               let before_projection = database.projection in
-               let before_snapshot = snapshot_of_database database in
-               (match replay_authoritative database prepared with
-                | Error message ->
-                  database.closed <- true;
-                  None, Error (Types.Authoritative_commit_fatal_state message)
-                | Ok () ->
-                  database.outbox <- candidate_outbox;
-                  database.receipts <- [];
-                  refresh_queryable_outbox database;
-                  let candidate_projection = before_projection + 1 in
-                  let after_snapshot =
-                    snapshot_for_sources database authoritative_after candidate_outbox
-                  in
-                  let transitioned_records =
-                    resolved_records
-                    @ List.map fst remote_won_queued
-                    @ List.map (fun (record, _, _, _) -> record) remote_won_submitted
-                    @ List.map (fun (record, _, _, _, _) -> record) stale_remote_won
-                    @ List.map fst blocked_stale
-                    @ mismatched_accepted
-                    @ no_change_queued
-                    @ blocked_queued
-                    @ replanned_queued
-                  in
-                  let block_uuids, page_uuids, structure_interests, fanout_overflow =
-                    logical_change_footprint
-                      ~before:before_snapshot
-                      ~after:after_snapshot
-                      ~authoritative_before
-                      ~authoritative_after
-                      ~transaction_data:prepared.authoritative_expected_tx_data
-                      ~outbox_effects:
-                        (List.map
-                           (fun (record : outbox_record) -> record.effect_footprint)
-                           transitioned_records)
-                  in
-                  let changed =
-                    fanout_overflow
-                    || block_uuids <> []
-                    || page_uuids <> []
-                    || structure_interests <> []
-                  in
-                  database.projection
-                  <- (if changed then candidate_projection else before_projection);
-                  database.checkpoint <- through;
-                  database.checkpoint_metadata <- metadata;
-                  database.sync_revision <- database.sync_revision + 1;
-                  let before_revision = projection_revision before_projection in
-                  let after_revision = projection_revision database.projection in
-                  let logical_change_summary =
-                    if fanout_overflow
-                    then Types.Logical_resync_required Change_limit_exceeded
-                    else if changed
-                    then
-                      bounded_logical_summary
-                        database
-                        ~block_uuids
-                        ~page_uuids
-                        ~structure_interests
-                    else No_logical_change
-                  in
-                  let change =
-                    Change_dispatcher.event
-                      ~generation:database.generation
-                      ~before_revision
-                      ~after_revision
-                      logical_change_summary
-                  in
-                  ( change
-                  , Ok
-                      { Types.generation = database.generation
-                      ; before_projection_revision = before_revision
-                      ; after_projection_revision = after_revision
-                      ; checkpoint = through
-                      ; sync_token = sync_token database.sync_revision
-                      ; terminal_receipts
-                      ; replanned_queued_ids =
-                          List.map
-                            (fun (record : outbox_record) -> record.mutation_id)
-                            replanned_queued
-                      ; blocked_ids =
-                          List.map
-                            (fun (record : outbox_record) -> record.mutation_id)
-                            mismatched_accepted
-                          @ List.map (fun (record, _) -> record.mutation_id) blocked_stale
-                          @ List.map
+                     in
+                     Types.{ receipt; transport_disposition = Clear_transport_owner })
+                  resolved_records
+              in
+              let terminal_receipts =
+                terminal_receipts
+                @ List.map
+                    (fun ((record : outbox_record), conflicts) ->
+                       Types.
+                         { receipt =
+                             Remote_won_receipt
+                               (remote_won_before_submission
+                                  ~conflict_kinds:conflicts
+                                  record)
+                         ; transport_disposition = No_transport_owner
+                         })
+                    remote_won_queued
+              in
+              let terminal_receipts =
+                terminal_receipts
+                @ List.map
+                    (fun (record, batch_id, cursor, conflicts) ->
+                       Types.
+                         { receipt =
+                             Remote_won_receipt
+                               (remote_won_proven_unexecuted
+                                  ~conflict_kinds:conflicts
+                                  record
+                                  ~batch_id
+                                  ~earliest_conflict_cursor:cursor)
+                         ; transport_disposition =
+                             Retain_terminal_owner_until_response batch_id
+                         })
+                    remote_won_submitted
+              in
+              let terminal_receipts =
+                terminal_receipts
+                @ List.map
+                    (fun (record, batch_id, earliest, rejection_through, conflicts) ->
+                       Types.
+                         { receipt =
+                             Remote_won_receipt
+                               (remote_won_proven_unexecuted
+                                  ~rejection_through
+                                  ~conflict_kinds:conflicts
+                                  record
+                                  ~batch_id
+                                  ~earliest_conflict_cursor:earliest)
+                         ; transport_disposition = Clear_transport_owner
+                         })
+                    stale_remote_won
+              in
+              let terminal_receipts =
+                terminal_receipts
+                @ List.map
+                    (fun (record : outbox_record) ->
+                       Types.
+                         { receipt =
+                             No_change_receipt
+                               { mutation_id = record.mutation_id
+                               ; fingerprint =
+                                   typed_mutation_fingerprint record.fingerprint
+                               }
+                         ; transport_disposition = No_transport_owner
+                         })
+                    no_change_queued
+              in
+              let terminal_batches =
+                stale_batches
+                @ List.map
+                    (fun (record, batch_id, _cursor, _conflicts) ->
+                       { terminal_batch_id = batch_id
+                       ; terminal_outcome =
+                           Terminal_proven_unexecuted
+                             { mutation_id = record.mutation_id
+                             ; fingerprint = record.fingerprint
+                             }
+                       })
+                    remote_won_submitted
+                @ List.map
+                    (fun (record, batch_id, _, _, _) ->
+                       { terminal_batch_id = batch_id
+                       ; terminal_outcome =
+                           Terminal_proven_unexecuted
+                             { mutation_id = record.mutation_id
+                             ; fingerprint = record.fingerprint
+                             }
+                       })
+                    stale_remote_won
+                @ List.map
+                    (fun (record, batch_id) ->
+                       { terminal_batch_id = batch_id
+                       ; terminal_outcome =
+                           Terminal_proven_unexecuted
+                             { mutation_id = record.mutation_id
+                             ; fingerprint = record.fingerprint
+                             }
+                       })
+                    (resolved_stale @ blocked_stale)
+              in
+              let checksum =
+                Authoritative_checksum.to_string prepared.authoritative_digest_after
+              in
+              let metadata =
+                Logseq_db_types.Sync_checkpoint.create
+                  ~graph_id:database.graph_uuid
+                  ~schema:database.schema
+                  ~applied_server_t:through
+                  ~checksum
+                |> Result.get_ok
+              in
+              let outbox_delta, durable_outbox =
+                outbox_write_set
+                  database
+                  ~revision:(database.sync_revision + 1)
+                  candidate_outbox
+              in
+              let receipts =
+                List.filter_map Persistence_receipt_v1.encode_mutation candidate_receipts
+              in
+              (match
+                 Logseq_db_storage.Storage_session
+                 .commit_staged_with_sync_metadata_outbox_and_receipts
+                   ~outbox_delta
+                   database.storage_session
+                   staged
+                   metadata
+                   []
+                   receipts
+                   (List.map
+                      Persistence_receipt_v1.encode_terminal_batch
+                      terminal_batches)
+               with
+               | Error error ->
+                 ( None
+                 , Error
+                     (Types.Authoritative_commit_persistence_failed
+                        (storage_session_error error)) )
+               | Ok () ->
+                 database.durable_outbox <- durable_outbox;
+                 database.durable_sync_revision <- database.sync_revision + 1;
+                 preparation.authoritative_state <- Authoritative_consumed;
+                 checkpoint_before := Some database.checkpoint;
+                 let before_projection = database.projection in
+                 let before_snapshot = snapshot_of_database database in
+                 (match replay_authoritative database prepared with
+                  | Error message ->
+                    database.closed <- true;
+                    None, Error (Types.Authoritative_commit_fatal_state message)
+                  | Ok () ->
+                    database.outbox <- candidate_outbox;
+                    database.receipts <- [];
+                    refresh_queryable_outbox database;
+                    let candidate_projection = before_projection + 1 in
+                    let after_snapshot =
+                      snapshot_for_sources database authoritative_after candidate_outbox
+                    in
+                    let transitioned_records =
+                      resolved_records
+                      @ List.map fst remote_won_queued
+                      @ List.map (fun (record, _, _, _) -> record) remote_won_submitted
+                      @ List.map (fun (record, _, _, _, _) -> record) stale_remote_won
+                      @ List.map fst blocked_stale
+                      @ mismatched_accepted
+                      @ no_change_queued
+                      @ blocked_queued
+                      @ replanned_queued
+                    in
+                    let block_uuids, page_uuids, structure_interests, fanout_overflow =
+                      logical_change_footprint
+                        ~before:before_snapshot
+                        ~after:after_snapshot
+                        ~authoritative_before
+                        ~authoritative_after
+                        ~transaction_data:prepared.authoritative_expected_tx_data
+                        ~outbox_effects:
+                          (List.map
+                             (fun (record : outbox_record) -> record.effect_footprint)
+                             transitioned_records)
+                    in
+                    let changed =
+                      fanout_overflow
+                      || block_uuids <> []
+                      || page_uuids <> []
+                      || structure_interests <> []
+                    in
+                    database.projection
+                    <- (if changed then candidate_projection else before_projection);
+                    database.authoritative_checksum <- prepared.authoritative_digest_after;
+                    database.checkpoint <- through;
+                    database.sync_revision <- database.sync_revision + 1;
+                    Eio.Condition.broadcast database.sync_changed;
+                    let before_revision = projection_revision before_projection in
+                    let after_revision = projection_revision database.projection in
+                    let logical_change_summary =
+                      if fanout_overflow
+                      then Types.Logical_resync_required Change_limit_exceeded
+                      else if changed
+                      then
+                        bounded_logical_summary
+                          database
+                          ~block_uuids
+                          ~page_uuids
+                          ~structure_interests
+                      else No_logical_change
+                    in
+                    let change =
+                      Change_dispatcher.event
+                        ~generation:database.generation
+                        ~before_revision
+                        ~after_revision
+                        logical_change_summary
+                    in
+                    ( change
+                    , Ok
+                        { Types.generation = database.generation
+                        ; before_projection_revision = before_revision
+                        ; after_projection_revision = after_revision
+                        ; checkpoint = through
+                        ; sync_token = sync_token database.sync_revision
+                        ; terminal_receipts
+                        ; replanned_queued_ids =
+                            List.map
                               (fun (record : outbox_record) -> record.mutation_id)
-                              blocked_queued
-                      ; logical_change_summary
-                      } )))))
-    in
-    change, outcome) in
+                              replanned_queued
+                        ; blocked_ids =
+                            List.map
+                              (fun (record : outbox_record) -> record.mutation_id)
+                              mismatched_accepted
+                            @ List.map
+                                (fun (record, _) -> record.mutation_id)
+                                blocked_stale
+                            @ List.map
+                                (fun (record : outbox_record) -> record.mutation_id)
+                                blocked_queued
+                        ; logical_change_summary
+                        } )))))
+      in
+      change, outcome)
+  in
   (match outcome, !checkpoint_before with
    | Ok commit, Some before -> report_timeline_commit database.graph_uuid before commit
    | _ -> ());
@@ -11412,8 +12537,7 @@ let inspect_local_mutation database mutation =
   Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
     if database.closed
     then Error Types.Local_database_closed
-    else
-      existing_mutation database (mutation_id mutation) (fingerprint mutation))
+    else existing_mutation database (mutation_id mutation) (fingerprint mutation))
 ;;
 
 let set_asset_reference database ~expected ~mutation_id ~block ~previous ~asset =

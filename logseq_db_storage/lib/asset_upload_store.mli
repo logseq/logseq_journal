@@ -21,6 +21,15 @@ val list
   -> limit:int
   -> (Logseq_db_types.Asset_upload_intent.t list, string) result
 
+val find_original
+  : Sqlite3.db
+  -> origin:string
+  -> account:string
+  -> graph:Logseq_db_types.Graph_types.Uuid.t
+  -> asset:Logseq_db_types.Graph_types.Uuid.t
+  -> checksum:string
+  -> (Logseq_db_types.Asset_upload_intent.t option, string) result
+
 (** Retires checkpoints and complete inputs atomically. The caller supplies
     namespaces derived from this account and its existing graph identities;
     source bytes cannot establish account ownership on their own. *)

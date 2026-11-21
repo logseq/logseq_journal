@@ -3,7 +3,7 @@ module Error = Logseq_db_worker_contract.Error
 module Pure_reducer = Logseq_db_worker_pure_reducer.Core
 module Effect_runner = Logseq_db_worker_effect_runner.Effect_runner
 
-module Sync = Logseq_sync_pure_reducer.Core
+module Sync = Logseq_sync_domain.Core
 
 let unlock_log_count = Atomic.make 0
 let unlock_attempt_count = Atomic.make 0
@@ -35,8 +35,6 @@ let observe_unlock before (transition : Pure_reducer.transition) event =
     | Pure_reducer.Sync_event (Sync.E2ee_password_submitted _) ->
       let attempt = Atomic.fetch_and_add unlock_attempt_count 1 in
       let operation = List.find_map (function
-        | Pure_reducer.Run_sync (Sync.Request (ticket, Sync.Unlock_private_key _)) ->
-          Some (Sync.effect_ticket_id ticket |> Sync.effect_id_to_string)
         | _ -> None) transition.effects in
       unlock_log "attempt=%d op=%s phase=password decision=%s challenge_advertised=%b challenge_ready=%b failure=%s account_generation=%d graph_generation=%d"
         attempt (Option.value operation ~default:"none")
@@ -102,6 +100,9 @@ type coordination_snapshot =
 type t =
   { state : Pure_reducer.state ref
   ; runner : Effect_runner.t
+  ; mutable lifecycle : Pure_reducer.Lifecycle.t option
+  ; lifecycle_wake : Eio.Condition.t
+  ; lifecycle_retired : (Sync.graph_scope, unit) Hashtbl.t
   ; events : queued_event Eio.Stream.t
   ; followups : queued_event Queue.t
   ; mutable next_request_id : int64
@@ -141,10 +142,50 @@ let host_error=function
   |Not_settled->"The physical host change has not settled."
 ;;
 
+let lifecycle_step t event =
+  let module L=Pure_reducer.Lifecycle in
+  match t.lifecycle with
+  | None -> []
+  | Some state ->
+    let transition=L.step state event in
+    t.lifecycle<-Some transition.next;
+    List.filter_map(function
+      | L.Worker work -> Some(Pure_reducer.Run_worker work)
+      | L.Publish output -> Some(Pure_reducer.Publish output)
+      | L.Attached _ -> None
+      | L.Retired scope -> Hashtbl.replace t.lifecycle_retired scope ();Eio.Condition.broadcast t.lifecycle_wake;None) transition.effects
+;;
 let dispatch t event =
   let refused_deletion=ref None in
   let before = !(t.state) in
-  let transition = Pure_reducer.step before event in
+  let transition = match t.lifecycle,event with
+    | Some _,Pure_reducer.Lifecycle_snapshot(sync,coordination,attachments) ->
+      let transition=Pure_reducer.step before (Pure_reducer.Lifecycle_snapshot(sync,coordination,attachments)) in
+      let admitted=Pure_reducer.graph_scopes transition.next in
+      let attachments=List.filter(fun(scope,_)->List.mem scope admitted)attachments in
+      let revision=Int64.succ (Pure_reducer.Lifecycle.snapshot(Option.get t.lifecycle)).revision in
+      let selected=Option.bind (Pure_reducer.coordination_state transition.next).sync.selected(fun selected->List.find_opt(fun(scope:Sync.graph_scope)->scope.graph_id=selected.graph_id)(List.map fst attachments)) in
+      let effects=lifecycle_step t (Projection{revision;scopes=List.map fst attachments;selected}) in
+      let effects=effects @ List.concat_map(fun(scope,opened)->lifecycle_step t (Attach(scope,opened)))attachments in
+      {transition with effects=effects @ transition.effects}
+    | Some _,Pure_reducer.Sync_event(Sync.Host_fence_started _) ->
+      let transition=Pure_reducer.step before event in
+      let current=Pure_reducer.Lifecycle.snapshot(Option.get t.lifecycle) in
+      let scopes=List.filter(fun scope->List.mem scope (Pure_reducer.graph_scopes transition.next))current.scopes in
+      let selected=Option.bind current.selected(fun scope->if List.mem scope scopes then Some scope else None) in
+      let effects=lifecycle_step t (Projection{revision=Int64.succ current.revision;scopes;selected}) in
+      {transition with effects=effects @ transition.effects}
+    | Some _,Pure_reducer.Graph_request_for_scope{scope;id;read} ->
+      {Pure_reducer.next=before;effects=lifecycle_step t (Read{scope;id;read})}
+    | Some _,Pure_reducer.Graph_request{id;read} ->
+      (match (Pure_reducer.Lifecycle.snapshot(Option.get t.lifecycle)).selected with
+       | Some scope -> {Pure_reducer.next=before;effects=lifecycle_step t (Read{scope;id;read})}
+       | None -> Pure_reducer.step before event)
+    | Some _,Pure_reducer.Projection_push_for_scope(scope,push) ->
+      {Pure_reducer.next=before;effects=lifecycle_step t (Push(scope,push))}
+    | Some _,Pure_reducer.Runner_completed completion ->
+      {Pure_reducer.next=before;effects=lifecycle_step t (Completed completion)}
+    | _ -> Pure_reducer.step before event in
   observe_unlock before transition event;
   t.state := transition.next;
   let state=Pure_reducer.coordination_state transition.next in
@@ -212,9 +253,10 @@ let dispatch t event =
 ;;
 
 let accepts_after_shutdown = function
+  | Pure_reducer.Runner_completed (Execute_request_completed _) -> true
   | Pure_reducer.Asset_cleanup_barrier _->true
   | Pure_reducer.Sync_event
-      ( Logseq_sync_pure_reducer.Core.Asset_requested _ | Protected_requested _
+      ( Logseq_sync_domain.Core.Asset_requested _ | Protected_requested _
       | Runner_completed (Asset_completion _ | Protected_completion _)
       | IO_fence_completed _
       | Shutdown ) -> true
@@ -308,10 +350,12 @@ let fresh_host_lifetime () =
   |> Result.get_ok
 ;;
 
-let create ~sw ~config ~runner_dependencies =
+let create_internal ~lifecycle ~sw ~config ~runner_dependencies =
   match Pure_reducer.initial config with
   | Error (Pure_reducer.Invalid_create message) -> Error (Invalid_create message)
   | Ok state ->
+    let state=if lifecycle then let sync=(Pure_reducer.view state).sync in
+      Pure_reducer.install_lifecycle state ~sync ~coordination:(Pure_reducer.coordination_state state).sync ~attachments:[] else state in
     let events = Eio.Stream.create 256 in
     let state_ref = ref state in
     let event_sink = ref (fun event -> Eio.Stream.add events (Event event)) in
@@ -330,7 +374,8 @@ let create ~sw ~config ~runner_dependencies =
      | Error (Effect_runner.Invalid_create message) -> Error (Invalid_create message)
      | Ok runner ->
        let t =
-         { state = state_ref; runner; events;followups=Queue.create(); next_request_id = 0L; stopped = false
+         { state = state_ref; runner; lifecycle=(if lifecycle then Some Pure_reducer.Lifecycle.empty else None);
+           lifecycle_wake=Eio.Condition.create();lifecycle_retired=Hashtbl.create 8; events;followups=Queue.create(); next_request_id = 0L; stopped = false
          ; local_deletion_waiter = None
          ; coordination={version=0L;presentation=0L;state=Pure_reducer.coordination_state state}
          ; coordination_registration=0L;coordination_notify=None;coordination_retirement=Pure_reducer.Registration_retirement.empty
@@ -347,10 +392,33 @@ let create ~sw ~config ~runner_dependencies =
        Ok t)
 ;;
 
+let create ~sw ~config ~runner_dependencies = create_internal ~lifecycle:false ~sw ~config ~runner_dependencies
+let create_lifecycle ~sw ~config ~runner_dependencies = create_internal ~lifecycle:true ~sw ~config ~runner_dependencies
+let attach_database_owner t ~scope owner = Effect_runner.attach_database_owner t.runner ~scope owner
+let detach_database_owner t ~scope =
+  List.iter (Effect_runner.submit t.runner) (lifecycle_step t (Retire scope));
+  Eio.Condition.loop_no_mutex t.lifecycle_wake (fun () ->
+    if Hashtbl.mem t.lifecycle_retired scope then Some () else None);
+  Effect_runner.detach_database_owner t.runner ~scope
 let post t event = route_event t event
 let report_asset_diagnostic t ~scope ~operation ~request_operation diagnostic =
   if not t.stopped then
     Effect_runner.report_asset_diagnostic t.runner ~scope ~operation ~request_operation diagnostic
+;;
+
+let database_owner t ~scope =
+  if t.stopped then Error "Worker stopped"
+  else Effect_runner.database_owner t.runner ~scope
+;;
+
+let sync_upload_store t =
+  if t.stopped then Error "Worker stopped"
+  else Effect_runner.sync_upload_store t.runner
+;;
+
+let worker_owner t ~scope =
+  if t.stopped then Error "Worker stopped"
+  else Effect_runner.worker_owner t.runner ~scope
 ;;
 
 let view t = Pure_reducer.view !(t.state)
@@ -400,7 +468,7 @@ let replace_coordinated_asset_demand t ~registration ~scope ~consumer ~priority 
     | R.Start->
       Eio.Cancel.protect(fun()->
         run_asset_command_barrier t ~owner ~data:true
-          (Pure_reducer.Asset_requested_for_scope(scope,Logseq_sync_pure_reducer.Asset_transfer.Replace{consumer;priority;assets}))
+          (Pure_reducer.Asset_requested_for_scope(scope,Logseq_sync_asset_transfer.Core.Replace{consumer;priority;assets}))
         |> Result.map(fun _->()))
 ;;
 
@@ -427,7 +495,7 @@ let release_coordinated_asset_demand t ~registration ~scope ~consumer =
   | R.Release->
     let actual=R.pending t.demand_registry ~registration |> Rrbvec.find_opt(fun owner->owner.R.consumer=consumer) |> Option.get in
     Result.bind(run_asset_command_barrier t ~owner:actual ~data:false
-      (Pure_reducer.Asset_requested_for_scope(actual.scope,Logseq_sync_pure_reducer.Asset_transfer.Release consumer)))
+      (Pure_reducer.Asset_requested_for_scope(actual.scope,Logseq_sync_asset_transfer.Core.Release consumer)))
       (fun snapshot->Result.map(fun()->t.demand_registry<-R.settled t.demand_registry actual)
         (Effect_runner.await_asset_cleanup t.runner snapshot))
 ;;
@@ -493,6 +561,10 @@ let delete_local_copy_internal ?prepared_handoff t ~account_generation ~graph_id
      || List.exists (fun (scope:Sync.graph_scope)->scope.graph_id=graph_id) (Pure_reducer.graph_scopes !(t.state))
      || not (List.exists (fun (graph : Sync.graph) -> graph.graph_id = graph_id) snapshot.catalog)
   then Error "This local copy cannot be deleted now."
+  else if Option.is_some t.lifecycle || Option.is_some prepared_handoff then
+    (match t.coordination.state.sync.account with
+     | None -> Error "The graph account is no longer current."
+     | Some account -> Effect_runner.delete_local_copy t.runner ?prepared_handoff ~account ~graph_id ())
   else (
     let outcome, resolve = Eio.Promise.create () in
     let waiter = { graph_id; account_generation; prepared_handoff;request = None; resolve } in
@@ -570,7 +642,7 @@ let unsettled_orphan_retains t=Effect_runner.unsettled_orphan_retains t.runner
 type import_receipt =
   { operation : Logseq_db_types.Graph_types.Uuid.t
   ; graph_generation : int
-  ; scope : Logseq_sync_pure_reducer.Core.graph_scope
+  ; scope : Logseq_sync_domain.Core.graph_scope
   ; target : Logseq_db_types.Graph_types.Uuid.t
   ; asset : Logseq_db_types.Asset_descriptor.t
   ; file_type : string

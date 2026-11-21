@@ -1,0 +1,5 @@
+(library
+ (name logseq_sync_crypto)
+ (public_name logseq_sync.crypto)
+ (modules core)
+ (libraries eio execute sync_dsl logseq_sync.native_crypto logseq_overlay_db logseq_db_types rrbvec melange-transit-core melange-transit-native uri yojson))

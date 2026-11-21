@@ -1,7 +1,17 @@
 module Core = Logseq_db_worker_pure_reducer.Core
 module Runner = Logseq_db_worker_effect_runner.Effect_runner
-module Sync = Logseq_sync_pure_reducer.Core
+module Sync = Logseq_sync_domain.Core
 module T = Logseq_db_worker_test_support.Test_support
+
+let services ?(post = fun _ -> ()) () : Runner.services =
+  { post
+  ; owner = (fun ~scope:_ -> Error "No graph owner installed")
+  ; asset = (fun _ -> Error Sync.Asset_cancelled)
+  ; await_io = (fun ~scope:_ -> Ok ())
+  ; shutdown = (fun () -> ())
+  ; retire_account = (fun ~account:_ -> Ok ())
+  }
+;;
 
 let account ?(generation = 1) user_id : Sync.account_scope =
   { managed_sync_origin = Uri.of_string "https://api.logseq.io"
@@ -10,123 +20,6 @@ let account ?(generation = 1) user_id : Sync.account_scope =
   ; presentation_generation = 1
   ; lifecycle_generation = 1L
   }
-;;
-
-module Sync_runner = Logseq_sync_effect_runner.Effect_runner
-
-let asset_io_runner ?(pending_budget_bytes=16L) ?(fork=(fun ~sw:_ task->task())) ?on_asset_diagnostic ?(token_failure = "test must not use network") ~env ~sw ~support ~post () =
-  let module R = Sync_runner in
-  let dependencies =
-    R.dependencies
-      ~runtime:
-        (R.runtime ~fork ~sleep:(fun _ -> ()) |> Result.get_ok)
-      ~transport:
-        (R.transport
-           ~tls_authenticator:(R.system_tls_authenticator () |> Result.get_ok)
-           ~network:(Eio.Stdenv.net env)
-           ~clock:(Eio.Stdenv.clock env)
-           ~websocket_liveness:R.Disabled
-         |> Result.get_ok)
-      ~local_store:
-        (R.local_store
-           ~asset_cache_budget_bytes:16L
-           ~asset_maximum_file_bytes:16
-           ~asset_pending_budget_bytes:pending_budget_bytes
-           ~application_support_directory:support
-           ()
-         |> Result.get_ok)
-      ~artifact_store:
-        (R.artifact_store ~staging_directory:(Filename.concat support "snapshot-staging")
-         |> Result.get_ok)
-      ~secrets:
-        (R.secrets
-           ~unlock_private_key:
-             (fun
-               ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
-             Error "unused")
-           ~unlock_graph_key:
-             (fun
-               ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ -> Error "unused")
-           ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
-             Error (R.Wrapped_graph_key_unavailable "unused"))
-           ~verify_and_save_wrapped_graph_key:
-             (fun
-               ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
-             Error "unused")
-           ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
-         |> Result.get_ok)
-      ~crypto:
-        (R.crypto
-           ~encrypt_aes_gcm:(fun ~key:_ ~plaintext:_ -> Error "unused")
-           ~decrypt_aes_gcm:(fun ~key:_ ~iv:_ ~ciphertext:_ -> Error "unused")
-         |> Result.get_ok)
-      ~id_token_provider:
-        (R.id_token_provider
-           ~acquire:(fun _ -> Error token_failure)
-           ~invalidate:(fun _ ~token:_ -> ()))
-    |> Result.get_ok
-  in
-  R.create ?on_asset_diagnostic ~sw dependencies ~post |> Result.get_ok
-;;
-
-let failure_details outputs =
-  let module D = Logseq_db_types.Failure_diagnostic in
-  List.filter_map
-    (function
-      | Core.Diagnostic signal when String.starts_with ~prefix:D.signal_prefix signal ->
-        D.decode (String.sub signal (String.length D.signal_prefix)
-          (String.length signal - String.length D.signal_prefix))
-      | _ -> None)
-    outputs
-;;
-
-let has_failure_reason outputs operation reason =
-  let module D = Logseq_db_types.Failure_diagnostic in
-  List.exists (fun detail -> D.operation detail = operation && D.reason detail = reason)
-    (failure_details outputs)
-;;
-
-let test_unlock_runner_logging () =
-  let path = Filename.temp_file "journal-unlock-runner-log-" "" in
-  let saved = Unix.dup Unix.stderr in
-  let output = Unix.openfile path [Unix.O_WRONLY; Unix.O_TRUNC] 0o600 in
-  let previous = Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" in
-  Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" "1";
-  Unix.dup2 output Unix.stderr;
-  let has text value =
-    let n = String.length value in
-    let rec loop i = i + n <= String.length text
-      && (String.sub text i n = value || loop (i + 1)) in loop 0
-  in
-  Fun.protect ~finally:(fun () ->
-    flush stderr; Unix.dup2 saved Unix.stderr; Unix.close saved; Unix.close output;
-    Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" (Option.value previous ~default:""); Sys.remove path)
-    (fun () ->
-      Eio_main.run (fun env -> Eio.Switch.run (fun sw -> T.with_managed (fun fixture ->
-        let completions = ref [] in
-        let runner = asset_io_runner ~env ~sw
-          ~support:fixture.config.application_support_directory
-          ~post:(fun event -> completions := event :: !completions) () in
-        let limits = Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024
-          ~submission_batch_size:1 |> Result.get_ok in
-        let config = Sync.config ~managed_sync_origin:(Uri.of_string "https://example.invalid")
-          ~limits |> Result.get_ok in
-        let state = Sync.initial config |> Result.get_ok in
-        let state = (Sync.step state (Sync.Sign_in_requested {account_generation=0; presentation_generation=0})).next in
-        let transition = Sync.step state (Sync.Account_authenticated {user_id=Some "LOG_SECRET_USER"}) in
-        let request = List.find_map (function
-          | Sync.Run (Sync.Request (_, Sync.Fetch_catalog _) as request) -> Some request
-          | _ -> None) transition.effects |> Option.get in
-        Sync_runner.submit runner request;
-        Alcotest.(check bool) "runner still posts typed completion" true (!completions <> []);
-        Sync_runner.shutdown runner)));
-      flush stderr;
-      let logs = In_channel.with_open_bin path In_channel.input_all in
-      List.iter (fun value -> Alcotest.(check bool) value true (has logs value))
-        [ "source=runner"; "request=fetch-catalog"; "phase=begin"; "phase=end"
-        ; "result=effect-failed"; "failure_category=token"; "elapsed_ms="; "op=" ];
-      List.iter (fun value -> Alcotest.(check bool) "sensitive runner value excluded" false (has logs value))
-        [ "LOG_SECRET_USER"; "test must not use network"; "example.invalid" ])
 ;;
 
 let far_future_token = "header.eyJleHAiOjIwMDAwMDAwMDB9.signature"
@@ -454,18 +347,20 @@ let test_sync_and_publish_instructions_are_not_reduced_recursively () =
             ~fork:(fun ~sw:_ task -> task ())
           |> Result.get_ok
         in
-        let sync_runner =
-          Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture")
-            ~submit:(fun runner_effect -> submitted := runner_effect :: !submitted)
-            ~shutdown:(fun () -> ())
-            ()
+        let services : Runner.services =
+          {post=(fun intent -> submitted := intent :: !submitted);
+           owner=(fun ~scope:_ -> Error "No graph owner installed");
+           asset=(fun _ -> Alcotest.fail "Unexpected asset request");
+           await_io=(fun ~scope:_ -> Alcotest.fail "Unexpected I/O join");
+           retire_account=(fun ~account:_ -> Alcotest.fail "Unexpected account retirement in fixture");
+           shutdown=(fun () -> ())}
         in
         let dependencies =
           Runner.dependencies
             ~runtime
             ~config:fixture.config
             ~overlay:fixture.overlay
-            ~sync_runner
+            ~services
             ~publish:(fun output -> published := output :: !published)
           |> Result.get_ok
         in
@@ -480,31 +375,45 @@ let test_sync_and_publish_instructions_are_not_reduced_recursively () =
             ~post:(fun event -> posted := event :: !posted)
           |> Result.get_ok
         in
-        let limits =
-          Sync.limits
-            ~maximum_response_bytes:1024
-            ~maximum_artifact_bytes:1024
-            ~submission_batch_size:1
-          |> Result.get_ok
-        in
-        let sync =
-          Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits
-          |> Result.get_ok
-          |> Sync.initial
-          |> Result.get_ok
-        in
-        let transition = Sync.step sync (Restore_local_account { user_id = "user-1" }) in
-        List.iter
-          (function
-            | Sync.Run runner_effect -> Runner.submit runner (Core.Run_sync runner_effect)
-            | Sync.Publish output ->
-              Runner.submit runner (Core.Publish (Core.Sync_output output))
-            | Sync.Delegate _ -> ())
-          transition.effects;
-        Alcotest.check Alcotest.int "sync runner receives run" 1 (List.length !submitted);
+        let intent = Core.Sync_intent (Sync.Restore_local_account {user_id="user-1"}) in
+        Runner.submit runner (Core.Publish (Core.Lifecycle_intent intent));
+        Runner.submit runner (Core.Publish (Core.Diagnostic "fixture publication"));
+        Alcotest.check Alcotest.int "lifecycle receives post" 1 (List.length !submitted);
+        Alcotest.(check bool) "original intent retained" true (!submitted=[intent]);
         Alcotest.check Alcotest.int "host receives publish" 1 (List.length !published);
         Alcotest.check Alcotest.int "runner never calls reducer" 0 (List.length !posted);
         Runner.shutdown runner)))
+;;
+
+let test_direct_owner_io_failure_has_no_event_bridge () =
+  T.with_managed (fun fixture -> Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
+    let posted = ref [] in
+    let calls = ref 0 in
+    let services : Runner.services =
+      {post=(fun _ -> Alcotest.fail "Unexpected lifecycle intent");
+       owner=(fun ~scope:_ -> Error "No graph owner installed");
+       asset=(fun _ -> Error Sync.Asset_cancelled);
+       await_io=(fun ~scope:_ -> incr calls; Error "Original owner cleanup failed");
+       retire_account=(fun ~account:_ -> Ok ()); shutdown=(fun () -> ())} in
+    let dependencies = Runner.dependencies
+      ~runtime:(Runner.runtime ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
+        ~sleep:(fun _ -> ()) |> Result.get_ok)
+      ~config:fixture.config ~overlay:fixture.overlay ~services
+      ~publish:(fun _ -> ()) |> Result.get_ok in
+    let runner = Runner.create ~sw dependencies ~post:(fun event -> posted := event :: !posted)
+      ~recovery_current:(fun _ -> false) ~upload_current:(fun _ -> false)
+      ~asset_current:(fun _ -> false) |> Result.get_ok in
+    let account : Sync.account_scope =
+      {managed_sync_origin=Uri.of_string "https://api.logseq.io";user_id="user-1";account_generation=0;
+       presentation_generation=0;lifecycle_generation=0L} in
+    Alcotest.(check (result unit string)) "physical error preserved"
+      (Error "Original owner cleanup failed")
+      (Runner.await_sync_io runner ~scope:(Sync.effect_scope_of_account account));
+    Alcotest.(check int) "direct callback called once" 1 !calls;
+    Alcotest.(check int) "no reducer fence event" 0 (List.length !posted);
+    Runner.shutdown runner;
+    Alcotest.(check bool) "stopped worker cannot borrow upload store" true
+      (Result.is_error (Runner.sync_upload_store runner)))))
 ;;
 
 let asset_sync_config () =
@@ -512,9 +421,28 @@ let asset_sync_config () =
   Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits |> Result.get_ok
 ;;
 (* Scheduling failures belong to the effect runner, not the pure reducer. *)
+let lifecycle_projection config (scope : Sync.graph_scope) =
+  let state = Core.initial (Core.config ~worker:config ~sync:(asset_sync_config ())) |> Result.get_ok in
+  let initial = (Core.view state).sync in
+  let graph : Sync.graph = {graph_id=scope.graph_id;name="Direct owner fixture";
+    schema={major=65;minor=33;exact=true};encrypted=false} in
+  let sync : Sync.state = {initial with snapshot={initial.snapshot with
+    selected_graph=Some graph.graph_id;catalog=[graph];resident_graphs=[graph.graph_id];
+    startup={initial.snapshot.startup with authenticated=true;local_access=Sync.Local_available;
+      account_generation=scope.account.account_generation;graph_generation=scope.graph_generation;
+      presentation_generation=scope.account.presentation_generation}}} in
+  let coordination : Sync.coordination_state = {account=Some scope.account;
+    selected=Some {startup={account_generation=scope.account.account_generation;
+      presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;
+      graph_generation=scope.graph_generation};
+    residents=[scope,sync];desired_residents=[scope.graph_id];deletion=None} in
+  sync, coordination
+;;
+
 let test_worker_schedule_failure_completes
     ?(failure=Unix.Unix_error (Unix.EACCES, "fork", "PRIVATE_SYNTHETIC_PAYLOAD"))
     ?(expected_source="io-permission") ?(expected_reason="resourceFailed") () =
+  let module Sync = Logseq_sync_domain.Core in
   T.with_managed (fun fixture -> Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
     let posted = ref [] in
     let dependencies = Runner.dependencies
@@ -522,35 +450,53 @@ let test_worker_schedule_failure_completes
         raise failure)
         ~sleep:(fun _ -> ()) |> Result.get_ok)
       ~config:fixture.config ~overlay:fixture.overlay
-      ~sync_runner:(Runner.sync_runner ~retire_account:(fun ~account:_ -> Ok ())
-        ~submit:(fun _ -> ()) ~shutdown:(fun () -> ()) ())
+      ~services:(services ())
       ~publish:(fun _ -> ()) |> Result.get_ok in
     let runner = Runner.create ~sw dependencies
       ~recovery_current:(fun _ -> false) ~upload_current:(fun _ -> false)
       ~asset_current:(fun _ -> false) ~post:(fun event -> posted := event :: !posted)
       |> Result.get_ok in
     let state = Core.initial (Core.config ~worker:fixture.config ~sync:(asset_sync_config ())) |> Result.get_ok in
-    let state = (Core.step state (Core.Sync_event (Sync.Sign_in_requested
-      {account_generation=0;presentation_generation=0}))).next in
-    let signed_in = Core.step state (Core.Sync_event (Sync.Account_authenticated {user_id=Some "user-1"})) in
     let graph : Sync.graph = {graph_id=(Logseq_db_types.Graph_types.Uuid.of_string "94000000-0000-4000-8000-000000000709" |> Result.get_ok);name="fixture";
       schema={major=65;minor=33;exact=true};encrypted=false} in
-    let catalog = List.find_map (function
-      | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_catalog _)) ->
-        Some (Core.step signed_in.next (Core.Sync_event (Sync.Runner_completed
-          (Sync.Completion (ticket, Ok [graph])))))
-      | _ -> None) signed_in.effects |> Option.get in
-    let selected = Core.step catalog.next (Core.Sync_event (Sync.Graph_selected graph.graph_id)) in
-    let work = List.find (function Core.Run_worker _ -> true | _ -> false) selected.effects in
+    let scope : Sync.graph_scope = {account=account "user-1";graph_id=graph.graph_id;graph_generation=1} in
+    let initial = (Core.view state).sync in
+    let sync : Sync.state = {initial with snapshot={initial.snapshot with
+      selected_graph=Some graph.graph_id;catalog=[graph];resident_graphs=[graph.graph_id];
+      startup={initial.snapshot.startup with authenticated=true;local_access=Sync.Local_available;
+        account_generation=1;graph_generation=1;presentation_generation=1}}} in
+    let coordination : Sync.coordination_state = {account=Some scope.account;
+      selected=Some {startup={account_generation=1;presentation_generation=1};graph_id=graph.graph_id;graph_generation=1};
+      residents=[scope,sync];desired_residents=[graph.graph_id];deletion=None} in
+    let opened = Core.database_opened ~database_id:"schedule-fixture" ~graph_id:graph.graph_id in
+    let snapshot = Core.step state (Core.Lifecycle_snapshot (sync, coordination, [scope, opened])) in
+    let module Read = Worker_pure_read in
+    let module F = Read.For_worker in
+    let binding = F.binding ~serial:1L ~incarnation:(Read.worker_incarnation
+      ~runtime_epoch:(Journal_worker_ids.Runtime.Epoch.of_int64 1L)
+      ~worker_generation:(Journal_worker_ids.Worker.Generation.of_int64 1L))
+      ~origin:(Uri.to_string scope.account.managed_sync_origin) ~user:scope.account.user_id in
+    let owner : Sync.timeline_scope = {startup={account_generation=scope.account.account_generation;
+      presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;
+      graph_generation=scope.graph_generation} in
+    let limits : Worker_pure_data.capability_limits = {response_budget_bytes=fixture.config.response_budget_bytes;
+      outbox_max_records=4096;outbox_max_bytes=8388608;change_max_items=4096;change_max_bytes=1048576;
+      dispatcher_capacity=256;wire_batch_max_bytes=262144} in
+    let session = F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation
+      ~lifecycle:scope.account.lifecycle_generation ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits in
+    let budget = Read.read_budget session ~maximum_items:1 ~maximum_bytes:limits.response_budget_bytes |> Result.get_ok in
+    let requested = Core.step snapshot.next (Core.Graph_request_for_scope
+      {scope;id=Core.request_id_of_int64 1L;read=F.pack_query budget Read.Admission}) in
+    let work = List.find (function Core.Run_worker _ -> true | _ -> false) requested.effects in
     Runner.submit runner work;
     match !posted with
-    | [Core.Runner_completed (Core.Sync_worker_effect_completed (_, Error error))] ->
+    | [Core.Runner_completed (Core.Execute_request_completed (_, Error error))] ->
       let module E = Logseq_db_worker_contract.Error in
       let module D = Logseq_db_types.Failure_diagnostic in
       let detail = List.find_map (fun (item:E.detail) -> match item.value with
         | E.Detail_string source when item.name=D.detail_name -> D.decode source
         | _ -> None) (E.details error) |> Option.get in
-      Alcotest.(check string) "operation retained" "inspectMirror" (D.operation detail);
+      Alcotest.(check string) "operation retained" "workerOperation" (D.operation detail);
       Alcotest.(check string) "source cause retained" expected_source (D.source_class detail);
       Alcotest.(check string) "specific reason retained" expected_reason (D.reason detail);
       let encoded=Yojson.Safe.to_string(E.to_yojson error) in
@@ -559,244 +505,6 @@ let test_worker_schedule_failure_completes
         && (String.sub encoded offset (String.length marker)=marker || contains (offset+1)) in
       Alcotest.(check bool) "private exception argument excluded" false (contains 0)
     | _ -> Alcotest.fail "Scheduling failure must post exactly one typed completion")))
-;;
-
-let admitted_asset_state graph_id =
-  let initial=Sync.initial(asset_sync_config()) |> Result.get_ok in
-  let graph : Sync.graph =
-    { graph_id
-    ; name = "Upload checkpoint fixture"
-    ; schema = { major = 1; minor = 0; exact = true }
-    ; encrypted = false
-    }
-  in
-  let initial = (Sync.step initial (Sync.Sign_in_requested {account_generation=0; presentation_generation=0})).next in
-  let authenticated =
-    Sync.step initial (Sync.Account_authenticated { user_id = Some "user-1" })
-  in
-  let catalog =
-    List.find_map
-      (function
-        | Sync.Run (Sync.Request (ticket, Sync.Fetch_catalog _)) ->
-          Some
-            (Sync.step
-               authenticated.next
-               (Sync.Runner_completed (Sync.Completion (ticket, Ok [ graph ]))))
-        | _ -> None)
-      authenticated.effects
-    |> Option.get
-  in
-  let selected = Sync.step catalog.next (Sync.Graph_selected graph.graph_id) in
-  let mirror =
-    List.find_map
-      (function
-        | Sync.Delegate (Sync.Inspect_mirror request) -> Some request
-        | _ -> None)
-      selected.effects
-    |> Option.get
-  in
-  let admitted =
-    Sync.step selected.next (Sync.Mirror_inspected (Sync.Mirror_available mirror))
-  in
-  let context = Sync.asset_context admitted.next |> Option.get in
-  admitted.next, context
-;;
-
-type asset_bridge_fixture =
-  { sw:Eio.Switch.t
-  ; runner : Runner.t
-  ; context : Sync.asset_context
-  ; support : string
-  ; gate : ?hold_callback:bool -> (Sync.asset_output -> bool) -> deliver_first:bool -> unit Eio.Promise.t
-  ; deliver_held : ?keep_gate:bool -> unit -> unit
-  ; hold_asset_barrier : unit -> unit Eio.Promise.t
-  ; deliver_asset_barriers : unit -> unit
-  ; set_asset_current : (Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool) -> unit
-  ; on_sync_fence : (int64 * Sync.effect_scope -> unit) -> unit
-  ; on_asset_completed : (Logseq_sync_pure_reducer.Asset_transfer.event -> unit) -> unit
-  ; held_path : string option ref
-  ; actions : Sync.asset_action list ref
-  ; fixture_result : Sync.asset_action -> Sync.asset_result
-  ; fixture_asset : Sync.asset_action -> Sync.asset_value
-  }
-
-let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) ?(pending_budget_bytes=16L) run =
-  T.with_managed (fun fixture ->
-    Eio_main.run (fun env ->
-      Eio.Switch.run (fun sw ->
-        let graph_id =
-          Logseq_db_types.Graph_types.Uuid.of_string
-            "22000000-0000-4000-8000-000000000001"
-          |> Result.get_ok
-        in
-        let admitted, context = admitted_asset_state graph_id in
-        let state = ref admitted in
-        let worker_state=ref(Core.initial(Core.config ~worker:fixture.config ~sync:(asset_sync_config())) |> Result.get_ok) in
-        let on_sync_fence=ref(fun (_:int64*Sync.effect_scope)->()) in
-        let active_runner = ref None in
-        let io_runner = ref None in
-        let actions = ref [] in
-        let output_handler = ref (fun (_ : Sync.asset_output) -> false) in
-        let held = Queue.create () in
-        let held_path = ref None in
-        let fixture_output = ref None in
-        let barrier_handler=ref(fun (_:int64)->false) in
-        let asset_current=ref(fun (_:Logseq_sync_pure_reducer.Asset_transfer.ticket)->false) in
-        let asset_completed=ref(fun (_:Logseq_sync_pure_reducer.Asset_transfer.event)->()) in
-        let post = function
-          | Core.Sync_event((Sync.IO_fence_requested _|Sync.IO_fence_completed _)as event)->
-            (match event with Sync.IO_fence_requested(id,scope)-> !on_sync_fence(id,scope)|_->());
-            let transition=Core.step !worker_state(Core.Sync_event event) in
-            worker_state:=transition.next;
-            List.iter(Runner.submit(Option.get !active_runner))transition.effects
-          | Core.Sync_event event ->
-            (match event with
-             | Sync.Asset_requested request -> actions := request.action :: !actions
-             | _ -> ());
-            let transition = Sync.step !state event in
-            state := transition.next;
-            List.iter
-              (function
-                | Sync.Run runner_effect ->
-                  Sync_runner.submit (Option.get !io_runner) runner_effect
-                | Sync.Publish (Sync.Asset_finished output) ->
-                  if String.starts_with ~prefix:"fixture:" output.request.operation
-                  then fixture_output := Some output.result
-                  else if not (!output_handler output)
-                  then
-                    Runner.submit
-                      (Option.get !active_runner)
-                      (Core.Deliver_asset_result output)
-                | Sync.Publish _ -> ()
-                | Sync.Delegate _ -> Alcotest.fail "unexpected bridge graph effect")
-              transition.effects
-          | Core.Asset_completed(_,event)-> !asset_completed event
-          | Core.Asset_cleanup_barrier token->if not(!barrier_handler token) then Runner.submit(Option.get !active_runner)(Core.Asset_cleanup_barrier_reached token)
-          | _ -> ()
-        in
-        io_runner
-        := Some
-             (asset_io_runner ~pending_budget_bytes
-                ~fork:(fun ~sw task->if asynchronous_io then Eio.Fiber.fork ~sw task else task())
-                ~on_asset_diagnostic:(fun ~scope ~operation ~request_operation detail ->
-                  Runner.report_asset_diagnostic (Option.get !active_runner)
-                    ~scope ~operation ~request_operation detail)
-                ~env
-                ~sw
-                ~support:fixture.config.application_support_directory
-                ~post:(fun event -> post (Core.Sync_event event)) ());
-        let sync_runner =
-          Runner.sync_runner ~retire_account:(Sync_runner.retire_account (Option.get !io_runner))
-            ~submit:(fun runnable -> Sync_runner.submit (Option.get !io_runner) runnable)
-            ~shutdown:(fun () -> Sync_runner.shutdown (Option.get !io_runner))
-            ()
-        in
-        let dependencies =
-          Runner.dependencies
-            ~runtime:
-              (Runner.runtime
-                ~fork:(fun ~sw task -> if asynchronous then Eio.Fiber.fork ~sw task else task ())
-                ~sleep:(fun seconds->if asynchronous then Eio.Time.sleep(Eio.Stdenv.clock env)seconds)
-               |> Result.get_ok)
-            ~config:fixture.config
-            ~overlay:fixture.overlay
-            ~sync_runner
-            ~publish:(fun _ -> ())
-          |> Result.get_ok
-        in
-        let runner =
-          Runner.create
-            ~sw
-            dependencies
-            ~post
-            ~recovery_current:(fun _ -> false)
-            ~upload_current:(fun _ -> false)
-            ~asset_current:(fun ticket -> !asset_current ticket)
-          |> Result.get_ok
-        in
-        active_runner := Some runner;
-        let serial = ref 0 in
-        let fixture_result action =
-          incr serial;
-          fixture_output := None;
-          post
-            (Core.Sync_event
-               (Sync.Asset_requested
-                  { scope = context.scope
-                  ; operation = "fixture:" ^ string_of_int !serial
-                  ; action
-                  }));
-          while !fixture_output=None do Eio.Fiber.yield() done;
-          Option.get !fixture_output
-        in
-        let fixture_asset action=fixture_result action |> Result.get_ok in
-        let path_of_output (output : Sync.asset_output) =
-          match output.result with
-          | Ok (Sync.Asset_staged { file; _ }) ->
-            (match fixture_asset (Sync.Retain_staged_file file) with
-             | Sync.Asset_retained (Some (lease, path)) ->
-               ignore (fixture_asset (Sync.Release_asset_file lease));
-               Some path
-             | _ -> Alcotest.fail "gated staged resource unavailable")
-          | Ok (Sync.Asset_retained (Some (_, path))) -> Some path
-          | _ -> None
-        in
-        let gate ?(hold_callback=false) predicate ~deliver_first =
-          let reached, resolve = Eio.Promise.create () in
-          let callback_done, callback_resolve = Eio.Promise.create () in
-          (output_handler
-           := fun output ->
-                if not (predicate output)
-                then false
-                else (
-                  held_path := path_of_output output;
-                  Queue.add (output, deliver_first,callback_resolve) held;
-                  if deliver_first
-                  then Runner.submit runner (Core.Deliver_asset_result output);
-                  ignore(Eio.Promise.try_resolve resolve ():bool);
-                  if deliver_first || hold_callback then Eio.Promise.await callback_done;
-                  true));
-          reached
-        in
-        let deliver_held ?(keep_gate=false) () =
-          if not keep_gate then (output_handler := fun _ -> false);
-          Queue.iter
-            (fun (output, delivered,callback_resolve) ->
-               if not delivered
-               then Runner.submit runner (Core.Deliver_asset_result output);
-               ignore(Eio.Promise.try_resolve callback_resolve():bool))
-            held;
-          Queue.clear held
-        in
-        let held_barriers=Queue.create() in
-        let hold_asset_barrier ()=
-          let reached,resolve=Eio.Promise.create() in
-          barrier_handler:=(fun token->Queue.add token held_barriers;
-            ignore(Eio.Promise.try_resolve resolve():bool);true);
-          reached in
-        let deliver_asset_barriers ()=
-          barrier_handler:=(fun _->false);
-          Queue.iter(fun token->Runner.submit runner(Core.Asset_cleanup_barrier_reached token))held_barriers;
-          Queue.clear held_barriers in
-        Fun.protect
-          ~finally:(fun () -> Runner.shutdown runner)
-          (fun () ->
-             run
-               { sw;runner
-               ; context
-               ; support = fixture.config.application_support_directory
-               ; gate
-               ; deliver_held
-               ; hold_asset_barrier
-               ; deliver_asset_barriers
-               ; set_asset_current=(fun callback->asset_current:=callback)
-               ; on_sync_fence=(fun callback->on_sync_fence:=callback)
-               ; on_asset_completed=(fun callback->asset_completed:=callback)
-               ; held_path
-               ; actions
-               ; fixture_result
-               ; fixture_asset
-               }))))
 ;;
 
 let picker_import support ordinal : Logseq_db_types.Asset_import.t =
@@ -823,153 +531,227 @@ let picker_import support ordinal : Logseq_db_types.Asset_import.t =
 
 (* Local staging publication and lease ownership live in the runner, not the
    transfer reducer. Exercise real cache pressure and filesystem failures. *)
-let test_wrapped_local_asset_fallback mode () =
-  with_asset_bridge ~asynchronous:true ~pending_budget_bytes:32L (fun fixture ->
-    let module Transfer=Logseq_sync_pure_reducer.Asset_transfer in
-    let scope=fixture.context.scope in
-    let source=picker_import fixture.support 400 in
-    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true)
+type owner_fixture =
+  { runner : Runner.t
+  ; context : Sync.asset_context
+  ; support : string
+  ; database : Logseq_overlay_db.Database.t
+  ; crypto : Logseq_sync_crypto.Core.t
+  ; identity : Sync_dsl.Core.identity
+  ; actions : Sync.asset_action list ref
+  ; fixture_result : Sync.asset_action -> Sync.asset_result
+  ; fixture_asset : Sync.asset_action -> Sync.asset_value
+  ; set_upload_current : (Logseq_db_worker_pure_reducer.Asset_upload.ticket -> bool) -> unit
+  ; upload_events : Logseq_db_worker_pure_reducer.Asset_upload.completion Queue.t
+  ; published : Core.output list ref
+  ; recover_uploads : unit -> (Logseq_db_types.Asset_upload_intent.t list, string) result
+  ; staged_path : string -> string option
+  ; gate : (Sync.asset_output -> bool) -> unit Eio.Promise.t
+  ; deliver_held : ?keep_gate:bool -> unit -> unit
+  }
+
+let with_direct_owner
+    ?(network : Execute.Core.worker_network =
+      {with_admission=(fun _ -> Alcotest.fail "Unexpected owner network admission")})
+    ?(put = fun ~identity:_ ~asset:_ ~version:_ ~wire:_ -> Alcotest.fail "Unexpected network PUT")
+    run =
+  T.with_managed (fun fixture -> Eio_main.run (fun env -> Eio.Switch.run (fun sw ->
+    let module D = Sync_dsl.Core in
+    let module Assets = Logseq_sync_assets.Core in
+    let module Cache = Logseq_sync_assets.Cache in
+    let scope : Sync.graph_scope =
+      { account = account "user-1"
+      ; graph_id = Logseq_db_types.Graph_types.Uuid.of_string
+          "22000000-0000-4000-8000-000000000001" |> Result.get_ok
+      ; graph_generation = 1
+      } in
+    let identity = D.identity ~origin:(Uri.to_string scope.account.managed_sync_origin)
+      ~account:scope.account.user_id ~graph:(Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id)
+      ~account_generation:1L ~graph_generation:1L |> Result.get_ok in
+    let limits = D.limits ~maximum_items:8 ~maximum_bytes:32768 ~maximum_pending:8
+      ~maximum_resources:8 ~steps_per_turn:8 ~maximum_tasks:8 ~maximum_messages:8
+      ~maximum_message_bytes:32768 ~maximum_demands:8 ~maximum_active_assets:2
+      ~foreground_reserve:1 ~foreground_demand_reserve:1 ~foreground_descriptor_reserve_bytes:128
+      ~asset_cache_budget_bytes:16L ~asset_maximum_file_bytes:16 ~asset_pending_budget_bytes:32L
+      ~snapshot_maximum_artifact_bytes:4096L ~snapshot_staging_budget_bytes:4096L
+      ~snapshot_scratch_budget_bytes:4096L |> Result.get_ok in
+    let crypto = Logseq_sync_crypto.Core.create ~identity ~limits ~encrypted:false
+      ~backend:{crypto=Logseq_sync_native_crypto.Platform_crypto.crypto;
+        unlock=(fun ~identity:_ ~wrapped_graph_key:_ -> Error D.Locked)} in
+    let support = fixture.config.application_support_directory in
+    let assets = Assets.create ~root:support ~identity ~limits ~crypto
+      ~key:(Assets.native_key ~identity ~crypto)
+      ~network:{get=(fun ~identity:_ ~asset:_ ~version:_ ~maximum_wire_bytes:_ ->
+          Alcotest.fail "Unexpected network GET");
+        put}
       |> Result.get_ok in
-    let filler=picker_import fixture.support 410 in
-    let remote_bytes=String.make 16 'r' in
-    Out_channel.with_open_bin filler.source_file(fun output->output_string output remote_bytes);
-    let checksum,file=match fixture.fixture_asset(Sync.Stage_asset_file
-      {operation=filler.operation;file_type=filler.file_type;source_file=filler.source_file}) with
-      | Sync.Asset_staged {checksum;file;_}->checksum,file | _->Alcotest.fail "remote cache staging failed" in
-    let version=Logseq_db_types.Asset_descriptor.version ~checksum ~file_type:"bin" |> Result.get_ok in
-    ignore(fixture.fixture_asset(Sync.Publish_staged_asset{asset=prepared.asset;version;file}));
-    let pinned=match fixture.fixture_asset(Sync.Check_asset_cache(prepared.asset,version)) with
-      | Sync.Asset_cached(Some handle)->handle | _->Alcotest.fail "remote cache did not fill budget" in
-    Alcotest.(check bool) "original version actually evicted" true
-      (fixture.fixture_asset(Sync.Check_asset_cache(prepared.asset,prepared.version))=Sync.Asset_cached None);
-    let descriptor=Logseq_db_types.Asset_descriptor.create ~uuid:prepared.asset
-      ~source:(Managed(Some version)) ~current_checksum:(Some prepared.version.checksum)
-      ~size:None ~dimensions:None |> Result.get_ok in
-    let transfer=Transfer.create(Transfer.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:0 |> Result.get_ok)
-      ~scope ~online:true ~unlocked:true in
-    let _,work=Transfer.step transfer(Replace{consumer="wrapped-local-fallback";priority=Foreground;assets=[descriptor]}) in
-    let lookup=List.find_map(function Transfer.Check_cache ticket->Some ticket|_->None)work |> Option.get in
-    fixture.set_asset_current(fun ticket->ticket=Transfer.Lookup lookup);
-    let completed,resolve=Eio.Promise.create() in
-    fixture.on_asset_completed(function Transfer.Cache_checked(_,result)->
-      ignore(Eio.Promise.try_resolve resolve result:bool)|_->());
-    let publication_failure=ref None and retained_lease=ref None and gated=ref false in
-    let releases handle=List.fold_left(fun count->function
-      | Sync.Release_asset_file actual when actual=handle -> count+1 | _->count) 0 !(fixture.actions) in
-    let remote_checks ()=List.fold_left(fun count->function
-      | Sync.Check_asset_cache(asset,actual) when asset=prepared.asset && actual=version -> count+1
-      | _->count) 0 !(fixture.actions) in
-    let before_remote=remote_checks () in
-    let reached=fixture.gate (fun output -> match output.Sync.request.action with
-      | Sync.Retain_staged_file file when file=prepared.staged_file && not !gated ->
-        retained_lease:=(match output.result with Ok(Sync.Asset_retained(Some(lease,_)))->Some lease|_->None);
-        gated:=true;true
-      | Sync.Publish_staged_asset _ ->
-        (match output.result with Error failure->publication_failure:=Some failure|_->());false
-      | _->false) ~deliver_first:false in
-    Runner.submit fixture.runner(Core.Run_asset(fixture.context,Transfer.Check_cache lookup));
-    Eio.Promise.await reached;
-    let path=Option.get !(fixture.held_path) in
-    (match mode with
-     | `Full->()
-     | `Missing->Unix.unlink path
-     | `Checksum->Out_channel.with_open_bin path(fun output->output_string output "fake")
-     | `Oversize->Out_channel.with_open_bin path(fun output->output_string output (String.make 17 'x')));
-    fixture.deliver_held ~keep_gate:true ();
-    let result=Eio.Promise.await completed in
-    let failure=Option.get !publication_failure in
-    let expected=match mode with `Full->Sync.Asset_storage_full | `Missing->Asset_missing_source
-      | `Checksum->Asset_checksum_mismatch | `Oversize->Asset_size_rejected in
-    Alcotest.(check bool) "actual publication error is wrapped with cause" true
-      (Sync.asset_failure_kind failure=expected && Option.is_some(Sync.asset_failure_cause failure));
-    Alcotest.(check int) "outer staging lease released only on non-full branch"
-      (if mode=`Full then 0 else 1) (releases (Option.get !retained_lease));
-    Alcotest.(check int) "only missing/checksum consult remote cache"
-      (if mode=`Missing || mode=`Checksum then 1 else 0) (remote_checks () - before_remote);
-    if mode=`Oversize then
-      Alcotest.(check bool) "nonfallback failure category reaches transfer unchanged" true
-        (result=Error(Transfer.Invalid_content "Asset size exceeds the limit"))
-    else (
-    let handle=match result with Ok(Some handle)->handle
-      | _->Alcotest.fail "wrapped local publication failure broke preview/cache fallback" in
-    let lease,readable=match fixture.fixture_asset(Sync.Retain_asset_file handle) with
-      | Sync.Asset_retained(Some file)->file | _->Alcotest.fail "fallback returned an unreadable lease" in
-    Alcotest.(check string) "fallback owns correct readable bytes"
-      (if mode=`Full then "file" else remote_bytes)
-      (In_channel.with_open_bin readable In_channel.input_all);
-    ignore(fixture.fixture_asset(Sync.Release_asset_file lease));
-    ignore(fixture.fixture_asset(Sync.Release_asset_file handle)));
-    ignore(fixture.fixture_asset(Sync.Release_asset_file pinned)))
-;;
-
-let cancelled_stage_output deliver_first () =
-  with_asset_bridge (fun fixture ->
-    let source = picker_import fixture.support 10 in
-    let reached =
-      fixture.gate
-        (fun output ->
-           match output.Sync.request.action with
-           | Sync.Stage_asset_file _ -> true
-           | _ -> false)
-        ~deliver_first
-    in
-    Eio.Fiber.first
+    ignore (Test_support.seed_mirror ~graph_id:scope.graph_id support);
+    let inspection = Logseq_overlay_db.Database.inspect_mirror
+      ~application_support_directory:support ~graph_id:scope.graph_id |> Result.get_ok in
+    let database = Logseq_overlay_db.Database.open_ ~sw fixture.overlay inspection
+      ~graph_name:"Direct import owner" |> Result.get_ok in
+    let database_owner = Execute.Core.database_owner database in
+    let cache = Assets.cache assets in
+    let actions = ref [] in
+    let owner_ref = ref None in
+    let await_owner () = match !owner_ref with
+      | None -> Ok ()
+      | Some owner ->
+        Result.bind (Logseq_sync_worker_owner.Core.fence owner ~identity)
+          (fun () -> Logseq_sync_worker_owner.Core.await_io owner ~identity)
+        |> Result.map_error D.error_message in
+    let with_cause kind message = Sync.Asset_with_cause (kind,
+      Logseq_db_types.Failure_diagnostic.of_source ~operation:"assetPreview"
+        ~reason:"ownerFailed" message) in
+    let failure error =
+      let kind = match error with
+        | Cache.Full -> Sync.Asset_storage_full
+        | Checksum_mismatch -> Sync.Asset_checksum_mismatch
+        | Stale -> Sync.Asset_cancelled
+        | Invalid message | Io message -> Sync.Asset_invalid_content message in
+      with_cause kind (D.error_message (Assets.cache_error error)) in
+    let fixture_result action =
+      actions := action :: !actions;
+      match action with
+      | Sync.Stage_asset_file {operation;file_type;source_file} ->
+        Cache.stage cache ~operation ~file_type ~source_file ~pending_budget_bytes:32L
+        |> Result.map (fun (staged : Cache.staged) -> Sync.Asset_staged
+          {file=staged.file;checksum=staged.checksum;size=staged.size})
+        |> Result.map_error failure
+      | Sync.Check_asset_cache (asset, version) ->
+        Cache.lookup cache ~asset ~version |> Result.map (fun handle -> Sync.Asset_cached handle)
+        |> Result.map_error failure
+      | Sync.Publish_staged_asset {asset;version;file} ->
+        let module Codec = Logseq_sync_native_crypto.Asset_codec in
+        (match Cache.staged_path cache ~file with
+         | None -> Error (with_cause Sync.Asset_missing_source "Staged original is missing")
+         | Some path when not (Sys.file_exists path) ->
+           Error (with_cause Sync.Asset_missing_source "Staged original is missing")
+         | Some path ->
+           let native = Logseq_sync_native_crypto.Platform_crypto.crypto in
+           let crypto : Codec.crypto = {encrypt=native.encrypt_aes_gcm;decrypt=native.decrypt_aes_gcm} in
+           let bytes = In_channel.with_open_bin path In_channel.input_all in
+           Codec.decode ~maximum_plaintext_bytes:16 ~crypto ~key:None ~expected:version bytes
+           |> Result.map_error (fun error ->
+             let kind = match error with
+               | Codec.Checksum_mismatch -> Sync.Asset_checksum_mismatch
+               | Wire_too_large | Plaintext_too_large -> Sync.Asset_size_rejected
+               | Invalid_limit | Malformed_envelope | Malformed_transit _ | Decryption_failed _ ->
+                 Sync.Asset_invalid_content (Codec.decode_error_message error) in
+             with_cause kind (Codec.decode_error_message error))
+           |> fun result -> Result.bind result (fun verified ->
+             Cache.publish cache ~asset ~current:(fun () -> true) ~verified
+             |> Result.map_error failure)
+           |> fun result -> Result.bind result (fun handle ->
+             Cache.release_checked cache handle |> Result.map (fun () -> Sync.Asset_unit)
+             |> Result.map_error failure))
+      | Sync.Retain_staged_file file ->
+        Ok (Sync.Asset_retained (Option.bind (Cache.retain_staged cache ~file)
+          (fun handle -> Option.map (fun path -> handle,path) (Cache.path cache handle))))
+      | Sync.Retain_asset_file handle ->
+        Ok (Sync.Asset_retained (Option.bind (Cache.retain cache handle)
+          (fun retained -> Option.map (fun path -> retained,path) (Cache.path cache retained))))
+      | Sync.Release_staged_file file ->
+        Cache.release_staged cache ~file |> Result.map (fun () -> Sync.Asset_unit) |> Result.map_error failure
+      | Sync.Release_asset_file handle ->
+        Cache.release_checked cache handle |> Result.map (fun () -> Sync.Asset_unit) |> Result.map_error failure
+      | Sync.Close_asset_scope ->
+        Cache.close_checked cache |> Result.map (fun () -> Sync.Asset_unit) |> Result.map_error failure
+      | Sync.Await_asset_operations ->
+        await_owner () |> Result.map (fun () -> Sync.Asset_unit)
+        |> Result.map_error (fun message -> Sync.Asset_invalid_content message)
+      | _ -> Alcotest.fail "Unexpected direct cache operation" in
+    let runner_ref = ref None in
+    let result_hook = ref (fun (_ : Sync.asset_output) -> ()) in
+    let held = Queue.create () in
+    let gate predicate =
+      let reached, resolve = Eio.Promise.create () in
+      result_hook := (fun output -> if predicate output then (
+        let released, release = Eio.Promise.create () in
+        Queue.add release held;
+        ignore (Eio.Promise.try_resolve resolve () : bool);
+        Eio.Promise.await released));
+      reached in
+    let deliver_held ?(keep_gate=false) () =
+      if not keep_gate then result_hook := (fun _ -> ());
+      while not (Queue.is_empty held) do
+        Eio.Promise.resolve (Queue.take held) ()
+      done in
+    let direct_services : Runner.services =
+      { (services ()) with
+        owner=(fun ~scope:actual ->
+          if actual<>scope then Error "Wrong owner incarnation"
+          else match !owner_ref with
+          | Some owner -> Ok (identity, owner)
+          | None ->
+            let store = Runner.sync_upload_store (Option.get !runner_ref) |> Result.get_ok in
+            let namespace = Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
+              ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id in
+            let owner = Logseq_sync_worker_owner.Core.create
+              ~clock:(Eio.Stdenv.mono_clock env) ~namespace ~assets ~store
+              ~notify_outbox_changed:(fun ~owner:_ ~identity:_ -> Ok ()) in
+            let module Owner = (val Logseq_sync_worker_owner.Core.worker_owner owner : Execute.Core.WORKER_OWNER) in
+            Owner.bind_runtime ~identity ~database_owner ~limits ~cleanup_seconds:2.
+              ~network
+            |> Result.map_error D.error_message
+            |> Result.map (fun () -> owner_ref := Some owner; identity, owner))
+      ; asset=(fun request ->
+          if request.Sync.scope<>scope then Error Sync.Asset_cancelled
+          else let result=fixture_result request.action in
+            !result_hook {Sync.request;result};
+            result)
+      ; await_io=(fun ~scope:_ -> await_owner ())
+      } in
+    let published = ref [] in
+    let dependencies = Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay
+      ~runtime:(Runner.runtime ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
+        ~sleep:(Eio.Time.sleep (Eio.Stdenv.clock env)) |> Result.get_ok)
+      ~services:direct_services ~publish:(fun output -> published := output :: !published) |> Result.get_ok in
+    let upload_current = ref (fun _ -> false) and upload_events = Queue.create () in
+    let recovery_results = Queue.create () in
+    let state = Core.initial (Core.config ~worker:fixture.config ~sync:(asset_sync_config ())) |> Result.get_ok in
+    let sync, coordination = lifecycle_projection fixture.config scope in
+    let opened = Core.database_opened ~database_id:"staging-recovery" ~graph_id:scope.graph_id in
+    let transition = Core.step state (Core.Lifecycle_snapshot (sync, coordination, [scope, opened])) in
+    let recovery_ticket = List.find_map (function Core.Read_uploads ticket -> Some ticket | _ -> None)
+      transition.effects |> Option.get in
+    let runner = Runner.create ~sw dependencies ~post:(function
+      | Core.Asset_cleanup_barrier token ->
+        Runner.submit (Option.get !runner_ref) (Core.Asset_cleanup_barrier_reached token)
+      | Core.Upload_completed (_, event) -> Queue.add event upload_events
+      | Core.Uploads_loaded (_, result) -> Queue.add result recovery_results
+      | _ -> ()) ~recovery_current:(fun ticket -> ticket = recovery_ticket) ~upload_current:(fun ticket -> !upload_current ticket)
+      ~asset_current:(fun _ -> false) |> Result.get_ok in
+    runner_ref := Some runner;
+    Runner.submit runner (Core.Publish (Core.Sync_output (Sync.State_changed sync)));
+    Runner.submit runner (Core.Publish (Core.Sync_output (Sync.Session_state_changed (scope, sync))));
+    Fun.protect ~finally:(fun () ->
+      deliver_held ();
+      Runner.shutdown runner;
+      let closed = Assets.close assets in
+      Logseq_sync_crypto.Core.retire crypto;
+      Logseq_overlay_db.Database.close database |> Result.get_ok;
+      match closed with Ok () -> () | Error error -> Alcotest.fail (D.error_message error))
       (fun () ->
-         ignore
-           (Runner.prepare_import
-              fixture.runner
-              ~context:fixture.context
-              source
-              ~current:(fun () -> true));
-         Alcotest.fail "gated import unexpectedly finished")
-      (fun () -> Eio.Promise.await reached);
-    let path = Option.get !(fixture.held_path) in
-    if not deliver_first
-    then
-      Alcotest.(check bool)
-        "queued accepted staging still exists"
-        true
-        (Sys.file_exists path);
-    fixture.deliver_held ();
-    Alcotest.(check bool)
-      "canceled caller releases accepted staging"
-      false
-      (Sys.file_exists path);
-    Alcotest.(check bool)
-      "staging cleanup requested through reducer"
-      true
-      (List.exists
-         (function
-           | Sync.Release_staged_file _ -> true
-           | _ -> false)
-         !(fixture.actions));
-    let db =
-      Sqlite3.db_open (Filename.concat fixture.support "asset-upload-intents.sqlite")
-    in
-    let durable =
-      Logseq_db_storage.Asset_upload_store.read db ~operation:source.operation
-      |> Result.get_ok
-    in
-    let namespace=Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
-      ~origin:fixture.context.scope.account.managed_sync_origin ~user:fixture.context.scope.account.user_id
-      ~graph:fixture.context.scope.graph_id in
-    let reserved=Logseq_db_storage.Asset_upload_store.Inputs.read db
-      ~owner:{namespace;origin=Uri.to_string fixture.context.scope.account.managed_sync_origin;account=fixture.context.scope.account.user_id;graph=fixture.context.scope.graph_id} ~operation:source.operation |> Result.get_ok in
-    let expected=Logseq_db_types.Asset_import.Pure_intent.create ~namespace source |> Result.get_ok in
-    Alcotest.(check bool) "canceled staging retains complete durable Unknown input" true
-      (Option.exists(fun(row:Logseq_db_storage.Asset_upload_store.Inputs.record)->row.prepared=None && row.evidence=None
-        && Logseq_db_types.Asset_import.Pure_intent.encode row.input=Logseq_db_types.Asset_import.Pure_intent.encode expected)reserved);
-    ignore (Sqlite3.db_close db);
-    Alcotest.(check bool)
-      "cancel before staging acceptance persists no import"
-      true
-      (durable = None))
+        try
+          Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 10. (fun () ->
+            run {runner;context={scope;encrypted=false;key=None};support;database;crypto;identity;actions;
+              fixture_result;fixture_asset=(fun action -> fixture_result action |> Result.get_ok);
+              gate;deliver_held;upload_events;published;set_upload_current=(fun current -> upload_current := current);
+              staged_path=(fun file -> Cache.staged_path cache ~file);
+              recover_uploads=(fun () ->
+                Runner.submit runner (Core.Read_uploads recovery_ticket);
+                let rec await turns =
+                  if not (Queue.is_empty recovery_results) then Queue.take recovery_results
+                  else if turns = 0 then Alcotest.fail "Recovery completion did not arrive"
+                  else (Eio.Fiber.yield (); await (turns - 1)) in
+                await 1000)})
+        with Eio.Time.Timeout ->
+          Alcotest.fail "Direct owner did not settle within 10s; check physical IO and fixture gate ownership"))))
 ;;
 
-(* Only this actual interpreter can establish that source recovery opens an
-   existing SQLite file read-only and never stages, acquires, or replays work. *)
 let test_import_input_readonly_recovery_and_proof_ack () =
-  with_asset_bridge(fun fixture->
+  with_direct_owner(fun fixture->
     let module P=Logseq_db_types.Asset_import.Pure_intent in
     let module W=Logseq_db_worker_contract.Worker_pure_mutation in
     let scope=fixture.context.scope in
@@ -1008,67 +790,43 @@ let test_import_input_readonly_recovery_and_proof_ack () =
 ;;
 
 let test_worker_sync_io_fence_correlates_real_child () =
-  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
-    let source=picker_import fixture.support 950 in
-    let reached=fixture.gate ~hold_callback:true
-      (fun output->match output.Sync.request.action with Sync.Stage_asset_file _->true|_->false)
-      ~deliver_first:false in
-    Eio.Fiber.first
-      (fun()->ignore(Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true));
-        Alcotest.fail "held source unexpectedly finished")
-      (fun()->Eio.Promise.await reached);
-    let outcome=ref None and request=ref None in
-    fixture.on_sync_fence(fun value->request:=Some value);
-    let scope=Sync.effect_scope_of_graph fixture.context.scope in
-    Eio.Fiber.fork ~sw:fixture.sw(fun()->outcome:=Some(Runner.await_sync_io fixture.runner ~scope));
-    while !request=None do Eio.Fiber.yield() done;
-    let id,actual_scope=Option.get !request in
-    let wrong={actual_scope with graph_generation=Some 9999} in
-    Runner.submit fixture.runner(Core.Sync_io_fence_reached(id,wrong,Ok()));
-    Runner.submit fixture.runner(Core.Sync_io_fence_reached(Int64.succ id,actual_scope,Ok()));
-    for _=1 to 20 do Eio.Fiber.yield() done;
-    let premature= !outcome<>None in
-    fixture.deliver_held();
-    while !outcome=None do Eio.Fiber.yield() done;
-    Alcotest.(check bool) "wrong scope/ID and canceled parent cannot fake I/O ACK" false premature;
-    Alcotest.(check bool) "actual Sync and Worker callback outlets settle exact fence" true(!outcome=Some(Ok()));
-    Runner.shutdown fixture.runner;
+  T.with_managed (fun fixture -> Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
+    let reached,reach=Eio.Promise.create () and physical,settle=Eio.Promise.create () in
+    let posted=ref [] and outcome=ref None in
+    let account : Sync.account_scope =
+      {managed_sync_origin=Uri.of_string "https://api.logseq.io";user_id="user-1";
+       account_generation=3;presentation_generation=4;lifecycle_generation=5L} in
+    let scope=Sync.effect_scope_of_account account in
+    let services : Runner.services =
+      {post=(fun _ -> Alcotest.fail "Unexpected lifecycle intent");
+       owner=(fun ~scope:_->Error "No graph owner is installed");
+       asset=(fun _->Error Sync.Asset_cancelled);
+       await_io=(fun ~scope:actual->
+         Alcotest.(check bool) "original account scope" true (actual=scope);
+         Eio.Promise.resolve reach (); Eio.Promise.await physical);
+       retire_account=(fun ~account:_->Ok ()); shutdown=(fun()->())} in
+    let dependencies=Runner.dependencies
+      ~runtime:(Runner.runtime ~fork:(fun ~sw task->Eio.Fiber.fork ~sw task)
+        ~sleep:(fun _->()) |> Result.get_ok)
+      ~config:fixture.config ~overlay:fixture.overlay ~services ~publish:(fun _->()) |> Result.get_ok in
+    let runner=Runner.create ~sw dependencies ~post:(fun event->posted:=event:: !posted)
+      ~recovery_current:(fun _->false) ~upload_current:(fun _->false)
+      ~asset_current:(fun _->false) |> Result.get_ok in
+    Eio.Fiber.fork ~sw (fun()->outcome:=Some(Runner.await_sync_io runner ~scope));
+    Eio.Promise.await reached;
+    Alcotest.(check bool) "physical completion is required" true (!outcome=None);
+    Alcotest.(check int) "no reducer ticket or fence event" 0 (List.length !posted);
+    Eio.Promise.resolve settle (Error "physical cleanup failed");
+    while !outcome=None do Eio.Fiber.yield () done;
+    Alcotest.(check bool) "exact cleanup failure survives forwarding" true
+      (!outcome=Some(Error "physical cleanup failed"));
+    Runner.shutdown runner;
     Alcotest.(check bool) "stopped Worker cannot mint an I/O ACK" true
-      (Result.is_error(Runner.await_sync_io fixture.runner ~scope)))
-;;
-
-let test_sync_io_fence_joins_nonasset_callback () =
-  T.with_managed(fun fixture->Eio_main.run(fun env->Eio.Switch.run(fun sw->
-    let reached,reached_resolve=Eio.Promise.create() and release,release_resolve=Eio.Promise.create() in
-    let fenced=ref None in
-    let runner=asset_io_runner ~env ~sw ~support:fixture.config.application_support_directory
-      ~fork:(fun ~sw task->Eio.Fiber.fork ~sw task)
-      ~post:(function
-        |Sync.Runner_completed _->ignore(Eio.Promise.try_resolve reached_resolve():bool);Eio.Promise.await release
-        |Sync.IO_fence_completed(id,_,outcome) when id=1L->fenced:=Some outcome
-        |_->())() in
-    Fun.protect ~finally:(fun()->ignore(Eio.Promise.try_resolve release_resolve():bool);Sync_runner.shutdown runner)(fun()->
-      let limits=Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024 ~submission_batch_size:1 |> Result.get_ok in
-      let state=Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits |> Result.get_ok |> Sync.initial |> Result.get_ok in
-      let state=(Sync.step state(Sync.Sign_in_requested{account_generation=0;presentation_generation=0})).next in
-      let authenticated=Sync.step state(Sync.Account_authenticated{user_id=Some "user-1"}) in
-      let request=List.find_map(function Sync.Run(Sync.Request(_,Sync.Fetch_catalog _) as request)->Some request|_->None)authenticated.effects |> Option.get in
-      Sync_runner.submit runner request;
-      Eio.Promise.await reached;
-      let scope:Sync.effect_scope={account_generation=None;graph_generation=None;connection_generation=None;
-        presentation_generation=None;lifecycle_generation=None} in
-      let barrier=Sync.step authenticated.next(Sync.IO_fence_requested(1L,scope)) in
-      List.iter(function Sync.Run instruction->Sync_runner.submit runner instruction|_->())barrier.effects;
-      for _=1 to 20 do Eio.Fiber.yield() done;
-      let premature= !fenced<>None in
-      ignore(Eio.Promise.try_resolve release_resolve():bool);
-      while !fenced=None do Eio.Fiber.yield() done;
-      Alcotest.(check bool) "generic Sync callback belongs to its actual I/O fence" false premature;
-      Alcotest.(check bool) "generic Sync callback completion settles fence" true(!fenced=Some(Ok()))))))
+      (Result.is_error(Runner.await_sync_io runner ~scope)))))
 ;;
 
 let test_scope_close_keeps_live_staged_lease () =
-  with_asset_bridge(fun fixture->
+  with_direct_owner(fun fixture->
     let source=picker_import fixture.support 960 in
     let staged=match fixture.fixture_asset(Sync.Stage_asset_file
       {operation=source.operation;file_type=source.file_type;source_file=source.source_file})with
@@ -1090,7 +848,7 @@ let test_scope_close_keeps_live_staged_lease () =
 (* Physical cache/lease ownership is outside Core.step; exercise the real Sync
    storage owner through the Worker interpreter, not an injected successful ACK. *)
 let test_host_scope_settlement_preserves_live_lease () =
-  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
+  with_direct_owner(fun fixture->
     let source=picker_import fixture.support 961 in
     let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
     let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
@@ -1119,38 +877,30 @@ let test_observation_release_waits_for_initial_snapshot () =
   T.with_managed(fun fixture->
     ignore(Fixture.seed_mirror fixture.config.application_support_directory);
     Eio_main.run(fun env->Eio.Switch.run(fun sw->
-      let worker=ref None in
-      let post event=Option.iter(fun db->Db.post db(Core.Sync_event event))!worker in
-      let graph:Sync.graph={graph_id=Fixture.graph_uuid;name="Observation snapshot fixture";
-        schema={major=65;minor=33;exact=true};encrypted=false}in
-      let sync_runner=Runner.sync_runner ~retire_account:(fun ~account:_->Ok()) ~shutdown:(fun()->())
-        ~submit:(function
-          |Sync.Request(ticket,Sync.Load_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok(Some
-             (Sync.catalog_cache ~user_id:"fixture-user" ~graphs:[graph] ~selected_graph:(Some graph.graph_id))))))
-          |Sync.Request(ticket,Sync.Save_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok())))
-          |Sync.Asset_io(ticket,request)->let value=match request.Sync.action with
-            |Sync.Prune_asset_staging _->Sync.Asset_pruned 0
-            |Close_asset_scope|Release_asset_file _|Release_staged_file _|Cancel_asset_operation _->Sync.Asset_unit
-            |_->failwith "Unexpected asset operation in observation fixture"in
-            post(Sync.Runner_completed(Sync.Asset_completion(ticket,Ok value)))
-          |_->())()in
-      let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
+      let scope : Sync.graph_scope = {account=account "fixture-user";
+        graph_id=Fixture.graph_uuid;graph_generation=1} in
+      let services = services () in
+      let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay ~services
         ~runtime:(Runner.runtime ~fork:(fun ~sw task->Eio.Fiber.fork ~sw task)
           ~sleep:(Eio.Time.sleep(Eio.Stdenv.clock env)) |> Result.get_ok) ~publish:(fun _->()) |> Result.get_ok in
-      let db=Db.create ~sw ~config:(Core.config ~worker:fixture.config ~sync:(asset_sync_config()))
+      let db=Db.create_lifecycle ~sw ~config:(Core.config ~worker:fixture.config ~sync:(asset_sync_config()))
         ~runner_dependencies:dependencies |> Result.get_ok in
-      worker:=Some db;
-      Fun.protect ~finally:(fun()->Db.shutdown db)(fun()->
+      let inspection=Logseq_overlay_db.Database.inspect_mirror
+        ~application_support_directory:fixture.config.application_support_directory ~graph_id:scope.graph_id |> Result.get_ok in
+      let database=Logseq_overlay_db.Database.open_ ~sw fixture.overlay inspection
+        ~graph_name:"Observation snapshot fixture" |> Result.get_ok in
+      Fun.protect ~finally:(fun()->Db.shutdown db;
+        Logseq_overlay_db.Database.close database |> Result.get_ok)(fun()->
+        let opened=Db.attach_database_owner db ~scope (Execute.Core.database_owner database) |> Result.get_ok in
+        let sync,coordination=lifecycle_projection fixture.config scope in
+        Db.post db (Core.Lifecycle_snapshot(sync,coordination,[scope,opened]));
         let latest=ref None in
         ignore(Db.register_coordination db ~registration:801L ~notify:(fun value->latest:=Some value) |> Result.get_ok);
-        post(Sync.Restore_local_account{user_id="fixture-user"});
         Eio.Time.with_timeout_exn(Eio.Stdenv.clock env)3.(fun()->
           while not(Option.exists(fun(snapshot:Db.coordination_snapshot)->
             List.exists(fun(_,state)->state.Db.phase=Db.Graph_open)snapshot.state.residents)!latest)
           do Eio.Fiber.yield()done);
-        let snapshot=Option.get !latest in
-        let scope,_=List.find(fun(_,state)->state.Db.phase=Db.Graph_open)snapshot.state.residents in
-        let owner=Option.get snapshot.state.sync.selected in
+        let owner=Option.get coordination.selected in
         let binding=F.binding ~serial:801L ~incarnation:(Read.worker_incarnation
           ~runtime_epoch:(Journal_worker_ids.Runtime.Epoch.of_int64 29000L)
           ~worker_generation:Journal_worker_ids.Worker.Generation.one)
@@ -1300,176 +1050,38 @@ let test_observation_release_waits_for_initial_snapshot () =
 let test_host_followup_survives_full_actor_queue () =
   T.with_managed(fun fixture->Eio_main.run(fun env->Eio.Switch.run(fun sw->
     let module Db=Logseq_db_worker in
-    let worker=ref None in
-    let post event=Option.iter(fun worker->Db.post worker(Core.Sync_event event))!worker in
-    let sync_runner=Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture") ~shutdown:(fun()->()) ~submit:(function
-      |Sync.Request(ticket,Sync.Load_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok None)))
-      |Sync.Await_io(id,scope)->post(Sync.IO_fence_completed(id,scope,Ok()))
-      |_->())() in
-    let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
+    let forwarded=ref 0 in
+    let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay
+      ~services:(services ~post:(function Core.Foreground_intent false -> incr forwarded | _ -> ()) ())
       ~runtime:(Runner.runtime ~fork:(fun ~sw task->Eio.Fiber.fork ~sw task)
-        ~sleep:(Eio.Time.sleep(Eio.Stdenv.clock env)) |> Result.get_ok) ~publish:(fun _->()) |> Result.get_ok in
-    let db=Db.create ~sw ~config:(Core.config ~worker:fixture.config ~sync:(asset_sync_config()))
+        ~sleep:(Eio.Time.sleep(Eio.Stdenv.clock env)) |> Result.get_ok)
+      ~publish:(fun _->()) |> Result.get_ok in
+    let db=Db.create_lifecycle ~sw ~config:(Core.config ~worker:fixture.config ~sync:(asset_sync_config()))
       ~runner_dependencies:dependencies |> Result.get_ok in
-    worker:=Some db;
     Fun.protect ~finally:(fun()->Db.shutdown db)(fun()->
-      let latest=ref None and armed=ref false and filled=ref false in
+      let scope : Sync.graph_scope = {account=account "host-queue-next";
+        graph_id=Test_support.graph_uuid;graph_generation=1} in
+      let sync,coordination=lifecycle_projection fixture.config scope in
+      let filled=ref false and latest=ref None in
       let notify (snapshot:Db.coordination_snapshot)=
         latest:=Some snapshot;
-        if !armed && not !filled && snapshot.state.sync.account=None then (
+        if not !filled then (
           filled:=true;
           for _=1 to 256 do Db.post db(Core.Set_foreground false) done;
-          Eio.Fiber.fork ~sw(fun()->post(Sync.Restore_local_account{user_id="host-queue-next"}))) in
+          Eio.Fiber.fork ~sw(fun()->Db.post db(Core.Lifecycle_snapshot(sync,coordination,[])))) in
       ignore(Db.register_coordination db ~registration:79L ~notify |> Result.get_ok);
-      post(Sync.Restore_local_account{user_id="host-queue-old"});
-      Eio.Time.with_timeout_exn(Eio.Stdenv.clock env) 2.(fun()->
-        while not(Option.exists(fun(snapshot:Db.coordination_snapshot)->snapshot.state.sync.account<>None)!latest)do Eio.Fiber.yield()done;
-        let snapshot=Option.get !latest in
-        let owner=Option.get snapshot.state.sync.account in
-        let plan:Db.host_plan={version=snapshot.version;registration=79L;owner;
-          id=Logseq_db_types.Graph_types.Uuid.of_string "10000000-0000-4000-8000-000000079079" |> Result.get_ok;
-          change=Core.Host_handoff.Replace_account;expected=Rrbvec.empty} in
-        let receipt=Db.prepare_host_change db plan |> Result.get_ok in
-        ignore(Db.apply_host_change db receipt |> Result.get_ok);
-        armed:=true;post(Sync.Account_authenticated{user_id=None});
-        while not(Option.exists(fun(snapshot:Db.coordination_snapshot)->
-          Option.exists(fun(account:Sync.account_scope)->account.user_id="host-queue-next")snapshot.state.sync.account)!latest)
-        do Eio.Fiber.yield()done;
-        Alcotest.(check bool) "consumer drains full queue across internal follow-up" true !filled)))))
-;;
-
-let test_asset_io_barrier_does_not_block_serial_submit () =
-  T.with_managed(fun fixture->Eio_main.run(fun env->Eio.Switch.run(fun sw->
-    let tasks=Queue.create() and events=ref [] in
-    let runner=asset_io_runner ~env ~sw ~support:fixture.config.application_support_directory
-      ~fork:(fun ~sw:_ task->Queue.add task tasks) ~post:(fun event->events:=event::!events)() in
-    Fun.protect ~finally:(fun()->Sync_runner.shutdown runner)(fun()->
-      let graph_id=Logseq_db_types.Graph_types.Uuid.of_string "22000000-0000-4000-8000-000000000001" |> Result.get_ok in
-      let initial,context=admitted_asset_state graph_id in
-      let source=picker_import fixture.config.application_support_directory 980 in
-      let issue state operation action=
-        let transition=Sync.step state(Sync.Asset_requested{scope=context.scope;operation;action}) in
-        let instruction=List.find_map(function Sync.Run instruction->Some instruction|_->None)transition.effects |> Option.get in
-        transition.next,instruction in
-      let pending,stage=issue initial "actual-stage-before-barrier"
-        (Sync.Stage_asset_file{operation=source.operation;file_type=source.file_type;source_file=source.source_file}) in
-      Sync_runner.submit runner stage;
-      let barrier_state,barrier=issue pending "actual-io-barrier" Sync.Await_asset_operations in
-      let returned=ref false in
-      Eio.Fiber.fork ~sw(fun()->Sync_runner.submit runner barrier;returned:=true);
-      Eio.Fiber.yield();
-      let blocked=not !returned in
-      let later_source=picker_import fixture.config.application_support_directory 990 in
-      let _,later=issue barrier_state "later-unrelated-stage"
-        (Sync.Stage_asset_file{operation=later_source.operation;file_type=later_source.file_type;source_file=later_source.source_file}) in
-      Sync_runner.submit runner later;
-      (Queue.take tasks)(); (* actual first source finishes; later source stays queued *)
-      let barrier_finished=ref false in
-      if not(Queue.is_empty tasks) then (
-        let task=Queue.take tasks in
-        Eio.Fiber.fork ~sw(fun()->task();barrier_finished:=true));
-      for _=1 to 4 do Eio.Fiber.yield() done;
-      let joined_later=not !barrier_finished in
-      while not(Queue.is_empty tasks)do (Queue.take tasks)() done;
-      while not !returned || not !barrier_finished do Eio.Fiber.yield() done;
-      Alcotest.(check bool) "Await submit must leave the serial callback consumer free" false blocked;
-      Alcotest.(check bool) "barrier cannot capture later unrelated I/O" false joined_later;
-      Alcotest.(check bool) "actual asset owner still reports completion" true(List.length !events>=3)))))
-;;
-
-let test_writer_fence_joins_actual_canceled_asset_callback () =
-  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
-    let source=picker_import fixture.support 970 in
-    let reached=fixture.gate ~hold_callback:true
-      (fun output->match output.Sync.request.action with Sync.Stage_asset_file _->true|_->false)
-      ~deliver_first:false in
-    Eio.Fiber.first
-      (fun()->ignore(Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true));
-        Alcotest.fail "held actual staging callback unexpectedly returned")
-      (fun()->Eio.Promise.await reached);
-    let outcome=ref None in
-    Eio.Fiber.fork ~sw:fixture.sw (fun()->
-      outcome:=Some(Runner.quiesce_writers fixture.runner ~scope:fixture.context.scope));
-    for _=1 to 20 do Eio.Fiber.yield() done;
-    let premature= !outcome<>None in
-    fixture.deliver_held();
-    while !outcome=None do Eio.Fiber.yield() done;
-    Alcotest.(check bool) "actual canceled Sync task callback must finish before writer ACK" false premature;
-    Alcotest.(check bool) "actual child callback allows writer barrier" true(!outcome=Some(Ok())))
-;;
-
-let test_cancelled_retained_output () =
-  with_asset_bridge (fun fixture ->
-    let source = picker_import fixture.support 20 in
-    let prepared =
-      Runner.prepare_import
-        fixture.runner
-        ~context:fixture.context
-        source
-        ~current:(fun () -> true)
-      |> Result.get_ok
-    in
-    let reached =
-      fixture.gate
-        (fun output ->
-           match output.Sync.request.action with
-           | Sync.Retain_staged_file _ -> true
-           | _ -> false)
-        ~deliver_first:false
-    in
-    Eio.Fiber.first
-      (fun () ->
-         ignore
-           (Runner.retain_imported_file
-              fixture.runner
-              ~scope:fixture.context.scope
-              ~operation:source.operation);
-         Alcotest.fail "gated lease acquisition unexpectedly finished")
-      (fun () -> Eio.Promise.await reached);
-    let path = Option.get !(fixture.held_path) in
-    fixture.deliver_held ();
-    Alcotest.(check bool)
-      "canceled lease acquisition requests release"
-      true
-      (List.exists
-         (function
-           | Sync.Release_asset_file _ -> true
-           | _ -> false)
-         !(fixture.actions));
-    ignore (fixture.fixture_asset (Sync.Release_staged_file prepared.staged_file));
-    Alcotest.(check bool)
-      "released lease no longer pins staged bytes"
-      false
-      (Sys.file_exists path))
-;;
-
-let test_checked_release_exact_physical_completion () =
-  with_asset_bridge(fun fixture->
-    let source=picker_import fixture.support 60 in
-    ignore(Runner.prepare_import fixture.runner ~context:fixture.context source
-      ~current:(fun()->true) |> Result.get_ok);
-    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope
-      ~operation:source.operation |> Option.get in
-    let wrong_scope={fixture.context.scope with graph_generation=fixture.context.scope.graph_generation+1} in
-    Alcotest.(check bool) "cancelled scoped release is not ACK" true
-      (Result.is_error(Runner.release_asset_file_checked fixture.runner ~scope:wrong_scope ~handle:lease));
-    Alcotest.(check bool) "old scope release leaves staged original intact" true (Sys.file_exists path);
-    let reached=fixture.gate (fun output->match output.Sync.request.action with
-      | Sync.Release_asset_file handle->handle=lease | _->false) ~deliver_first:false in
-    let completed=ref None in
-    Eio.Fiber.both
-      (fun()->completed:=Some(Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease))
-      (fun()->Eio.Promise.await reached;
-        Alcotest.(check bool) "release ACK waits for actual owner completion" true (!completed=None);
-        fixture.deliver_held());
-    Alcotest.(check bool) "exact physical release completes" true (!completed=Some(Ok()));
-    Runner.shutdown fixture.runner;
-    Alcotest.(check bool) "stopped runner cannot acknowledge release" true
-      (Result.is_error(Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease)))
+      let previous_scope={scope with account=account "host-queue-old"} in
+      let previous_sync,previous_coordination=lifecycle_projection fixture.config previous_scope in
+      Db.post db(Core.Lifecycle_snapshot(previous_sync,previous_coordination,[]));
+      Eio.Time.with_timeout_exn(Eio.Stdenv.clock env)2.(fun()->
+        while !forwarded<256 || not(Option.exists(fun(snapshot:Db.coordination_snapshot)->
+          snapshot.state.sync.account=Some scope.account)!latest) do Eio.Fiber.yield()done);
+      Alcotest.(check bool) "consumer drains full queue across lifecycle follow-up" true !filled;
+      Alcotest.(check int) "every queued foreground intent reaches lifecycle owner" 256 !forwarded))))
 ;;
 
 let test_checked_release_storage_retry () =
-  with_asset_bridge(fun fixture->
+  with_direct_owner(fun fixture->
     let source=picker_import fixture.support 80 in
     let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source
       ~current:(fun()->true) |> Result.get_ok in
@@ -1488,7 +1100,7 @@ let test_checked_release_storage_retry () =
 ;;
 
 let test_discarded_retain_retries_real_storage_cleanup () =
-  with_asset_bridge ~asynchronous:true(fun fixture->
+  with_direct_owner(fun fixture->
     let source=picker_import fixture.support 81 in
     let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source
       ~current:(fun()->true) |> Result.get_ok in
@@ -1513,20 +1125,72 @@ let test_discarded_retain_retries_real_storage_cleanup () =
 
 (* The public pure cleanup owner correctly queues both releases. Its state cannot
    reproduce the interpreter's job finishing before queued physical IO starts. *)
+let test_asset_cleanup_snapshot_retains_physical_failure () =
+  with_direct_owner(fun fixture->
+    let source=picker_import fixture.support 83 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
+    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let directory=Filename.dirname path in
+    Unix.chmod directory 0o500;
+    Fun.protect ~finally:(fun()->Unix.chmod directory 0o700)(fun()->
+      Runner.submit fixture.runner(Core.Run_asset(fixture.context,Logseq_sync_asset_transfer.Core.Release_handle lease));
+      let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
+      Alcotest.(check bool) "a failed physical resource cannot produce settlement ACK" true
+        (Result.is_error(Runner.await_asset_cleanup fixture.runner snapshot));
+      Alcotest.(check bool) "failure retains actual bytes" true(Sys.file_exists path));
+    let deadline=Unix.gettimeofday()+.2. in
+    while Runner.unsettled_orphan_retains fixture.runner>0 && Unix.gettimeofday()<deadline do Eio.Fiber.yield() done;
+    let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
+    Alcotest.(check bool) "settlement succeeds only after actual recovery" true(Runner.await_asset_cleanup fixture.runner snapshot=Ok());
+    Alcotest.(check bool) "recovered settlement removed actual bytes" false(Sys.file_exists path))
+;;
+
+
+let retain_fixture_staged_file fixture file =
+  match fixture.fixture_asset (Sync.Retain_staged_file file) with
+  | Sync.Asset_retained (Some retained) -> retained
+  | _ -> Alcotest.fail "Concrete cache owner did not retain staged file"
+;;
+
+let test_checked_release_exact_physical_completion () =
+  with_direct_owner(fun fixture->
+    let source=picker_import fixture.support 60 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun()->true) |> Result.get_ok in
+    let lease,path=retain_fixture_staged_file fixture prepared.staged_file in
+    let wrong_scope={fixture.context.scope with graph_generation=fixture.context.scope.graph_generation+1} in
+    Alcotest.(check bool) "cancelled scoped release is not ACK" true
+      (Result.is_error(Runner.release_asset_file_checked fixture.runner ~scope:wrong_scope ~handle:lease));
+    Alcotest.(check bool) "old scope release leaves staged original intact" true (Sys.file_exists path);
+    let reached=fixture.gate (fun output->match output.Sync.request.action with
+      | Sync.Release_asset_file handle->handle=lease | _->false) in
+    let completed=ref None in
+    Eio.Fiber.both
+      (fun()->completed:=Some(Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease))
+      (fun()->Eio.Promise.await reached;
+        Alcotest.(check bool) "release ACK waits for actual owner completion" true (!completed=None);
+        fixture.deliver_held());
+    Alcotest.(check bool) "exact physical release completes" true (!completed=Some(Ok()));
+    Runner.shutdown fixture.runner;
+    Alcotest.(check bool) "stopped runner cannot acknowledge release" true
+      (Result.is_error(Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease)))
+;;
+
 let test_asset_cleanup_snapshot_joins_queued_release () =
-  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
+  with_direct_owner(fun fixture->
     let source=picker_import fixture.support 87 in
     let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
-    let retain()=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get |> fst in
+    let retain()=retain_fixture_staged_file fixture prepared.staged_file |> fst in
     let first=retain() and second=retain() in
     ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
     let second_reached,resolve_second=Eio.Promise.create() in
     let reached=fixture.gate(fun output->match output.Sync.request.action with
       | Sync.Release_asset_file handle when handle=first->true
       | Sync.Release_asset_file handle when handle=second->Eio.Promise.resolve resolve_second();true
-      | _->false) ~deliver_first:false in
+      | _->false) in
     let release handle=Runner.submit fixture.runner(Core.Run_asset(fixture.context,
-      Logseq_sync_pure_reducer.Asset_transfer.Release_handle handle)) in
+      Logseq_sync_asset_transfer.Core.Release_handle handle)) in
     release first;
     Eio.Promise.await reached;
     release second;
@@ -1543,14 +1207,14 @@ let test_asset_cleanup_snapshot_joins_queued_release () =
 ;;
 
 let test_asset_cleanup_snapshot_joins_physical_release () =
-  with_asset_bridge ~asynchronous:true(fun fixture->
+  with_direct_owner(fun fixture->
     let source=picker_import fixture.support 82 in
     let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
-    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
+    let lease,path=retain_fixture_staged_file fixture prepared.staged_file in
     ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
     let reached=fixture.gate(fun output->match output.Sync.request.action with
-      | Sync.Release_asset_file handle->handle=lease|_->false) ~deliver_first:false in
-    Runner.submit fixture.runner(Core.Run_asset(fixture.context,Logseq_sync_pure_reducer.Asset_transfer.Release_handle lease));
+      | Sync.Release_asset_file handle->handle=lease|_->false) in
+    Runner.submit fixture.runner(Core.Run_asset(fixture.context,Logseq_sync_asset_transfer.Core.Release_handle lease));
     let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
     let completed=ref None in
     Eio.Fiber.both
@@ -1562,83 +1226,15 @@ let test_asset_cleanup_snapshot_joins_physical_release () =
     Alcotest.(check bool) "retired actual staging bytes were removed" false(Sys.file_exists path))
 ;;
 
-let test_asset_cleanup_ignores_later_unrelated_work () =
-  with_asset_bridge ~asynchronous:true(fun fixture->
-    let module Transfer=Logseq_sync_pure_reducer.Asset_transfer in
-    let asset=Logseq_db_types.Asset_descriptor.create ~uuid:(Logseq_db_types.Graph_types.Uuid.of_string "22000000-0000-4000-8000-000000000085" |> Result.get_ok)
-      ~source:(Managed None) ~current_checksum:(Some(String.make 64 'a')) ~size:None ~dimensions:None |> Result.get_ok in
-    let transfer=Transfer.create(Transfer.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:0 |> Result.get_ok)
-      ~scope:fixture.context.scope ~online:true ~unlocked:true in
-    let _,work=Transfer.step transfer(Replace{consumer="cancel-before-unrelated";priority=Foreground;assets=[asset]}) in
-    let lookup=List.find_map(function Transfer.Check_cache ticket->Some ticket|_->None)work |> Option.get in
-    let reached=fixture.hold_asset_barrier() in
-    Runner.submit fixture.runner(Core.Run_asset(fixture.context,Transfer.Cancel(Lookup lookup)));
-    let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
-    let source=picker_import fixture.support 85 in
-    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
-    let lease,_=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
-    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
-    let physical=fixture.gate(fun output->match output.Sync.request.action with Sync.Release_asset_file handle->handle=lease|_->false) ~deliver_first:false in
-    let completed=ref None in
-    Eio.Fiber.both
-      (fun()->completed:=Some(Runner.await_asset_cleanup fixture.runner snapshot))
-      (fun()->Eio.Promise.await reached;
-        Runner.submit fixture.runner(Core.Run_asset(fixture.context,Transfer.Release_handle lease));
-        Eio.Promise.await physical;
-        fixture.deliver_asset_barriers();
-        for _=0 to 9 do Eio.Fiber.yield() done;
-        let unrelated= !completed=Some(Ok()) in
-        fixture.deliver_held();
-        Alcotest.(check bool) "later unrelated cleanup cannot join an earlier consumer ACK" true unrelated))
-;;
-
-let test_asset_cleanup_joins_queued_result_child () =
-  with_asset_bridge ~asynchronous:true(fun fixture->
-    let module Transfer=Logseq_sync_pure_reducer.Asset_transfer in
-    let source=picker_import fixture.support 86 in
-    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
-    ignore(fixture.fixture_asset(Sync.Publish_staged_asset{asset=prepared.asset;version=prepared.version;file=prepared.staged_file}));
-    let asset=Logseq_db_types.Asset_descriptor.create ~uuid:prepared.asset ~source:(Managed(Some prepared.version))
-      ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
-    let transfer=Transfer.create(Transfer.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:0 |> Result.get_ok)
-      ~scope:fixture.context.scope ~online:true ~unlocked:true in
-    let active,work=Transfer.step transfer(Replace{consumer="queued-result-child";priority=Foreground;assets=[asset]}) in
-    let active=ref active in
-    fixture.set_asset_current(fun ticket->Transfer.ticket_current !active ticket);
-    let received,received_resolve=Eio.Promise.create() in
-    fixture.on_asset_completed(fun event->Eio.Promise.resolve received_resolve event);
-    List.iter(fun instruction->match instruction with Transfer.Check_cache _->Runner.submit fixture.runner(Core.Run_asset(fixture.context,instruction))|_->())work;
-    let result=Eio.Promise.await received in
-    let released,cancel=Transfer.step !active(Release "queued-result-child") in
-    active:=released;
-    let barrier=fixture.hold_asset_barrier() in
-    List.iter(fun instruction->match instruction with Transfer.Cancel _->Runner.submit fixture.runner(Core.Run_asset(fixture.context,instruction))|_->())cancel;
-    let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
-    let physical=fixture.gate(fun output->match output.Sync.request.action with Sync.Release_asset_file _->true|_->false) ~deliver_first:false in
-    let completed=ref None in
-    Eio.Fiber.both
-      (fun()->completed:=Some(Runner.await_asset_cleanup fixture.runner snapshot))
-      (fun()->Eio.Promise.await barrier;
-        let stale,children=Transfer.step !active result in active:=stale;
-        List.iter(fun instruction->match instruction with Transfer.Release_handle _->Runner.submit fixture.runner(Core.Run_asset(fixture.context,instruction))|_->())children;
-        Eio.Promise.await physical;
-        fixture.deliver_asset_barriers();
-        for _=0 to 9 do Eio.Fiber.yield() done;
-        let waiting= !completed=None in
-        fixture.deliver_held();
-        Alcotest.(check bool) "queued successful result's actual release child joins cancellation" true waiting);
-    Alcotest.(check bool) "exact causal resource ACK settles after real child IO" true(!completed=Some(Ok())))
-;;
-
 let test_asset_cleanup_stop_does_not_wait_for_lost_io () =
-  with_asset_bridge ~asynchronous:true(fun fixture->
+  with_direct_owner(fun fixture->
     let source=picker_import fixture.support 84 in
     let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
-    let lease,_=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
+    let lease,_=retain_fixture_staged_file fixture prepared.staged_file in
     ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
     let reached=fixture.gate(fun output->match output.Sync.request.action with
-      | Sync.Release_asset_file handle->handle=lease|_->false) ~deliver_first:false in
-    Runner.submit fixture.runner(Core.Run_asset(fixture.context,Logseq_sync_pure_reducer.Asset_transfer.Release_handle lease));
+      | Sync.Release_asset_file handle->handle=lease|_->false) in
+    Runner.submit fixture.runner(Core.Run_asset(fixture.context,Logseq_sync_asset_transfer.Core.Release_handle lease));
     let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
     let completed=ref None in
     Eio.Fiber.both
@@ -1650,1952 +1246,284 @@ let test_asset_cleanup_stop_does_not_wait_for_lost_io () =
         Alcotest.(check bool) "stopped cleanup reports failure without waiting for lost callback" true returned))
 ;;
 
-let test_asset_cleanup_snapshot_retains_physical_failure () =
-  with_asset_bridge ~asynchronous:true(fun fixture->
-    let source=picker_import fixture.support 83 in
-    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
-    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
-    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
-    let directory=Filename.dirname path in
-    Unix.chmod directory 0o500;
-    Fun.protect ~finally:(fun()->Unix.chmod directory 0o700)(fun()->
-      Runner.submit fixture.runner(Core.Run_asset(fixture.context,Logseq_sync_pure_reducer.Asset_transfer.Release_handle lease));
-      let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
-      Alcotest.(check bool) "a failed physical resource cannot produce settlement ACK" true
-        (Result.is_error(Runner.await_asset_cleanup fixture.runner snapshot));
-      Alcotest.(check bool) "failure retains actual bytes" true(Sys.file_exists path));
-    let deadline=Unix.gettimeofday()+.2. in
-    while Runner.unsettled_orphan_retains fixture.runner>0 && Unix.gettimeofday()<deadline do Eio.Fiber.yield() done;
-    let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
-    Alcotest.(check bool) "settlement succeeds only after actual recovery" true(Runner.await_asset_cleanup fixture.runner snapshot=Ok());
-    Alcotest.(check bool) "recovered settlement removed actual bytes" false(Sys.file_exists path))
+let test_recovery_staging_failure_is_not_acknowledged () =
+  with_direct_owner (fun fixture ->
+    let source = picker_import fixture.support 982 in
+    let intent = Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun () -> true) |> Result.get_ok in
+    let path = fixture.staged_path intent.staged_file |> Option.get in
+    let directory = Filename.dirname path in
+    let saved = directory ^ "-synthetic-failure" in
+    Unix.rename directory saved;
+    let channel = open_out_bin directory in
+    close_out channel;
+    Fun.protect ~finally:(fun () -> Sys.remove directory; Unix.rename saved directory)
+      (fun () ->
+        match fixture.recover_uploads () with
+        | Ok _ -> Alcotest.fail "Physical staging error must not acknowledge reconciliation"
+        | Error message ->
+          let cause = "Path component is not a directory" in
+          let rec contains offset =
+            offset + String.length cause <= String.length message
+            && (String.sub message offset (String.length cause) = cause || contains (offset + 1)) in
+          Alcotest.(check bool) "physical failure retains ENOTDIR cause" true (contains 0));
+    Alcotest.(check bool) "failed recovery preserves original physical source" true (Sys.file_exists path);
+    Alcotest.(check bool) "only actual successful prune settles recovery" true
+      (fixture.recover_uploads () = Ok [intent]))
 ;;
 
-let test_db_shutdown_accepts_late_staging_completion () =
-  let module Db = Logseq_db_worker in
-  T.with_managed (fun fixture ->
-    Eio_main.run (fun env ->
-      Eio.Switch.run (fun sw ->
-        let support = fixture.config.application_support_directory in
-        let source = picker_import support 40 in
-        let graph : Sync.graph =
-          { graph_id = source.target
-          ; name = "Shutdown fixture"
-          ; schema = { major = 65; minor = 33; exact = true }
-          ; encrypted = false
-          }
-        in
-        let db = ref None in
-        let io_runner = ref None in
-        let catalog_ready, catalog_resolve = Eio.Promise.create () in
-        let scope_ready, scope_resolve = Eio.Promise.create () in
-        let stage_ready, stage_resolve = Eio.Promise.create () in
-        let path_ready, path_resolve = Eio.Promise.create () in
-        let stage_completion = ref None in
-        let cleanup_actions = ref [] in
-        let post event =
-          match event with
-          | Sync.Runner_completed (Sync.Asset_completion (_, Ok (Sync.Asset_staged _))) ->
-            stage_completion := Some event;
-            Eio.Promise.resolve stage_resolve ()
-          | Sync.Runner_completed
-              (Sync.Asset_completion (_, Ok (Sync.Asset_retained (Some (_, path))))) ->
-            Eio.Promise.resolve path_resolve path;
-            Db.post (Option.get !db) (Core.Sync_event event)
-          | event -> Db.post (Option.get !db) (Core.Sync_event event)
-        in
-        io_runner := Some (asset_io_runner ~env ~sw ~support ~post ());
-        let sync_runner =
-          Runner.sync_runner ~retire_account:(Sync_runner.retire_account (Option.get !io_runner))
-            ~submit:(function
-              | Sync.Request (ticket, Sync.Fetch_catalog _) ->
-                Db.post
-                  (Option.get !db)
-                  (Core.Sync_event
-                     (Sync.Runner_completed (Sync.Completion (ticket, Ok [ graph ]))));
-                Eio.Promise.resolve catalog_resolve ()
-              | Sync.Request (_, Sync.Fetch_snapshot_metadata scope) ->
-                Eio.Promise.resolve scope_resolve scope
-              | Sync.Request (_, Sync.Fetch_snapshot_baseline _)
-              | Sync.Request (_, Sync.Download_snapshot _) -> ()
-              | Sync.Asset_io (_, request) as runnable ->
-                (match request.action with
-                 | Sync.Release_staged_file _ ->
-                   cleanup_actions := request.action :: !cleanup_actions
-                 | _ -> ());
-                Sync_runner.submit (Option.get !io_runner) runnable
-              | runnable -> Sync_runner.submit (Option.get !io_runner) runnable)
-            ~shutdown:(fun () -> Sync_runner.shutdown (Option.get !io_runner))
-            ()
-        in
-        let runner_dependencies =
-          Runner.dependencies
-            ~runtime:
-              (Runner.runtime ~fork:(fun ~sw:_ task -> task ()) ~sleep:(fun _ -> ())
-               |> Result.get_ok)
-            ~config:fixture.config
-            ~overlay:fixture.overlay
-            ~sync_runner
-            ~publish:(fun _ -> ())
-          |> Result.get_ok
-        in
-        let limits =
-          Sync.limits
-            ~maximum_response_bytes:1024
-            ~maximum_artifact_bytes:1024
-            ~submission_batch_size:1
-          |> Result.get_ok
-        in
-        let sync =
-          Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits
-          |> Result.get_ok
-        in
-        let worker =
-          Db.create
-            ~sw
-            ~config:(Core.config ~worker:fixture.config ~sync)
-            ~runner_dependencies
-          |> Result.get_ok
-        in
-        db := Some worker;
-        Fun.protect
-          ~finally:(fun () -> Db.shutdown worker)
-          (fun () ->
-             Db.post worker (Core.Sync_event (Sync.Sign_in_requested {account_generation=0; presentation_generation=0}));
-             Db.post
-               worker
-               (Core.Sync_event (Sync.Account_authenticated { user_id = Some "user-1" }));
-             Eio.Promise.await catalog_ready;
-             Db.post worker (Core.Sync_event (Sync.Graph_selected graph.graph_id));
-             let scope = Eio.Promise.await scope_ready in
-             Db.post
-               worker
-               (Core.Sync_event
-                  (Sync.Asset_requested
-                     { scope
-                     ; operation = "db-shutdown:stage"
-                     ; action =
-                         Sync.Stage_asset_file
-                           { operation = source.operation
-                           ; file_type = source.file_type
-                           ; source_file = source.source_file
-                           }
-                     }));
-             Eio.Promise.await stage_ready;
-             let file =
-               match Option.get !stage_completion with
-               | Sync.Runner_completed
-                   (Sync.Asset_completion (_, Ok (Sync.Asset_staged { file; _ }))) -> file
-               | _ -> Alcotest.fail "missing real staging completion"
-             in
-             Db.post
-               worker
-               (Core.Sync_event
-                  (Sync.Asset_requested
-                     { scope
-                     ; operation = "db-shutdown:path"
-                     ; action = Sync.Retain_staged_file file
-                     }));
-             let path = Eio.Promise.await path_ready in
-             Alcotest.(check bool)
-               "actual runner staged file before shutdown"
-               true
-               (Sys.file_exists path);
-             Db.shutdown worker;
-             Alcotest.(check bool) "actual worker stopped" true (Db.view worker).shutdown;
-             Db.post worker (Core.Sync_event (Option.get !stage_completion));
-             Alcotest.(check bool)
-               "late resource completion reaches cleanup submit"
-               true
-               (List.exists
-                  (function
-                    | Sync.Release_staged_file released -> released = file
-                    | _ -> false)
-                  !cleanup_actions);
-             Alcotest.(check bool)
-               "late completion leaves no staged orphan"
-               false
-               (Sys.file_exists path);
-             Eio.Fiber.yield ()))))
+let test_recovery_prunes_original_owner_staging () =
+  with_direct_owner (fun fixture ->
+    let source = picker_import fixture.support 980 in
+    let intent = Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun () -> true) |> Result.get_ok in
+    let durable_path = fixture.staged_path intent.staged_file |> Option.get in
+    let orphan_source = picker_import fixture.support 981 in
+    let orphan = match fixture.fixture_asset (Sync.Stage_asset_file
+      {operation=orphan_source.operation;file_type=orphan_source.file_type;source_file=orphan_source.source_file}) with
+      | Sync.Asset_staged value -> value.file
+      | _ -> Alcotest.fail "Expected real staged orphan" in
+    let orphan_path = fixture.staged_path orphan |> Option.get in
+    let before = !(fixture.actions) in
+    let recovered = match fixture.recover_uploads () with
+      | Ok rows -> rows
+      | Error message -> Alcotest.fail message in
+    Alcotest.(check bool) "real Read_uploads returns original durable intent" true (recovered = [intent]);
+    Alcotest.(check bool) "unpublished durable source survives" true (Sys.file_exists durable_path);
+    Alcotest.(check bool) "unproven staging is physically pruned" false (Sys.file_exists orphan_path);
+    Alcotest.(check bool) "recovery never reaches registration fallback" true (before = !(fixture.actions));
+    Alcotest.(check bool) "recovery is idempotent without PUT or metadata" true
+      (fixture.recover_uploads () = Ok [intent]))
 ;;
 
-(* Pure reducers cannot execute filesystem cleanup or warning-output failures.
-   Reuse real public Runner staging cleanup with an unwritable stderr capability. *)
-let test_upload_checkpoint_io ?(closed_stderr = false) () =
+let test_upload_owner_network_classification () =
+  let module D = Sync_dsl.Core in
   let module U = Logseq_db_worker_pure_reducer.Asset_upload in
   let module I = Logseq_db_types.Asset_upload_intent in
-  let module Store = Logseq_db_storage.Asset_upload_store in
-  let uuid n =
-    Logseq_db_types.Graph_types.Uuid.of_string
-      (Printf.sprintf "00000000-0000-4000-8000-%012d" n)
-    |> Result.get_ok
-  in
-  let admitted, context = admitted_asset_state (uuid 1) in
-  let sync_state = ref admitted in
-  let scope = context.Sync.scope in
-  let intent =
-    I.prepare
-      ~replace_reference:None
-      ~operation_id:(uuid 2)
-      ~origin:(Uri.to_string scope.account.managed_sync_origin)
-      ~account:"user-1"
-      ~graph:(uuid 1)
-      ~asset:(uuid 3)
-      ~version:
-        (Logseq_db_types.Asset_descriptor.version
-           ~checksum:(String.make 64 'a')
-           ~file_type:"png"
-         |> Result.get_ok)
-      ~title:"Imported image"
-      ~size:4L
-      ~staged_file:"fixture.bin"
-      ~target:(uuid 4)
-      ~local_mutation:(uuid 5)
-      ~metadata_mutation:(uuid 6)
-    |> Result.get_ok
-  in
-  let state, instructions = U.step (U.create ~scope ~available:true) (Start intent) in
-  let active_upload = ref state in
-  let instruction = List.hd instructions in
-  T.with_managed (fun fixture ->
-    Eio_main.run (fun env ->
-      Eio.Switch.run (fun sw ->
-        let source_file =
-          Filename.concat fixture.config.application_support_directory "picker.bin"
-        in
-        Out_channel.with_open_bin source_file (fun output -> output_string output "file");
-        let published = ref [] in
-        let posted = ref [] in
-        let current = ref true in
-        let runtime =
-          Runner.runtime
-            ~fork:(fun ~sw:_ f -> f ())
-            ~sleep:(fun _ -> failwith "unexpected wait")
-          |> Result.get_ok
-        in
-        let stage_calls = ref 0 in
-        let active_runner = ref None in
-        let source_diagnostic ~scope ~operation ~request_operation detail =
-          let runner = Option.get !active_runner in
-          Runner.report_asset_diagnostic runner ~scope ~operation ~request_operation detail;
-          let wrong = Logseq_db_types.Failure_diagnostic.create ~operation ~reason:"unknown" () in
-          Runner.report_asset_diagnostic runner ~scope:{scope with graph_id=uuid 90}
-            ~operation ~request_operation wrong;
-          Runner.report_asset_diagnostic runner ~scope ~operation
-            ~request_operation:(request_operation ^ "-unrelated") wrong;
-          Runner.report_asset_diagnostic runner ~scope ~operation:"workerOperation"
-            ~request_operation wrong in
-        let bridge_requests = ref 0 in
-        let bridge_outputs = ref 0 in
-        let io_runner = ref None in
-        let fixture_output = ref None in
-        let transfer_ticket = ref None in
-        let submit_sync = ref (fun _ -> failwith "sync interpreter not initialized") in
-        let post = function
-          | Core.Sync_event event ->
-            (match event with
-             | Sync.Asset_requested _ -> incr bridge_requests
-             | _ -> ());
-            let transition = Sync.step !sync_state event in
-            sync_state := transition.next;
-            List.iter
-              (function
-                | Sync.Run runner_effect -> !submit_sync runner_effect
-                | Sync.Publish (Sync.Asset_finished output) ->
-                  incr bridge_outputs;
-                  if String.starts_with ~prefix:"fixture:" output.request.operation
-                  then fixture_output := Some output.result
-                  else
-                    Runner.submit
-                      (Option.get !active_runner)
-                      (Core.Deliver_asset_result output)
-                | Sync.Publish _ -> ()
-                | Sync.Delegate _ -> Alcotest.fail "unexpected graph work in asset bridge")
-              transition.effects
-          | event -> posted := event :: !posted
-        in
-        io_runner
-        := Some
-             (asset_io_runner
-                ~on_asset_diagnostic:source_diagnostic
-                ~token_failure:(Printexc.to_string (Unix.Unix_error (Unix.EACCES,"open","PRIVATE_TOKEN_SOURCE")))
-                ~env
-                ~sw
-                ~support:fixture.config.application_support_directory
-                ~post:(fun event -> post (Core.Sync_event event)) ());
-        let sync_runner =
-          Runner.sync_runner ~retire_account:(Sync_runner.retire_account (Option.get !io_runner))
-            ~submit:(fun runner_effect ->
-              (match runner_effect with
-               | Sync.Asset_io (_, { action = Sync.Stage_asset_file _; _ }) ->
-                 incr stage_calls
-               | _ -> ());
-              Sync_runner.submit (Option.get !io_runner) runner_effect)
-            ~shutdown:(fun () -> Sync_runner.shutdown (Option.get !io_runner))
-            ()
-        in
-        (submit_sync
-         := fun runner_effect ->
-              Runner.submit (Option.get !active_runner) (Core.Run_sync runner_effect));
-        let dependencies =
-          Runner.dependencies
-            ~runtime
-            ~config:fixture.config
-            ~overlay:fixture.overlay
-            ~sync_runner
-            ~publish:(fun output -> published := output :: !published)
-          |> Result.get_ok
-        in
-        let runner =
-          Runner.create
-            ~sw
-            dependencies
-            ~post
-            ~recovery_current:(fun _ -> false)
-            ~upload_current:(fun ticket -> !current && U.ticket_current !active_upload ticket)
-            ~asset_current:(fun ticket -> !transfer_ticket = Some ticket)
-          |> Result.get_ok
-        in
-        active_runner := Some runner;
-        let fixture_serial = ref 0 in
-        let fixture_asset action =
-          incr fixture_serial;
-          fixture_output := None;
-          post
-            (Core.Sync_event
-               (Sync.Asset_requested
-                  { scope
-                  ; operation = "fixture:" ^ string_of_int !fixture_serial
-                  ; action
-                  }));
-          Option.get !fixture_output |> Result.get_ok
-        in
-        let staged_path file =
-          match fixture_asset (Sync.Retain_staged_file file) with
-          | Sync.Asset_retained (Some (lease, path)) ->
-            ignore (fixture_asset (Sync.Release_asset_file lease));
-            path
-          | _ -> Alcotest.fail "staged resource unavailable"
-        in
-        let orphan_file =
-          match
-            fixture_asset
-              (Sync.Stage_asset_file
-                 { operation = uuid 88; file_type = "bin"; source_file })
-          with
-          | Sync.Asset_staged { file; _ } -> file
-          | _ -> Alcotest.fail "orphan staging failed"
-        in
-        let orphan_path = staged_path orphan_file in
-        stage_calls := 0;
-        Runner.submit
-          runner
-          (Core.Run_upload ({ scope; encrypted = false; key = None }, instruction));
-        Alcotest.(check bool)
-          "durable acknowledgement"
-          true
-          (match !posted with
-           | [ Core.Upload_completed (_, U.Persisted) ] -> true
-           | _ -> false);
-        let db =
-          Sqlite3.db_open
-            (Filename.concat
-               fixture.config.application_support_directory
-               "asset-upload-intents.sqlite")
-        in
-        let stored =
-          Logseq_db_storage.Asset_upload_store.read db ~operation:intent.operation_id
-          |> Result.get_ok
-        in
-        ignore (Sqlite3.db_close db);
-        Alcotest.(check bool)
-          "survives independent database reopen"
-          true
-          (stored = Some intent);
-        current := false;
-        posted := [];
-        Runner.submit
-          runner
-          (Core.Run_upload ({ scope; encrypted = false; key = None }, instruction));
-        Alcotest.(check int) "stale ticket performs no completion" 0 (List.length !posted);
-        let source : Logseq_db_types.Asset_import.t =
-          { operation = uuid 10
-          ; asset = uuid 11
-          ; target = uuid 4
-          ; local_mutation = uuid 12
-          ; replace_reference = None
-          ; metadata_mutation = uuid 13
-          ; source_file
-          ; title = "Imported image"
-          ; file_type = "png"
-          }
-        in
-        Alcotest.(check bool)
-          "stale import does not stage"
-          true
-          (Result.is_error
-             (Runner.prepare_import runner ~context source ~current:(fun () -> false)));
-        Alcotest.(check int) "stale selection has no IO" 0 !stage_calls;
-        Alcotest.(check bool)
-          "stale import leaves orphan untouched"
-          true
-          (Sys.file_exists orphan_path);
-        let prepared =
-          Runner.prepare_import runner ~context source ~current:(fun () -> true)
-          |> Result.get_ok
-        in
-        let db =
-          Sqlite3.db_open
-            (Filename.concat
-               fixture.config.application_support_directory
-               "asset-upload-intents.sqlite")
-        in
-        Alcotest.(check bool)
-          "import reconciles orphan before staging"
-          false
-          (Sys.file_exists orphan_path);
-        let durable =
-          Logseq_db_storage.Asset_upload_store.read db ~operation:source.operation
-          |> Result.get_ok
-        in
-        ignore (Sqlite3.db_close db);
-        Alcotest.(check bool)
-          "import is durable before success"
-          true
-          (durable = Some prepared && prepared.phase = I.Prepared);
-        (* Worker import owns publishing the staged original. This exercises its
-           public prepare operation and the sealed Core/runner bridge. *)
-        let normal_handle =
-          match fixture_asset (Sync.Check_asset_cache (prepared.asset, prepared.version)) with
-          | Sync.Asset_cached (Some handle) -> handle
-          | _ -> Alcotest.fail "imported original must be in normal cache before upload"
-        in
-        let normal_lease, normal_path =
-          match fixture_asset (Sync.Retain_asset_file normal_handle) with
-          | Sync.Asset_retained (Some file) -> file
-          | _ -> Alcotest.fail "normal imported original must be retainable"
-        in
-        Alcotest.(check string) "normal cache contains the original" "file"
-          (In_channel.with_open_bin normal_path In_channel.input_all);
-        ignore (fixture_asset (Sync.Release_asset_file normal_lease));
-        ignore (fixture_asset (Sync.Release_asset_file normal_handle));
-        let local_descriptor = Logseq_db_types.Asset_descriptor.create
-          ~uuid:prepared.asset ~source:(Managed None)
-          ~current_checksum:(Some prepared.version.checksum) ~size:None ~dimensions:None
-          |> Result.get_ok in
-        let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
-        let transfer = Transfer.create
-          (Transfer.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:0 |> Result.get_ok)
-          ~scope ~online:false ~unlocked:false in
-        let _, instructions = Transfer.step transfer
-          (Replace { consumer = "local-original"; priority = Foreground; assets = [local_descriptor] }) in
-        let lookup = List.find_map (function Transfer.Check_cache ticket -> Some ticket | _ -> None) instructions |> Option.get in
-        transfer_ticket := Some (Transfer.Lookup lookup);
-        posted := [];
-        Runner.submit runner (Core.Run_asset (context, Transfer.Check_cache lookup));
-        let local_handle = List.find_map (function
-          | Core.Asset_completed (actual, Transfer.Cache_checked (_, Ok (Some handle))) when actual = scope -> Some handle
-          | _ -> None) !posted |> Option.get in
-        ignore (fixture_asset (Sync.Release_asset_file local_handle));
-        posted := [];
-        let before_wrong_scope = !bridge_requests in
-        Runner.submit runner (Core.Run_asset ({ context with scope = { scope with graph_id = uuid 90 } }, Transfer.Check_cache lookup));
-        Alcotest.(check int) "mismatched transfer context performs no asset IO" before_wrong_scope !bridge_requests;
-        Alcotest.(check bool) "mismatched transfer context has no completion" true (!posted = []);
-        transfer_ticket := None;
-        let lease, preview =
-          match Runner.retain_imported_file runner ~scope ~operation:source.operation with
-          | Some preview -> preview
-          | None -> Alcotest.fail "durable import preview unavailable"
-        in
-        Alcotest.(check bool) "preview uses staged bytes" true (Sys.file_exists preview);
-        Alcotest.(check bool)
-          "another graph cannot acquire import"
-          true
-          (Runner.retain_imported_file
-             runner
-             ~scope:{ scope with graph_id = uuid 90 }
-             ~operation:source.operation
-           = None);
-        Alcotest.(check bool)
-          "another account cannot acquire import"
-          true
-          (Runner.retain_imported_file
-             runner
-             ~scope:{ scope with account = { scope.account with user_id = "other" } }
-             ~operation:source.operation
-           = None);
-        Runner.release_asset_file runner ~scope ~handle:lease;
-        Alcotest.(check bool) "same operation cannot replace its complete original source" true
-          (Result.is_error(Runner.prepare_import runner ~context
-            {source with source_file="picker-no-longer-available"} ~current:(fun()->true)));
-        let duplicate =
-          Runner.prepare_import runner ~context source ~current:(fun () -> true)
-          |> Result.get_ok
-        in
-        Alcotest.(check bool)
-          "same identity restores its intent"
-          true
-          (duplicate = prepared);
-        Alcotest.(check int)
-          "duplicate import never recopies picker source"
-          1
-          !stage_calls;
-        (* A real changed staged file fails in the sync interpreter before PUT;
-           the Worker must keep that reason while retaining Invalid_content. *)
-        let uploading = I.advance prepared Local_committed |> Result.get_ok
-          |> fun i -> I.advance i Uploading |> Result.get_ok in
-        let upload_state, observe = U.step (U.create ~scope ~available:true) (Restore uploading) in
-        let observe = match observe with [U.Inspect (ticket, _)] -> ticket
-          | _ -> Alcotest.fail "upload restore must inspect" in
-        let upload_state, put = U.step upload_state (Completed (observe, Inspected Local_present)) in
-        let put = match put with [U.Put _ as instruction] -> instruction
-          | _ -> Alcotest.fail "upload restore must resume PUT" in
-        active_upload := upload_state;
-        current := true;
-        Runner.submit runner (Core.Publish (Core.Sync_output (Sync.State_changed (Sync.state !sync_state))));
-        published := []; posted := [];
-        let original_path = staged_path prepared.staged_file in
-        Out_channel.with_open_bin original_path (fun output -> output_string output "changed fixture bytes");
-        Fun.protect
-          ~finally:(fun () -> Out_channel.with_open_bin original_path (fun output -> output_string output "file"))
-          (fun () ->
-            Runner.submit runner (Core.Run_upload (context, put));
-            Alcotest.(check bool) "PUT failure keeps original result category" true
-              (List.exists (function Core.Upload_completed (_, U.Failed U.Invalid_content) -> true | _ -> false) !posted);
-            if not closed_stderr then Alcotest.(check bool) "failure detail waits for its owner notice" false
-              (List.exists (fun detail -> Logseq_db_types.Failure_diagnostic.operation detail = "assetUpload")
-                (failure_details !published));
-            Runner.submit runner (Core.Publish (Core.Asset_notice (scope, Core.Upload_status
-              {operation=prepared.operation_id;asset=prepared.asset;target=prepared.target;title=prepared.title;
-               status=U.Failed_upload U.Invalid_content})));
-            if not closed_stderr then Alcotest.(check bool) "PUT failure has a safe scoped reason" true
-              (List.exists (fun detail -> Logseq_db_types.Failure_diagnostic.operation detail = "assetUpload")
-                (failure_details !published)));
-        let put_ticket = match put with U.Put (ticket, _) -> ticket | _ -> assert false in
-        let retry_state, _ = U.step upload_state (Completed (put_ticket, Failed Invalid_content)) in
-        let retry_state, retried = U.step retry_state Retry in
-        let retried = match retried with [U.Put _ as instruction] -> instruction
-          | _ -> Alcotest.fail "PUT retry must remain PUT" in
-        active_upload := retry_state;
-        published := []; posted := [];
-        Runner.submit runner (Core.Run_upload (context, retried));
-        Alcotest.(check bool) "token failure keeps authentication result" true
-          (List.exists (function Core.Upload_completed (_, U.Failed U.Authentication) -> true | _ -> false) !posted);
-        Runner.submit runner (Core.Publish (Core.Asset_notice (scope, Core.Upload_status
-          {operation=prepared.operation_id;asset=prepared.asset;target=prepared.target;title=prepared.title;
-           status=U.Failed_upload U.Authentication})));
-        Alcotest.(check bool) "exact active request keeps safe token source class" true
-          (List.exists (fun detail -> Logseq_db_types.Failure_diagnostic.operation detail="assetUpload"
-            && Logseq_db_types.Failure_diagnostic.source_class detail="io-permission") (failure_details !published));
-        (* Real transfer policy fans a terminal failure out to every consumer.
-           Every notice must be followed by the same current safe cause. *)
-        let remote_asset = uuid 71 in
-        let remote_version = Logseq_db_types.Asset_descriptor.version
-          ~checksum:(String.make 64 'b') ~file_type:"png" |> Result.get_ok in
-        let descriptor = Logseq_db_types.Asset_descriptor.create ~uuid:remote_asset
-          ~source:(Managed (Some remote_version)) ~current_checksum:None ~size:None ~dimensions:None
-          |> Result.get_ok in
-        let transfer = Transfer.create
-          (Transfer.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:0 |> Result.get_ok)
-          ~scope ~online:true ~unlocked:true in
-        let transfer, work = Transfer.step transfer (Replace {consumer="first-view";priority=Foreground;assets=[descriptor]}) in
-        let transfer, _ = Transfer.step transfer (Replace {consumer="second-view";priority=Foreground;assets=[descriptor]}) in
-        let remote_lookup = List.find_map (function Transfer.Check_cache ticket -> Some ticket | _ -> None) work |> Option.get in
-        transfer_ticket := Some (Transfer.Lookup remote_lookup); posted := [];
-        Runner.submit runner (Core.Run_asset (context, Transfer.Check_cache remote_lookup));
-        let completion = List.find_map (function Core.Asset_completed (_, event) -> Some event | _ -> None) !posted |> Option.get in
-        let transfer, work = Transfer.step transfer completion in
-        let fetch = List.find_map (function Transfer.Fetch ticket -> Some ticket | _ -> None) work |> Option.get in
-        transfer_ticket := Some (Transfer.Download fetch); posted := [];
-        Runner.submit runner (Core.Run_asset (context, Transfer.Fetch fetch));
-        let completion = List.find_map (function Core.Asset_completed (_, event) -> Some event | _ -> None) !posted |> Option.get in
-        let _, work = Transfer.step transfer completion in
-        let failures = List.filter_map (function
-          | Transfer.Notify {consumer;asset;descriptor;availability=Failed _ as availability} ->
-            Some (Core.Asset_availability {consumer;asset;descriptor;availability})
-          | _ -> None) work in
-        Alcotest.(check int) "real terminal failure notifies both consumers" 2 (List.length failures);
-        List.iter (fun notice ->
-          published := [];
-          Runner.submit runner (Core.Publish (Core.Asset_notice (scope, notice)));
-          let latest = match !published with output::_ -> failure_details [output] | [] -> [] in
-          Alcotest.(check bool) "each failed consumer notice keeps its exact safe cause last" true
-            (List.exists (fun detail -> Logseq_db_types.Failure_diagnostic.operation detail="assetDownload"
-              && Logseq_db_types.Failure_diagnostic.source_class detail="io-permission") latest)) failures;
-        transfer_ticket := None;
-        active_upload := state;
-        current := false;
-        Alcotest.(check bool)
-          "changed identity payload is rejected"
-          true
-          (Result.is_error
-             (Runner.prepare_import
-                runner
-                ~context
-                { source with asset = uuid 99 }
-                ~current:(fun () -> true)));
-        let source_path = staged_path prepared.staged_file in
-        Sys.remove source_file;
-        let checkpoint_path =
-          Filename.concat
-            fixture.config.application_support_directory
-            "asset-upload-intents.sqlite"
-        in
-        let db = Sqlite3.db_open checkpoint_path in
-        let complete =
-          List.fold_left
-            (fun previous phase ->
-               let next = I.advance previous phase |> Result.get_ok in
-               Store.save db ~expected:(Some previous.I.revision) next |> Result.get_ok;
-               next)
-            prepared
-            [ I.Local_committed; Uploading; Remote_stored; Metadata_pending; Complete ]
-        in
-        ignore (Sqlite3.db_close db);
-        let restore_terminal () =
-          let db = Sqlite3.db_open checkpoint_path in
-          let restored =
-            Store.list
-              db
-              ~origin:complete.origin
-              ~account:complete.account
-              ~graph:complete.graph
-              ~after:None
-              ~limit:16
-            |> Result.get_ok
-          in
-          ignore (Sqlite3.db_close db);
-          let terminal =
-            List.find (fun i -> i.I.operation_id = complete.operation_id) restored
-          in
-          Alcotest.(check bool)
-            "terminal checkpoint survives database reopen"
-            true
-            (terminal = complete);
-          let _, instructions =
-            U.step (U.create ~scope ~available:false) (Restore terminal)
-          in
-          match instructions with
-          | [ (U.Release_staging _ as instruction) ] -> instruction
-          | _ -> Alcotest.fail "terminal recovery attempted non-cleanup work"
-        in
-        let staging_directory = Filename.dirname source_path in
-        Unix.chmod staging_directory 0o500;
-        Fun.protect
-          ~finally:(fun () -> Unix.chmod staging_directory 0o700)
-          (fun () ->
-             Runner.submit runner (Core.Publish (Core.Sync_output (Sync.State_changed (Sync.state !sync_state))));
-             let terminal_cleanup = restore_terminal () in
-             let cleanup () = Runner.submit runner (Core.Run_upload (context, terminal_cleanup)) in
-             if not closed_stderr then cleanup () else (
-               flush stderr;
-               let saved = Unix.dup Unix.stderr in
-               let read_only = Unix.openfile "/dev/null" [Unix.O_RDONLY] 0 in
-               Fun.protect ~finally:(fun () ->
-                 Unix.dup2 saved Unix.stderr; Unix.close saved; Unix.close read_only)
-                 (fun () -> Unix.dup2 read_only Unix.stderr; cleanup ()));
-             Alcotest.(check bool)
-               "unavailable cache retains pending source"
-               true
-               (Sys.file_exists source_path);
-             Alcotest.(check bool)
-               "failed cleanup is observable"
-               true
-               (List.exists
-                  (function
-                    | Core.Diagnostic _ -> true
-                    | _ -> false)
-                  !published);
-             let signed_out = Sync.step !sync_state (Sync.Account_authenticated {user_id=None}) in
-             Runner.submit runner (Core.Publish (Core.Sync_output (Sync.State_changed (Sync.state signed_out.next))));
-             published := [];
-             Runner.submit runner (Core.Run_upload (context, restore_terminal ()));
-             Alcotest.(check bool) "old scope cleanup cannot create a current diagnostic" false
-               (List.exists (function Core.Diagnostic _ -> true | _ -> false) !published);
-             Runner.shutdown runner);
-        sync_state := admitted;
-        io_runner
-        := Some
-             (asset_io_runner
-                ~on_asset_diagnostic:(fun ~scope ~operation ~request_operation detail ->
-                  Runner.report_asset_diagnostic (Option.get !active_runner)
-                    ~scope ~operation ~request_operation detail)
-                ~env
-                ~sw
-                ~support:fixture.config.application_support_directory
-                ~post:(fun event -> post (Core.Sync_event event)) ());
-        let restarted =
-          Runner.create
-            ~sw
-            dependencies
-            ~post
-            ~recovery_current:(fun _ -> false)
-            ~upload_current:(fun _ -> false)
-            ~asset_current:(fun ticket -> !transfer_ticket = Some ticket)
-          |> Result.get_ok
-        in
-        active_runner := Some restarted;
-        transfer_ticket := Some (Transfer.Lookup lookup);
-        posted := [];
-        Runner.submit restarted (Core.Run_asset (context, Transfer.Check_cache lookup));
-        let cold_handle = List.find_map (function
-          | Core.Asset_completed (actual, Transfer.Cache_checked (_, Ok (Some handle))) when actual = scope -> Some handle
-          | _ -> None) !posted |> Option.get in
-        ignore (fixture_asset (Sync.Release_asset_file cold_handle));
-        transfer_ticket := None;
-        let restored_import =
-          Runner.prepare_import restarted ~context source ~current:(fun () -> true)
-          |> Result.get_ok
-        in
-        Alcotest.(check bool)
-          "reconciliation retains durable terminal staging"
-          true
-          (restored_import = complete && Sys.file_exists source_path);
-        let cleanup = restore_terminal () in
-        Runner.submit restarted (Core.Run_upload (context, cleanup));
-        Alcotest.(check bool)
-          "restart completes durable terminal cleanup"
-          false
-          (Sys.file_exists source_path);
-        published := [];
-        Runner.submit restarted (Core.Run_upload (context, restore_terminal ()));
-        Alcotest.(check int) "repeated cleanup is idempotent" 0 (List.length !published);
-        Alcotest.(check int)
-          "every asset request returns through reducer output"
-          !bridge_requests
-          !bridge_outputs;
-        Alcotest.(check bool) "asset bridge exercised" true (!bridge_requests > 0);
-        (* Real malformed private checkpoint schema: optional preview stays None
-           while the current graph receives only a safe storage class. *)
-        let db = Sqlite3.db_open checkpoint_path in
-        Sqlite3.Rc.check (Sqlite3.exec db
-          "DROP TABLE asset_upload_intents; CREATE TABLE asset_upload_intents (PRIVATE_COLUMN TEXT)");
-        ignore (Sqlite3.db_close db);
-        Runner.submit restarted (Core.Publish (Core.Sync_output (Sync.State_changed (Sync.state !sync_state))));
-        published := [];
-        Alcotest.(check bool) "bad metadata keeps optional preview unavailable" true
-          (Runner.retain_imported_file restarted ~scope ~operation:source.operation = None);
-        Alcotest.(check bool) "bad metadata keeps its storage reason" true
-          (List.exists (fun detail ->
-            Logseq_db_types.Failure_diagnostic.operation detail = "assetMetadata"
-            && Logseq_db_types.Failure_diagnostic.source_class detail = "sqlite-schema")
-            (failure_details !published));
-        List.iter (fun detail ->
-          Alcotest.(check bool) "metadata diagnostic excludes raw column/path" false
-            (let encoded = Logseq_db_types.Failure_diagnostic.encode detail in
-             String.contains encoded '/' || String.contains encoded 'P')) (failure_details !published);
-        Runner.shutdown restarted)))
+  List.iter (fun (error, expected) ->
+    let admission = ref (Some error) and sent = ref [] in
+    let network : Execute.Core.worker_network =
+      {with_admission=(fun callback -> match !admission with
+        | Some error -> Error error
+        | None -> callback ())} in
+    with_direct_owner ~network
+      ~put:(fun ~identity:_ ~asset ~version ~wire ->
+        sent := (asset, version, wire) :: !sent; Ok ()) (fun fixture ->
+      let source = { (picker_import fixture.support 990) with target = Test_support.page_uuid } in
+      let intent = Runner.prepare_import fixture.runner ~context:fixture.context source
+        ~current:(fun () -> true) |> Result.get_ok in
+      let state = ref (U.create ~scope:fixture.context.scope ~available:true) in
+      fixture.set_upload_current (fun ticket -> U.ticket_current !state ticket);
+      let run instruction =
+        Runner.submit fixture.runner (Core.Run_upload (fixture.context, instruction));
+        let rec await turns =
+          if not (Queue.is_empty fixture.upload_events) then Queue.take fixture.upload_events
+          else if turns = 0 then Alcotest.fail "Owner upload completion did not arrive"
+          else (Eio.Fiber.yield (); await (turns - 1)) in
+        await 1000 in
+      let step event = let next, effects = U.step !state event in state := next; effects in
+      let rec reach_put = function
+        | [U.Put _ as put] -> put
+        | [instruction] ->
+          let ticket = match instruction with
+            | U.Persist (ticket, _, _) | Apply_local (ticket, _) -> ticket
+            | _ -> Alcotest.fail "Unexpected instruction before PUT" in
+          let completion = run instruction in
+          (match completion with U.Failed _ -> Alcotest.fail "Local owner setup failed" | _ -> ());
+          reach_put (step (Completed (ticket, completion)))
+        | _ -> Alcotest.fail "Expected one upload instruction" in
+      let put = reach_put (step (Start intent)) in
+      let ticket, uploading = match put with U.Put (ticket, intent) -> ticket, intent | _ -> assert false in
+      Alcotest.(check bool) "Uploading checkpoint precedes network admission" true
+        (uploading.phase = I.Uploading && uploading.revision = 2);
+      let completion = run put in
+      Alcotest.(check bool) "typed owner failure is classified" true (completion = U.Failed expected);
+      ignore (step (Completed (ticket, completion)));
+      Runner.submit fixture.runner (Core.Publish (Core.Asset_notice (fixture.context.scope,
+        Core.Upload_status {operation=intent.operation_id; asset=intent.asset; target=intent.target;
+          title=intent.title; status=U.Failed_upload expected})));
+      let module Diagnostic = Logseq_db_types.Failure_diagnostic in
+      let detail = List.find_map (function
+        | Core.Diagnostic text when String.starts_with ~prefix:Diagnostic.signal_prefix text ->
+          Diagnostic.decode (String.sub text (String.length Diagnostic.signal_prefix)
+            (String.length text - String.length Diagnostic.signal_prefix))
+        | _ -> None) !(fixture.published) |> Option.get in
+      let encoded = Diagnostic.encode detail in
+      Alcotest.(check bool) "safe diagnostic carrier stays bounded" true (String.length encoded <= 1024);
+      Alcotest.(check bool) "safe diagnostic message stays bounded" true
+        (String.length (Diagnostic.message detail) <= 512);
+      Alcotest.(check bool) "raw paths never reach public diagnostic" false (String.contains encoded '/');
+      let reason = match error with
+        | D.Network_closed | Network_failure _ | Cleanup_failure _ -> "networkFailed"
+        | Authentication_failure _ -> "authenticationFailed"
+        | Storage_failure _ -> "persistenceFailed"
+        | Crypto_failure _ -> "cryptoInvalid"
+        | _ -> Alcotest.fail "Unexpected fixture error" in
+      Alcotest.(check string) "specific owner reason survives safe public output"
+        reason (Diagnostic.reason detail);
+      (match error with
+       | D.Cleanup_failure _ ->
+         Alcotest.(check bool) "cleanup cause is retained independently" true
+           (Option.map Diagnostic.reason (Diagnostic.related detail) = Some "persistenceFailed")
+       | _ -> ());
+      Alcotest.(check int) "closed admission sends no bytes" 0 (List.length !sent);
+      let path = fixture.staged_path intent.staged_file |> Option.get in
+      Alcotest.(check string) "original source survives failure" "file"
+        (In_channel.with_open_bin path In_channel.input_all);
+      if expected = U.Network then (
+        admission := None;
+        let retried = match step Retry with [U.Put (_, intent) as put] ->
+          Alcotest.(check bool) "same operation and publication IDs on retry" true (intent = uploading); put
+          | _ -> Alcotest.fail "Network retry did not issue original PUT" in
+        Alcotest.(check bool) "original owner PUT succeeds" true (run retried = U.Put_succeeded);
+        Alcotest.(check bool) "plain source bytes unchanged on wire" true
+          (!sent = [intent.asset, intent.version, "file"]))))
+    [D.Network_closed, U.Network; D.Network_failure "Disconnected", U.Network;
+     D.Authentication_failure "Denied", U.Authentication;
+     D.Storage_failure ("/PRIVATE_SYNTHETIC_PAYLOAD/" ^ String.make 8192 'x'), U.Invalid_content;
+     D.Crypto_failure "Encode failed", U.Invalid_content;
+     D.Cleanup_failure {primary=Some D.Network_closed;
+       failures=Rrbvec.singleton (D.Storage_failure "Release failed")}, U.Invalid_content]
 ;;
 
-let deletion_runtime_fixture ?deletion_case ?(journal_failure = false)
-      ?(confirmation_failure = false) ~busy () =
-  let module Db = Logseq_db_worker in
-  let module G = Logseq_db_types.Graph_types in
-  T.with_managed (fun fixture ->
-    Eio_main.run (fun env -> Eio.Switch.run (fun sw ->
-      let graph_id suffix = G.Uuid.of_string ("94000000-0000-4000-8000-" ^ suffix) |> Result.get_ok in
-      let first = graph_id "000000000201" and second = graph_id "000000000202" in
-      let graph graph_id : Sync.graph =
-        { graph_id; name = "Deletion waiter fixture"; encrypted = false
-        ; schema = { major = 65; minor = 33; exact = true } } in
-      let root = fixture.config.application_support_directory in
-      let worker_root = Filename.concat root "logseq-db-worker" in
-      Unix.mkdir worker_root 0o700;
-      let mirrors = Filename.concat worker_root "synced-graphs" in
-      Unix.mkdir mirrors 0o700;
-      let directory = Filename.concat mirrors (G.Uuid.to_string first) in
-      Unix.mkdir directory 0o700;
-      let first_database_path = Filename.concat directory "db.sqlite" in
-      let sqlite = Sqlite3.db_open first_database_path in
-      let checkpoint = Logseq_db_types.Sync_checkpoint.create ~graph_id:first
-          ~schema:{ major = 65; minor = 33 }
-          ~applied_server_t:(Logseq_db_types.Server_cursor.of_int64 0L |> Result.get_ok)
-          ~checksum:"0123456789abcdef" |> Result.get_ok in
-      Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint |> Result.get_ok;
-      ignore (Sqlite3.db_close sqlite);
-      (match deletion_case with
-       | None | Some `Legacy -> ()
-       | Some `Corrupt_sqlite ->
-         Out_channel.with_open_bin first_database_path (fun output -> output_string output "not a SQLite database")
-       | Some `Corrupt_checkpoint ->
-         let db = Sqlite3.db_open first_database_path in
-         Sqlite3.Rc.check (Sqlite3.exec db "DROP TABLE sync_meta; CREATE TABLE sync_meta (broken TEXT)");
-         ignore (Sqlite3.db_close db)
-       | Some `Missing_database -> Unix.unlink first_database_path
-       | Some `Linked_database ->
-         let external_database = Filename.concat root "unrelated-database.sqlite" in
-         Unix.rename first_database_path external_database;
-         Unix.symlink external_database first_database_path);
-      let second_directory = Filename.concat mirrors (G.Uuid.to_string second) in
-      Unix.mkdir second_directory 0o700;
-      let sqlite = Sqlite3.db_open (Filename.concat second_directory "db.sqlite") in
-      let open Yojson.Safe.Util in
-      let storage = T.read_json (T.fixture "storage/logseq-65.33-create-page.json") in
-      Sqlite3.Rc.check (Sqlite3.exec sqlite (storage |> member "tableSql" |> to_string));
-      let statement = Sqlite3.prepare sqlite "INSERT INTO kvs(addr, content, addresses) VALUES(?, ?, ?)" in
-      storage |> member "rows" |> to_list |> List.iter (fun row ->
-        Sqlite3.Rc.check (Sqlite3.reset statement);
-        Sqlite3.Rc.check (Sqlite3.bind_int statement 1 (row |> member "addr" |> to_int));
-        Sqlite3.Rc.check (Sqlite3.bind_text statement 2 (row |> member "content" |> to_string));
-        Sqlite3.Rc.check (Sqlite3.bind statement 3 (match member "addresses" row with
-          | `Null -> Sqlite3.Data.NULL | `String value -> TEXT value | _ -> assert false));
-        Sqlite3.Rc.check (Sqlite3.step statement));
-      Sqlite3.Rc.check (Sqlite3.finalize statement);
-      let checkpoint = Logseq_db_types.Sync_checkpoint.create ~graph_id:second
-          ~schema:{ major = 65; minor = 33 }
-          ~applied_server_t:(Logseq_db_types.Server_cursor.of_int64 0L |> Result.get_ok)
-          ~checksum:"0123456789abcdef" |> Result.get_ok in
-      Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint |> Result.get_ok;
-      Logseq_db_storage.Sync_outbox_store.initialize_database sqlite |> Result.get_ok;
-      ignore (Sqlite3.db_close sqlite);
-      let worker = ref None and refreshed = ref false and held_cleanup = ref None in
-      let destructive_requests = ref 0 in
-      let published = ref [] and blocked_states = ref None in
-      let post event = Db.post (Option.get !worker) (Core.Sync_event event) in
-      let sync_runner = Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture") ~submit:(function
-        | Sync.Request (ticket, Sync.Load_catalog _) ->
-          post (Sync.Runner_completed (Sync.Completion (ticket, Ok None)))
-        | Sync.Request (ticket, Sync.Save_catalog _) ->
-          post (Sync.Runner_completed (Sync.Completion (ticket, Ok ())))
-        | Sync.Request (ticket, Sync.Fetch_catalog _) ->
-          post (Sync.Runner_completed (Sync.Completion
-            (ticket, Ok (if !refreshed then [graph first] else [graph first; graph second]))))
-        | Sync.Request (ticket, Sync.Fetch_snapshot_baseline _) ->
-          post (Sync.Runner_completed (Sync.Completion
-            (ticket, Error (Sync.Effect_failed "Synthetic bootstrap unavailable."))))
-        | Sync.Request (ticket, Sync.Fetch_snapshot_metadata _) ->
-          post (Sync.Runner_completed (Sync.Completion
-            (ticket, Error (Sync.Effect_failed "Synthetic bootstrap unavailable."))))
-        | Sync.Asset_io (ticket, { context; action = Sync.Prepare_graph_asset_deletion retirement; _ }) ->
-          incr destructive_requests;
-          let deletion = Sync.asset_deletion_reference ~scope:context.scope ~retirement in
-          if confirmation_failure then (
-            (* Preparation has already written the uncommitted receipt. Keep
-               it readable so the canonical rename can commit, but prevent
-               the receipt rewrite that confirms durability afterwards. *)
-            let states = Filename.concat mirrors
-                (Filename.concat ".mirror-deletions"
-                   (Filename.concat (G.Uuid.to_string first) "states")) in
-            Unix.chmod states 0o500;
-            blocked_states := Some states;
-            post (Sync.Runner_completed (Sync.Asset_completion
-              (ticket, Ok (Sync.Asset_deletion_prepared deletion)))))
-          else if busy || Option.is_some deletion_case then post (Sync.Runner_completed (Sync.Asset_completion (ticket, Ok (Sync.Asset_deletion_prepared deletion))))
-          else held_cleanup := Some (ticket, deletion)
-        | Sync.Asset_io (ticket, _) ->
-          post (Sync.Runner_completed (Sync.Asset_completion (ticket, Ok Sync.Asset_unit)))
-        | _ -> ()) ~shutdown:(fun () -> ()) () in
-      let dependencies = Runner.dependencies
-          ~runtime:(Runner.runtime ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
-              ~sleep:(Eio.Time.sleep (Eio.Stdenv.clock env)) |> Result.get_ok)
-          ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
-          ~publish:(fun output -> published := output :: !published)
-          |> Result.get_ok in
-      let limits = Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024
-          ~submission_batch_size:1 |> Result.get_ok in
-      let sync = Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits
-          |> Result.get_ok in
-      let db = Db.create ~sw ~config:(Core.config ~worker:fixture.config ~sync)
-          ~runner_dependencies:dependencies |> Result.get_ok in
-      worker := Some db;
-      let wait predicate =
-        match Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 3. (fun () ->
-          while not (predicate ()) do Eio.Fiber.yield () done) with
-        | () -> ()
-        | exception error ->
-          let snapshot = (Db.view db).sync.snapshot in
-          Alcotest.failf "Wait failed: %s selected=%s bootstrap=%b restore=%b failure=%b error=%s"
-            (Printexc.to_string error)
-            (Option.fold ~none:"none" ~some:G.Uuid.to_string snapshot.selected_graph)
-            snapshot.startup.bootstrapping snapshot.startup.restoring_local
-            (Option.is_some snapshot.startup.failure)
-            (Option.value snapshot.last_error ~default:"none") in
-      Fun.protect ~finally:(fun () ->
-        Option.iter (fun states -> Unix.chmod states 0o700) !blocked_states;
-        Option.iter (fun (ticket, _) -> post (Sync.Runner_completed
-          (Sync.Asset_completion (ticket, Error Sync.Asset_cancelled)))) !held_cleanup;
-        Db.shutdown db)
-        (fun () ->
-          post (Sync.Sign_in_requested {account_generation=0; presentation_generation=0});
-          post (Sync.Account_authenticated { user_id = Some "user-1" });
-          wait (fun () -> (Db.view db).sync.snapshot.catalog <> []);
-          post (Sync.Graph_selected second);
-          wait (fun () -> let snapshot = (Db.view db).sync.snapshot in
-            snapshot.selected_graph = Some second && (Db.graph_state db).phase = Db.Graph_open
-            && not snapshot.startup.bootstrapping && not snapshot.startup.restoring_local);
-          let generation = (Db.view db).sync.snapshot.startup.account_generation in
-          if confirmation_failure then (
-            published := [];
-            ignore (Db.delete_local_copy db ~account_generation:generation ~graph_id:first);
-            Alcotest.(check bool) "canonical deletion reached the caught confirmation fault" false
-              (Sys.file_exists directory);
-            Alcotest.(check bool) "current other graph stays open" true
-              ((Db.graph_state db).phase = Db.Graph_open);
-            let states = Option.get !blocked_states in
-            let receipts = Sys.readdir states |> Array.to_list in
-            Alcotest.(check bool) "unconfirmed receipt remains replayable" true
-              (List.exists (fun name -> Filename.check_suffix name ".json"
-                 && not (T.read_json (Filename.concat states name)
-                    |> Yojson.Safe.Util.member "committed" |> Yojson.Safe.Util.to_bool)) receipts);
-            Alcotest.(check bool) "caught current confirmation failure publishes Diagnostic" true
-              (List.exists (function
-                | Core.Diagnostic "worker.confirmMirrorRetirement" -> true
-                | _ -> false) !published))
-          else if Option.is_some deletion_case then (
-            let result = Db.delete_local_copy db ~account_generation:generation ~graph_id:first in
-            (match result with Ok () -> () | Error message -> Alcotest.failf "unopened local copy must delete: %s" message);
-            Alcotest.(check bool) "selected target directory is absent" false (Sys.file_exists directory);
-            Alcotest.(check bool) "other graph database survives" true
-              (Sys.file_exists (Filename.concat second_directory "db.sqlite"));
-            Alcotest.(check bool) "current Worker remains open" true ((Db.graph_state db).phase = Db.Graph_open);
-            Alcotest.(check bool) "opening current graph creates no account-owner JSON" false
-              (Sys.file_exists (Filename.concat second_directory ".journal-local-owner.json"));
-            if deletion_case = Some `Linked_database then
-              Alcotest.(check bool) "linked external database survives deletion" true
-                (Sys.file_exists (Filename.concat root "unrelated-database.sqlite")))
-          else if journal_failure then (
-            let blocked = Filename.concat worker_root "local-copy-retirements" in
-            Out_channel.with_open_bin blocked (fun output -> output_string output "synthetic mkdir fault");
-            Alcotest.(check bool) "journal IO failure returns a deletion error" true
-              (Result.is_error (Db.delete_local_copy db ~account_generation:generation ~graph_id:first));
-            Alcotest.(check int) "journal failure never retires assets" 0 !destructive_requests;
-            Alcotest.(check bool) "journal failure preserves target mirror" true (Sys.file_exists first_database_path);
-            Alcotest.(check bool) "current graph Worker stays open" true ((Db.graph_state db).phase = Db.Graph_open);
-            Alcotest.(check bool) "journal IO failure has a safe deletion reason" true
-              (has_failure_reason !published "deleteMirror" "deleteFailed");
-            post (Sync.Catalog_refresh_requested
-              (let f=(Db.view db).sync.snapshot.startup in
-               {account_generation=f.account_generation;presentation_generation=f.presentation_generation}));
-            wait (fun () -> (Db.view db).sync.snapshot.catalog <> []))
-          else if busy then (
-            let lock = Sqlite3.db_open (Filename.concat directory ".logseq-overlay-owner.sqlite") in
-            Fun.protect ~finally:(fun () -> ignore (Sqlite3.exec lock "ROLLBACK"); ignore (Sqlite3.db_close lock)) (fun () ->
-              Sqlite3.Rc.check (Sqlite3.exec lock "BEGIN IMMEDIATE");
-              Alcotest.(check bool) "busy mirror reports failure" true
-                (Result.is_error (Db.delete_local_copy db ~account_generation:generation ~graph_id:first));
-              Alcotest.(check int) "busy mirror never starts destructive asset work" 0 !destructive_requests;
-              Alcotest.(check bool) "busy mirror retains safe ownership reason" true
-                (has_failure_reason !published "deleteMirror" "busy");
-              Alcotest.(check bool) "busy mirror remains usable" true (Sys.file_exists first_database_path)))
-          else (
-          let result, resolve = Eio.Promise.create () in
-          Eio.Fiber.fork ~sw (fun () -> Eio.Promise.resolve resolve
-            (Db.delete_local_copy db ~account_generation:generation ~graph_id:first));
-          wait (fun () -> Option.is_some !held_cleanup);
-          refreshed := true;
-          post (Sync.Catalog_refresh_requested
-              (let f=(Db.view db).sync.snapshot.startup in
-               {account_generation=f.account_generation;presentation_generation=f.presentation_generation}));
-          wait (fun () -> (Db.view db).sync.snapshot.selected_graph = None);
-          Alcotest.(check bool) "catalog refresh cannot report deletion success" true
-            (match Eio.Promise.peek result with Some (Ok ()) -> false | _ -> true);
-          Option.iter (fun (ticket, deletion) -> post (Sync.Runner_completed
-            (Sync.Asset_completion (ticket, Ok (Sync.Asset_deletion_prepared deletion))))) !held_cleanup;
-          held_cleanup := None;
-          Alcotest.(check bool) "matching deletion finishes with cancellation failure" true
-            (match Eio.Promise.await result with Error _ -> true | Ok () -> false);
-          Alcotest.(check bool) "unauthorized deletion preserves its mirror" true
-            (Sys.file_exists first_database_path))))))
+let test_upload_checkpoint_io () =
+  let module Upload = Logseq_db_worker_pure_reducer.Asset_upload in
+  with_direct_owner (fun fixture ->
+    let source = picker_import fixture.support 900 in
+    let intent = Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun () -> true) |> Result.get_ok in
+    let state, instructions = Upload.step
+      (Upload.create ~scope:fixture.context.scope ~available:true) (Upload.Start intent) in
+    let current = ref true in
+    fixture.set_upload_current (fun ticket -> !current && Upload.ticket_current state ticket);
+    let instruction = List.hd instructions in
+    Runner.submit fixture.runner (Core.Run_upload (fixture.context, instruction));
+    let rec await turns =
+      if not (Queue.is_empty fixture.upload_events) then Queue.take fixture.upload_events
+      else if turns=0 then Alcotest.fail "Upload checkpoint completion did not arrive"
+      else (Eio.Fiber.yield (); await (turns-1)) in
+    Alcotest.(check bool) "durable acknowledgement" true (await 1000 = Upload.Persisted);
+    let db = Sqlite3.db_open ~mode:`READONLY
+      (Filename.concat fixture.support "asset-upload-intents.sqlite") in
+    let stored = Fun.protect ~finally:(fun () ->
+      Alcotest.(check bool) "independent checkpoint reader closes" true (Sqlite3.db_close db))
+      (fun () -> Logseq_db_storage.Asset_upload_store.read db ~operation:intent.operation_id
+        |> Result.get_ok) in
+    Alcotest.(check bool) "survives independent database reopen" true (stored=Some intent);
+    current := false;
+    Runner.submit fixture.runner (Core.Run_upload (fixture.context, instruction));
+    for _=1 to 8 do Eio.Fiber.yield () done;
+    Alcotest.(check bool) "stale upload ticket performs no completion" true
+      (Queue.is_empty fixture.upload_events))
 ;;
 
-let test_catalog_refresh_cannot_complete_another_deletion () = deletion_runtime_fixture ~busy:false ()
-let test_deletion_checks_ownership_before_assets () = deletion_runtime_fixture ~busy:true ()
-let test_deletion_journal_failure_preserves_worker () = deletion_runtime_fixture ~journal_failure:true ~busy:false ()
-let test_deletion_confirmation_failure_reports () =
-  deletion_runtime_fixture ~confirmation_failure:true ~busy:false ()
-
-(* Producer mapping lives in the runner. Real cursor/format failures reach it
-   through the public reducer and database; no failed external result is injected. *)
-let authoritative_detail_cases =
-  [ "empty", "[]", [ "stage=prepare"; "reason=empty-transaction"; "transaction=1" ]
-  ; "top-level", "{}", [ "stage=prepare"; "reason=transaction-shape"; "type=map" ]
-  ; "syntax", "[", [ "stage=prepare"; "reason=transit-syntax" ]
-  ; "entry", "[42]", [ "reason=operation-shape"; "operationIndex=1"; "type=integer" ]
-  ; ( "keyword"
-    , "[[\"PRIVATE_SYNTHETIC_PAYLOAD\",99999]]"
-    , [ "reason=operation-keyword"; "type=string" ] )
-  ; ( "attribute"
-    , "[[\"~:db/add\",99999,\"PRIVATE_SYNTHETIC_PAYLOAD\",1]]"
-    , [ "reason=operation-fields"; "operation=add"; "arity=4" ] )
-  ; ( "protected"
-    , "[[\"~:db/add\",99999,\"~:block/title\",false]]"
-    , [ "reason=protected-value-type"; "attribute=block/title"; "type=bool" ] )
-  ; ( "extra-fields"
-    , "[[\"~:db/add\",99999,\"~:block/PRIVATE_SYNTHETIC_PAYLOAD\",1,2,3]]"
-    , [ "stage=decode"; "reason=operation-fields"; "arity=6"; "attribute=custom" ] )
-  ; ( "source-tx"
-    , "[[\"~:db/add\",99999,\"~:block/foo\",1,\"PRIVATE_SYNTHETIC_PAYLOAD\"]]"
-    , [ "reason=source-tx-type"; "field=source-tx"; "type=string" ] )
-  ; ( "entity-range"
-    , "[[\"~:db/add\",\"~i4611686018427387904\",\"~:block/foo\",1]]"
-    , [ "reason=integer-range"; "field=entity"; "type=int64" ] )
-  ; ( "big-integer"
-    , "[[\"~:db/add\",99999,\"~:block/foo\",\"~n9223372036854775808\"]]"
-    , [ "reason=integer-value"; "type=big-integer" ] )
-  ; ( "reference"
-    , "[[\"~:db/add\",[\"~:block/uuid\",\"~u22222222-2222-4222-8222-222222222222\"],\"~:block/parent\",null]]"
-    , [ "reason=reference-shape"; "field=value"; "type=null" ] )
-  ; ( "missing-lookup"
-    , "[[\"~:db/add\",[\"~:block/uuid\",\"~u99999999-9999-4999-8999-999999999999\"],\"~:block/foo\",42]]"
-    , [ "stage=application"
-      ; "reason=application-exception"
-      ; "exception=invalid-argument"
-      ; "lookupRefs=1"
-      ; "operationCount=1"
-      ] )
-  ; ( "application-nil"
-    , "[[\"~:db/add\",99999,\"~:block/PRIVATE_SYNTHETIC_PAYLOAD\",null]]"
-    , [ "stage=application"
-      ; "reason=application-exception"
-      ; "exception=invalid-argument"
-      ; "operationCount=1"
-      ] )
-  ; ( "cas-expected"
-    , "[[\"~:db.fn/cas\",99999,\"~:block/title\",false,true]]"
-    , [ "stage=prepare"
-      ; "reason=protected-value-type"
-      ; "field=expected"
-      ; "operation=cas"
-      ] )
-  ; ( "cas-value"
-    , "[[\"~:db.fn/cas\",99999,\"~:block/title\",null,false]]"
-    , [ "stage=prepare"; "reason=protected-value-type"; "field=value" ] )
-  ; ( "second-transaction"
-    , "[]"
-    , [ "stage=prepare"; "reason=empty-transaction"; "transaction=2" ] )
-  ; ( "second-operation"
-    , "[[\"~:db/retractEntity\",99998],[\"~:PRIVATE_SYNTHETIC_PAYLOAD\",99999]]"
-    , [ "transaction=1"
-      ; "operationIndex=2"
-      ; "operation=other"
-      ; "reason=unsupported-operation"
-      ] )
-  ; ( "application-bounded-stats"
-    , "[[\"~:db/add\",99999,\"~:block/foo\",null],[\"~:db/add\",99999,\"~:block/bar\",["
-      ^ String.concat "," (List.init 3000 (fun _ -> "0"))
-      ^ "]]]"
-    , [ "stage=application"
-      ; "reason=application-exception"
-      ; "operationCount=2"
-      ; "!lookupRefs="
-      ] )
-  ]
-;;
-
-let test_authoritative_rejection_diagnostics kind () =
-  let module G = Logseq_db_types.Graph_types in
-  let module Error = Logseq_db_worker.Error in
-  T.with_managed (fun fixture ->
-    Eio_main.run (fun _ ->
-      Eio.Switch.run (fun sw ->
-        let graph_id =
-          G.Uuid.of_string "94000000-0000-4000-8000-000000000707" |> Result.get_ok
-        in
-        let graph : Sync.graph =
-          { graph_id
-          ; name = "Synthetic authoritative diagnostics"
-          ; encrypted = false
-          ; schema = { major = 65; minor = 33; exact = true }
-          }
-        in
-        let root = fixture.config.application_support_directory in
-        let worker_root = Filename.concat root "logseq-db-worker" in
-        Unix.mkdir worker_root 0o700;
-        let mirrors = Filename.concat worker_root "synced-graphs" in
-        Unix.mkdir mirrors 0o700;
-        let directory = Filename.concat mirrors (G.Uuid.to_string graph_id) in
-        Unix.mkdir directory 0o700;
-        let sqlite = Sqlite3.db_open (Filename.concat directory "db.sqlite") in
-        let open Yojson.Safe.Util in
-        let storage = T.read_json (T.fixture "storage/logseq-65.33-create-page.json") in
-        Sqlite3.Rc.check (Sqlite3.exec sqlite (storage |> member "tableSql" |> to_string));
-        let stmt =
-          Sqlite3.prepare sqlite "INSERT INTO kvs(addr,content,addresses) VALUES(?,?,?)"
-        in
-        storage
-        |> member "rows"
-        |> to_list
-        |> List.iter (fun row ->
-          Sqlite3.Rc.check (Sqlite3.reset stmt);
-          Sqlite3.Rc.check (Sqlite3.bind_int stmt 1 (row |> member "addr" |> to_int));
-          Sqlite3.Rc.check
-            (Sqlite3.bind_text stmt 2 (row |> member "content" |> to_string));
-          Sqlite3.Rc.check
-            (Sqlite3.bind
-               stmt
-               3
-               (match member "addresses" row with
-                | `Null -> Sqlite3.Data.NULL
-                | `String value -> TEXT value
-                | _ -> assert false));
-          Sqlite3.Rc.check (Sqlite3.step stmt));
-        Sqlite3.Rc.check (Sqlite3.finalize stmt);
-        let cursor n = Logseq_db_types.Server_cursor.of_int64 n |> Result.get_ok in
-        let checkpoint =
-          Logseq_db_types.Sync_checkpoint.create
-            ~graph_id
-            ~schema:{ major = 65; minor = 33 }
-            ~applied_server_t:(cursor 0L)
-            ~checksum:"0123456789abcdef"
-          |> Result.get_ok
-        in
-        Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint
-        |> Result.get_ok;
-        Logseq_db_storage.Sync_outbox_store.initialize_database sqlite |> Result.get_ok;
-        ignore (Sqlite3.db_close sqlite);
-        (match kind with
-         | `Integrity ->
-           let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
-           let module Session = Logseq_db_storage.Storage_session in
-           let storage =
-             Storage.open_database (Filename.concat directory "db.sqlite")
-             |> Result.get_ok
-           in
-           let db = Storage.restore_database storage |> Result.get_ok in
-           let session =
-             Session.create
-               ~tail:
-                 (Datascript.Storage.restore_tail_groups
-                    (Storage.datascript_storage storage))
-               ~callbacks:(Storage.connection_callbacks storage)
-           in
-           let block = Datascript.Temp_id "diagnostic-synthetic-block" in
-           let page =
-             Datascript.Lookup_ref
-               ("block/uuid", Datascript.Uuid "11111111-1111-4111-8111-111111111111")
-           in
-           let staged =
-             Session.stage_transact
-               session
-               ~authoritative_before:db
-               [ Datascript.Add
-                   (block, "block/uuid", Uuid "22222222-2222-4222-8222-222222222224")
-               ; Add (block, "block/title", String "Synthetic initial block")
-               ; Add (block, "block/parent", Ref_to page)
-               ; Add (block, "block/page", Ref_to page)
-               ; Add (block, "block/order", String "a00000001")
-               ; Add (block, "block/created-at", Int64 1700000000000L)
-               ; Add (block, "block/updated-at", Int64 1700000000000L)
-               ]
-             |> Result.get_ok
-           in
-           Session.commit_staged session staged |> Result.get_ok;
-           Session.close session |> Result.get_ok;
-           let module O = Logseq_overlay_db.Types in
-           let module DB = Logseq_overlay_db.Database in
-           let inspection =
-             DB.inspect_mirror ~application_support_directory:root ~graph_id
-             |> Result.get_ok
-           in
-           let database =
-             DB.open_ ~sw fixture.overlay inspection ~graph_name:graph.name
-             |> Result.get_ok
-           in
-           Fun.protect
-             ~finally:(fun () -> ignore (DB.close database))
-             (fun () ->
-                let block =
-                  G.Uuid.of_string "22222222-2222-4222-8222-222222222224" |> Result.get_ok
-                in
-                let mutation_id =
-                  G.Uuid.of_string "94000000-0000-4000-8000-000000000709" |> Result.get_ok
-                in
-                let snapshot = DB.current_snapshot database |> Result.get_ok in
-                let revision =
-                  match DB.get_outline_blocks snapshot [ block ] |> Result.get_ok with
-                  | [ O.Present_block { revision; _ } ] -> revision
-                  | _ -> Alcotest.fail "synthetic block missing"
-                in
-                DB.release_snapshot snapshot;
-                let expected =
-                  DB.write_precondition ~blocks:[ block, revision ] ~pages:[] ~scopes:[]
-                  |> Result.get_ok
-                in
-                ignore
-                  (DB.commit_local
-                     database
-                     ~expected
-                     (O.Save_block
-                        { mutation_id; block; title = "PRIVATE_SYNTHETIC_PAYLOAD" })
-                   |> Result.get_ok);
-                let sync = DB.inspect_sync database |> Result.get_ok in
-                let prepared, crypto =
-                  DB.begin_outbox_transition
-                    database
-                    ~expected:(O.sync_view_token sync)
-                    (O.Submit_group [ mutation_id ])
-                  |> Result.get_ok
-                in
-                let crypto = Option.get crypto in
-                let encrypted =
-                  DB.protection_plaintexts crypto
-                  |> List.map (fun (id, plain) -> id, "synthetic:" ^ plain)
-                in
-                let commit =
-                  DB.apply_outbox_transition
-                    database
-                    prepared
-                    ~encrypted:(Some (crypto, encrypted))
-                  |> Result.get_ok
-                in
-                let batch = Option.get commit.submission_batch in
-                let sync = DB.inspect_sync database |> Result.get_ok in
-                let barrier =
-                  O.
-                    { through = cursor 1L
-                    ; checksum =
-                        Checksum.of_string "checksum:v1:0123456789abcdef" |> Result.get_ok
-                    }
-                in
-                let prepared, _ =
-                  DB.begin_outbox_transition
-                    database
-                    ~expected:(O.sync_view_token sync)
-                    (O.Accept_group { batch_id = O.submission_batch_id batch; barrier })
-                  |> Result.get_ok
-                in
-                ignore
-                  (DB.apply_outbox_transition database prepared ~encrypted:None
-                   |> Result.get_ok))
-         | _ -> ());
-        let limits =
-          Sync.limits
-            ~maximum_response_bytes:
-              (match kind with
-               | `Detail ("application-bounded-stats", _, _) -> 16384
-               | _ -> 1024)
-            ~maximum_artifact_bytes:1048576
-            ~submission_batch_size:32
-          |> Result.get_ok
-        in
-        let sync =
-          Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits
-          |> Result.get_ok
-        in
-        let state =
-          ref (Core.initial (Core.config ~worker:fixture.config ~sync) |> Result.get_ok)
-        in
-        let events = Queue.create ()
-        and emitted = ref []
-        and failures = ref []
-        and connection = ref None in
-        let post event = Queue.add event events in
-        let sync_runner =
-          Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture")
-            ~shutdown:(fun () -> ())
-            ~submit:(function
-              | Sync.Request (ticket, Sync.Fetch_catalog _) ->
-                post
-                  (Core.Sync_event
-                     (Sync.Runner_completed (Sync.Completion (ticket, Ok [ graph ]))))
-              | Sync.Request (ticket, Sync.Save_catalog _) ->
-                post
-                  (Core.Sync_event
-                     (Sync.Runner_completed (Sync.Completion (ticket, Ok ()))))
-              | Sync.Start_websocket request -> connection := Some request.scope
-              | _ -> ())
-            ()
-        in
-        let dependencies =
-          Runner.dependencies
-            ~runtime:
-              (Runner.runtime ~fork:(fun ~sw:_ task -> task ()) ~sleep:(fun _ -> ())
-               |> Result.get_ok)
-            ~config:fixture.config
-            ~overlay:fixture.overlay
-            ~sync_runner
-            ~publish:(fun output -> emitted := output :: !emitted)
-          |> Result.get_ok
-        in
-        let runner =
-          Runner.create
-            ~sw
-            dependencies
-            ~post
-            ~recovery_current:(fun _ -> false)
-            ~upload_current:(fun _ -> false)
-            ~asset_current:(fun _ -> false)
-          |> Result.get_ok
-        in
-        let drive event =
-          post event;
-          while not (Queue.is_empty events) do
-            let event = Queue.take events in
-            (match event with
-             | Core.Runner_completed (Sync_worker_effect_completed (_, Error error)) ->
-               failures := error :: !failures
-             | _ -> ());
-            let transition = Core.step !state event in
-            state := transition.next;
-            List.iter
-              (fun instruction ->
-                 (match instruction with
-                  | Core.Publish (Core.Reply _ as reply) -> emitted := reply :: !emitted
-                  | _ -> ());
-                 Runner.submit runner instruction)
-              transition.effects
-          done
-        in
-        Fun.protect
-          ~finally:(fun () -> Runner.shutdown runner)
-          (fun () ->
-             drive
-               (Core.Sync_event
-                  (Sync.Sign_in_requested
-                     { account_generation = 0; presentation_generation = 0 }));
-             drive
-               (Core.Sync_event
-                  (Sync.Account_authenticated { user_id = Some "synthetic-user" }));
-             drive (Core.Sync_event (Sync.Graph_selected graph_id));
-             Alcotest.(check bool)
-               "actual mirror opens"
-               true
-               ((Core.view !state).graph.phase = Graph_open);
-             let connection = Option.get !connection in
-             drive (Core.Sync_event (Sync.Websocket_opened connection));
-             let t, payload, code, category, message, checks =
-               match kind with
-               | `Integrity ->
-                 ( 1L
-                 , "[]"
-                 , Error.Ambiguous_sync_state
-                 , "authoritativeIntegrityFailure"
-                 , None
-                 , [ "reason=payload-mismatch"
-                   ; "checkpoint=0"
-                   ; "through=1"
-                   ; "expectedCursor=1"
-                   ; "tBefore=0"
-                   ; "ordinal=0"
-                   ; "count=1"
-                   ; "outboxState=accepted"
-                   ; "mutation=save-block"
-                   ; "expectedDatoms="
-                   ; "actualDatoms="
-                   ] )
-               | `Cursor ->
-                 ( 2L
-                 , "[[\"~:db/retractEntity\",99999]]"
-                 , Error.Ambiguous_sync_state
-                 , "authoritativeCursorDiscontinuous"
-                 , Some "Authoritative transaction cursors are not continuous."
-                 , [] )
-               | `Format ->
-                 ( 1L
-                 , "[[\"~:PRIVATE_SYNTHETIC_PAYLOAD\",99999]]"
-                 , Error.Unsupported_semantics
-                 , "authoritativeDecodeFailed"
-                 , None
-                 , [ "stage=prepare"; "reason=unsupported-operation"; "operation=other" ]
-                 )
-               | `Apply_format ->
-                 ( 1L
-                 , "[[\"~:db/add\",null,\"~:block/foo\",\"PRIVATE_SYNTHETIC_PAYLOAD\"]]"
-                 , Error.Unsupported_semantics
-                 , "authoritativeDecodeFailed"
-                 , None
-                 , [ "stage=decode"; "reason=entity-shape"; "field=entity"; "type=null" ]
-                 )
-               | `Detail (name, payload, checks) ->
-                 ( (if name = "second-transaction" then 2L else 1L)
-                 , payload
-                 , Error.Unsupported_semantics
-                 , "authoritativeDecodeFailed"
-                 , None
-                 , checks )
-             in
-             let tx : Logseq_sync_pure_reducer.Sync_protocol.Server.pull_transaction =
-               { t = cursor t; tx = payload; outliner_op = None }
-             in
-             let txs =
-               match kind with
-               | `Detail ("second-transaction", _, _) ->
-                 [ { tx with t = cursor 1L; tx = "[[\"~:db/retractEntity\",99998]]" }
-                 ; tx
-                 ]
-               | _ -> [ tx ]
-             in
-             drive
-               (Core.Sync_event
-                  (Sync.Websocket_message
-                     (connection, Pull_ok { t = cursor t; checksum = None; txs })));
-             let empty_success =
-               match kind with
-               | `Detail (("empty" | "second-transaction"), _, _) -> true
-               | _ -> false
-             in
-             if empty_success
-             then (
-               Alcotest.(check bool)
-                 "legal empty authoritative batch succeeds"
-                 true
-                 (!failures = []);
-               Alcotest.(check bool)
-                 "empty cursor reaches actual manager"
-                 true
-                 ((Core.view !state).sync.snapshot.applied_server_t = Some (cursor t));
-               Alcotest.(check (option string))
-                 "successful empty pull has no Last error"
-                 None
-                 (Core.view !state).sync.snapshot.last_error;
-               Alcotest.(check bool)
-                 "successful empty pull keeps graph open"
-                 true
-                 ((Core.view !state).graph.phase = Graph_open))
-             else (
-               let error =
-                 match !failures with
-                 | [ error ] -> error
-                 | _ -> Alcotest.fail "expected actual authoritative failure"
-               in
-               Alcotest.(check bool)
-                 "failure code reflects actual category"
-                 true
-                 (Error.code error = code);
-               let message_text = Error.message error in
-               let includes text needle =
-                 let rec loop i =
-                   i + String.length needle <= String.length text
-                   && (String.sub text i (String.length needle) = needle || loop (i + 1))
-                 in
-                 loop 0
-               in
-               Option.iter
-                 (fun expected ->
-                    Alcotest.(check string)
-                      "producer retains a fixed safe reason"
-                      expected
-                      message_text)
-                 message;
-               List.iter
-                 (fun expected ->
-                    let absent = String.starts_with ~prefix:"!" expected in
-                    let part =
-                      if absent
-                      then String.sub expected 1 (String.length expected - 1)
-                      else expected
-                    in
-                    Alcotest.(check bool)
-                      ("safe detail " ^ expected)
-                      (not absent)
-                      (includes message_text part))
-                 checks;
-               Alcotest.(check (option string))
-                 "typed origin retains category"
-                 (Some category)
-                 (Error.trace error).origin.code;
-               Alcotest.(check (option string))
-                 "actual Last error retains category"
-                 (Some message_text)
-                 (Core.view !state).sync.snapshot.last_error;
-               Alcotest.(check bool)
-                 "actual Worker diagnostic retains category"
-                 true
-                 (List.exists
-                    (function
-                      | Core.Diagnostic signal ->
-                        String.starts_with
-                          ~prefix:("worker.applyAuthoritative." ^ category)
-                          signal
-                      | _ -> false)
-                    !emitted);
-               if checks <> []
-               then
-                 Alcotest.(check bool)
-                   "validated detail travels in actual diagnostic signal"
-                   true
-                   (List.exists
-                      (function
-                        | Core.Diagnostic signal ->
-                          includes
-                            signal
-                            (match kind with
-                             | `Integrity -> "authoritative-integrity:v1:"
-                             | _ -> "authoritative-decode:v1:")
-                        | _ -> false)
-                      !emitted);
-               Alcotest.(check bool)
-                 "failure precedes checkpoint advancement"
-                 true
-                 ((Core.view !state).sync.snapshot.applied_server_t = Some (cursor 0L));
-               (match kind with
-                | `Integrity ->
-                  let module Read=Worker_pure_read in
-                  let module F=Read.For_worker in
-                  let scope=List.hd(Core.graph_scopes !state) in
-                  let binding=F.binding ~serial:1L ~incarnation:(Read.worker_incarnation
-                    ~runtime_epoch:(Journal_worker_ids.Runtime.Epoch.of_int64 1L)
-                    ~worker_generation:(Journal_worker_ids.Worker.Generation.of_int64 1L))
-                    ~origin:(Uri.to_string scope.account.managed_sync_origin) ~user:scope.account.user_id in
-                  let owner:Sync.timeline_scope={startup={account_generation=scope.account.account_generation;
-                    presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;graph_generation=scope.graph_generation}in
-                  let limits:Worker_pure_data.capability_limits={response_budget_bytes=fixture.config.response_budget_bytes;
-                    outbox_max_records=4096;outbox_max_bytes=8388608;change_max_items=4096;change_max_bytes=1048576;
-                    dispatcher_capacity=256;wire_batch_max_bytes=262144}in
-                  let session=F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation
-                    ~lifecycle:scope.account.lifecycle_generation ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits in
-                  let budget=Read.read_budget session ~maximum_items:1 ~maximum_bytes:limits.response_budget_bytes|>Result.get_ok in
-                  drive(Core.Graph_request_for_scope{scope;id=Core.request_id_of_int64 3L;
-                    read=F.pack_query budget Read.Admission});
-                  let active =
-                    List.find_map
-                      (function
-                        |Core.Reply(_,Read.Query_answer(_,Read.Admission,Ok inspection))->Some inspection.active_records
-                        | _ -> None)
-                      !emitted
-                    |> Option.get
-                  in
-                  Alcotest.(check int) "failed validation retains durable outbox" 1 active;
-                  Option.iter
-                    (fun path ->
-                       let signal =
-                         List.find_map
-                           (function
-                             | Core.Diagnostic s
-                               when String.starts_with
-                                      ~prefix:
-                                        "worker.applyAuthoritative.authoritativeIntegrityFailure:"
-                                      s -> Some s
-                             | _ -> None)
-                           !emitted
-                         |> Option.get
-                       in
-                       let groups =
-                         (Core.view !state).sync.diagnostics.groups
-                         |> List.filter_map (fun (g : Sync.diagnostic_group) ->
-                           if g.title = "Sync transactions"
-                           then
-                             Some
-                               (`Assoc
-                                   [ "title", `String g.title
-                                   ; ( "entries"
-                                     , `List
-                                         (List.map
-                                            (fun (k, v) -> `List [ `String k; `String v ])
-                                            g.entries) )
-                                   ])
-                           else None)
-                       in
-                       Yojson.Safe.to_file
-                         path
-                         (`Assoc
-                             [ "lastError", `String message_text
-                             ; "signal", `String signal
-                             ; "outboxRecords", `Int active
-                             ; "groups", `List groups
-                             ]))
-                    (Sys.getenv_opt "JOURNAL_DIAGNOSTIC_FIXTURE_OUTPUT")
-                | _ -> ());
-               let encoded =
-                 Yojson.Safe.to_string (Error.to_yojson error)
-                 ^ "\n"
-                 ^ String.concat
-                     "\n"
-                     (List.filter_map
-                        (function
-                          | Core.Diagnostic signal -> Some signal
-                          | _ -> None)
-                        !emitted)
-               in
-               let contains needle =
-                 let rec loop i =
-                   i + String.length needle <= String.length encoded
-                   && (String.sub encoded i (String.length needle) = needle || loop (i + 1)
-                      )
-                 in
-                 loop 0
-               in
-               List.iter
-                 (fun secret ->
-                    Alcotest.(check bool)
-                      "source content excluded"
-                      false
-                      (contains secret))
-                 ([ root
-                  ; "PRIVATE_SYNTHETIC_PAYLOAD"
-                  ; "99999999-9999-4999-8999-999999999999"
-                  ; "Nothing found"
-                  ; "Cannot store nil"
-                  ]
-                  @ if String.length payload > 30 then [ payload ] else []))))))
-;;
-
-(* The pure reducer can consume an outbox notice, but cannot reproduce a missing
-   notice from the physical commit owner. Exercise that public runner boundary
-   against isolated synthetic mirrors, then drain its real events. *)
-let test_durable_commit_notifies_own_graph ~resident () =
-  let module Mutation=Logseq_db_worker_contract.Worker_pure_mutation in
-  let require condition message=Alcotest.(check bool) message true condition in
-  T.with_managed(fun fixture->
-    let graph_id=Test_support.graph_uuid in
-    let other_id=Test_support.mutation_uuid 29800 in
-    List.iter(fun graph_id->ignore(Test_support.seed_mirror ~graph_id fixture.config.application_support_directory))
-      (if resident then [graph_id;other_id] else [graph_id]);
-    Eio_main.run(fun _->Eio.Switch.run(fun sw->
-      let graph graph_id : Sync.graph={graph_id;name="Durable notification fixture";
-        encrypted=false;schema={major=65;minor=33;exact=true}} in
-      let state=ref(Core.initial(Core.config ~worker:fixture.config ~sync:(asset_sync_config())) |> Result.get_ok) in
-      let events=Queue.create() and connections=ref [] and inspections=ref [] in
-      let authority=ref true and retire_on_projection=ref false in
-      let post event=
-        (match event with Core.Projection_push_for_scope _ when !retire_on_projection->authority:=false|_->());
-        Queue.add event events in
-      let sync_runner=Runner.sync_runner ~retire_account:(fun ~account:_->Ok()) ~shutdown:(fun()->())
-        ~submit:(function
-          |Sync.Request(ticket,Sync.Fetch_catalog _)->post(Core.Sync_event(Sync.Runner_completed
-            (Sync.Completion(ticket,Ok(List.map graph (if resident then [graph_id;other_id] else [graph_id]))))))
-          |Sync.Request(ticket,Sync.Save_catalog _)->post(Core.Sync_event(Sync.Runner_completed(Sync.Completion(ticket,Ok()))))
-          |Sync.Start_websocket request->connections:=request.scope :: !connections
-          |_->())() in
-      let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
-        ~runtime:(Runner.runtime ~fork:(fun ~sw:_ task->task()) ~sleep:(fun _->()) |> Result.get_ok)
-        ~publish:(fun _->()) |> Result.get_ok in
-      let runner=Runner.create ~sw dependencies ~post ~recovery_current:(fun _->false)
-        ~upload_current:(fun _->false) ~asset_current:(fun _->false) |> Result.get_ok in
-      let drain ()=while not(Queue.is_empty events)do
-        let transition=Core.step !state(Queue.take events)in state:=transition.next;
-        List.iter(fun instruction->
-          (match instruction with
-           |Core.Run_worker(Core.Request(_,Core.Handle_sync_worker_effect(Sync.Inspect_sync scope)))->
-             inspections:=scope :: !inspections
-           |_->());
-          Runner.submit runner instruction)transition.effects done in
-      let drive event=post(Core.Sync_event event);drain() in
-      let notices ()=Queue.fold(fun scopes->function
-        |Core.Sync_event(Sync.Local_graph_outbox_changed scope)->scope::scopes
-        |Core.Sync_event Sync.Local_outbox_changed->Alcotest.fail "durable mutation emitted an unscoped notice"
-        |_->scopes)[] events in
-      let intent ?(title="Durable notification") n=
-        Mutation.create_append ~origin:(Uri.of_string "https://api.logseq.io") ~user:"fixture-user" ~graph:graph_id
-          ~mutation_id:(Test_support.mutation_uuid n) ~page:(Test_support.mutation_uuid 29801)
-          ~day:(Logseq_db_worker_contract.Worker_pure_day.create 20261107 |> Result.get_ok)
-          ~root:{block_id=Test_support.mutation_uuid(n+100);title;task_status=None;children=Rrbvec.empty}
-          |> Result.get_ok |> fun value->Mutation.Append_intent value in
-      Fun.protect ~finally:(fun()->Runner.shutdown runner)(fun()->
-        drive(Sync.Sign_in_requested{account_generation=0;presentation_generation=0});
-        drive(Sync.Account_authenticated{user_id=Some "fixture-user"});
-        if resident then (
-          drive(Sync.Resident_graphs_changed[graph_id;other_id]);
-          drive(Sync.Visible_graph_changed other_id))
-        else drive(Sync.Graph_selected graph_id);
-        List.iter(fun connection->drive(Sync.Websocket_opened connection))!connections;
-        let connection=List.find(fun (value:Sync.connection_scope)->value.graph.graph_id=graph_id)!connections in
-        let scope=connection.graph in
-        if resident then require((Core.view !state).sync.snapshot.selected_graph=Some other_id)
-          "mutation fixture must keep another resident visible";
-        inspections:=[];
-        let mutate intent=Runner.durable_mutation runner ~scope ~intent ~current:(fun()-> !authority) in
-        let first=intent 29810 in
-        let proof=match mutate first with Mutation.Committed proof->proof|_->Alcotest.fail "synthetic append did not commit" in
-        require(notices()=[scope]) "committed append posts exactly its own scoped sync notice";
-        drain();
-        require(!inspections=[scope]) "committed append automatically inspects only its own graph";
-        require(match mutate first with Mutation.Committed replay->replay=proof|_->false)
-          "idempotent replay retains original commit proof";
-        require(notices()=[scope]) "replayed commit can repair a lost sync notification";
-        drain();
-        require(match mutate(intent ~title:"Conflicting payload" 29810)with Mutation.Rejected _->true|_->false)
-          "conflicting intent is rejected";
-        require(notices()=[]) "rejected mutation never notifies sync";
-        authority:=false;
-        require(mutate(intent 29811)=Mutation.Unknown) "retired authority cannot commit";
-        require(notices()=[]) "unknown mutation never notifies sync";
-        authority:=true;retire_on_projection:=true;
-        require(match mutate(intent 29812)with Mutation.Committed _->true|_->false)
-          "physical commit retains evidence when presentation retires";
-        require(not !authority) "fixture retires authority during actual commit publication";
-        require(notices()=[scope]) "caller retirement cannot strand a successfully committed outbox";
-        let cancelled=Runner.durable_mutation runner ~scope ~intent:(intent 29813)
-          ~current:(fun()->raise(Eio.Cancel.Cancelled(Failure "synthetic cancellation"))) in
-        require(cancelled=Mutation.Unknown) "cancellation retains legacy Unknown";
-        let raised=ref false in
-        let outcome=Runner.durable_mutation runner ~scope ~intent:(intent 29814)
-          ~current:(fun()->if !raised then true else (
-            raised:=true;raise(Unix.Unix_error(Unix.EACCES,"open","PRIVATE_SYNTHETIC_PAYLOAD")))) in
-        match outcome with
-        | Mutation.Unknown_with_cause cause ->
-          let module D=Logseq_db_types.Failure_diagnostic in
-          Alcotest.(check string) "resource exception operation is request bound" "commitLocal" (D.operation cause);
-          Alcotest.(check string) "resource exception reason is request bound" "resourceFailed" (D.reason cause);
-          Alcotest.(check string) "resource exception has safe classification" "io-permission" (D.source_class cause);
-          require(not(String.contains(D.encode cause) '/')) "resource exception excludes private paths"
-        | _ -> Alcotest.fail "non-cancel resource exception must return a request-bound cause"))))
-;;
-
-let test_durable_commit_during_protection ?(resident=false) mode () =
-  let module Mutation=Logseq_db_worker_contract.Worker_pure_mutation in
-  let require condition message=Alcotest.(check bool) message true condition in
-  T.with_managed(fun fixture->
-    let graph_id=Test_support.graph_uuid in
-    let other_id=Test_support.mutation_uuid 29800 in
-    List.iter(fun graph_id->ignore(Test_support.seed_mirror ~graph_id fixture.config.application_support_directory))
-      (if resident then [graph_id;other_id] else [graph_id]);
-    Eio_main.run(fun env->Eio.Switch.run(fun sw->
-      let graph graph_id : Sync.graph={graph_id;name="Durable notification fixture";
-        encrypted=true;schema={major=65;minor=33;exact=true}} in
-      let state=ref(Core.initial(Core.config ~worker:fixture.config ~sync:(asset_sync_config())) |> Result.get_ok) in
-      let events=Queue.create() and connections=ref [] and inspections=ref [] in
-      let authority=ref true and retire_on_projection=ref false in
-      let held=ref None and running=ref 0 and failures=ref [] and inspected=ref None and closes=ref 0 in
-      let hold_crypto=ref(mode<>`Ack) and hold_ack=ref(mode=`Ack) and held_ack=ref None in
-      let sends=ref 0 and superseded=ref 0 and applied=ref None in
-      let post event=
-        (match event with Core.Projection_push_for_scope _ when !retire_on_projection->authority:=false|_->());
-        Queue.add event events in
-      let sync_runner=Runner.sync_runner ~retire_account:(fun ~account:_->Ok()) ~shutdown:(fun()->())
-        ~submit:(function
-          |Sync.Request(ticket,Sync.Fetch_catalog _)->post(Core.Sync_event(Sync.Runner_completed
-            (Sync.Completion(ticket,Ok(List.map graph (if resident then [graph_id;other_id] else [graph_id]))))))
-          |Sync.Request(ticket,Sync.Save_catalog _)->post(Core.Sync_event(Sync.Runner_completed(Sync.Completion(ticket,Ok()))))
-          |Sync.Request(ticket,Sync.Load_and_unlock_graph_key scope)->
-            post(Core.Sync_event(Sync.Runner_completed(Sync.Completion(ticket,Ok(Sync.graph_key_handle ~id:"synthetic-key" ~scope)))))
-          |Sync.Request(ticket,Sync.Fetch_and_unlock_graph_key request)->
-            post(Core.Sync_event(Sync.Runner_completed(Sync.Completion(ticket,Ok(Sync.graph_key_handle ~id:"synthetic-key" ~scope:request.scope)))))
-          |Sync.Protected_io(ticket,request)->
-            if !hold_crypto then held:=Some(ticket,request) else
-            let values=match request.Sync.protected_action with Sync.Encrypt_values(_,values)->values|_->assert false in
-            post(Core.Sync_event(Sync.Runner_completed(Sync.Protected_completion(ticket,
-              Ok(Sync.Encrypted_values(List.map(fun value->String.make 12 'i',value)values))))))
-          |Sync.Send_websocket {message=Logseq_sync_pure_reducer.Sync_protocol.Client.Tx_batch _;_}->incr sends
-          |Sync.Close_websocket _->incr closes
-          |Sync.Start_websocket request->connections:=request.scope :: !connections
-          |_->())() in
-      let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
-        ~runtime:(Runner.runtime ~fork:(fun ~sw task->incr running;Eio.Fiber.fork ~sw(fun()->Fun.protect ~finally:(fun()->decr running)task)) ~sleep:(fun _->()) |> Result.get_ok)
-        ~publish:(fun _->()) |> Result.get_ok in
-      let runner=Runner.create ~sw dependencies ~post ~recovery_current:(fun _->false)
-        ~upload_current:(fun _->false) ~asset_current:(fun _->false) |> Result.get_ok in
-      let drain ()=while not(Queue.is_empty events)do
-        let event=Queue.take events in
-        (match event with
-         |Core.Runner_completed(Core.Sync_worker_effect_completed(_,Error error))->failures:=error:: !failures
-         |Core.Runner_completed(Core.Sync_worker_effect_completed(_,Ok{event=Some(Sync.Sync_inspected{sync;_});_}))->inspected:=Some sync
-         |Core.Runner_completed(Core.Sync_worker_effect_completed(_,Ok{event=Some(Sync.Outbox_transition_superseded _);_}))->incr superseded
-         |Core.Runner_completed(Core.Sync_worker_effect_completed(_,Ok{event=Some(Sync.Outbox_transition_applied result);_}))->applied:=Some result
-         |_->());
-        let transition=Core.step !state event in state:=transition.next;
-        List.iter(fun instruction->
-          (match instruction with
-           |Core.Run_worker(Core.Request(_,Core.Handle_sync_worker_effect(Sync.Inspect_sync scope)))->
-             inspections:=scope :: !inspections
-           |_->());
-          match instruction with
-          |Core.Run_worker(Core.Request(_,Core.Handle_sync_worker_effect(Sync.Apply_outbox_transition request)))
-            when !hold_ack && (match request.transition with Logseq_overlay_db.Types.Accept_group _->true|_->false)->
-              held_ack:=Some(instruction,request)
-          |_->Runner.submit runner instruction)transition.effects done in
-      let until condition=Eio.Time.with_timeout_exn(Eio.Stdenv.clock env)3.(fun()->
-        while not(condition())do drain();Eio.Fiber.yield()done;drain()) in
-      let settle ()=until(fun()-> !running=0 && Queue.is_empty events) in
-      let drive event=post(Core.Sync_event event);settle() in
-      let intent ?(title="Durable notification") n=
-        Mutation.create_append ~origin:(Uri.of_string "https://api.logseq.io") ~user:"fixture-user" ~graph:graph_id
-          ~mutation_id:(Test_support.mutation_uuid n) ~page:(Test_support.mutation_uuid 29801)
-          ~day:(Logseq_db_worker_contract.Worker_pure_day.create 20261107 |> Result.get_ok)
-          ~root:{block_id=Test_support.mutation_uuid(n+100);title;task_status=None;children=Rrbvec.empty}
-          |> Result.get_ok |> fun value->Mutation.Append_intent value in
-      Fun.protect ~finally:(fun()->Runner.shutdown runner)(fun()->
-        drive(Sync.Sign_in_requested{account_generation=0;presentation_generation=0});
-        drive(Sync.Account_authenticated{user_id=Some "fixture-user"});
-        if resident then (
-          drive(Sync.Resident_graphs_changed[graph_id;other_id]);
-          drive(Sync.Visible_graph_changed other_id))
-        else drive(Sync.Graph_selected graph_id);
-        List.iter(fun connection->drive(Sync.Websocket_opened connection))!connections;
-        let connection=List.find(fun (value:Sync.connection_scope)->value.graph.graph_id=graph_id)!connections in
-        let scope=connection.graph in
-        if resident then require((Core.view !state).sync.snapshot.selected_graph=Some other_id)
-          "mutation fixture must keep another resident visible";
-        inspections:=[];
-        let mutate intent=Runner.durable_mutation runner ~scope ~intent ~current:(fun()-> !authority) in
-        require(match mutate(intent 29810)with Mutation.Committed _->true|_->false) "first append commits";
-        (match mode with
-         |`Ack->
-           settle();require(!sends=1) "first capture reaches actual submission";
-           drive(Sync.Websocket_message(connection,Logseq_sync_pure_reducer.Sync_protocol.Server.Tx_batch_ok
-             {t=Logseq_db_types.Server_cursor.of_int64 1L |> Result.get_ok;checksum=Some "0123456789abcdef"}));
-           let instruction,request=Option.get !held_ack in
-           require(match mutate(intent 29811)with Mutation.Committed _->true|_->false) "second append commits before ACK preparation starts";
-           settle();hold_ack:=false;Runner.submit runner instruction;settle();
-           let result=Option.get !applied in
-           require(result.commit.transition=request.transition) "ACK recovery preserves its exact server barrier";
-           let records=Logseq_overlay_db.Types.sync_view_submissions result.sync in
-           require(List.length records=2 && List.exists(fun (item:Logseq_overlay_db.Types.submission_descriptor)->
-             match item.state with Accepted_pending_authoritative _->true|_->false)records)
-             "ACK settles only its submitted capture while later capture stays durable"
-         |`Crypto|`Malformed|`Crypto_error->
-           until(fun()-> !held<>None);
-           require(!running>0) "first outbox preparation is suspended in protected IO";
-           if mode=`Crypto then (
-             require(match mutate(intent 29811)with Mutation.Committed _->true|_->false) "second append commits while protection waits";
-             until(fun()-> !running=1 && Queue.is_empty events);
-             let queued=Logseq_overlay_db.Types.sync_view_submissions(Option.get !inspected) in
-             require(List.length queued=2 && List.for_all(fun (item:Logseq_overlay_db.Types.submission_descriptor)->item.state=Queued)queued)
-               "both rapid captures remain durably queued before crypto release");
-           let ticket,request=Option.get !held in
-           let encrypted=match request.Sync.protected_action with
-             |Sync.Encrypt_values(_,values)->List.map(fun value->String.make 12 'i',value)values
-             |_->Alcotest.fail "expected encryption request" in
-           hold_crypto:=false;
-           let result=match mode with
-             |`Crypto_error->Error(Sync.Crypto_failed(Sync.Invalid_key_material,"synthetic invalid key"))
-             |`Malformed->Ok(Sync.Encrypted_values [])
-             |_->Ok(Sync.Encrypted_values encrypted) in
-           post(Core.Sync_event(Sync.Runner_completed(Sync.Protected_completion(ticket,result))));
-           settle());
-        if mode=`Malformed || mode=`Crypto_error then (
-          require(List.length !failures=1 && !closes=1) "genuine crypto failure remains visible and closes connection";
-          require(!superseded=0 && !sends=0) "genuine crypto failure is never retried or sent")
-        else (
-          require(!failures=[] && !closes=0) "concurrent durable commit recovers without failing or closing sync";
-          require(!superseded=1) "exactly one revision-driven recovery";
-          require(!sends=1) "capture submits once after recovery");
-        require((Core.view !state).graph.phase=Core.Graph_open) "concurrent durable commit preserves attached graph"))))
+let test_plaintext_submission_encoding () =
+  let module D = Sync_dsl.Core in
+  let module C = Logseq_sync_crypto.Core in
+  let module Database = Logseq_overlay_db.Database in
+  let module Types = Logseq_overlay_db.Types in
+  with_direct_owner (fun fixture ->
+    let require = function Ok value -> value | Error _ -> Alcotest.fail "submission setup failed" in
+    let uuid value = Logseq_db_types.Graph_types.Uuid.of_string value |> require in
+    let page = uuid "70000000-0000-4000-8000-000000000001" in
+    let mutation_id = uuid "70000000-0000-4000-8000-000000000002" in
+    let title = "~:plain-中文-\"quoted\"" in
+    let snapshot = Database.current_snapshot fixture.database |> require in
+    let expected = Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot)
+      (fun () -> match Database.get_pages snapshot [page] |> require with
+        | [Types.Missing_page {revision;_}] ->
+          Database.write_precondition ~blocks:[] ~pages:[page,revision] ~scopes:[] |> require
+        | _ -> Alcotest.fail "new page exists") in
+    Database.commit_local fixture.database ~expected
+      (Types.Create_journal_page {mutation_id;page;title;journal_day=20261119}) |> require |> ignore;
+    let view = Database.inspect_sync fixture.database |> require in
+    let prepared, request = Database.begin_outbox_transition fixture.database
+      ~expected:(Types.sync_view_token view) (Types.Submit_group [mutation_id]) |> require in
+    let request = Option.get request in
+    let run crypto operation = C.run crypto ~identity:fixture.identity
+      ~check_current:(fun () -> Ok ()) operation in
+    let locked = C.create ~identity:fixture.identity ~limits:(D.limits
+      ~maximum_items:8 ~maximum_bytes:32768 ~maximum_pending:8 ~maximum_resources:8
+      ~steps_per_turn:8 ~maximum_tasks:8 ~maximum_messages:8 ~maximum_message_bytes:32768
+      ~maximum_demands:8 ~maximum_active_assets:2 ~foreground_reserve:1
+      ~foreground_demand_reserve:1 ~foreground_descriptor_reserve_bytes:128
+      ~asset_cache_budget_bytes:16L ~asset_maximum_file_bytes:16 ~asset_pending_budget_bytes:32L
+      ~snapshot_maximum_artifact_bytes:4096L ~snapshot_staging_budget_bytes:4096L
+      ~snapshot_scratch_budget_bytes:4096L |> require) ~encrypted:true ~backend:C.apple_backend in
+    Fun.protect ~finally:(fun () -> C.retire locked) (fun () ->
+      Alcotest.(check bool) "encrypted graph cannot downgrade without key" true
+        (run locked (D.Protect request) = Error D.Locked));
+    let values = match run fixture.crypto (D.Protect request) with
+      | Ok values -> values
+      | Error error -> Alcotest.fail (D.error_message error) in
+    Alcotest.(check bool) "plain upload decodes the serialized title" true
+      (List.mem title (List.map snd values));
+    let result = Database.apply_outbox_transition fixture.database prepared
+      ~encrypted:(Some (request,values)) |> require in
+    let wire = Option.get result.submission_batch |> Types.submission_batch_wires
+      |> List.hd |> Types.submission_wire_protected_transaction in
+    let operations = match Logseq_db_storage.Logseq_sqlite_codec.decode_transit wire with
+      | Ok (Array operations) -> operations
+      | Ok _ -> Alcotest.fail "submission wire is not a Transit transaction array"
+      | Error message -> Alcotest.fail message in
+    let select_operations select = List.filter_map select operations in
+    let page_entities = select_operations (function
+      | Array [Keyword "db/add"; entity; Keyword "block/uuid"; Uuid value]
+        when value = Logseq_db_types.Graph_types.Uuid.to_string page -> Some entity
+      | _ -> None) in
+    let entity = match page_entities with
+      | [entity] -> entity
+      | _ -> Alcotest.fail "submission must identify exactly one target page entity" in
+    let titles = select_operations (function
+      | Array [Keyword "db/add"; target; Keyword "block/title"; value]
+        when target = entity -> Some value
+      | _ -> None) in
+    match titles with
+    | [String value] ->
+      Alcotest.(check string) "target page title survives Transit decoding" title value
+    | _ -> Alcotest.fail "target page must have exactly one Transit String block/title")
 ;;
 
 let () =
-  Alcotest.run
-    "logseq db worker effect runner"
-    [ ( "durable protection race", [
-        Alcotest.test_case "second append during protected preparation" `Quick (test_durable_commit_during_protection `Crypto);
-        Alcotest.test_case "second append before ACK preparation" `Quick (test_durable_commit_during_protection `Ack);
-        Alcotest.test_case "genuine crypto failure is not retried" `Quick (test_durable_commit_during_protection `Crypto_error);
-        Alcotest.test_case "malformed crypto result is not retried" `Quick (test_durable_commit_during_protection `Malformed);
-        Alcotest.test_case "hidden resident protection race" `Quick (test_durable_commit_during_protection ~resident:true `Crypto)])
-    ; ( "durable sync notification", [
-        Alcotest.test_case "single graph commit and replay" `Quick (test_durable_commit_notifies_own_graph ~resident:false);
-        Alcotest.test_case "hidden resident commit and replay" `Quick (test_durable_commit_notifies_own_graph ~resident:true) ])
-    ; ( "authoritative diagnostics", [
-        Alcotest.test_case "real own echo mismatch retains safe integrity reason" `Quick (test_authoritative_rejection_diagnostics `Integrity);
-        Alcotest.test_case "real cursor rejection reaches Diagnostics" `Quick (test_authoritative_rejection_diagnostics `Cursor);
-        Alcotest.test_case "real format rejection reaches Diagnostics" `Quick (test_authoritative_rejection_diagnostics `Format);
-        Alcotest.test_case "apply format failure excludes raw source" `Quick (test_authoritative_rejection_diagnostics `Apply_format) ] @
-      List.map (fun ((name,_,_) as detail) -> Alcotest.test_case ("safe detail "^name) `Quick
-        (test_authoritative_rejection_diagnostics (`Detail detail))) authoritative_detail_cases)
-    ; ( "ID token cache"
-      , [ Alcotest.test_case
-            "caps reuse at twenty-four hours"
-            `Quick
-            test_id_token_cache_caps_reuse_at_twenty_four_hours
-        ; Alcotest.test_case
-            "caps reuse one hour before expiration"
-            `Quick
-            test_id_token_cache_caps_reuse_one_hour_before_expiration
-        ; Alcotest.test_case
-            "does not retain immediately non-reusable token"
-            `Quick
-            test_id_token_cache_does_not_retain_immediately_non_reusable_token
-        ; Alcotest.test_case
-            "rejects invalid responses without retaining them"
-            `Quick
-            test_id_token_cache_rejects_invalid_responses_without_retaining_them
-        ; Alcotest.test_case
-            "coalesces concurrent misses"
-            `Quick
-            test_id_token_cache_coalesces_concurrent_misses
-        ; Alcotest.test_case
-            "propagates Flutter failure without caching"
-            `Quick
-            test_id_token_cache_propagates_flutter_failure_without_caching
-        ; Alcotest.test_case
-            "invalidation is credential-specific"
-            `Quick
-            test_id_token_cache_invalidation_is_credential_specific
-        ; Alcotest.test_case
-            "sign-out clears entry and cancels waiters"
-            `Quick
-            test_id_token_cache_sign_out_clears_entry_and_cancels_waiters
-        ; Alcotest.test_case
-            "account replacement makes delayed response inert"
-            `Quick
-            test_id_token_cache_account_replacement_makes_delayed_response_inert
-        ; Alcotest.test_case
-            "shutdown clears entry and cancels waiters"
-            `Quick
-            test_id_token_cache_shutdown_clears_entry_and_cancels_waiters
-        ] )
-    ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
-    ; ( "contract"
-      , [ Alcotest.test_case "wrapped local publication storage full retains staging" `Quick (test_wrapped_local_asset_fallback `Full)
-        ; Alcotest.test_case "wrapped missing staging falls back to remote cache" `Quick (test_wrapped_local_asset_fallback `Missing)
-        ; Alcotest.test_case "wrapped checksum failure falls back to remote cache" `Quick (test_wrapped_local_asset_fallback `Checksum)
-        ; Alcotest.test_case "wrapped nonfallback publication failure releases lease" `Quick (test_wrapped_local_asset_fallback `Oversize)
-        ; Alcotest.test_case "worker scheduling failure completes" `Quick (fun () -> test_worker_schedule_failure_completes ())
-        ; Alcotest.test_case "worker encoded exception preserves reason" `Quick
-            (test_worker_schedule_failure_completes
-              ~failure:(Invalid_argument (Logseq_db_storage.Logseq_sqlite_codec.diagnostic_error
-                (Logseq_db_storage.Logseq_sqlite_codec.Unsupported_tag "PRIVATE_SYNTHETIC_PAYLOAD")))
-              ~expected_source:"unknown" ~expected_reason:"codecUnsupportedTag")
-        ; Alcotest.test_case "readonly import input recovery and exact proof ACK" `Quick test_import_input_readonly_recovery_and_proof_ack
-        ; Alcotest.test_case "initial observation snapshot joins real release" `Quick test_observation_release_waits_for_initial_snapshot
-        ; Alcotest.test_case "host internal followup survives full actor queue" `Quick test_host_followup_survives_full_actor_queue
-        ; Alcotest.test_case "host scope settlement preserves real lease" `Quick test_host_scope_settlement_preserves_live_lease
-        ; Alcotest.test_case "Worker Sync IO fence correlates actual child" `Quick test_worker_sync_io_fence_correlates_real_child
-        ; Alcotest.test_case "Sync IO fence joins nonasset callback" `Quick test_sync_io_fence_joins_nonasset_callback
-        ; Alcotest.test_case "scope close keeps live staged lease" `Quick test_scope_close_keeps_live_staged_lease
-        ; Alcotest.test_case "asset IO barrier submit stays nonblocking" `Quick test_asset_io_barrier_does_not_block_serial_submit
-        ; Alcotest.test_case "writer fence joins actual canceled asset callback" `Quick test_writer_fence_joins_actual_canceled_asset_callback
-        ; Alcotest.test_case "asset cleanup joins queued result child" `Quick test_asset_cleanup_joins_queued_result_child
-        ; Alcotest.test_case "asset cleanup ignores later unrelated work" `Quick test_asset_cleanup_ignores_later_unrelated_work
-        ; Alcotest.test_case "asset cleanup stop returns failure" `Quick test_asset_cleanup_stop_does_not_wait_for_lost_io
-        ; Alcotest.test_case "asset cleanup snapshot retains physical failure" `Quick test_asset_cleanup_snapshot_retains_physical_failure
-        ; Alcotest.test_case "asset cleanup snapshot joins queued release" `Quick test_asset_cleanup_snapshot_joins_queued_release
-        ; Alcotest.test_case "asset cleanup snapshot joins physical release" `Quick test_asset_cleanup_snapshot_joins_physical_release
-        ; Alcotest.test_case "discarded retain retries actual storage cleanup" `Quick
-            test_discarded_retain_retries_real_storage_cleanup
-        ; Alcotest.test_case
-            "checked release preserves storage failure for same-handle retry" `Quick
-            test_checked_release_storage_retry
-        ; Alcotest.test_case
-            "checked release awaits exact physical completion" `Quick
-            test_checked_release_exact_physical_completion
-        ; Alcotest.test_case
-            "cancel queued staging output"
-            `Quick
-            (cancelled_stage_output false)
-        ; Alcotest.test_case
-            "cancel resolved staging output"
-            `Quick
-            (cancelled_stage_output true)
-        ; Alcotest.test_case
-            "cancel queued retained lease output"
-            `Quick
-            test_cancelled_retained_output
-        ; Alcotest.test_case
-            "actual Db shutdown late staging completion"
-            `Quick
-            test_db_shutdown_accepts_late_staging_completion
-        ; Alcotest.test_case
-            "durable upload checkpoint IO"
-            `Quick
-            test_upload_checkpoint_io
-        ; Alcotest.test_case "staging cleanup survives unavailable warning output" `Quick
-            (test_upload_checkpoint_io ~closed_stderr:true)
-        ; Alcotest.test_case
-            "sync and publish delegation"
-            `Quick
-            test_sync_and_publish_instructions_are_not_reduced_recursively
-        ; Alcotest.test_case
-            "catalog refresh cannot complete another deletion"
-            `Quick
-            test_catalog_refresh_cannot_complete_another_deletion
-        ; Alcotest.test_case "busy mirror preserves attachment sources" `Quick
-            test_deletion_checks_ownership_before_assets
-        ; Alcotest.test_case "journal IO failure preserves current Worker" `Quick
-            test_deletion_journal_failure_preserves_worker
-        ; Alcotest.test_case "caught retirement confirmation failure reports Diagnostic" `Quick
-            test_deletion_confirmation_failure_reports
-        ; Alcotest.test_case "delete never-opened legacy copy" `Quick
-            (deletion_runtime_fixture ~deletion_case:`Legacy ~busy:false)
-        ; Alcotest.test_case "delete non-SQLite copy" `Quick
-            (deletion_runtime_fixture ~deletion_case:`Corrupt_sqlite ~busy:false)
-        ; Alcotest.test_case "delete invalid checkpoint copy" `Quick
-            (deletion_runtime_fixture ~deletion_case:`Corrupt_checkpoint ~busy:false)
-        ; Alcotest.test_case "delete residual directory without database" `Quick
-            (deletion_runtime_fixture ~deletion_case:`Missing_database ~busy:false)
-        ; Alcotest.test_case "delete contained database link without following it" `Quick
-            (deletion_runtime_fixture ~deletion_case:`Linked_database ~busy:false)
-        ] )
-    ]
+  Alcotest.run "logseq db worker effect runner"
+    [ "ID token cache", [
+      Alcotest.test_case "caps reuse at twenty four hours" `Quick test_id_token_cache_caps_reuse_at_twenty_four_hours;
+      Alcotest.test_case "caps reuse one hour before expiration" `Quick test_id_token_cache_caps_reuse_one_hour_before_expiration;
+      Alcotest.test_case "does not retain immediately non reusable token" `Quick test_id_token_cache_does_not_retain_immediately_non_reusable_token;
+      Alcotest.test_case "rejects invalid responses without retaining them" `Quick test_id_token_cache_rejects_invalid_responses_without_retaining_them;
+      Alcotest.test_case "coalesces concurrent misses" `Quick test_id_token_cache_coalesces_concurrent_misses;
+      Alcotest.test_case "propagates flutter failure without caching" `Quick test_id_token_cache_propagates_flutter_failure_without_caching;
+      Alcotest.test_case "invalidation is credential specific" `Quick test_id_token_cache_invalidation_is_credential_specific;
+      Alcotest.test_case "sign out clears entry and cancels waiters" `Quick test_id_token_cache_sign_out_clears_entry_and_cancels_waiters;
+      Alcotest.test_case "account replacement makes delayed response inert" `Quick test_id_token_cache_account_replacement_makes_delayed_response_inert;
+      Alcotest.test_case "shutdown clears entry and cancels waiters" `Quick test_id_token_cache_shutdown_clears_entry_and_cancels_waiters
+    ];
+      "contract", [
+      Alcotest.test_case "sync and publish instructions are not reduced recursively" `Quick test_sync_and_publish_instructions_are_not_reduced_recursively;
+      Alcotest.test_case "direct owner io failure has no event bridge" `Quick test_direct_owner_io_failure_has_no_event_bridge;
+      Alcotest.test_case "worker schedule failure completes" `Quick (fun () -> test_worker_schedule_failure_completes ());
+      Alcotest.test_case "import input readonly recovery and proof ack" `Quick test_import_input_readonly_recovery_and_proof_ack;
+      Alcotest.test_case "worker sync io fence correlates real child" `Quick test_worker_sync_io_fence_correlates_real_child;
+      Alcotest.test_case "scope close keeps live staged lease" `Quick test_scope_close_keeps_live_staged_lease;
+      Alcotest.test_case "host scope settlement preserves live lease" `Quick test_host_scope_settlement_preserves_live_lease;
+      Alcotest.test_case "observation release waits for initial snapshot" `Quick test_observation_release_waits_for_initial_snapshot;
+      Alcotest.test_case "host followup survives full actor queue" `Quick test_host_followup_survives_full_actor_queue;
+      Alcotest.test_case "checked release storage retry" `Quick test_checked_release_storage_retry;
+      Alcotest.test_case "discarded retain retries real storage cleanup" `Quick test_discarded_retain_retries_real_storage_cleanup;
+      Alcotest.test_case "asset cleanup snapshot retains physical failure" `Quick test_asset_cleanup_snapshot_retains_physical_failure
+      ; Alcotest.test_case "worker encoded exception preserves reason" `Quick
+          (test_worker_schedule_failure_completes
+            ~failure:(Invalid_argument (Logseq_db_storage.Logseq_sqlite_codec.diagnostic_error
+              (Logseq_db_storage.Logseq_sqlite_codec.Unsupported_tag "PRIVATE_SYNTHETIC_PAYLOAD")))
+            ~expected_source:"unknown" ~expected_reason:"codecUnsupportedTag")
+      ; Alcotest.test_case "checked release exact physical completion" `Quick test_checked_release_exact_physical_completion
+      ; Alcotest.test_case "asset cleanup snapshot joins queued release" `Quick test_asset_cleanup_snapshot_joins_queued_release
+      ; Alcotest.test_case "asset cleanup snapshot joins physical release" `Quick test_asset_cleanup_snapshot_joins_physical_release
+      ; Alcotest.test_case "asset cleanup stop does not wait for lost io" `Quick test_asset_cleanup_stop_does_not_wait_for_lost_io
+      ; Alcotest.test_case "recovery prunes original owner staging" `Quick test_recovery_prunes_original_owner_staging
+      ; Alcotest.test_case "failed staging recovery is not acknowledged" `Quick test_recovery_staging_failure_is_not_acknowledged
+      ; Alcotest.test_case "owner upload network classification" `Quick test_upload_owner_network_classification
+      ; Alcotest.test_case "durable upload checkpoint IO" `Quick test_upload_checkpoint_io
+      ; Alcotest.test_case "plaintext submission encoding" `Quick test_plaintext_submission_encoding
+    ] ]
 ;;

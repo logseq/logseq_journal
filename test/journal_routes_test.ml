@@ -5730,14 +5730,62 @@ let test_restart_draft_store () =
     require(List.length(Result.get_ok(S.load store))=1) "failed write destroyed last good snapshot";
     let interrupted=Journal_capture.begin_submission capture in
     Result.get_ok(S.save store [{item with parent=Some graph;capture=interrupted}]);
-    let restored=List.hd(Result.get_ok(S.load store)) in
-    require(restored.parent=Some graph) "append parent not retained";
-    require(not(Journal_capture.can_save restored.capture)) "interrupted save became a new mutation";
-    let edited=Journal_capture.update_source restored.capture ~source:"must not become editable" in
-    require(Journal_capture.source edited="unsaved 中文") "interrupted recovery allowed editing an unknown submission";
-    let _,retry=Journal_capture.retry edited in
-    require(retry=None) "interrupted recovery admitted another mutation";
-    require(Journal_capture.attachment_imports restored.capture=None) "execution authority survived restart";
+    require(Result.get_ok(S.load store)=[]) "accepted Send survived as a restart draft";
+    require(Journal_capture.source interrupted="unsaved 中文") "draft deletion destroyed submission text";
+    List.iter (fun parent ->
+      let sent,rejected=match parent with
+        |None->let sent=Journal_capture.begin_submission capture in
+          sent,Journal_capture.release_rejected_attempt sent
+        |Some _->
+          let detail=Journal_detail.update_child_source(child_identity_detail()) "unsaved 中文" in
+          let saving,request=child_identity_append detail in
+          let command=child_command(Option.get request) in
+          let sent=Option.get(Journal_detail.child_capture saving) in
+          let rejected=Journal_detail.release_rejected_child saving ~command ~message:"Known rejected" in
+          require(Journal_detail.child_error rejected=Some "Known rejected") "Append lost rejection feedback";
+          let retained=Option.get(Journal_detail.retain_composer saving) in
+          let retained=Journal_detail.release_rejected_retained retained ~command ~message:"Known rejected" in
+          Result.get_ok(S.save store [{item with parent;capture=Journal_detail.retained_capture retained}]);
+          require(Result.get_ok(S.load(S.create ~directory:root ~binding))=[])
+            "retained Append checkpoint resurrected a rejected Send";
+          sent,Option.get(Journal_detail.child_capture rejected) in
+      Result.get_ok(S.save store [{item with parent;capture=sent}]);
+      require(Journal_capture.can_save rejected) "known rejection lost the in-memory retry";
+      require(Journal_capture.source rejected="unsaved 中文") "known rejection lost execution text";
+      let checkpoint capture=Result.get_ok(S.save store [{item with parent;capture}]) in
+      let restart ()=Result.get_ok(S.load(S.create ~directory:root ~binding)) in
+      checkpoint rejected;
+      require(restart()=[]) "ordinary checkpoint resurrected a rejected Send";
+      checkpoint(Journal_capture.rebind rejected ~session_number:20L);
+      require(restart()=[]) "remount resurrected a rejected Send";
+      checkpoint(Journal_capture.update_source rejected ~source:"unsaved 中文");
+      require(restart()=[]) "unchanged editor echo resurrected a rejected Send";
+      let native text=edit ~session_id:(Journal_capture.session_id rejected)
+        ~local_revision:1L ~base_document_revision:0L ~text
+        ~selection_start:0 ~selection_end:0 () in
+      checkpoint(Journal_capture.apply_text_edit rejected (native "unsaved 中文"));
+      require(restart()=[]) "selection-only native edit resurrected a rejected Send";
+      checkpoint(Journal_capture.apply_text_edit rejected (native "new native draft"));
+      require(Journal_capture.source(List.hd(restart())).capture="new native draft")
+        "new native content did not become a recoverable draft";
+      checkpoint(Journal_capture.update_source rejected ~source:"new user draft");
+      let restored=List.hd(restart()) in
+      require(restored.parent=parent && Journal_capture.source restored.capture="new user draft")
+        "explicit new edit did not recover under its Capture/Append owner") [None;Some graph];
+    Result.get_ok(S.save store [item]);
+    let owned=Filename.concat root "JournalDrafts-v1" in
+    let account=Filename.concat owned (Array.get(Sys.readdir owned)0) in
+    let manifest=Filename.concat account "state.json" in
+    let json=Yojson.Safe.from_file manifest in
+    let rec mark_interrupted = function
+      | `Assoc fields -> `Assoc(List.map(fun(key,value)->
+          key,if key="interrupted" then `Bool true else mark_interrupted value)fields)
+      | `List values -> `List(List.map mark_interrupted values)
+      | value -> value in
+    Yojson.Safe.to_file manifest (mark_interrupted json);
+    require(Result.get_ok(S.load store)=[]) "legacy interrupted draft was restored";
+    let migrated=Yojson.Safe.Util.member "drafts" (Yojson.Safe.from_file manifest) in
+    require(migrated=`List []) "legacy interrupted source remained on disk";
     let media=Filename.temp_file "journal-import-test-" ".bin" in
     let channel=open_out_bin media in output_string channel "synthetic-media";close_out channel;
     let selection=`Assoc["operation",`String graph;"asset",`String graph;
@@ -5747,6 +5795,13 @@ let test_restart_draft_store () =
       (`Assoc["action",`String "picked";"selection",selection])) with
       |Ok(Picked(staged,_))->staged |_->failwith "invalid synthetic pick" in
     let with_media=Journal_capture.add_attachment capture staged in
+    List.iter(fun parent->
+      let rejected=Journal_capture.begin_submission with_media |> Journal_capture.release_rejected_attempt in
+      Result.get_ok(S.save store [{item with parent;capture=rejected}]);
+      require(Result.get_ok(S.load(S.create ~directory:root ~binding))=[])
+        "attachment checkpoint resurrected a rejected Send";
+      require(Journal_capture.pending_attachments rejected=[staged] && Sys.file_exists media)
+        "Send cleanup released the in-memory attachment lease") [None;Some graph];
     Result.get_ok(S.save store [{item with capture=with_media}]);
     Unix.unlink media;
     let recovered=List.hd(Result.get_ok(S.load store)) in
@@ -5780,8 +5835,6 @@ let test_restart_draft_store () =
     let retained=Journal_routes.recover_captures [graph,capture] in
     let parent,roundtrip=List.hd(Journal_routes.recovery_captures retained) in
     require(parent=graph && Journal_capture.source roundtrip="unsaved 中文") "append restart adapter lost owner or text";
-    let retained=Journal_detail.recover_composer ~parent:graph restored.capture in
-    require(Journal_detail.retained_pending_submission retained=None) "append restart restored execution authority";
     let old_media=Array.to_list(Sys.readdir account)
       |>List.filter(fun name->String.ends_with ~suffix:".media" name) in
     let uncertain=S.For_testing.with_directory_sync store

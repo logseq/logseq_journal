@@ -70,6 +70,7 @@ import AppKit
   /// each connect/disconnect transition, in delivery order on the main actor.
   @ObservationIgnored var requestObserver: ((JournalPlatformWire.Request) -> Void)?
   @ObservationIgnored var connectionObserver: ((Bool) -> Void)?
+  @ObservationIgnored var authenticationNotificationCompletionObserver: (() -> Void)?
 
   init(services: JournalPlatformServices) { self.services = services }
 
@@ -222,8 +223,10 @@ import AppKit
   }
 
   /// Called after the first local timeline frame or successful native sign-in.
-  func refreshAuthentication() {
-    guard !pending.terminating, !accountAuthenticationPresented, services.onlineAllowed else { return }
+  @discardableResult
+  func refreshAuthentication() -> Task<Void, Never>? {
+    guard !pending.terminating, !accountAuthenticationPresented,
+      services.onlineAllowed, !services.signingOut else { return nil }
     refresh?.cancel()
     let identity = connection, scope=startupScope
     refresh = Task { [weak self] in
@@ -248,6 +251,7 @@ import AppKit
         }
       }
     }
+    return refresh
   }
 
   func setAccountAuthenticationPresented(_ presented: Bool) {
@@ -362,7 +366,9 @@ import AppKit
       forName: JournalCognitoSession.changed, object: nil, queue: .main) { @Sendable [weak self] _ in
       Task { @MainActor [weak self] in
         guard let self, connection == identity, connected else { return }
-        refreshAuthentication()
+        let refresh = refreshAuthentication()
+        await refresh?.value
+        authenticationNotificationCompletionObserver?()
       }
     }
   }

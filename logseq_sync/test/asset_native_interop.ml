@@ -1,5 +1,5 @@
 (* Run through tool/test_asset_interop.py with the production Apple crypto library. *)
-module C = Logseq_sync_effect_runner.Asset_codec
+module C = Logseq_sync_native_crypto.Asset_codec
 module T = Transit_native.Transit.Json
 
 external native_crypto

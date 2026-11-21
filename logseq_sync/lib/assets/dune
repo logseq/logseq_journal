@@ -1,0 +1,6 @@
+(library
+ (name logseq_sync_assets)
+ (public_name logseq_sync.assets)
+ (modules namespace cache selection core)
+ (libraries eio execute sync_dsl logseq_sync.crypto logseq_sync.native_crypto logseq_db_types digestif mirage-crypto-rng.unix rrbvec unix uri yojson ppx_deriving_yojson.runtime)
+ (preprocess (pps ppx_deriving_yojson)))

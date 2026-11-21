@@ -1,0 +1,6 @@
+(library
+ (name logseq_sync_domain)
+ (public_name logseq_sync.domain)
+ (modules core)
+ (libraries logseq_sync.protocol logseq_db_types logseq_overlay_db ppx_deriving_yojson.runtime rrbvec uri yojson)
+ (preprocess (pps ppx_deriving_yojson)))

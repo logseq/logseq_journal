@@ -51,17 +51,18 @@ type unlock_ui =
   | Unlock_idle
   | Unlock_waiting of Unlock.unlock_challenge
   | Unlock_queued of Unlock.unlock_challenge
+  | Unlock_native_queued of Unlock.graph_scope
   | Unlock_active of Unlock.unlock_submission
   | Unlock_downloading of Unlock.unlock_submission
   | Unlock_retry of Unlock.unlock_challenge * string
   | Unlock_preparation_error of string
   | Unlock_complete of Unlock.unlock_attached
 
-let unlock_pending = function Unlock_queued _ | Unlock_active _ -> true | _ -> false
+let unlock_pending = function Unlock_native_queued _ | Unlock_queued _ | Unlock_active _ -> true | _ -> false
 let unlock_ui_challenge = function
   | Unlock_waiting challenge | Unlock_queued challenge | Unlock_retry (challenge, _) -> Some challenge
   | Unlock_active submission -> Some (Unlock.unlock_submission_challenge submission)
-  | Unlock_idle | Unlock_downloading _ | Unlock_preparation_error _ | Unlock_complete _ -> None
+  | Unlock_native_queued _ | Unlock_idle | Unlock_downloading _ | Unlock_preparation_error _ | Unlock_complete _ -> None
 ;;
 let unlock_ui_error = function
   | Unlock_retry (_, message) | Unlock_preparation_error message -> Some message
@@ -69,6 +70,7 @@ let unlock_ui_error = function
 ;;
 
 let unlock_rejected = function
+  | Unlock_native_queued _ -> Unlock_preparation_error "Unable to unlock the graph. Try again."
   | Unlock_queued challenge -> Unlock_retry (challenge, "Unable to unlock the graph. Try again.")
   | Unlock_active submission -> Unlock_retry
       (Unlock.unlock_submission_challenge submission, "Unable to unlock the graph. Try again.")
@@ -82,7 +84,10 @@ let reconcile_unlock previous (snapshot : Graph_service.snapshot) =
     && snapshot.selected_graph = Some scope.graph_id in
   let same_challenge challenge = Option.fold ~none:false
     ~some:(Unlock.equal_unlock_challenge challenge) (unlock_ui_challenge previous) in
-  match snapshot.unlock with
+  match previous,snapshot.unlock with
+  | Unlock_native_queued scope,Unlock.Unlock_inactive when current_scope scope
+      && snapshot.startup.awaiting_e2ee_password && snapshot.last_error=None -> previous
+  | _,_ -> match snapshot.unlock with
   | Unlock.Unlock_challenge challenge when current_scope (Unlock.unlock_challenge_scope challenge) ->
     if unlock_pending previous && same_challenge challenge then previous
     else Unlock_waiting challenge
@@ -791,7 +796,9 @@ let apply_manager_state ~discard state (manager_state : Graph_service.state) =
     | None | Some _ -> state
   in
   let state =
-    if owner_changed then (
+    if owner_changed
+       || Option.bind state.manager (fun manager -> manager.selected_graph) <> snapshot.selected_graph
+    then (
       let forget graph_id copies = Option.fold ~none:copies
         ~some:(fun id -> Local_copies.remove (Logseq_db_types.Graph_types.Uuid.to_string id) copies) graph_id in
       let copies = forget (Option.bind state.manager (fun manager -> manager.selected_graph)) state.local_copies in
@@ -1798,6 +1805,7 @@ module Root_navigation = struct
     | Capture_closed
     | Capture_discarded
     | Capture_picker_requested of Journal_asset_import.source
+    | Capture_picker_unavailable of string
     | Capture_asset_picked of Journal_asset_import.staged * int option
     | Capture_assets_picked of
         Journal_asset_import.staged list * int option * string option
@@ -1918,6 +1926,12 @@ module Root_navigation = struct
         ; capture_pick_source = source
         ; capture_pick_request = state.capture_pick_request + 1
         }
+      | Capture_picker_unavailable message ->
+        if not state.capture_picker_armed then state
+        else set_composer_error
+          {state with capture_picker_armed=false}
+          (picker_owner state)
+          (Some (Local_capture_failure message))
       | (Capture_asset_picked (_, _) as event)
       | (Capture_assets_picked (_, _, _) as event) ->
         let items, request_id, error =
@@ -2981,7 +2995,8 @@ let manager_props state dispatch : Journal_manager_view.props =
     let error = match unlock_ui_error state.unlock with Some _ as error -> error | None -> error in
     let pending = unlock_pending state.unlock in
     let challenge_ready = Option.is_some
-      (Option.bind state.manager (fun manager -> Unlock.unlock_challenge manager.unlock)) in
+      (Option.bind state.manager (fun manager -> Unlock.unlock_challenge manager.unlock))
+      || Option.fold ~none:false ~some:(fun manager->manager.Graph_service.startup.awaiting_e2ee_password && manager.resident_scopes<>[]) state.manager in
     let graph_name =
       Option.bind state.manager (fun snapshot ->
         Option.bind snapshot.selected_graph (fun selected ->
@@ -3565,7 +3580,7 @@ let start
     | Graph_service.Client_command (Reconcile_authenticated_user _), Full -> ()
     | _ ->
       let operation = match request with
-        | Graph_service.Client_command (Submit_e2ee_password _) -> "submitE2eePassword"
+        | Graph_service.Client_command (Submit_e2ee_password _ | Submit_native_password _) -> "submitE2eePassword"
         | Client_command (Restore_local_account _) -> "restoreLocalAccount"
         | Client_command (Select_graph _) -> "selectGraph"
         | Client_command (Refresh_catalog _) -> "refreshCatalog"
@@ -4153,7 +4168,7 @@ let start
       let owner = unlock_owner !state_ref in
       let result = dispatch_worker (Graph_service.Client_command command) in
       match command with
-       | Graph_service.Submit_e2ee_password _ ->
+       | Graph_service.Submit_e2ee_password _ | Submit_native_password _ ->
          (match result with
           | Worker.Accepted request_id ->
             unlock_request := Some (request_id, owner);
@@ -6836,13 +6851,7 @@ let start
            then { state with capture_picker_armed = false }
            else state)
        | Journal_asset_import.Unavailable message ->
-         update (fun state ->
-           if not state.capture_picker_armed then state
-           else set_composer_error
-             (report_ui_error {state with capture_picker_armed=false}
-                ~operation:"selectAttachment" ~phase:"native")
-             (picker_owner state)
-             (Some (Local_capture_failure message)))
+         update (fun state -> step_root state (Capture_picker_unavailable message))
        | Journal_asset_import.Removed token ->
          update (fun state -> finish_cleanup (with_cleanup (fun ~discard ->
            match current_composer_owner state with
@@ -6984,9 +6993,14 @@ let start
     | Submit_e2ee_password ->
       let password = Journal_capture.source snapshot.e2ee_password in
       let challenge = Option.bind snapshot.manager (fun manager -> Unlock.unlock_challenge manager.unlock) in
+      let native_scope=Option.bind snapshot.manager(fun manager->
+        if not manager.Graph_service.startup.awaiting_e2ee_password then None else
+        List.find_opt(fun(scope:Unlock.graph_scope)->Some scope.graph_id=manager.selected_graph
+          && scope.graph_generation=manager.startup.graph_generation
+          && scope.account.account_generation=manager.startup.account_generation)manager.resident_scopes) in
       if
         (unlock_pending snapshot.unlock)
-        || Option.is_none challenge
+        || (Option.is_none challenge && Option.is_none native_scope)
         || String.equal (String.trim password) ""
       then Effect.ignore
       else (
@@ -6996,14 +7010,17 @@ let start
         Effect.bind
           (update (fun state ->
              { state with
-               unlock = Unlock_queued (Option.get challenge)
+               unlock = (match challenge with Some challenge->Unlock_queued challenge
+                 | None->Unlock_native_queued(Option.get native_scope))
              ; e2ee_password =
                  Journal_capture.create
                    ~session_number:state.next_local_sequence
                    ~source:""
              ; next_local_sequence = Int64.succ state.next_local_sequence
              }))
-          ~f:(fun () -> send_manager (Graph_service.Submit_e2ee_password (Option.get challenge, password))))
+          ~f:(fun () -> send_manager (match challenge with
+            | Some challenge->Graph_service.Submit_e2ee_password(challenge,password)
+            | None->Graph_service.Submit_native_password(Option.get native_scope,password))))
     | Request_local_cache_reset ->
       update (fun state -> { state with graph_picker_open = true; modal = No_modal })
     | Timeline_retry value ->
@@ -7587,7 +7604,7 @@ let start
         {root with resident_states=Graph_drafts.add key next root.resident_states} in
       ignore(checkpoint_drafts snapshot);
       match !draft_writer with
-      |None->Error "A durable draft lock could not be created for this account."
+      |None->Error "The submitted draft could not be removed for this account."
       |Some writer when not !draft_storage_blocked->
         (match Draft_store.Writer.enqueue writer (fun()->draft_snapshot snapshot) with
         |Error cause->Error cause |Ok()->flush_drafts())

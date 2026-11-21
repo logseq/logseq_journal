@@ -14,7 +14,7 @@ module Worker_runtime = Logseq_db_worker_lui.Journal_worker_runtime
 module W = Journal_worker_coordination.Worker_api
 module Support = Managed_sync_e2e_support
 module Probe = Managed_sync_protocol_probe
-module Sync_protocol = Logseq_sync_pure_reducer.Sync_protocol
+module Sync_protocol = Logseq_sync_protocol.Sync_protocol
 module ID = Journal_worker_ids
 
 exception E2e_failure of string
@@ -22,6 +22,25 @@ exception E2e_failure of string
 let fail format = Printf.ksprintf (fun message -> raise (E2e_failure message)) format
 let base_url = "https://api.logseq.io"
 let report_phase phase = prerr_endline ("managed sync deployed E2E phase: " ^ phase)
+
+let safe_exception_class = function
+  | Invalid_argument _ -> "invalid-argument"
+  | Failure _ -> "failure"
+  | Assert_failure _ -> "assert-failure"
+  | Match_failure _ -> "match-failure"
+  | Not_found -> "not-found"
+  | End_of_file -> "end-of-file"
+  | Sys_error _ -> "sys-error"
+  | Unix.Unix_error _ -> "unix-error"
+  | Fun.Finally_raised _ -> "finally-raised"
+  | _ -> "unclassified-exception"
+;;
+
+let report_exception exception_ backtrace =
+  prerr_endline
+    ("managed sync deployed E2E exception-class=" ^ safe_exception_class exception_);
+  prerr_string (Printexc.raw_backtrace_to_string backtrace)
+;;
 
 let rec remove_tree path =
   match Unix.lstat path with
@@ -204,7 +223,7 @@ let fail_worker context phase reason =
           state.snapshot.applied_server_t
       , startup_failure_stage_name state.snapshot.startup.failure
       , sync_error_kind state.snapshot.last_error
-      , Option.fold ~none:"none" ~some:String.escaped state.snapshot.last_error )
+      , Option.fold ~none:"none" ~some:(fun _ -> "redacted") state.snapshot.last_error )
   in
   fail
     "client=%s phase=%s reason=%s sync=%s startup-failure=%s error-kind=%s graph=%s \
@@ -249,10 +268,17 @@ let handle_public_state context state =
    | Failed, Some During_local_restore when not context.recovery_started ->
      context.recovery_started <- true;
      (match snapshot.selected_graph with
-      | Some graph_id -> send_command context (Begin_online_recovery
-          {startup={account_generation=snapshot.startup.account_generation;
-                    presentation_generation=snapshot.startup.presentation_generation};
-           graph_id; graph_generation=snapshot.startup.graph_generation})
+      | Some graph_id ->
+        send_command
+          context
+          (Begin_online_recovery
+             { startup =
+                 { account_generation = snapshot.startup.account_generation
+                 ; presentation_generation = snapshot.startup.presentation_generation
+                 }
+             ; graph_id
+             ; graph_generation = snapshot.startup.graph_generation
+             })
       | None -> fail_worker context "local-restore" "missing-selected-graph")
    | Failed, _ -> fail_worker context "sync" "failed"
    | _ -> ());
@@ -266,6 +292,12 @@ let handle_public_state context state =
        "catalog"
        (Printf.sprintf "target-unavailable-count-%d" (List.length snapshot.catalog))
    | Ok (Some graph) ->
+     (match Sys.getenv_opt "LOGSEQ_DB_WORKER_E2E_ACTION" with
+      | Some "guarded-save" ->
+        if Sys.getenv_opt "LOGSEQ_DB_WORKER_E2E_EXPECTED_GRAPH_UUID"
+           <> Some (Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id)
+        then fail_worker context "catalog" "expected-graph-mismatch"
+      | _ -> ());
      context.saw_catalog <- true;
      (match context.selected_graph with
       | Some selected
@@ -278,27 +310,43 @@ let handle_public_state context state =
       | None -> ()));
   if snapshot.startup.awaiting_e2ee_password && not context.password_submitted
   then (
-    context.password_submitted <- true;
-    send_command context (Submit_e2ee_password
-      (Logseq_sync_pure_reducer.Core.unlock_challenge snapshot.unlock |> Option.get,
-       context.credentials.e2ee_password)))
+    let command =
+      match Logseq_sync_domain.Core.unlock_challenge snapshot.unlock with
+      | Some challenge ->
+        Some (Service.Submit_e2ee_password (challenge, context.credentials.e2ee_password))
+      | None ->
+        List.find_opt
+          (fun (scope : Service.Unlock.graph_scope) ->
+             Some scope.graph_id = snapshot.selected_graph
+             && scope.graph_generation = snapshot.startup.graph_generation
+             && scope.account.account_generation = snapshot.startup.account_generation)
+          snapshot.resident_scopes
+        |> Option.map (fun scope ->
+          Service.Submit_native_password (scope, context.credentials.e2ee_password))
+    in
+    Option.iter
+      (fun command ->
+         context.password_submitted <- true;
+         send_command context command)
+      command)
 ;;
 
 let handle_graph_state context state =
   context.graph_phase <- state.Logseq_db_worker.phase;
   context.last_event <- "graph-state";
-  if state.phase=Logseq_db_worker.Graph_open && not context.coordination_started then (
-    let module I=(val context.issuer:Worker_effect_authority.ISSUER)in
-    context.coordination_started<-true;
-    ignore(send context(I.bootstrap_request()|>Result.get_ok)))
+  if state.phase = Logseq_db_worker.Graph_open && not context.coordination_started
+  then (
+    let module I = (val context.issuer : Worker_effect_authority.ISSUER) in
+    context.coordination_started <- true;
+    ignore (send context (I.bootstrap_request () |> Result.get_ok)))
 ;;
 
 let accept_baseline context value =
-  let module I=(val context.issuer:Worker_effect_authority.ISSUER)in
-  match I.bootstrap(Service.Coordination_registered value)with
-  |Ok(W.Ready projection)->context.projection<-Some projection
-  |Ok(W.Awaiting_baseline|W.Bootstrap_not_ready _)->context.projection<-None
-  |_->fail_worker context "coordination-bootstrap" "invalid-authoritative-baseline"
+  let module I = (val context.issuer : Worker_effect_authority.ISSUER) in
+  match I.bootstrap (Service.Coordination_registered value) with
+  | Ok (W.Ready projection) -> context.projection <- Some projection
+  | Ok (W.Awaiting_baseline | W.Bootstrap_not_ready _) -> context.projection <- None
+  | _ -> fail_worker context "coordination-bootstrap" "invalid-authoritative-baseline"
 ;;
 
 let handle_push context = function
@@ -317,9 +365,15 @@ let handle_push context = function
   | Asset_notice _ | Asset_notices _ ->
     fail_worker context "assets" "unexpected asset notice without demand"
   | Graph_push _ | Graph_pushes _ -> context.last_event <- "graph-push"
-  | Graph_states states -> List.iter (fun (_,state)->handle_graph_state context state) states
+  | Graph_states states ->
+    List.iter (fun (_, state) -> handle_graph_state context state) states
   | Session_states _ -> ()
-  | Coordination_updates updates->List.iter(function Service.Coordination_snapshot value->accept_baseline context value|_->())updates
+  | Coordination_updates updates ->
+    List.iter
+      (function
+        | Service.Coordination_snapshot value -> accept_baseline context value
+        | _ -> ())
+      updates
   | Coordination_observations _ -> ()
 ;;
 
@@ -333,15 +387,48 @@ let handle_event context = function
   | Response { outcome = Completed (Service.Local_copy_inspected _); _ }
   | Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
     fail_worker context "local-copy" "unexpected local-copy response"
-  | Response { outcome = Completed (Service.Coordination_asset_demand_finalized _ | Coordination_observation_finalized _ | Coordination_confirmed _ | Coordination_changes_acknowledged _ | Coordination_released _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _ | Coordination_import_inputs_recovered _ | Coordination_import_input_confirmed _ | Coordination_import_input_acknowledged _); _ } ->
-    fail_worker context "coordination" "unexpected unowned coordination response"
+  | Response
+      { outcome =
+          Completed
+            ( Service.Coordination_asset_demand_finalized _
+            | Coordination_observation_finalized _
+            | Coordination_confirmed _
+            | Coordination_changes_acknowledged _
+            | Coordination_released _
+            | Coordination_observed _
+            | Coordination_observation_released _
+            | Coordination_mutations_recovered _
+            | Coordination_mutation_acknowledged _
+            | Coordination_asset_demand_accepted _
+            | Coordination_asset_demand_released _
+            | Coordination_imported _
+            | Coordination_writers_quiesced _
+            | Coordination_host_prepared _
+            | Coordination_host_applied _
+            | Coordination_host_confirmed _
+            | Coordination_import_inputs_recovered _
+            | Coordination_import_input_confirmed _
+            | Coordination_import_input_acknowledged _ )
+      ; _
+      } -> fail_worker context "coordination" "unexpected unowned coordination response"
   | Response { outcome = Completed Service.Client_command_completed; _ } -> None
   | Response { outcome = Completed (Service.Graph_state state); _ } ->
     handle_graph_state context state;
     None
-  |Response{outcome=Completed(Service.Coordination_registered value);_}->accept_baseline context value;None
-  |Response{request_id;outcome=Completed((Service.Coordination_queried _|Coordination_query_revoked _|Coordination_mutation_result _)as response);_}->
-    context.last_event<-"typed-response";Some(request_id,response)
+  | Response { outcome = Completed (Service.Coordination_registered value); _ } ->
+    accept_baseline context value;
+    None
+  | Response
+      { request_id
+      ; outcome =
+          Completed
+            (( Service.Coordination_queried _
+             | Coordination_query_revoked _
+             | Coordination_mutation_result _ ) as response)
+      ; _
+      } ->
+    context.last_event <- "typed-response";
+    Some (request_id, response)
   | Response { outcome = Failed _; _ } -> fail_worker context "worker-request" "failed"
   | Response { outcome = Cancelled; _ } ->
     fail_worker context "worker-request" "cancelled"
@@ -372,26 +459,31 @@ let await_response context ~phase request_id =
   loop ()
 ;;
 
-let opening_complete context =
+let opening_complete ~require_bootstrap context =
   match context.last_state with
   | Some state ->
     state.snapshot.sync_phase = Current
     && Option.is_some state.snapshot.applied_server_t
     && context.saw_catalog
-    && context.saw_bootstrap
+    && ((not require_bootstrap) || context.saw_bootstrap)
     && context.saw_opening_pull
     && context.graph_phase = Graph_open
-    && Option.exists(fun projection->List.exists(fun resident->resident.W.phase=W.Open)(W.residents projection))context.projection
+    && Option.exists
+         (fun projection ->
+            List.exists
+              (fun resident -> resident.W.phase = W.Open)
+              (W.residents projection))
+         context.projection
   | None -> false
 ;;
 
-let await_opening_current ?(timeout_seconds = 300.) context =
+let await_opening_current ?(timeout_seconds = 300.) ?(require_bootstrap = true) context =
   let deadline = timeout_at timeout_seconds in
   let rec loop () =
     if Unix.gettimeofday () >= deadline
     then fail_worker context "cold-bootstrap" "timeout";
     ignore (drain context : (ID.Worker.Request_id.t * Service.response) list);
-    if opening_complete context
+    if opening_complete ~require_bootstrap context
     then (
       match context.last_state, context.selected_graph with
       | Some state, Some graph -> Option.get state.snapshot.applied_server_t, graph
@@ -424,39 +516,72 @@ let await_authoritative_current context ~after_server_t phase =
 ;;
 
 let current_session context =
-  match context.projection,context.selected_graph with
-  |Some projection,Some graph->
-    (match List.find_opt(fun resident->resident.W.phase=W.Open && W.graph_id resident.session=graph.graph_id)(W.residents projection)with
-     |Some resident->resident.session|None->fail_worker context "typed-request" "graph-session-unavailable")
-  |_->fail_worker context "typed-request" "bootstrap-not-ready"
+  match context.projection, context.selected_graph with
+  | Some projection, Some graph ->
+    (match
+       List.find_opt
+         (fun resident ->
+            resident.W.phase = W.Open && W.graph_id resident.session = graph.graph_id)
+         (W.residents projection)
+     with
+     | Some resident -> resident.session
+     | None -> fail_worker context "typed-request" "graph-session-unavailable")
+  | _ -> fail_worker context "typed-request" "bootstrap-not-ready"
 ;;
-let execute :type a. client_context -> W.session -> a W.request -> a = fun context session operation->
-  let module I=(val context.issuer:Worker_effect_authority.ISSUER)in
-  let request_id=W.request_id(fresh_uuid())in
-  let request=match I.request session ~request_id operation with
-    |Ok value->value|Error _->fail_worker context "typed-request" "admission-rejected"in
-  let response=await_response context ~phase:"typed-request" (send context request)in
+
+let execute : type a. client_context -> W.session -> a W.request -> a =
+  fun context session operation ->
+  let module I = (val context.issuer : Worker_effect_authority.ISSUER) in
+  let request_id = W.request_id (fresh_uuid ()) in
+  let request =
+    match I.request session ~request_id operation with
+    | Ok value -> value
+    | Error _ -> fail_worker context "typed-request" "admission-rejected"
+  in
+  let response = await_response context ~phase:"typed-request" (send context request) in
   match I.reply session ~request_id operation response with
-  |Ok(W.Answered(Ok value))->value
-  |_->fail_worker context "typed-request" "response-rejected"
+  | Ok (W.Answered (Ok value)) -> value
+  | _ -> fail_worker context "typed-request" "response-rejected"
 ;;
-let query :type a. ?maximum_items:int -> client_context -> a W.query -> a =
-  fun ?(maximum_items=200) context query->
-    let session=current_session context in
-    let budget=W.read_budget session ~maximum_items ~maximum_bytes:Worker_pure_data.maximum_response_bytes|>Result.get_ok in
-    execute context session(W.Query(budget,query))
+
+let query : type a. ?maximum_items:int -> client_context -> a W.query -> a =
+  fun ?(maximum_items = 200) context query ->
+  let session = current_session context in
+  let budget =
+    W.read_budget
+      session
+      ~maximum_items
+      ~maximum_bytes:Worker_pure_data.maximum_response_bytes
+    |> Result.get_ok
+  in
+  execute context session (W.Query (budget, query))
 ;;
+
 let journal_parent context =
-  let result=query ~maximum_items:50 context(W.Journals{
-    from_day=W.journal_day 10101|>Result.get_ok;through_day=W.journal_day 99991231|>Result.get_ok;
-    revision=None;after=None})in
-  match List.find_opt(fun(item:Worker_pure_data.journal_item)->not item.page.recycled)result.items with
-  |Some item->item.page.uuid
-  |None->fail_worker context "journal-read" "no-active-journal"
+  let result =
+    query
+      ~maximum_items:50
+      context
+      (W.Journals
+         { from_day = W.journal_day 10101 |> Result.get_ok
+         ; through_day = W.journal_day 99991231 |> Result.get_ok
+         ; revision = None
+         ; after = None
+         })
+  in
+  match
+    List.find_opt
+      (fun (item : Worker_pure_data.journal_item) -> not item.page.recycled)
+      result.items
+  with
+  | Some item -> item.page.uuid
+  | None -> fail_worker context "journal-read" "no-active-journal"
 ;;
-let read_block context block_uuid=match query context(W.Outline_block{uuid=block_uuid;revision=None})with
-  |Worker_pure_data.V2_present_block{value;revision}->Ok(value,revision)
-  |V2_missing_block _->Error()
+
+let read_block context block_uuid =
+  match query context (W.Outline_block { uuid = block_uuid; revision = None }) with
+  | Worker_pure_data.V2_present_block { value; revision } -> Ok (value, revision)
+  | V2_missing_block _ -> Error ()
 ;;
 
 let require_block context ~block_uuid ~parent_uuid ~title =
@@ -472,39 +597,76 @@ let require_block context ~block_uuid ~parent_uuid ~title =
     block, basis
 ;;
 
-let run_mutation ?(on_applied=fun()->()) context ~after_server_t phase ~mutation_id command =
-  report_phase(phase^"-request");
-  let session=current_session context in
-  let intent=W.mutation_intent session ~mutation_id command|>Result.get_ok in
-  (match execute context session(W.Mutate intent)with
-   |W.Submission_committed receipt->
-     let _,before,after=W.receipt_revisions receipt in
-     if before=after then fail_worker context phase "mutation-not-applied";
-     report_phase(phase^"-local-commit");on_applied()
-   |_->fail_worker context phase "mutation-not-applied");
-  let cursor=await_authoritative_current context ~after_server_t phase in
-  report_phase(phase^"-authoritative");cursor
+let run_mutation
+      ?(on_applied = fun () -> ())
+      context
+      ~after_server_t
+      phase
+      ~mutation_id
+      command
+  =
+  report_phase (phase ^ "-request");
+  let session = current_session context in
+  let intent = W.mutation_intent session ~mutation_id command |> Result.get_ok in
+  (match execute context session (W.Mutate intent) with
+   | W.Submission_committed receipt ->
+     let _, before, after = W.receipt_revisions receipt in
+     if before = after then fail_worker context phase "mutation-not-applied";
+     report_phase (phase ^ "-local-commit");
+     on_applied ()
+   | _ -> fail_worker context phase "mutation-not-applied");
+  let cursor = await_authoritative_current context ~after_server_t phase in
+  report_phase (phase ^ "-authoritative");
+  cursor
 ;;
+
 let insert_preconditions context parent =
-  let page_revision=match query context(W.Page{uuid=parent;revision=None})with
-    |Worker_pure_data.V2_present_page{revision;_}->revision
-    |_->fail_worker context "insert-precondition" "parent-page-missing"in
-  let children=query context(W.Child_members{parent;revision=None;after=None})in
-  Worker_pure_data.{blocks=[];pages=[parent,page_revision];
-    scopes=[V2_children_scope parent,children.scope_revision]}
+  let page_revision =
+    match query context (W.Page { uuid = parent; revision = None }) with
+    | Worker_pure_data.V2_present_page { revision; _ } -> revision
+    | _ -> fail_worker context "insert-precondition" "parent-page-missing"
+  in
+  let children =
+    query context (W.Child_members { parent; revision = None; after = None })
+  in
+  Worker_pure_data.
+    { blocks = []
+    ; pages = [ parent, page_revision ]
+    ; scopes = [ V2_children_scope parent, children.scope_revision ]
+    }
 ;;
+
 let insert_block context ~block_uuid ~parent_uuid ~title ~after_server_t ~on_applied =
-  run_mutation ~on_applied context ~after_server_t "insert-block" ~mutation_id:(fresh_uuid())
-    (W.Insert_blocks{parent=parent_uuid;roots=[{uuid=block_uuid;title;children=[]}];
-      preconditions=insert_preconditions context parent_uuid})
+  run_mutation
+    ~on_applied
+    context
+    ~after_server_t
+    "insert-block"
+    ~mutation_id:(fresh_uuid ())
+    (W.Insert_blocks
+       { parent = parent_uuid
+       ; roots = [ { uuid = block_uuid; title; children = [] } ]
+       ; preconditions = insert_preconditions context parent_uuid
+       })
 ;;
+
 let delete_block context ~block_uuid ~after_server_t =
   report_phase "delete-precondition-start";
-  let _,revision=match read_block context block_uuid with
-    |Ok value->value|Error()->fail_worker context "delete-precondition" "block-missing"in
+  let _, revision =
+    match read_block context block_uuid with
+    | Ok value -> value
+    | Error () -> fail_worker context "delete-precondition" "block-missing"
+  in
   report_phase "delete-precondition-complete";
-  run_mutation context ~after_server_t "delete-block" ~mutation_id:(fresh_uuid())
-    (W.Delete_blocks{root=block_uuid;preconditions={blocks=[block_uuid,revision];pages=[];scopes=[]}})
+  run_mutation
+    context
+    ~after_server_t
+    "delete-block"
+    ~mutation_id:(fresh_uuid ())
+    (W.Delete_blocks
+       { root = block_uuid
+       ; preconditions = { blocks = [ block_uuid, revision ]; pages = []; scopes = [] }
+       })
 ;;
 
 let raw_transaction ~mutation_id ~operation operations =
@@ -622,7 +784,8 @@ let raw_batch ~t_before transactions =
 
 let probe_require_ok phase = function
   | Ok value -> value
-  | Error message -> fail "deployed protocol phase=%s reason=%s" phase message
+  | Error message ->
+    fail "deployed protocol phase=%s error-kind=%s" phase (sync_error_kind (Some message))
 ;;
 
 let probe_hello clock connection =
@@ -631,7 +794,7 @@ let probe_hello clock connection =
     ~timeout_seconds:30.
     (function
       | Sync_protocol.Server.Hello { t; _ } -> Some t
-      | Error { message } -> fail "deployed protocol hello failed: %s" message
+      | Error _ -> fail "deployed protocol hello failed: server-error"
       | _ -> None)
     connection
   |> probe_require_ok "hello"
@@ -648,7 +811,7 @@ let probe_batch_result clock connection =
     (function
       | Sync_protocol.Server.Tx_batch_ok { t; checksum } -> Some (`Accepted (t, checksum))
       | Tx_reject rejection -> Some (`Rejected rejection)
-      | Error { message } -> fail "deployed protocol batch failed: %s" message
+      | Error _ -> fail "deployed protocol batch failed: server-error"
       | _ -> None)
     connection
   |> probe_require_ok "batch-result"
@@ -673,7 +836,10 @@ let probe_expect_accepted clock connection phase =
       phase
       (rejection_reason_name rejection.Sync_protocol.reason)
       (List.length rejection.missing_block_uuids)
-      (Option.fold ~none:"none" ~some:String.escaped rejection.Sync_protocol.error_detail)
+      (Option.fold
+         ~none:"none"
+         ~some:(fun _ -> "redacted")
+         rejection.Sync_protocol.error_detail)
 ;;
 
 let probe_pull clock connection ~since =
@@ -683,7 +849,7 @@ let probe_pull clock connection ~since =
     ~timeout_seconds:30.
     (function
       | Sync_protocol.Server.Pull_ok { t; checksum; txs } -> Some (t, checksum, txs)
-      | Error { message } -> fail "deployed protocol pull failed: %s" message
+      | Error _ -> fail "deployed protocol pull failed: server-error"
       | _ -> None)
     connection
   |> probe_require_ok "pull-result"
@@ -752,206 +918,267 @@ let run_deployed_protocol_contract
       ~source_cursor
   =
   report_phase "protocol-contract-start";
-  Eio_main.run (fun environment ->
-    Eio.Switch.run (fun sw ->
-      let network = Eio.Stdenv.net environment in
-      let clock = Eio.Stdenv.clock environment in
-      let first =
-        Probe.connect ~sw ~network ~clock ~base_url ~graph_id ~token
-        |> probe_require_ok "connect-first"
-      in
-      let second =
-        Probe.connect ~sw ~network ~clock ~base_url ~graph_id ~token
-        |> probe_require_ok "connect-second"
-      in
-      Fun.protect
-        ~finally:(fun () ->
-          Probe.close first;
-          Probe.close second)
-        (fun () ->
-           probe_send
-             first
-             (Sync_protocol.Client.Hello { client = "logseq-journal-e2e-first" })
-             "hello-first";
-           probe_send
-             second
-             (Sync_protocol.Client.Hello { client = "logseq-journal-e2e-second" })
-             "hello-second";
-           let first_t = probe_hello clock first in
-           let second_t = probe_hello clock second in
-           let baseline =
-             if Logseq_db_types.Server_cursor.compare first_t second_t >= 0
-             then first_t
-             else second_t
-           in
-           let _, _, source_history = probe_pull clock first ~since:source_cursor in
-           let protected_title =
-             match
-               protected_title_from_history ~block_uuid:source_block_uuid source_history
-             with
-             | Some title -> title
-             | None -> fail "deployed Pull omitted the source protected title"
-           in
-           let _, _, _ = probe_pull clock first ~since:baseline in
-           let _, _, _ = probe_pull clock second ~since:baseline in
-           let accepted_block = fresh_uuid () in
-           let second_accepted_block = fresh_uuid () in
-           let first_id = fresh_uuid () in
-           let second_id = fresh_uuid () in
-           let first_transaction =
-             raw_marker_create
-               ~mutation_id:first_id
-               ~block_uuid:accepted_block
-               ~parent_uuid
-               ~protected_title
-           in
-           let second_transaction =
-             raw_marker_create
-               ~mutation_id:second_id
-               ~block_uuid:second_accepted_block
-               ~parent_uuid
-               ~protected_title
-           in
-           let group =
-             raw_batch ~t_before:baseline [ first_transaction; second_transaction ]
-           in
-           probe_send first group "group-submit";
-           let group_t, _ = probe_expect_accepted clock first "group-submit" in
-           if
-             not
-               (Logseq_db_types.Server_cursor.equal
-                  group_t
-                  (advance_server_cursor baseline 2))
-           then fail "deployed group cursors are not contiguous in member order";
-           let pulled_t, _, pulled = probe_pull clock second ~since:baseline in
-           if Logseq_db_types.Server_cursor.compare pulled_t group_t < 0
-           then fail "deployed pull did not reach the accepted group";
-           let group_members =
-             pulled
-             |> List.filter (fun transaction ->
-               Logseq_db_types.Server_cursor.compare
-                 transaction.Sync_protocol.Server.t
-                 baseline
-               > 0
-               && Logseq_db_types.Server_cursor.compare transaction.t group_t <= 0)
-           in
-           if
-             List.map (fun tx -> tx.Sync_protocol.Server.t) group_members
-             <> [ advance_server_cursor baseline 1; advance_server_cursor baseline 2 ]
-           then fail "deployed group interval was interleaved or reordered";
-           List.iter2
-             (fun (expected_uuid, expected) transaction ->
-                if not (transaction_adds_block_uuid ~block_uuid:expected_uuid transaction)
-                then fail "deployed Pull omitted a normalized group member";
-                if
-                  transaction.Sync_protocol.Server.outliner_op
-                  <> expected.Sync_protocol.Client.outliner_op
-                then fail "deployed Pull changed the separate outliner operation")
-             [ accepted_block, first_transaction
-             ; second_accepted_block, second_transaction
-             ]
-             group_members;
-           probe_send first group "stale-retry";
-           (match probe_batch_result clock first with
-            | `Rejected { reason = Sync_protocol.Stale; t = Some retry_t; _ }
-              when Logseq_db_types.Server_cursor.equal retry_t group_t -> ()
-            | `Rejected _ -> fail "deployed retry did not return the current stale cursor"
-            | `Accepted _ -> fail "deployed retry unexpectedly executed twice");
-           let accepted_delete_id = fresh_uuid () in
-           let accepted_delete =
-             raw_batch
-               ~t_before:group_t
-               [ raw_marker_delete ~mutation_id:accepted_delete_id accepted_block ]
-           in
-           probe_send first accepted_delete "accepted-before-remote-delete";
-           let delete_t, _ =
-             probe_expect_accepted clock first "accepted-before-remote-delete"
-           in
-           let later_remote_id = fresh_uuid () in
-           probe_send
-             second
-             (raw_batch
-                ~t_before:delete_t
-                [ raw_marker_touch
-                    ~mutation_id:later_remote_id
-                    ~block_uuid:second_accepted_block
-                    ~updated_at:1_704_067_200_001
-                ])
-             "remote-after-delete";
-           let later_remote_t, _ =
-             probe_expect_accepted clock second "remote-after-delete"
-           in
-           if Logseq_db_types.Server_cursor.compare delete_t later_remote_t >= 0
-           then fail "deployed accepted delete did not precede the remote transaction";
-           let stale_block = fresh_uuid () in
-           let create_stale_id = fresh_uuid () in
-           probe_send
-             first
-             (raw_batch
-                ~t_before:later_remote_t
-                [ raw_marker_create
-                    ~mutation_id:create_stale_id
-                    ~block_uuid:stale_block
-                    ~parent_uuid
-                    ~protected_title
-                ])
-             "stale-marker-create";
-           let stale_baseline, _ =
-             probe_expect_accepted clock first "stale-marker-create"
-           in
-           let intervening_id = fresh_uuid () in
-           probe_send
-             second
-             (raw_batch
-                ~t_before:stale_baseline
-                [ raw_marker_touch
-                    ~mutation_id:intervening_id
-                    ~block_uuid:second_accepted_block
-                    ~updated_at:1_704_067_200_002
-                ])
-             "intervening-remote";
-           let intervening_t, _ =
-             probe_expect_accepted clock second "intervening-remote"
-           in
-           let stale_delete_id = fresh_uuid () in
-           probe_send
-             first
-             (raw_batch
-                ~t_before:stale_baseline
-                [ raw_marker_delete ~mutation_id:stale_delete_id stale_block ])
-             "stale-delete";
-           (match probe_batch_result clock first with
-            | `Rejected
-                { reason = Sync_protocol.Stale
-                ; t = Some rejection_t
-                ; success_tx_ids = []
-                ; failed_tx_id = None
-                ; _
-                }
-              when Logseq_db_types.Server_cursor.compare rejection_t intervening_t >= 0 ->
-              ()
-            | `Rejected _ ->
-              fail "deployed stale delete lacked batch-level non-execution evidence"
-            | `Accepted _ -> fail "deployed stale t_before delete executed");
-           probe_send
-             first
-             (raw_batch
-                ~t_before:intervening_t
-                [ raw_marker_delete ~mutation_id:(fresh_uuid ()) stale_block ])
-             "stale-marker-cleanup";
-           let stale_cleanup_t, _ =
-             probe_expect_accepted clock first "stale-marker-cleanup"
-           in
-           probe_send
-             first
-             (raw_batch
-                ~t_before:stale_cleanup_t
-                [ raw_marker_delete ~mutation_id:(fresh_uuid ()) second_accepted_block ])
-             "second-group-marker-cleanup";
-           ignore
-             (probe_expect_accepted clock first "second-group-marker-cleanup"
-              : Sync_protocol.cursor * string option))));
-  report_phase "protocol-contract-complete"
+  let markers =
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let network = Eio.Stdenv.net environment in
+        let clock = Eio.Stdenv.clock environment in
+        let first =
+          Probe.connect ~sw ~network ~clock ~base_url ~graph_id ~token
+          |> probe_require_ok "connect-first"
+        in
+        let second =
+          Probe.connect ~sw ~network ~clock ~base_url ~graph_id ~token
+          |> probe_require_ok "connect-second"
+        in
+        let pending_markers = ref [] in
+        let marker_ids = ref [] in
+        let baseline_cursor = ref None in
+        let remember markers =
+          pending_markers := markers @ !pending_markers;
+          marker_ids := markers @ !marker_ids
+        in
+        let forget uuid =
+          pending_markers
+          := List.filter
+               (fun marker -> not (Logseq_db_types.Graph_types.Uuid.equal marker uuid))
+               !pending_markers
+        in
+        Fun.protect
+          ~finally:(fun () ->
+            Fun.protect
+              ~finally:(fun () ->
+                Probe.close first;
+                Probe.close second)
+              (fun () ->
+                 match !pending_markers, !baseline_cursor with
+                 | [], _ -> ()
+                 | markers, Some baseline ->
+                   List.iter
+                     (fun uuid ->
+                        try
+                          let cursor, _, _ = probe_pull clock first ~since:baseline in
+                          probe_send
+                            first
+                            (raw_batch
+                               ~t_before:cursor
+                               [ raw_marker_delete ~mutation_id:(fresh_uuid ()) uuid ])
+                            "protocol-finally-cleanup";
+                          ignore
+                            (probe_expect_accepted clock first "protocol-finally-cleanup"
+                             : Sync_protocol.cursor * string option);
+                          forget uuid
+                        with
+                        | exception_ ->
+                          let backtrace = Printexc.get_raw_backtrace () in
+                          report_phase
+                            ("protocol-cleanup-failed-marker-"
+                             ^ Logseq_db_types.Graph_types.Uuid.to_string uuid);
+                          report_exception exception_ backtrace)
+                     markers
+                 | markers, None ->
+                   List.iter
+                     (fun uuid ->
+                        report_phase
+                          ("protocol-cleanup-unavailable-marker-"
+                           ^ Logseq_db_types.Graph_types.Uuid.to_string uuid))
+                     markers))
+          (fun () ->
+             probe_send
+               first
+               (Sync_protocol.Client.Hello { client = "logseq-journal-e2e-first" })
+               "hello-first";
+             probe_send
+               second
+               (Sync_protocol.Client.Hello { client = "logseq-journal-e2e-second" })
+               "hello-second";
+             let first_t = probe_hello clock first in
+             let second_t = probe_hello clock second in
+             let baseline =
+               if Logseq_db_types.Server_cursor.compare first_t second_t >= 0
+               then first_t
+               else second_t
+             in
+             baseline_cursor := Some baseline;
+             let _, _, source_history = probe_pull clock first ~since:source_cursor in
+             let protected_title =
+               match
+                 protected_title_from_history ~block_uuid:source_block_uuid source_history
+               with
+               | Some title -> title
+               | None -> fail "deployed Pull omitted the source protected title"
+             in
+             let _, _, _ = probe_pull clock first ~since:baseline in
+             let _, _, _ = probe_pull clock second ~since:baseline in
+             let accepted_block = fresh_uuid () in
+             let second_accepted_block = fresh_uuid () in
+             let first_id = fresh_uuid () in
+             let second_id = fresh_uuid () in
+             let first_transaction =
+               raw_marker_create
+                 ~mutation_id:first_id
+                 ~block_uuid:accepted_block
+                 ~parent_uuid
+                 ~protected_title
+             in
+             let second_transaction =
+               raw_marker_create
+                 ~mutation_id:second_id
+                 ~block_uuid:second_accepted_block
+                 ~parent_uuid
+                 ~protected_title
+             in
+             let group =
+               raw_batch ~t_before:baseline [ first_transaction; second_transaction ]
+             in
+             remember [ accepted_block; second_accepted_block ];
+             probe_send first group "group-submit";
+             let group_t, _ = probe_expect_accepted clock first "group-submit" in
+             if
+               not
+                 (Logseq_db_types.Server_cursor.equal
+                    group_t
+                    (advance_server_cursor baseline 2))
+             then fail "deployed group cursors are not contiguous in member order";
+             let pulled_t, _, pulled = probe_pull clock second ~since:baseline in
+             if Logseq_db_types.Server_cursor.compare pulled_t group_t < 0
+             then fail "deployed pull did not reach the accepted group";
+             let group_members =
+               pulled
+               |> List.filter (fun transaction ->
+                 Logseq_db_types.Server_cursor.compare
+                   transaction.Sync_protocol.Server.t
+                   baseline
+                 > 0
+                 && Logseq_db_types.Server_cursor.compare transaction.t group_t <= 0)
+             in
+             if
+               List.map (fun tx -> tx.Sync_protocol.Server.t) group_members
+               <> [ advance_server_cursor baseline 1; advance_server_cursor baseline 2 ]
+             then fail "deployed group interval was interleaved or reordered";
+             List.iter2
+               (fun (expected_uuid, expected) transaction ->
+                  if
+                    not
+                      (transaction_adds_block_uuid ~block_uuid:expected_uuid transaction)
+                  then fail "deployed Pull omitted a normalized group member";
+                  if
+                    transaction.Sync_protocol.Server.outliner_op
+                    <> expected.Sync_protocol.Client.outliner_op
+                  then fail "deployed Pull changed the separate outliner operation")
+               [ accepted_block, first_transaction
+               ; second_accepted_block, second_transaction
+               ]
+               group_members;
+             probe_send first group "stale-retry";
+             (match probe_batch_result clock first with
+              | `Rejected { reason = Sync_protocol.Stale; t = Some retry_t; _ }
+                when Logseq_db_types.Server_cursor.equal retry_t group_t -> ()
+              | `Rejected _ ->
+                fail "deployed retry did not return the current stale cursor"
+              | `Accepted _ -> fail "deployed retry unexpectedly executed twice");
+             let accepted_delete_id = fresh_uuid () in
+             let accepted_delete =
+               raw_batch
+                 ~t_before:group_t
+                 [ raw_marker_delete ~mutation_id:accepted_delete_id accepted_block ]
+             in
+             probe_send first accepted_delete "accepted-before-remote-delete";
+             let delete_t, _ =
+               probe_expect_accepted clock first "accepted-before-remote-delete"
+             in
+             forget accepted_block;
+             let later_remote_id = fresh_uuid () in
+             probe_send
+               second
+               (raw_batch
+                  ~t_before:delete_t
+                  [ raw_marker_touch
+                      ~mutation_id:later_remote_id
+                      ~block_uuid:second_accepted_block
+                      ~updated_at:1_704_067_200_001
+                  ])
+               "remote-after-delete";
+             let later_remote_t, _ =
+               probe_expect_accepted clock second "remote-after-delete"
+             in
+             if Logseq_db_types.Server_cursor.compare delete_t later_remote_t >= 0
+             then fail "deployed accepted delete did not precede the remote transaction";
+             let stale_block = fresh_uuid () in
+             let create_stale_id = fresh_uuid () in
+             remember [ stale_block ];
+             probe_send
+               first
+               (raw_batch
+                  ~t_before:later_remote_t
+                  [ raw_marker_create
+                      ~mutation_id:create_stale_id
+                      ~block_uuid:stale_block
+                      ~parent_uuid
+                      ~protected_title
+                  ])
+               "stale-marker-create";
+             let stale_baseline, _ =
+               probe_expect_accepted clock first "stale-marker-create"
+             in
+             let intervening_id = fresh_uuid () in
+             probe_send
+               second
+               (raw_batch
+                  ~t_before:stale_baseline
+                  [ raw_marker_touch
+                      ~mutation_id:intervening_id
+                      ~block_uuid:second_accepted_block
+                      ~updated_at:1_704_067_200_002
+                  ])
+               "intervening-remote";
+             let intervening_t, _ =
+               probe_expect_accepted clock second "intervening-remote"
+             in
+             let stale_delete_id = fresh_uuid () in
+             probe_send
+               first
+               (raw_batch
+                  ~t_before:stale_baseline
+                  [ raw_marker_delete ~mutation_id:stale_delete_id stale_block ])
+               "stale-delete";
+             (match probe_batch_result clock first with
+              | `Rejected
+                  { reason = Sync_protocol.Stale
+                  ; t = Some rejection_t
+                  ; success_tx_ids = []
+                  ; failed_tx_id = None
+                  ; _
+                  }
+                when Logseq_db_types.Server_cursor.compare rejection_t intervening_t >= 0
+                -> ()
+              | `Rejected _ ->
+                fail "deployed stale delete lacked batch-level non-execution evidence"
+              | `Accepted _ -> fail "deployed stale t_before delete executed");
+             probe_send
+               first
+               (raw_batch
+                  ~t_before:intervening_t
+                  [ raw_marker_delete ~mutation_id:(fresh_uuid ()) stale_block ])
+               "stale-marker-cleanup";
+             let stale_cleanup_t, _ =
+               probe_expect_accepted clock first "stale-marker-cleanup"
+             in
+             forget stale_block;
+             probe_send
+               first
+               (raw_batch
+                  ~t_before:stale_cleanup_t
+                  [ raw_marker_delete ~mutation_id:(fresh_uuid ()) second_accepted_block ])
+               "second-group-marker-cleanup";
+             ignore
+               (probe_expect_accepted clock first "second-group-marker-cleanup"
+                : Sync_protocol.cursor * string option);
+             forget second_accepted_block;
+             !marker_ids)))
+  in
+  report_phase "protocol-contract-complete";
+  markers
 ;;
 
 let config support =
@@ -994,14 +1221,20 @@ let with_client ~label ~support ~credentials ~cognito f =
       client
     | Error _ -> fail "client=%s phase=start reason=failed" label
   in
-  let issuer=Worker_effect_authority.issuer ~managed_origin:base_url ~user_id:cognito.Support.user_id
-    ~runtime_epoch:(Worker.runtime_epoch client) ~worker_generation:(Worker.worker_generation client)|>Result.get_ok in
+  let issuer =
+    Worker_effect_authority.issuer
+      ~managed_origin:base_url
+      ~user_id:cognito.Support.user_id
+      ~runtime_epoch:(Worker.runtime_epoch client)
+      ~worker_generation:(Worker.worker_generation client)
+    |> Result.get_ok
+  in
   let context =
     { label
     ; client
     ; issuer
-    ; projection=None
-    ; coordination_started=false
+    ; projection = None
+    ; coordination_started = false
     ; credentials
     ; cognito
     ; token_requests = Hashtbl.create 8
@@ -1022,7 +1255,9 @@ let with_client ~label ~support ~credentials ~cognito f =
       if not (Worker.For_testing.is_stopping client) then Worker_runtime.stop client;
       await_runtime_idle label)
     (fun () ->
-       send_command context (Request_sign_in {account_generation=0; presentation_generation=0});
+       send_command
+         context
+         (Request_sign_in { account_generation = 0; presentation_generation = 0 });
        send_command
          context
          (Reconcile_authenticated_user { user_id = Some cognito.user_id });
@@ -1076,7 +1311,13 @@ let require_durable_advance facts initial_cursor label =
   then fail "%s durable cursor did not advance" label;
   if String.equal facts.checksum "0000000000000000"
   then fail "%s durable checksum did not advance" label;
-  if not facts.outbox_empty then fail "%s durable outbox is not empty" label
+  if not facts.outbox_empty then fail "%s durable outbox is not empty" label;
+  report_phase
+    (Printf.sprintf
+       "%s-durable-checkpoint-%Ld-to-%Ld-outbox-empty"
+       label
+       (Logseq_db_types.Server_cursor.to_int64 initial_cursor)
+       (Logseq_db_types.Server_cursor.to_int64 facts.cursor))
 ;;
 
 let cleanup_block context ~block_uuid ~parent_uuid ~title ~opening_cursor =
@@ -1112,7 +1353,12 @@ let best_effort_cleanup
            : Logseq_db_types.Server_cursor.t));
     report_phase "best-effort-cleanup-complete"
   with
-  | _ -> report_phase "best-effort-cleanup-failed"
+  | exception_ ->
+    let backtrace = Printexc.get_raw_backtrace () in
+    report_phase
+      ("best-effort-cleanup-failed-marker-"
+       ^ Logseq_db_types.Graph_types.Uuid.to_string block_uuid);
+    report_exception exception_ backtrace
 ;;
 
 let require_macos () =
@@ -1338,28 +1584,171 @@ let run () =
                receiver_final_cursor
              < 0
            then fail "receiver durable cursor is behind public state";
-           run_deployed_protocol_contract
-             ~token:cognito.id_token
-             ~graph_id:receiver_graph.graph_id
-             ~parent_uuid
-             ~source_block_uuid:block_uuid
-             ~source_cursor:sender_opening_cursor)))
+           let protocol_markers =
+             run_deployed_protocol_contract
+               ~token:cognito.id_token
+               ~graph_id:receiver_graph.graph_id
+               ~parent_uuid
+               ~source_block_uuid:block_uuid
+               ~source_cursor:sender_opening_cursor
+           in
+           with_client
+             ~label:"durable-recovery"
+             ~support:receiver_support
+             ~credentials
+             ~cognito
+             (fun recovery ->
+                let cursor, graph =
+                  await_opening_current
+                    ~timeout_seconds:60.
+                    ~require_bootstrap:false
+                    recovery
+                in
+                if
+                  not
+                    (Logseq_db_types.Graph_types.Uuid.equal
+                       graph.graph_id
+                       receiver_graph.graph_id)
+                then fail_worker recovery "durable-recovery" "graph-mismatch";
+                if Logseq_db_types.Server_cursor.compare cursor receiver_facts.cursor < 0
+                then fail_worker recovery "durable-recovery" "checkpoint-regressed";
+                List.iter
+                  (fun uuid ->
+                     match read_block recovery uuid with
+                     | Error () -> ()
+                     | Ok _ ->
+                       fail
+                         "remote cleanup verification failed marker=%s"
+                         (Logseq_db_types.Graph_types.Uuid.to_string uuid))
+                  (block_uuid :: protocol_markers);
+                report_phase "durable-recovery-all-four-owned-markers-absent");
+           let recovered_facts = durable_facts receiver_support receiver_graph.graph_id in
+           require_durable_advance
+             recovered_facts
+             receiver_opening_cursor
+             "recovered-receiver")))
+;;
+
+let run_guarded_save () =
+  require_macos ();
+  let required name =
+    match Sys.getenv_opt ("LOGSEQ_DB_WORKER_E2E_" ^ name) with
+    | Some value when String.length value > 0 && String.length value <= 4096
+                      && not (String.contains value '\000') -> value
+    | _ -> fail "missing or invalid guarded input: %s" name
+  in
+  let uuid name =
+    match Logseq_db_types.Graph_types.Uuid.of_string (required name) with
+    | Ok value -> value
+    | Error _ -> fail "invalid guarded UUID: %s" name
+  in
+  let graph_id = uuid "EXPECTED_GRAPH_UUID" in
+  let block_uuid = uuid "OWNED_BLOCK_UUID" in
+  let parent_uuid = uuid "EXPECTED_PARENT_UUID" in
+  let expected = required "EXPECTED_BODY" in
+  let prefix = required "SELF_PREFIX" in
+  let title = required "NEW_BODY" in
+  if String.length prefix < 16
+     || not (String.starts_with ~prefix expected)
+     || not (String.starts_with ~prefix:expected title)
+     || String.length title <= String.length expected
+     || String.length title > 512
+     || String.length title - String.length expected > 64
+  then fail "guarded body bounds or ownership prefix rejected";
+  let credentials =
+    match Support.credentials_from_environment Sys.getenv_opt with
+    | Ok value -> value
+    | Error message -> fail "%s" message
+  in
+  let cognito =
+    match Support.authenticate credentials with
+    | Ok value -> value
+    | Error message -> fail "%s" message
+  in
+  let verify context body =
+    let block, revision = require_block context ~block_uuid ~parent_uuid ~title:body in
+    let status =
+      match block.task_status with
+      | Some value -> value
+      | None -> fail "guarded block is not a task"
+    in
+    (match query context (W.Task_status_definitions [ status ]) with
+     | [ Some definition ] when String.equal definition.title "Done" -> ()
+     | _ -> fail "guarded task is not Done");
+    let children =
+      query ~maximum_items:1 context
+        (W.Child_members { parent = block_uuid; revision = None; after = None })
+    in
+    if children.items <> [] then fail "guarded owned block has children";
+    status, revision
+  in
+  with_temp_directory "logseq-guarded-save-" (fun support ->
+    let initial, acknowledged, status =
+      with_client ~label:"guarded-save" ~support ~credentials ~cognito (fun context ->
+        let initial, graph = await_opening_current context in
+        if not (Logseq_db_types.Graph_types.Uuid.equal graph.graph_id graph_id)
+        then fail "guarded graph mismatch";
+        let status, revision = verify context expected in
+        report_phase "guarded-save-guards-passed-Done-children-empty";
+        let acknowledged =
+          run_mutation context ~after_server_t:initial "guarded-save"
+            ~mutation_id:(fresh_uuid ())
+            (W.Save_block
+               { block = block_uuid; title
+               ; preconditions =
+                   { blocks = [ block_uuid, revision ]; pages = []; scopes = [] }
+               })
+        in
+        let after_status, _ = verify context title in
+        if after_status <> status then fail "guarded task status changed";
+        initial, acknowledged, status)
+    in
+    let facts = durable_facts support graph_id in
+    require_durable_advance facts initial "guarded-save";
+    if Logseq_db_types.Server_cursor.compare facts.cursor acknowledged < 0
+    then fail "guarded durable checkpoint behind acknowledgement";
+    report_phase
+      (Printf.sprintf "guarded-save-checkpointAck-%Ld-Done-preserved"
+         (Logseq_db_types.Server_cursor.to_int64 acknowledged));
+    with_temp_directory "logseq-guarded-incoming-" (fun receiver_support ->
+      with_client ~label:"guarded-incoming" ~support:receiver_support
+        ~credentials ~cognito (fun context ->
+          let cursor, _ = await_opening_current context in
+          if Logseq_db_types.Server_cursor.compare cursor acknowledged < 0
+          then fail "incoming checkpoint behind acknowledgement";
+          let incoming_status, _ = verify context title in
+          if incoming_status <> status then fail "incoming task status changed";
+          report_phase "guarded-incoming-exact-body-Done-preserved");
+      let incoming = durable_facts receiver_support graph_id in
+      if not incoming.outbox_empty then fail "incoming durable outbox not empty";
+      report_phase "guarded-incoming-durable-outbox-empty"))
+;;
+
+let selected_run () =
+  match Sys.getenv_opt "LOGSEQ_DB_WORKER_E2E_ACTION" with
+  | None -> run ()
+  | Some "guarded-save" -> run_guarded_save ()
+  | Some _ -> fail "unknown managed sync E2E action"
 ;;
 
 let () =
+  Printexc.record_backtrace true;
   let status =
     try
       if Sys.getenv_opt platform_crypto_provider_marker = Some "1"
       then (
-        with_execution_lock run;
+        with_execution_lock selected_run;
         0)
       else run_with_platform_crypto_provider ()
     with
     | E2e_failure message ->
+      let backtrace = Printexc.get_raw_backtrace () in
       prerr_endline ("managed sync deployed E2E failed: " ^ message);
+      prerr_string (Printexc.raw_backtrace_to_string backtrace);
       2
-    | _ ->
-      prerr_endline "managed sync deployed E2E failed: unexpected failure";
+    | exception_ ->
+      let backtrace = Printexc.get_raw_backtrace () in
+      report_exception exception_ backtrace;
       2
   in
   if !runtime_started then Worker_runtime.For_testing.final_shutdown ();

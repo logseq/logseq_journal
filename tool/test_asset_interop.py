@@ -23,11 +23,11 @@ print(work, flush=True)
 record = {"commands": [], "sources": {}, "result": "incomplete"}
 for source in [crypt, upstream / "deps/db/src/logseq/db/sqlite/util.cljs",
                root / "swift/JournalE2EECrypto.swift",
-               root / "logseq_sync/lib/effect_runner/protocol/asset_codec.ml",
+               root / "logseq_sync/lib/native_crypto/asset_codec.ml",
                root / "logseq_sync/test/asset_native_interop.ml",
                root / "logseq_sync/test/asset_adapter_memory.ml",
-               root / "logseq_sync/lib/effect_runner/platform/platform_crypto.ml",
-               root / "logseq_sync/lib/effect_runner/platform/platform_crypto_stubs.c",
+               root / "logseq_sync/lib/native_crypto/platform_crypto.ml",
+               root / "logseq_sync/lib/native_crypto/platform_crypto_stubs.c",
                root / "tool/asset_interop.cljs", Path(__file__).resolve()]:
     record["sources"][str(source)] = hashlib.sha256(source.read_bytes()).hexdigest()
 record["upstreamCommit"] = subprocess.check_output(
