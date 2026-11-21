@@ -11,13 +11,13 @@ val create
   -> http:Http_client.t
   -> (t, Dsl.error) result
 
-(** No preliminary pull. Metadata cursor must match the requested baseline; live rows do not advance it. *)
+(** Metadata defines the baseline; no WebSocket or preliminary pull is required. *)
 val acquire
   :  t
   -> scope:Http_client.scope
   -> epoch:int64
   -> handoff:(Dsl.resource_reference Rrbvec.t -> (unit, Dsl.error) result)
-  -> Dsl.Overlay.Types.server_cursor
+  -> unit
   -> (Dsl.snapshot, Dsl.error) result
 
 (** Exact original descriptors only; files remain owned across network fencing until checked release. *)

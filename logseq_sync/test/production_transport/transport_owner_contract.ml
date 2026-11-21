@@ -483,7 +483,8 @@ let rejection_partition () =
 ;;
 
 let snapshot_handoff () =
-  let fetch_snapshot ~scope through =
+  let fetch_snapshot ~scope () =
+    let through = cursor 3L in
     let resource = get (D.resource ~owner:identity ~token:"synthetic-snapshot") in
     let snapshot =
       get
@@ -494,15 +495,12 @@ let snapshot_handoff () =
       (scope.Transport.handoff (Rrbvec.singleton (D.Snapshot_reference snapshot)))
   in
   with_owner ~fetch_snapshot (fun _ run _ _ _ _ _ ledger _ ->
-    let connection = get (run.run D.Connect) in
-    let snapshot =
-      get (run.run (D.On_connection (connection, D.Fetch_snapshot (cursor 3L))))
-    in
+    let snapshot = get (run.run D.Fetch_snapshot) in
     Alcotest.(check int64)
       "snapshot exact baseline"
       3L
       (O.Server_cursor.to_int64 snapshot.through);
-    Alcotest.(check int) "original ledgers transferred" 2 (List.length !ledger))
+    Alcotest.(check int) "original ledgers transferred" 1 (List.length !ledger))
 ;;
 
 let retire_joins_waiters () =

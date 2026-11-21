@@ -276,11 +276,12 @@ type _ transport =
   | Retire_connection : connection -> unit transport
   | On_connection : connection * 'a transport -> 'a transport
   | Head : remote_head transport
-  | Fetch_snapshot : Overlay.Types.server_cursor -> snapshot transport
+  (** Metadata defines the baseline independently of WebSocket connections. *)
+  | Fetch_snapshot : snapshot transport
   | Pull : Overlay.Types.server_cursor -> pull_result transport
   | Push : Overlay.Types.submission_batch -> submission_reply transport
 
-(** Validate framing/authentication/cursors/bounds before delivery. Wrap only Head/Fetch_snapshot/Pull/Push
+(** Validate framing/authentication/cursors/bounds before delivery. Wrap only Head/Pull/Push
     once in On_connection; one unresolved response-family request and one Receive per connection.
     Match generation/baseline/frozen IDs/barriers; ambiguity fails the connection, retaining Submitted.
     Empty/replayed Pull returns No_progress. Only Remote_changed hints coalesce; overflow backpressures.
@@ -730,6 +731,7 @@ val policy_config
     leaving retirement to the owner. Recover Submitted exact wires before fresh submissions; persist before Push.
     Unknown outcomes reconcile original IDs. Deferred retains exact batch/outcome ID, pauses Pull/fresh sends,
     then re-inspects/reapplies after settlement; scope exit drops only volatile bytes, preserving restart recovery.
+    Without a checkpoint, activate the metadata baseline before Connect; restart reuses a checkpoint.
     No_progress uses configured delay; snapshots release on every path, deferred activation waits for change.
     Only Network_failure/Remote_closed/Network_lost/Asset_network retry; join old connection before reconnect.
     Retry Sleep cancels on stop/gate close. Reconnect budget resets after authoritative catch-up and Submitted

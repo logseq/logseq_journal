@@ -185,14 +185,14 @@ let encryption_failure () =
          ~scope
          ~epoch:7L
          ~handoff:(fun _ -> Alcotest.fail "Invalid encryption must not hand off")
-         cursor);
+         ());
     Alcotest.(check int)
       "encryption failure cleans staging"
       0
       (Array.length (Sys.readdir root)))
 ;;
 
-let acquire owner handoff = S.acquire owner ~scope ~epoch:7L ~handoff cursor
+let acquire owner handoff = S.acquire owner ~scope ~epoch:7L ~handoff ()
 
 let success () =
   with_owner (fun root owner requests downloads tokens ->
@@ -251,7 +251,6 @@ let metadata_failure () =
          Alcotest.(check int) "no artifacts" 0 (Array.length (Sys.readdir root))))
     [ "{\"ok\":true,\"url\":\"https://cdn.example.com/x\"}"
     ; "{\"ok\":true,\"url\":\"https://cdn.example.com/x\",\"t\":-1}"
-    ; "{\"ok\":true,\"url\":\"https://cdn.example.com/x\",\"t\":4}"
     ; "{\"ok\":true,\"url\":\"http://cdn.example.com/x\",\"t\":3}"
     ]
 ;;
@@ -1273,7 +1272,14 @@ let start_encrypted_native_fixture
         (get (X.database_if_open owner)) )
 ;;
 
-let native_service_bootstrap ?(checksum_mode = `Valid) ?(new_head = false) () =
+let native_service_bootstrap
+      ?(checksum_mode = `Valid)
+      ?(new_head = false)
+      ?(no_ws = false)
+      ?(baseline = 3)
+      ?(catchup = false)
+      ()
+  =
   let module App = Journal_sync_lifecycle.Core in
   let module X = Execute.Core in
   let module Database = Logseq_overlay_db.Database in
@@ -1300,7 +1306,7 @@ let native_service_bootstrap ?(checksum_mode = `Valid) ?(new_head = false) () =
   let metadata =
     wire_response
       "Content-Type: application/json\r\nContent-Length: {{LENGTH}}\r\n"
-      "{\"ok\":true,\"url\":\"{{ORIGIN}}/snapshot\",\"t\":3}"
+      (Printf.sprintf "{\"ok\":true,\"url\":\"{{ORIGIN}}/snapshot\",\"t\":%d}" baseline)
   in
   let artifact =
     wire_response
@@ -1310,11 +1316,16 @@ let native_service_bootstrap ?(checksum_mode = `Valid) ?(new_head = false) () =
   let module Protocol = Logseq_sync_protocol.Sync_protocol in
   let wire_checksum = Types.Checksum.to_string checksum in
   let wire_checksum = String.sub wire_checksum (String.length "checksum:v1:") 16 in
+  let final_cursor =
+    Result.get_ok
+      (Types.Server_cursor.of_int64
+         (Int64.of_int (if catchup then baseline + 1 else baseline)))
+  in
   let hello =
     Result.get_ok
       (Protocol.encode_server_message
          (Protocol.Server.Hello
-            { t = cursor
+            { t = (if catchup then final_cursor else cursor)
             ; checksum =
                 (match checksum_mode with
                  | `Valid -> Some wire_checksum
@@ -1329,11 +1340,26 @@ let native_service_bootstrap ?(checksum_mode = `Valid) ?(new_head = false) () =
   let frame =
     String.make 1 (Char.chr 0x81) ^ String.make 1 (Char.chr (String.length hello)) ^ hello
   in
+  let pull =
+    Result.get_ok
+      (Protocol.encode_server_message
+         (Protocol.Server.Pull_ok
+            { t = final_cursor
+            ; checksum = None
+            ; txs =
+                [ { Protocol.Server.t = final_cursor; tx = "[]"; outliner_op = None } ]
+            }))
+  in
+  let pull_frame =
+    String.make 1 (Char.chr 0x81) ^ String.make 1 (Char.chr (String.length pull)) ^ pull
+  in
   let socket ?(parallel = true) frame =
     match Tls_peer.case ~ws:true "" with
     | `Assoc fields ->
       `Assoc
-        (("parallel", `Bool parallel)
+        (("expected_pull_since", `Int baseline)
+         :: ("reply_by_type", `Assoc [ "pull", `String (Tls_peer.hex pull_frame) ])
+         :: ("parallel", `Bool parallel)
          :: ("lifetime", `Int 10)
          :: ("reply_text", `String (Tls_peer.hex frame))
          :: fields)
@@ -1351,9 +1377,14 @@ let native_service_bootstrap ?(checksum_mode = `Valid) ?(new_head = false) () =
   in
   let report =
     Tls_peer.with_peer
-      ([ socket frame
-       ; Tls_peer.case ~eof:true metadata
+      ([ Tls_peer.case ~eof:true metadata
        ; Tls_peer.case ~eof:true artifact
+       ; (if no_ws
+          then
+            Tls_peer.case
+              ~eof:true
+              "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n"
+          else socket ~parallel:new_head frame)
        ]
        @ if new_head then [ socket ~parallel:false later_frame ] else [])
       (fun ~environment ~sw ~support ~origin ->
@@ -1479,9 +1510,11 @@ let native_service_bootstrap ?(checksum_mode = `Valid) ?(new_head = false) () =
                    | D.Activation_failure
                        (Types.Snapshot_commit_persistence_failed message)
                      :: _ -> Alcotest.fail ("Activation persistence: " ^ message)
+                   | D.Network_failure _ :: _ when no_ws -> ()
                    | error :: _ -> Alcotest.fail (D.error_message error)
                    | [] -> ());
-                  Option.is_some !observed_checkpoint && !online);
+                  Option.is_some !observed_checkpoint
+                  && if no_ws then !errors <> [] else !online);
                 let database = get (X.database owner) in
                 Alcotest.(check (option bool))
                   "actual snapshot digest is committed"
@@ -1489,7 +1522,7 @@ let native_service_bootstrap ?(checksum_mode = `Valid) ?(new_head = false) () =
                   (Result.get_ok
                      (Database.check_checkpoint_checksum
                         database
-                        ~through:cursor
+                        ~through:final_cursor
                         ~expected:checksum));
                 let inspection =
                   Result.get_ok
@@ -1522,7 +1555,7 @@ let native_service_bootstrap ?(checksum_mode = `Valid) ?(new_head = false) () =
                   "SQLite stores actual snapshot digest"
                   (Types.Checksum.to_string checksum)
                   (Types.Checksum.to_string durable_digest);
-                if checksum_mode = `Invalid
+                if checksum_mode = `Invalid && not no_ws
                 then (
                   let expected =
                     Result.get_ok
@@ -1550,12 +1583,24 @@ let native_service_bootstrap ?(checksum_mode = `Valid) ?(new_head = false) () =
                 let view = Result.get_ok (Database.inspect_sync database) in
                 Alcotest.(check int64)
                   "native service activates exact server checkpoint"
-                  3L
+                  (Types.Server_cursor.to_int64 final_cursor)
                   (Types.sync_view_checkpoint view |> Types.Server_cursor.to_int64);
-                Alcotest.(check int)
-                  "bootstrap subscription errors"
-                  0
-                  (List.length !errors);
+                if no_ws
+                then
+                  Alcotest.(check bool)
+                    "only WS network failure follows local activation"
+                    true
+                    (!errors <> []
+                     && List.for_all
+                          (function
+                            | D.Network_failure _ -> true
+                            | _ -> false)
+                          !errors)
+                else
+                  Alcotest.(check int)
+                    "bootstrap subscription errors"
+                    0
+                    (List.length !errors);
                 if new_head
                 then (
                   resample true;
@@ -2109,7 +2154,13 @@ let native_error_cause kind () =
 
 let () =
   let tests =
-    [ ( "encrypted native snapshot activation respects crypto bounds"
+    [ ( "native HTTP initializes locally without WS at advanced metadata"
+      , fun () -> native_service_bootstrap ~no_ws:true ~baseline:12 () )
+    ; ( "native WS pulls from metadata baseline to advanced head"
+      , fun () -> native_service_bootstrap ~catchup:true () )
+    ; ( "encrypted HTTP initializes locally without WS"
+      , fun () -> native_service_bootstrap ~checksum_mode:`Invalid ~no_ws:true () )
+    ; ( "encrypted native snapshot activation respects crypto bounds"
       , fun () -> encrypted_snapshot_activation () )
     ; ( "AES protected append reordered echo and six exact-payload rejections"
       , fun () -> encrypted_snapshot_activation ~echo:false () )

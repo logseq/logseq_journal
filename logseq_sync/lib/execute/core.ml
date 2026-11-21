@@ -1467,12 +1467,12 @@ let perform_transport : type a. t -> unit ref -> a Dsl.transport -> (a, Dsl.erro
       | Dsl.On_connection (connection, request) ->
         let* _ = require_resource t (Dsl.Connection_reference connection) in
         (match request with
-         | Dsl.Head | Dsl.Fetch_snapshot _ | Dsl.Pull _ | Dsl.Push _ -> Ok ()
+         | Dsl.Head | Dsl.Pull _ | Dsl.Push _ -> Ok ()
          | _ -> Error (Dsl.Invalid_input "Invalid scoped transport"))
       | Dsl.Receive connection ->
         let* _ = require_resource t (Dsl.Connection_reference connection) in
         Ok ()
-      | Dsl.Connect | Dsl.Head | Dsl.Fetch_snapshot _ | Dsl.Pull _ | Dsl.Push _ -> Ok ()
+      | Dsl.Connect | Dsl.Head | Dsl.Fetch_snapshot | Dsl.Pull _ | Dsl.Push _ -> Ok ()
       | Dsl.Retire_connection _ -> Ok ()
     in
     let* () = validate operation in
@@ -1489,7 +1489,7 @@ let perform_transport : type a. t -> unit ref -> a Dsl.transport -> (a, Dsl.erro
              | Dsl.Connect ->
                let* _ = require_resource t (Dsl.Connection_reference result) in
                Ok ()
-             | Dsl.Fetch_snapshot _ ->
+             | Dsl.Fetch_snapshot ->
                let* _ = require_resource t (Dsl.Snapshot_reference result) in
                Ok ()
              | Dsl.On_connection (_, op) -> check_result op result

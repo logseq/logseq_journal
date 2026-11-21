@@ -567,7 +567,7 @@ let real_activation env () =
                  (operation : a D.transport)
                  : (a, D.error) result ->
                  match operation with
-                 | D.Fetch_snapshot _ ->
+                 | D.Fetch_snapshot ->
                    Result.map
                      (fun () -> snapshot)
                      (X.handoff scope (Rrbvec.of_list [ D.Snapshot_reference snapshot ]))
@@ -583,7 +583,7 @@ let real_activation env () =
          get (X.open_network t ~authorization_epoch:7L);
          let program =
            D.perform
-             (D.Transport (D.Fetch_snapshot through))
+             (D.Transport D.Fetch_snapshot)
              ~failure:D.abort
              ~success:(fun snapshot ->
                D.perform
@@ -1231,6 +1231,7 @@ let service_exhausted_network_recovery ?terminal maximum_attempts env () =
                   ~checksum
                   ~encrypted:false)
            in
+           let downloads = ref 0 in
            let attempts = ref 0
            and repaired = ref false in
            let authorized = ref []
@@ -1271,7 +1272,8 @@ let service_exhausted_network_recovery ?terminal maximum_attempts env () =
                  ; snapshot_available = true
                  ; expected_checksum = Some expected_checksum
                  }
-             | D.Fetch_snapshot _ ->
+             | D.Fetch_snapshot ->
+               incr downloads;
                Result.map
                  (fun () -> snapshot)
                  (X.handoff scope (Rrbvec.singleton (D.Snapshot_reference snapshot)))
@@ -1406,7 +1408,9 @@ let service_exhausted_network_recovery ?terminal maximum_attempts env () =
                   "no remaining automatic retry"
                   (maximum_attempts + 1)
                   !attempts;
-                check (checkpoint () = None) "offline checkpoint does not advance";
+                check
+                  (checkpoint () = Some target)
+                  "HTTP bootstrap survives offline WebSocket";
                 repaired := true;
                 get (Service.set_network service D.Closed);
                 let reopening =
@@ -1446,8 +1450,8 @@ let service_exhausted_network_recovery ?terminal maximum_attempts env () =
                    Eio.Time.sleep (Eio.Stdenv.clock env) 0.02;
                    Alcotest.(check int) "terminal recovery never reconnects" 1 !attempts;
                    check
-                     (checkpoint () = None)
-                     "terminal recovery never advances checkpoint"
+                     (checkpoint () = Some target)
+                     "terminal recovery preserves activated checkpoint"
                  | None ->
                    wait (fun () ->
                      Option.exists
@@ -1472,6 +1476,10 @@ let service_exhausted_network_recovery ?terminal maximum_attempts env () =
                      "explicit recovery resumes one fresh connection"
                      (maximum_attempts + 2)
                      !attempts);
+                Alcotest.(check int)
+                  "reconnect never redownloads activated mirror"
+                  1
+                  !downloads;
                 check
                   (List.rev !events = [ "open"; "fence"; "joined"; "open" ])
                   "physical fence and join precede fresh authorization"))))
