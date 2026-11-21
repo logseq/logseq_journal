@@ -288,7 +288,7 @@ let cached_key_effect ?origin () =
     | Some scope -> scope
     | None -> fail "encrypted graph selection did not inspect its mirror"
   in
-  let missing = Core.step selected.next (Mirror_inspected (Mirror_absent scope)) in
+  let missing = Core.step selected.next (Mirror_inspected (Mirror_absent scope)) |> Core_contract.snapshot_metadata_ready in
   let instruction =
     List.find_map
       (function
@@ -804,7 +804,7 @@ let private_key_unlock_and_sign_out () =
   in
   let selected = Core.step catalog.next (Graph_selected (graph_id ())) in
   let scope = Core.admitted_graph_scope selected.next |> Option.get in
-  let missing = Core.step selected.next (Mirror_inspected (Mirror_absent scope)) in
+  let missing = Core.step selected.next (Mirror_inspected (Mirror_absent scope)) |> Core_contract.snapshot_metadata_ready in
   let failed =
     List.find_map
       (function

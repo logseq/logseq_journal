@@ -119,11 +119,81 @@ let selected_graph selected_graph =
   selected, Core.admitted_graph_scope selected.next |> Option.get
 ;;
 
+let snapshot_metadata_ready (transition : Core.transition) =
+  List.find_map
+    (function
+      | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+        Some
+          (Core.step
+             transition.next
+             (Core.Runner_completed
+                (Core.Completion
+                   ( ticket
+                   , Ok
+                       {|{"ok":true,"t":42,"key":"stream/graph.snapshot","url":"https://example.com/sync/graph/snapshot/stream","content-encoding":"gzip"}|}
+                   ))))
+      | _ -> None)
+    transition.effects
+  |> Option.get
+;;
+
+let encrypted_snapshot_metadata_precedes_key_access () =
+  let selected, scope = selected_graph encrypted_graph in
+  let absent =
+    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope))
+  in
+  Alcotest.(check bool)
+    "metadata precedes all key and websocket work"
+    true
+    (match
+       List.filter
+         (function
+           | Core.Publish _ -> false
+           | _ -> true)
+         absent.effects
+     with
+     | [ Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) ] -> true
+     | _ -> false);
+  let failed =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+          Some
+            (Core.step
+               absent.next
+               (Core.Runner_completed
+                  (Core.Completion
+                     ( ticket
+                     , Ok {|{"ok":true,"t":-1,"url":"https://example.com/snapshot"}|} ))))
+        | _ -> None)
+      absent.effects
+    |> Option.get
+  in
+  Alcotest.(check bool)
+    "invalid metadata fails before any key prompt"
+    true
+    ((Core.state failed.next).snapshot.startup.failure = Some Core.During_bootstrap
+     && List.for_all
+          (function
+            | Core.Publish _ -> true
+            | _ -> false)
+          failed.effects);
+  let ready = snapshot_metadata_ready absent in
+  Alcotest.(check bool)
+    "valid metadata then requests the scoped key"
+    true
+    (List.exists
+       (function
+         | Core.Run (Core.Request (_, Core.Load_and_unlock_graph_key requested)) ->
+           requested = scope
+         | _ -> false)
+       ready.effects)
+;;
 (* Invalid/stale submission scenarios still carry a genuine challenge, obtained
    through production events rather than a test constructor. *)
 let fixture_challenge = lazy (
   let selected, scope = selected_graph encrypted_graph in
-  let absent = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope)) in
+  let absent = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope)) |> snapshot_metadata_ready in
   let prepare = List.find_map (function
     | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
       Some (Core.step absent.next (Core.Runner_completed
@@ -580,7 +650,7 @@ let warm_encrypted_graph_loads_key_before_attach_and_protects_outbox () =
 let graph_picker_clears_terminal_graph_failure () =
   let selected, scope = selected_graph encrypted_graph in
   let missing =
-    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope))
+    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope)) |> snapshot_metadata_ready
   in
   let failed =
     List.find_map
@@ -733,7 +803,7 @@ let warm_encrypted_graph_online_recovery_attaches_existing_mirror () =
 
 let e2ee_password_retry_recovers_after_failed_unlock () =
   let selected, scope = selected_graph encrypted_graph in
-  let missing = Core.step selected.next (Core.Mirror_inspected (Mirror_absent scope)) in
+  let missing = Core.step selected.next (Core.Mirror_inspected (Mirror_absent scope)) |> snapshot_metadata_ready in
   let failed_cache =
     List.find_map
       (function
@@ -875,11 +945,11 @@ let e2ee_password_retry_recovers_after_failed_unlock () =
     |> Option.get
   in
   Alcotest.(check bool)
-    "successful retry resumes snapshot bootstrap"
+    "successful retry downloads without refetching metadata"
     true
     (List.exists
        (function
-         | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
+         | Core.Run (Core.Request (_, Core.Download_snapshot _)) -> true
          | Run _ | Delegate _ | Publish _ -> false)
        resumed.effects);
   let picker = Core.step rejected.next Core.Graph_picker_requested in
@@ -902,7 +972,7 @@ let e2ee_password_retry_recovers_after_failed_unlock () =
     (List.length abandoned.effects)
 ;;
 
-let encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap () =
+let encrypted_graph_recovery_fetches_and_unlocks_key_before_download () =
   let authenticated =
     Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
   in
@@ -921,7 +991,7 @@ let encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap () =
   let selected = Core.step catalog.next (Core.Graph_selected graph_id) in
   let scope = Core.admitted_graph_scope selected.next |> Option.get in
   let missing =
-    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope))
+    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope)) |> snapshot_metadata_ready
   in
   let failed =
     List.find_map
@@ -1003,7 +1073,7 @@ let encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap () =
     |> Option.get
   in
   Alcotest.(check bool)
-    "bootstrap phase is published before waiting for metadata"
+    "bootstrap phase is published before downloading the snapshot"
     true
     (List.exists
        (function
@@ -1012,13 +1082,27 @@ let encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap () =
          | _ -> false)
        bootstrapping.effects);
   Alcotest.(check bool)
-    "unlocked graph key resumes snapshot bootstrap"
+    "unlocked graph key resumes snapshot download"
     true
     (List.exists
        (function
-         | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
+         | Core.Run (Core.Request (_, Core.Download_snapshot _)) -> true
          | Run _ | Delegate _ | Publish _ -> false)
-       bootstrapping.effects)
+       bootstrapping.effects);
+  let activation = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Download_snapshot request)) ->
+      let artifact = Core.stage_snapshot_download request ~path:"/tmp/encrypted-snapshot-fixture"
+        ~expected_rows:1 |> Result.get_ok in
+      let completed = Core.step bootstrapping.next (Core.Runner_completed
+        (Core.Completion (ticket, Ok artifact))) in
+      List.find_map (function
+        | Core.Delegate (Core.Activate_snapshot activation) -> Some activation
+        | _ -> None) completed.effects
+    | _ -> None) bootstrapping.effects |> Option.get in
+  Alcotest.(check cursor_testable) "key recovery retains metadata baseline"
+    (server_cursor_of_int 42) (Core.snapshot_activation_cursor activation);
+  Alcotest.(check (option string)) "activation retains the scoped key"
+    (Some "graph-key") (Option.map Core.graph_key_handle_id (Core.snapshot_activation_key activation))
 ;;
 
 let begin_snapshot_bootstrap ?(graphs = [ graph ]) () =
@@ -1167,6 +1251,10 @@ let snapshot_catchup_fixture () =
   let attached =
     Core.step attaching.next (Core.Graph_attached { scope = attachment.scope; sync })
   in
+  Alcotest.(check bool) "local data is available before any websocket opens" true
+    ((Core.state attached.next).snapshot.startup.local_access = Core.Local_available);
+  Alcotest.(check (option cursor_testable)) "attachment publishes the persisted baseline"
+    (Some (server_cursor_of_int 42)) (Core.state attached.next).snapshot.applied_server_t;
   let connection =
     List.find_map
       (function
@@ -1183,8 +1271,8 @@ let snapshot_catchup_fixture () =
        (function
          | Core.Run
              (Core.Send_websocket
-                { scope; message = Logseq_sync_pure_reducer.Sync_protocol.Client.Pull _ })
-           -> scope = connection
+                { scope; message = Logseq_sync_pure_reducer.Sync_protocol.Client.Pull { since } })
+           -> scope = connection && since = Some (server_cursor_of_int 42)
          | Run _ | Delegate _ | Publish _ -> false)
        pulling.effects);
   pulling, connection, sync
@@ -2617,8 +2705,7 @@ let local_deletion_orders_cleanup encrypted () =
   let absent = Core.step requested.next (Core.Mirror_inspected (Core.Mirror_absent mirror.scope)) in
   Alcotest.(check bool) "explicit download of deleted graph uses normal absent-mirror flow" true
     (List.exists (function
-       | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> not encrypted
-       | Core.Run (Core.Request (_, Core.Load_and_unlock_graph_key _)) -> encrypted
+       | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
        | _ -> false) absent.effects);
   let _ = sync in
   ()
@@ -4255,6 +4342,7 @@ let scenarios =
   ; Pure_reducer_bad_case_08.scenario
   ; Pure_reducer_bad_case_09.scenario
   ; Pure_reducer_bad_case_10.scenario
+  ; Alcotest.test_case "encrypted snapshot metadata precedes key access" `Quick encrypted_snapshot_metadata_precedes_key_access
   ; Alcotest.test_case "config is bounded" `Quick config_is_bounded
   ; Alcotest.test_case
       "authentication delegates catalog transport"
@@ -4313,9 +4401,9 @@ let scenarios =
       `Quick
       e2ee_password_retry_recovers_after_failed_unlock
   ; Alcotest.test_case
-      "encrypted recovery unlocks graph key before bootstrap"
+      "encrypted recovery retains metadata and unlocks before download"
       `Quick
-      encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap
+      encrypted_graph_recovery_fetches_and_unlocks_key_before_download
   ; Alcotest.test_case
       "warm encrypted graph loads key before attach and protects outbox"
       `Quick
@@ -5276,7 +5364,7 @@ let scenarios =
    effect tickets reproduce these state defects; no runner/UI duplication. *)
 let e2ee_preparation_fixture () =
   let selected, scope = selected_graph encrypted_graph in
-  let absent = Core.step selected.next (Core.Mirror_inspected (Mirror_absent scope)) in
+  let absent = Core.step selected.next (Core.Mirror_inspected (Mirror_absent scope)) |> snapshot_metadata_ready in
   let cached = List.find_map (function
     | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
       Some (Core.step absent.next (Core.Runner_completed (Core.Completion
@@ -5408,7 +5496,7 @@ let scenarios =
    to fetch the challenge or advertise a terminal failure; no runner/UI replica. *)
 let e2ee_auto_preparation () =
   let selected, scope = selected_graph encrypted_graph in
-  let absent = Core.step selected.next (Core.Mirror_inspected (Mirror_absent scope)) in
+  let absent = Core.step selected.next (Core.Mirror_inspected (Mirror_absent scope)) |> snapshot_metadata_ready in
   let completion = List.find_map (function
     | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
       Some (Core.Runner_completed (Core.Completion
@@ -5822,7 +5910,7 @@ let selected_encrypted_download_retains_crypto_and_failure () =
   Alcotest.(check bool) "encrypted selection opens scoped permission" true
     ((Core.state missing.next).snapshot.startup.network_phase=Core.Online_by_user);
   let confirmed=Core.step missing.next (Core.Account_authenticated {user_id=Some "user"}) in
-  let keys=confirmed in
+  let keys=snapshot_metadata_ready confirmed in
   Alcotest.(check bool) "encrypted selection still requires local key validation" true
     (List.exists (function Core.Run(Core.Request(_,Core.Load_and_unlock_graph_key _))->true|_->false) keys.effects);
   let missing_key=List.find_map (function
@@ -6911,6 +6999,344 @@ let superseded_outbox_request_recovers kind () =
   let signed_out=Core.step pending.next(Core.Account_authenticated{user_id=None})in
   check_instructions "retired account ignores superseded preparation" []
     (Core.step signed_out.next(superseded request fresh)).effects
+;;
+let cancelled_snapshot_key_completion ~success ~reauthenticate_first () =
+  let selected, scope = selected_graph encrypted_graph in
+  let awaiting =
+    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope))
+    |> snapshot_metadata_ready
+  in
+  let complete =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+          Some
+            (fun core ->
+              Core.step
+                core
+                (Core.Runner_completed
+                   (Core.Completion
+                      ( ticket
+                      , if success
+                        then Ok (Core.graph_key_handle ~id:"late-local-key" ~scope)
+                        else Error (Core.Effect_failed "local key unavailable") ))))
+        | _ -> None)
+      awaiting.effects
+    |> Option.get
+  in
+  let startup = (Core.state awaiting.next).snapshot.startup in
+  let cancelled =
+    Core.step
+      awaiting.next
+      (Core.Online_cancelled
+         { account_generation = startup.account_generation
+         ; presentation_generation = startup.presentation_generation
+         })
+  in
+  let resume core =
+    let startup = (Core.state core).snapshot.startup in
+    let online =
+      Core.step
+        core
+        (Core.Sign_in_requested
+           { account_generation = startup.account_generation
+           ; presentation_generation = startup.presentation_generation
+           })
+    in
+    Core.step online.next (Core.Account_authenticated { user_id = Some "user" })
+  in
+  let completed =
+    complete
+      (if reauthenticate_first then (resume cancelled.next).next else cancelled.next)
+  in
+  Alcotest.(check bool)
+    "late key callback never downloads canceled metadata"
+    false
+    (List.exists
+       (function
+         | Core.Run (Core.Request (_, Core.Download_snapshot _)) -> true
+         | _ -> false)
+       completed.effects);
+  if not reauthenticate_first
+  then (
+    Alcotest.(check bool)
+      "cancellation stays unauthenticated"
+      false
+      (Core.state completed.next).snapshot.startup.authenticated;
+    Alcotest.(check bool)
+      "late callback cannot fetch remote key"
+      false
+      (List.exists
+         (function
+           | Core.Run (Core.Request (_, Core.Fetch_e2ee_graph_key _)) -> true
+           | _ -> false)
+         completed.effects));
+  let resumed = if reauthenticate_first then completed else resume completed.next in
+  let inspected =
+    List.find_map
+      (function
+        | Core.Delegate (Core.Inspect_mirror requested) ->
+          Some
+            (Core.step
+               resumed.next
+               (Core.Mirror_inspected (Core.Mirror_absent requested.scope)))
+        | _ -> None)
+      resumed.effects
+  in
+  let effects =
+    resumed.effects
+    @ Option.fold ~none:[] ~some:(fun (part : Core.transition) -> part.effects) inspected
+  in
+  Alcotest.(check bool)
+    "authentication restarts with fresh metadata"
+    true
+    (List.exists
+       (function
+         | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
+         | _ -> false)
+       effects);
+  if success
+  then (
+    let resumed =
+      match inspected with
+      | Some part -> part
+      | None -> resumed
+    in
+    let fresh = snapshot_metadata_ready resumed in
+    Alcotest.(check bool)
+      "retained local key is not loaded a second time"
+      false
+      (List.exists
+         (function
+           | Core.Run (Core.Request (_, Core.Load_and_unlock_graph_key _)) -> true
+           | _ -> false)
+         fresh.effects);
+    let activation =
+      List.find_map
+        (function
+          | Core.Run (Core.Request (ticket, Core.Download_snapshot download)) ->
+            let artifact =
+              Core.stage_snapshot_download
+                download
+                ~path:"/tmp/cancelled-snapshot-reducer-fixture"
+                ~expected_rows:1
+              |> Result.get_ok
+            in
+            let completed =
+              Core.step
+                fresh.next
+                (Core.Runner_completed (Core.Completion (ticket, Ok artifact)))
+            in
+            List.find_map
+              (function
+                | Core.Delegate (Core.Activate_snapshot activation) -> Some activation
+                | _ -> None)
+              completed.effects
+          | _ -> None)
+        fresh.effects
+      |> Option.get
+    in
+    Alcotest.(check (option string))
+      "same-epoch activation retains local key ownership"
+      (Some "late-local-key")
+      (Option.map Core.graph_key_handle_id (Core.snapshot_activation_key activation)))
+;;
+
+let cancelled_snapshot_remote_phase phase () =
+  let metadata, _ =
+    begin_snapshot_bootstrap
+      ~graphs:
+        [ (if phase = `Remote_key || phase = `Password then encrypted_graph else graph) ]
+      ()
+  in
+  let awaiting =
+    match phase with
+    | `Metadata -> metadata
+    | `Download -> snapshot_metadata_ready metadata
+    | `Remote_key | `Password ->
+      let local = snapshot_metadata_ready metadata in
+      let remote =
+        List.find_map
+          (function
+            | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+              Some
+                (Core.step
+                   local.next
+                   (Core.Runner_completed
+                      (Core.Completion (ticket, Error (Core.Effect_failed "no local key")))))
+            | _ -> None)
+          local.effects
+        |> Option.get
+      in
+      if phase = `Remote_key
+      then remote
+      else (
+        let user_keys =
+          List.find_map
+            (function
+              | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
+                Some
+                  (Core.step
+                     remote.next
+                     (Core.Runner_completed
+                        (Core.Completion (ticket, Ok "encrypted-graph-key"))))
+              | _ -> None)
+            remote.effects
+          |> Option.get
+        in
+        List.find_map
+          (function
+            | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_user_keys _)) ->
+              Some
+                (Core.step
+                   user_keys.next
+                   (Core.Runner_completed
+                      (Core.Completion (ticket, Ok "private-key-package"))))
+            | _ -> None)
+          user_keys.effects
+        |> Option.get)
+  in
+  let cancelled =
+    Core.step awaiting.next (Core.Online_cancelled (startup_ticket awaiting.next))
+  in
+  no_network "all canceled bootstrap phases stop remote work" cancelled.effects;
+  let resumed =
+    Core.step cancelled.next (Core.Sign_in_requested (startup_ticket cancelled.next))
+  in
+  let authenticated =
+    Core.step resumed.next (Core.Account_authenticated { user_id = Some "user" })
+  in
+  let restarted =
+    List.find_map
+      (function
+        | Core.Delegate (Core.Inspect_mirror request) ->
+          Some
+            (Core.step
+               authenticated.next
+               (Core.Mirror_inspected (Core.Mirror_absent request.scope)))
+        | _ -> None)
+      authenticated.effects
+    |> Option.value ~default:authenticated
+  in
+  Alcotest.(check bool)
+    "every canceled remote phase restarts with fresh metadata"
+    true
+    (List.exists
+       (function
+         | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
+         | _ -> false)
+       restarted.effects);
+  List.iter
+    (function
+      | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+        let late =
+          Core.step
+            restarted.next
+            (Core.Runner_completed
+               (Core.Completion
+                  (ticket, Ok {|{"ok":true,"t":999,"url":"https://example.com/old"}|})))
+        in
+        check_instructions "old metadata cannot replace resumed metadata" [] late.effects
+      | Core.Run (Core.Request (ticket, Core.Download_snapshot download)) ->
+        let artifact =
+          Core.stage_snapshot_download
+            download
+            ~path:"/tmp/old-download-reducer-fixture"
+            ~expected_rows:1
+          |> Result.get_ok
+        in
+        let late =
+          Core.step
+            restarted.next
+            (Core.Runner_completed (Core.Completion (ticket, Ok artifact)))
+        in
+        check_instructions "old download cannot activate after resume" [] late.effects
+      | _ -> ())
+    awaiting.effects
+;;
+
+let scenarios =
+  scenarios
+  @ List.map
+      (fun (name, phase) ->
+         Alcotest.test_case name `Quick (cancelled_snapshot_remote_phase phase))
+      [ "cancelled snapshot metadata resumes", `Metadata
+      ; "cancelled snapshot download resumes", `Download
+      ; "cancelled snapshot remote key resumes", `Remote_key
+      ; "cancelled snapshot password resumes", `Password
+      ]
+;;
+
+let cancelled_snapshot_key_account_epoch () =
+  List.iter
+    (fun user_id ->
+       let selected, scope = selected_graph encrypted_graph in
+       let awaiting =
+         Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope))
+         |> snapshot_metadata_ready
+       in
+       let complete =
+         List.find_map
+           (function
+             | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+               Some
+                 (fun core ->
+                   Core.step
+                     core
+                     (Core.Runner_completed
+                        (Core.Completion
+                           (ticket, Ok (Core.graph_key_handle ~id:"old-epoch-key" ~scope)))))
+             | _ -> None)
+           awaiting.effects
+         |> Option.get
+       in
+       let signed_out =
+         Core.step awaiting.next (Core.Account_authenticated { user_id = None })
+       in
+       let startup = (Core.state signed_out.next).snapshot.startup in
+       let online =
+         Core.step
+           signed_out.next
+           (Core.Sign_in_requested
+              { account_generation = startup.account_generation
+              ; presentation_generation = startup.presentation_generation
+              })
+       in
+       let authenticated =
+         Core.step online.next (Core.Account_authenticated { user_id = Some user_id })
+       in
+       let late = complete authenticated.next in
+       check_observed
+         "late key account epoch"
+         "old epoch cannot change new account"
+         (observe authenticated.next)
+         (observe late.next);
+       check_instructions "late key account epoch" [] late.effects)
+    [ "user"; "other-user" ]
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "cancelled snapshot key account epoch"
+        `Quick
+        cancelled_snapshot_key_account_epoch
+    ]
+;;
+
+let scenarios =
+  scenarios
+  @ List.map
+      (fun (name, success, reauthenticate_first) ->
+         Alcotest.test_case
+           name
+           `Quick
+           (cancelled_snapshot_key_completion ~success ~reauthenticate_first))
+      [ "cancelled snapshot late key success resumes", true, false
+      ; "cancelled snapshot late key failure resumes", false, false
+      ; "cancelled snapshot reauth before late key", true, true
+      ; "cancelled snapshot reauth before late key failure", false, true
+      ]
 ;;
 let scenarios=scenarios @ List.map(fun(name,kind)->Alcotest.test_case name `Quick(superseded_outbox_request_recovers kind))
  ["superseded submit replans and fences",`Submit;"superseded retry replans and fences",`Retry;

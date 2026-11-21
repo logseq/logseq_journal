@@ -707,13 +707,14 @@ type bootstrap =
   | No_bootstrap
   | Preparing_snapshot of graph_scope
   | Awaiting_snapshot_metadata of graph_scope * effect_id
+  | Awaiting_snapshot_key of snapshot_download
   | Downloading_snapshot of snapshot_download
   | Activating_snapshot of snapshot_activation_request
 
 let bootstrap_scope = function
   | No_bootstrap -> None
   | Preparing_snapshot scope | Awaiting_snapshot_metadata (scope, _) -> Some scope
-  | Downloading_snapshot request -> Some request.scope
+  | Awaiting_snapshot_key request | Downloading_snapshot request -> Some request.scope
   | Activating_snapshot request -> Some request.scope
 ;;
 
@@ -1308,10 +1309,36 @@ let begin_snapshot_bootstrap core scope =
   { next; effects }
 ;;
 
+let begin_snapshot_download core (download : snapshot_download) =
+  if not (network_allowed core)
+  then
+    local_unavailable
+      { core with bootstrap = No_bootstrap }
+      Local_mirror_unavailable
+      "This graph is not downloaded. Connect to download it."
+  else (
+    let download = { download with download_id = core.next_effect_id } in
+    let unlock =
+      match core.public_state.snapshot.unlock with
+      | Unlock_running submission when submission.stage = Attachment ->
+        Unlock_bootstrapping submission
+      | phase -> phase
+    in
+    let core = set_snapshot core { core.public_state.snapshot with unlock } in
+    let next, request = issue_request core (Download_snapshot download) in
+    { next = { next with bootstrap = Downloading_snapshot download }
+    ; effects =
+        (match unlock with
+         | Unlock_bootstrapping _ -> [ publish next; Run request ]
+         | _ -> [ Run request ])
+    })
+;;
 let begin_e2ee_key_access core scope =
   if not (network_allowed core) then local_unavailable core Local_key_unavailable "The local encryption key is unavailable. Connect to recover access." else
   let core = set_snapshot
-    { core with bootstrap = Preparing_snapshot scope
+    { core with bootstrap = (match core.bootstrap with
+        | Awaiting_snapshot_key _ as waiting -> waiting
+        | _ -> Preparing_snapshot scope)
       ; unlock_preparation = Fetching_graph_key (scope, core.next_effect_id) }
     { core.public_state.snapshot with unlock = Unlock_inactive } in
   let next, request = issue_request core (Fetch_e2ee_graph_key scope) in
@@ -1676,13 +1703,8 @@ let begin_missing_mirror_bootstrap core scope =
   in
   let core = set_snapshot { core with pending_selected_download = None }
       { core.public_state.snapshot with startup } in
-  match core.selected_graph_value with
-  | Some graph when graph.encrypted ->
-    let next, request = issue_request core (Load_and_unlock_graph_key scope) in
-    { next; effects = [ publish next; Run request ] }
-  | Some _ | None ->
-    let requested = begin_snapshot_bootstrap core scope in
-    { requested with effects = publish requested.next :: requested.effects }
+  let requested = begin_snapshot_bootstrap core scope in
+  { requested with effects = publish requested.next :: requested.effects }
 ;;
 
 let mirror_inspected core = function
@@ -2647,7 +2669,9 @@ let graph_key_loaded core key =
        }
      | None ->
        let core = { core with graph_key = Some key } in
-       begin_snapshot_bootstrap core scope
+       (match core.bootstrap with
+        | Awaiting_snapshot_key download -> begin_snapshot_download core download
+        | _ -> begin_snapshot_bootstrap core scope)
      | Some _ -> unchanged core)
   | None | Some _ ->
     fail core During_e2ee "graph key handle is outside the selected graph scope"
@@ -2868,10 +2892,16 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
          ; expected_bytes = None
          ; maximum_bytes = core.config.limits.maximum_artifact_bytes }
        in
-       let next, request_effect = issue_request core (Download_snapshot request) in
-       (* Metadata is a lower bound for the live stream, never its maximum t. *)
-       { next = { next with bootstrap = Downloading_snapshot request }
-       ; effects = [ Run request_effect ] }
+       (match core.selected_graph_value with
+        | Some graph when graph.encrypted ->
+          (match core.graph_key with
+           | Some key when graph_key_handle_scope key = scope ->
+             begin_snapshot_download core request
+           | None | Some _ ->
+             let core = { core with bootstrap = Awaiting_snapshot_key request } in
+             let next, key_request = issue_request core (Load_and_unlock_graph_key scope) in
+             { next; effects = [ Run key_request ] })
+        | Some _ | None -> begin_snapshot_download core request)
      | Error message, _ -> fail core During_bootstrap message
      | _ -> unchanged core)
   | Download_snapshot_kind ->
@@ -2987,7 +3017,10 @@ let consume_completion core = function
                message
            | Load_and_unlock_graph_key_kind ->
              (match core.current_graph_scope with
-              | Some scope when network_allowed core -> begin_e2ee_key_access core scope
+              | Some scope when network_allowed core ->
+                (match core.pending_graph_open, core.bootstrap with
+                 | None, No_bootstrap -> begin_snapshot_bootstrap core scope
+                 | _ -> begin_e2ee_key_access core scope)
               | Some _ -> local_unavailable core Local_key_unavailable "The local encryption key is unavailable. Connect to recover access."
               | None -> unchanged core)
            | Unlock_private_key_kind when core.public_state.snapshot.startup.network_phase = Local_only ->
@@ -3221,12 +3254,19 @@ let step core event =
         restoring_local = snapshot.startup.restoring_local && local_restore_pending;
         bootstrapping = false; catalog_loading = next.catalog_cache_loading;
         awaiting_e2ee_password = false; local_access;
-        failure = (if Option.is_some next.pending_selected_download then Some During_local_restore else snapshot.startup.failure) } in
+        failure = (if Option.is_some next.pending_selected_download
+          || (Option.is_some (bootstrap_scope next.bootstrap)
+              && not (bootstrap_activating next.bootstrap))
+          then Some During_local_restore else snapshot.startup.failure) } in
       let next = set_snapshot { next with
         pending_selected_download = None;
         pending_effects = local_pending; websocket_live = false; deferred_catalog_reconciliation = false;
         unlock_preparation = No_unlock_preparation;
-        bootstrap = (if bootstrap_downloading next.bootstrap then No_bootstrap else next.bootstrap); pull_wanted = None; force_pull_pending = false;
+        bootstrap = (match next.bootstrap with
+          | Activating_snapshot _ as activation -> activation
+          | No_bootstrap | Preparing_snapshot _ | Awaiting_snapshot_metadata _
+          | Awaiting_snapshot_key _ | Downloading_snapshot _ -> No_bootstrap);
+        pull_wanted = None; force_pull_pending = false;
         pull_owner = (match next.pull_owner with
           | Some {pull_stage=Applying_pull; _} as owner -> owner | _ -> None)
       } { snapshot with timeline_presentation_pending = false; startup; sync_phase = Offline
@@ -3254,7 +3294,14 @@ let step core event =
             | None | Some {phase=Retiring;_} -> true | Some _ -> false) -> start_websocket next scope
         | Some scope,None,Local_unavailable Local_key_unavailable
           when core.public_state.snapshot.startup.failure=Some During_local_restore ->
-          begin_e2ee_key_access next scope
+          (match next.pending_graph_open with
+           | Some _ -> begin_e2ee_key_access next scope
+           | None -> begin_snapshot_bootstrap next scope)
+        | Some scope,None,Local_unavailable Local_mirror_unavailable
+          when Option.is_some next.graph_key
+               && next.public_state.snapshot.startup.network_phase=Online_by_user
+               && core.public_state.snapshot.startup.failure=Some During_local_restore ->
+          begin_snapshot_bootstrap next scope
         | Some scope,None,Local_unavailable _
           when next.public_state.snapshot.startup.network_phase=Online_by_user
                && core.public_state.snapshot.startup.failure=Some During_local_restore ->

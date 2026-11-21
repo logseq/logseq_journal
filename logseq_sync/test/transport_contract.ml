@@ -607,7 +607,6 @@ let http_test
       ~download
       ~success
       ?(payload = "x")
-      ?retained_download
       ?(segment = 16384)
       ?(eof = false)
       ?failure_message
@@ -645,23 +644,7 @@ let http_test
                "exact artifact payload"
                payload
                (read_file (Filename.concat staging (List.hd names))))
-           else (
-             match retained_download with
-             | None -> Alcotest.(check (list string)) "no partial artifact" [] names
-             | Some body ->
-               Alcotest.(check int)
-                 "only completed download remains"
-                 1
-                 (List.length names);
-               let name = List.hd names in
-               Alcotest.(check bool)
-                 "no decompressed artifact or staging file published"
-                 true
-                 (Filename.check_suffix name ".download");
-               Alcotest.(check string)
-                 "completed download is intact"
-                 body
-                 (read_file (Filename.concat staging name))));
+           else Alcotest.(check (list string)) "no failed attempt artifact" [] names);
          Runner.shutdown t)
   in
   check_retired report;
@@ -1647,6 +1630,109 @@ let test_stalled_tcp ?(network_only = false) ~cancel () =
   check_retired report
 ;;
 
+let test_snapshot_collision ~success ~concurrent () =
+  let body =
+    if success
+    then
+      "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x93\xef\xe6\x60\x00\x01\xa6\xff\xab\x19\x18\x9a\xc5\xee\xf4\x30\x02\x39\x00\xd5\xaa\x22\xe2\x15\x00\x00\x00"
+    else "\x1f\x8b"
+  in
+  let wire =
+    response ~headers:(Printf.sprintf "Content-Length: %d\r\n" (String.length body)) body
+  in
+  let report =
+    with_peer
+      [ case wire; case wire ]
+      (fun ~environment ~sw ~support ~origin ->
+         let posted = ref []
+         and invalidations = ref 0 in
+         let first = runner ~environment ~sw ~support ~posted ~invalidations () in
+         let op = operation ~download:true origin in
+         let id =
+           match op with
+           | Core.Request (ticket, _) ->
+             Core.effect_id_to_string (Core.effect_ticket_id ticket)
+           | _ -> assert false
+         in
+         let staging = Filename.concat support "staging" in
+         Unix.mkdir staging 0o700;
+         let fixtures =
+           List.map
+             (fun suffix ->
+                let path = Filename.concat staging ("snapshot-" ^ id ^ suffix) in
+                let output = open_out_bin path in
+                output_string output ("old" ^ suffix);
+                close_out output;
+                path, "old" ^ suffix)
+             [ ".artifact"; ".download"; ".gzip-1"; ".gzip-2" ]
+         in
+         let count () =
+           List.length
+             (List.filter
+                (function
+                  | Core.Runner_completed (Core.Completion _) -> true
+                  | _ -> false)
+                !posted)
+         in
+         let clock = Eio.Stdenv.clock environment in
+         Runner.submit first op;
+         if not concurrent
+         then (
+           wait clock (fun () -> count () = 1);
+           Runner.shutdown first);
+         let second = runner ~environment ~sw ~support ~posted ~invalidations () in
+         Runner.submit second op;
+         wait clock (fun () -> count () = 2);
+         List.iter
+           (fun (path, expected) ->
+              Alcotest.(check string)
+                "pre-existing collision bytes preserved"
+                expected
+                (read_file path))
+           fixtures;
+         List.iter
+           (function
+             | Core.Runner_completed (Core.Completion (_, result)) ->
+               Alcotest.(check bool) "attempt outcome" success (Result.is_ok result)
+             | _ -> ())
+           !posted;
+         let rec files path =
+           if Sys.is_directory path
+           then
+             Sys.readdir path
+             |> Array.to_list
+             |> List.concat_map (fun name -> files (Filename.concat path name))
+           else if List.mem_assoc path fixtures
+           then []
+           else [ path ]
+         in
+         let artifacts = files staging in
+         Alcotest.(check int)
+           "successful artifact handoffs"
+           (if success then 2 else 0)
+           (List.length artifacts);
+         List.iter
+           (fun path ->
+              Alcotest.(check string)
+                "success survives finalizer and next effect-id collision"
+                "x"
+                (read_file path))
+           artifacts;
+         if success
+         then
+           Alcotest.(check bool)
+             "physical attempts are distinct"
+             true
+             (List.length (List.sort_uniq String.compare artifacts) = 2);
+         Alcotest.(check int)
+           "only fixtures and handed-off artifacts remain"
+           (4 + if success then 2 else 0)
+           (Array.length (Sys.readdir staging));
+         Runner.shutdown first;
+         Runner.shutdown second)
+  in
+  check_retired report
+;;
 let test_artifact_publication_failure () =
   let report =
     with_peer
@@ -1670,16 +1756,16 @@ let test_artifact_publication_failure () =
          wait (Eio.Stdenv.clock environment) (fun () ->
            Option.is_some (completed !posted));
          Alcotest.(check bool)
-           "failed atomic publication never succeeds"
+           "pre-existing path cannot block a private download"
            true
-           (Result.is_error (Option.get (completed !posted)));
+           (Result.is_ok (Option.get (completed !posted)));
          Alcotest.(check bool)
            "existing destination preserved"
            true
            (Sys.is_directory destination);
          Alcotest.(check int)
-           "temporary removed after publication failure"
-           1
+           "only existing directory and published artifact remain"
+           2
            (Array.length (Sys.readdir staging));
          Runner.shutdown t)
   in
@@ -1704,6 +1790,14 @@ let scenarios =
         "download publication failure preserves destination"
         `Quick
         test_artifact_publication_failure
+    ; Alcotest.test_case "snapshot collision success concurrent" `Quick
+        (test_snapshot_collision ~success:true ~concurrent:true)
+    ; Alcotest.test_case "snapshot collision success restart" `Quick
+        (test_snapshot_collision ~success:true ~concurrent:false)
+    ; Alcotest.test_case "snapshot collision failure concurrent" `Quick
+        (test_snapshot_collision ~success:false ~concurrent:true)
+    ; Alcotest.test_case "snapshot collision failure restart" `Quick
+        (test_snapshot_collision ~success:false ~concurrent:false)
     ]
 ;;
 
@@ -1808,7 +1902,6 @@ let scenarios =
               ~payload
               ?failure_message:(if name = "truncated gzip rejected" then
                 Some "snapshot gzip decode failed" else None)
-              ?retained_download:(if success then None else Some body)
               (response ~headers body)))
       gzip_downloads
   @ [ Alcotest.test_case
@@ -4015,7 +4108,7 @@ let unlock_classification_effect origin =
     | _ -> None) auth.effects |> Option.get in
   let selected = Core.step catalog.next (Core.Graph_selected encrypted.graph_id) in
   let scope = Core.admitted_graph_scope selected.next |> Option.get in
-  let absent = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope)) in
+  let absent = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope)) |> Core_contract.snapshot_metadata_ready in
   let cached = List.find_map (function
     | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
       Some (Core.step absent.next (Core.Runner_completed (Core.Completion
