@@ -772,72 +772,99 @@ let execute_request
     then effect_error "snapshot staging directory is unavailable"
     else (
       let id = Core.effect_id_to_string (Core.effect_ticket_id ticket) in
-      let raw = Filename.concat staging ("snapshot-" ^ id ^ ".download") in
-      let destination = Filename.concat staging ("snapshot-" ^ id ^ ".artifact") in
+      let directory =
+        Filename.temp_dir ~temp_dir:staging ~perms:0o700 ("snapshot-" ^ id ^ "-") ".work"
+      in
+      let raw = Filename.concat directory "snapshot.download" in
+      let destination = Filename.concat directory "snapshot.artifact" in
       let temporary_paths =
-        [ Filename.concat staging ("snapshot-" ^ id ^ ".gzip-1")
-        ; Filename.concat staging ("snapshot-" ^ id ^ ".gzip-2")
+        [ Filename.concat directory "snapshot.gzip-1"
+        ; Filename.concat directory "snapshot.gzip-2"
         ]
       in
-      let base_url = (Core.snapshot_download_scope download).account.managed_sync_origin in
-      let bearer_authorized = Http.same_origin base_url (Core.snapshot_download_uri download) in
-      let download_once token =
-        let request = Http.artifact ~base_url ~uri:(Core.snapshot_download_uri download) ~token in
-        let response =
-          t.dependencies.transport.download
-            ~sw:t.sw
-            ~request
-            ~destination:raw
-            ~maximum_bytes:(Core.snapshot_download_maximum_bytes download)
-            ~on_progress:(fun progress ->
-              if not t.closed
+      let artifact_path = directory ^ ".artifact" in
+      let linked = ref false in
+      let published = ref false in
+      Fun.protect
+        ~finally:(fun () ->
+          Bootstrap.cleanup (raw :: destination :: temporary_paths);
+          if !linked && not !published then Bootstrap.cleanup [ artifact_path ];
+          Unix.rmdir directory)
+        (fun () ->
+           let base_url =
+             (Core.snapshot_download_scope download).account.managed_sync_origin
+           in
+           let bearer_authorized =
+             Http.same_origin base_url (Core.snapshot_download_uri download)
+           in
+           let download_once token =
+             let request =
+               Http.artifact ~base_url ~uri:(Core.snapshot_download_uri download) ~token
+             in
+             let response =
+               t.dependencies.transport.download
+                 ~sw:t.sw
+                 ~request
+                 ~destination:raw
+                 ~maximum_bytes:(Core.snapshot_download_maximum_bytes download)
+                 ~on_progress:(fun progress ->
+                   if not t.closed
+                   then
+                     t.post
+                       (Core.Snapshot_download_progress
+                          { graph_id = (Core.snapshot_download_scope download).graph_id
+                          ; received_bytes = Int64.of_int progress.received_bytes
+                          ; total_bytes = Option.map Int64.of_int progress.total_bytes
+                          }))
+               |> Result.map_error (fun message -> Core.Effect_failed message)
+             in
+             Result.map (fun response -> request, response) response
+           in
+           let response =
+             let perform token =
+               match download_once token with
+               | Error (Core.Effect_failed message | Crypto_failed (_, message)) ->
+                 Error (Request_failed message)
+               | Ok (_, response) when bearer_authorized && response.Http_eio.status = 401
+                 -> Error Unauthorized
+               | Ok (_, response) when response.Http_eio.status = 403 -> Error Forbidden
+               | Ok (request, response) ->
+                 successful_response request response
+                 |> Result.map_error (function
+                     | Core.Effect_failed message | Crypto_failed (_, message) ->
+                     Request_failed message)
+             in
+             (if bearer_authorized
               then
-                t.post
-                  (Core.Snapshot_download_progress
-                     { graph_id = (Core.snapshot_download_scope download).graph_id
-                     ; received_bytes = Int64.of_int progress.received_bytes
-                     ; total_bytes = Option.map Int64.of_int progress.total_bytes
-                     }))
-          |> Result.map_error (fun message -> Core.Effect_failed message)
-        in
-        Result.map (fun response -> request, response) response
-      in
-      let response =
-        let perform token =
-          match download_once token with
-          | Error (Core.Effect_failed message | Crypto_failed (_, message)) ->
-            Error (Request_failed message)
-          | Ok (_, response) when bearer_authorized && response.Http_eio.status = 401 ->
-            Error Unauthorized
-          | Ok (_, response) when response.Http_eio.status = 403 -> Error Forbidden
-          | Ok (request, response) ->
-            successful_response request response
-            |> Result.map_error (function
-                | Core.Effect_failed message | Crypto_failed (_, message) ->
-                Request_failed message)
-        in
-        (if bearer_authorized
-         then
-           authenticated_operation
-             t.dependencies.id_token_provider
-             ~account:(Core.snapshot_download_scope download).account
-             ~perform:(fun token -> perform (Some token))
-         else Result.map_error authenticated_failure (perform None))
-        |> Result.map_error (fun message -> Core.Effect_failed message)
-      in
-      Result.bind response (fun response ->
-        Result.bind (Bootstrap.artifact_row_count response.headers) (fun expected_rows ->
-          Result.bind
-            (Bootstrap.peel_gzip_layers
-               ~decompress_gzip:Artifact_decoder.decompress_gzip
-               ~maximum_bytes:(Core.snapshot_download_maximum_bytes download)
-               ~source:raw
-               ~destination
-               ~temporary_paths)
-            (fun () ->
-               Bootstrap.cleanup (raw :: temporary_paths);
-               Core.stage_snapshot_download download ~path:destination ~expected_rows))
-        |> Result.map_error (fun message -> Core.Effect_failed message)))
+                authenticated_operation
+                  t.dependencies.id_token_provider
+                  ~account:(Core.snapshot_download_scope download).account
+                  ~perform:(fun token -> perform (Some token))
+              else Result.map_error authenticated_failure (perform None))
+             |> Result.map_error (fun message -> Core.Effect_failed message)
+           in
+           Result.bind response (fun response ->
+             Result.bind
+               (Bootstrap.artifact_row_count response.headers)
+               (fun expected_rows ->
+                  Result.bind
+                    (Bootstrap.peel_gzip_layers
+                       ~decompress_gzip:Artifact_decoder.decompress_gzip
+                       ~maximum_bytes:(Core.snapshot_download_maximum_bytes download)
+                       ~source:raw
+                       ~destination
+                       ~temporary_paths)
+                    (fun () ->
+                       Unix.link destination artifact_path;
+                       linked := true;
+                       Core.stage_snapshot_download
+                         download
+                         ~path:artifact_path
+                         ~expected_rows
+                       |> Result.map (fun artifact ->
+                         published := true;
+                         artifact)))
+             |> Result.map_error (fun message -> Core.Effect_failed message))))
   | Load_and_unlock_graph_key scope ->
     run_secret_action t (fun () ->
       let account = scope.account in
