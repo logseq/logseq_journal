@@ -2939,7 +2939,7 @@ let accepted_member_terminalizes_at_its_authoritative_barrier_with
     | Local_existing _ -> Alcotest.fail "fresh accepted fixture already existed"
   in
   let submitted = submit_one database local behavior in
-  let barrier = { through = server_cursor 1; checksum = checksum "87d0b4e319dbf287" } in
+  let barrier = { through = server_cursor 1; checksum = checksum "ffffffffffffffff" } in
   let sync = Database.inspect_sync database |> T.require_ok ~behavior in
   let accepted, _crypto =
     Database.begin_outbox_transition
@@ -2994,7 +2994,24 @@ let accepted_member_terminalizes_at_its_authoritative_barrier_with
   let final_sync = Database.inspect_sync database |> T.require_ok ~behavior in
   T.require
     (sync_view_submissions final_sync = [])
-    "incorporated accepted member remained in the active outbox"
+    "incorporated accepted member remained in the active outbox";
+  let duplicate, _ =
+    Database.begin_outbox_transition
+      database
+      ~expected:(sync_view_token final_sync)
+      (Accept_group
+         { batch_id = submission_batch_id submitted
+         ; barrier = { barrier with checksum = checksum "0000000000000000" }
+         })
+    |> T.require_ok ~behavior
+  in
+  Database.apply_outbox_transition database duplicate ~encrypted:None
+  |> T.require_ok ~behavior
+  |> ignore;
+  let continued = Database.inspect_sync database |> T.require_ok ~behavior in
+  T.require
+    (Server_cursor.equal (sync_view_checkpoint continued) (server_cursor 1))
+    "checksum-only duplicate ACK prevented subsequent inspection"
 ;;
 
 let accepted_member_terminalizes_at_its_authoritative_barrier database =

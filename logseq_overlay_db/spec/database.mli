@@ -128,7 +128,7 @@ type unprotection_request
     lease. [path] must name an absolute, single-linked regular file and
     [expected_rows] must be nonnegative. The operation fails before allocating
     staging resources when those inputs are invalid, or when the inspected
-    location is no longer absent. *)
+    location is no longer absent. State checksum differences emit warnings only. *)
 val prepare_snapshot_activation
   :  dependencies
   -> mirror_inspection
@@ -718,7 +718,8 @@ type prepared_outbox_transition
     return a protection request whose result is required by
     [apply_outbox_transition]. [Retry_group] is reserved for transport-uncertain
     submitted batches and retains their identity, encrypted bytes, and baseline.
-    A duplicate Stale rejection must retain the original rejection cursor. *)
+    A duplicate Stale rejection must retain the original rejection cursor.
+    Acceptance checksum differences are diagnostic; batch and cursor conflicts fail. *)
 val begin_outbox_transition
   :  t
   -> expected:Types.sync_token
@@ -774,7 +775,8 @@ val begin_authoritative
 
 (** Validates optional decryption, replans the overlay, and atomically persists the
     authoritative candidate, checkpoint, and logical change. A result is deferred
-    when a submitted delete still awaits its terminal transport outcome. *)
+    when a submitted delete still awaits its terminal transport outcome.
+    Remote state checksum differences warn; the computed digest is persisted. *)
 val apply_authoritative
   :  t
   -> authoritative_preparation

@@ -86,6 +86,7 @@ type fixture =
   ; mutable head_failure : D.error option
   ; mutable pull_checksum : T.checksum option
   ; mutable expected_checksum : T.checksum option
+  ; mutable snapshot_checksum : string
   ; mutable snapshot_through : T.server_cursor option
   ; mutable unknown_pushes : int
   ; mutable defer : bool
@@ -117,6 +118,7 @@ let fixture ?(submissions = []) () =
   ; head_failure = None
   ; pull_checksum = None
   ; expected_checksum = None
+  ; snapshot_checksum = "checksum:v1:verified"
   ; snapshot_through = None
   ; unknown_pushes = 0
   ; defer = false
@@ -245,22 +247,19 @@ let database : type value. fixture -> value D.database -> (value, D.error) resul
            }))
   | D.Activate_snapshot staged ->
     record fixture "activate";
+    Alcotest.(check string)
+      "activation retains actual local digest"
+      fixture.snapshot_checksum
+      staged.checksum;
     (match fixture.activation_failure, fixture.snapshot_activation with
      | Some error, _ -> Error error
      | None, Some result -> Ok result
      | None, None ->
        fixture.checkpoint <- Some staged.through;
        Ok (D.Activated generation))
-  | D.Verify_checksum (through, expected) ->
+  | D.Verify_checksum _ ->
     record fixture "verify-checksum";
-    if
-      Option.exists (T.Server_cursor.equal through) fixture.checkpoint
-      && not
-           (List.mem
-              (T.Checksum.to_string expected)
-              [ "checksum:v1:verified"; T.Checksum.to_string checksum ])
-    then Error (D.Protocol_failure "Remote checkpoint checksum mismatch")
-    else Ok ()
+    Ok ()
   | D.Release_snapshot _ ->
     record fixture "release-snapshot";
     Ok ()
@@ -310,8 +309,8 @@ let rec transport
             (D.snapshot
                ~resource
                ~through:(Option.value fixture.snapshot_through ~default:through)
-               ~checksum:"checksum:v1:verified"
-               ~encrypted:false)))
+               ~checksum:fixture.snapshot_checksum
+               ~encrypted:(fixture.keys = D.Key_available))))
   | D.Push actual ->
     Alcotest.(check bool)
       "push exposes actual submitting workflow"
@@ -533,6 +532,9 @@ let normal () =
 
 let recovery () =
   let fixture = fixture ~submissions:[ descriptor (T.Submitted batch_id) ] () in
+  fixture.expected_checksum
+  <- Some (ok (T.Checksum.of_string "checksum:v1:ffffffffffffffff"));
+  fixture.pull_checksum <- Some (ok (T.Checksum.of_string "checksum:v1:0000000000000000"));
   check_success (run fixture);
   check_count fixture "persist-submit" 0;
   check_count fixture "persist-retry" 1;
@@ -912,11 +914,24 @@ let snapshot_checksum_policy () =
     (fun (expected, older, blocked) ->
        let fixture = fixture () in
        fixture.checkpoint <- None;
-       fixture.remote <- cursor 3L;
+       fixture.remote <- cursor 53740L;
+       fixture.keys <- D.Key_available;
+       fixture.snapshot_checksum <- "checksum:v1:4c07439063f40db4";
        fixture.expected_checksum
        <- Option.map (fun value -> ok (T.Checksum.of_string value)) expected;
        if older then fixture.snapshot_through <- Some (cursor 1L);
-       check_success (run fixture);
+       let resampled = ref false in
+       let input () =
+         match fixture.status with
+         | D.Service_online when (not older) && not !resampled ->
+           resampled := true;
+           fixture.outbox_dirty <- true;
+           None
+         | D.Service_online when (not older) && count fixture "ack-outbox" < 2 -> None
+         | D.Service_online | D.Service_blocked _ -> Some D.Stop_requested
+         | _ -> None
+       in
+       check_success (run ~input fixture);
        Alcotest.(check bool)
          "checksum policy blocks exactly when required"
          blocked
@@ -926,12 +941,24 @@ let snapshot_checksum_policy () =
               | _ -> false)
             fixture.statuses);
        check_count fixture "release-snapshot" 1;
-       check_count fixture "activate" (if blocked && not older then 0 else 1))
-    [ Some "checksum:v1:wrong", false, true
-    ; Some "checksum:v1:verified", false, false
+       check_count fixture "activate" 1;
+       if not older
+       then (
+         Alcotest.(check bool)
+           "checkpoint verification remains observational"
+           true
+           (count fixture "verify-checksum" = if Option.is_some expected then 2 else 0);
+         Alcotest.(check bool)
+           "snapshot checkpoint locally available"
+           true
+           (fixture.checkpoint = Some fixture.remote)))
+    [ Some "checksum:v1:wrong", false, false
+    ; Some "checksum:v1:55d5780f6d2331dd", false, false
+    ; Some "checksum:v1:55d5780f6d2331dd", true, false
+    ; Some "checksum:v1:4c07439063f40db4", false, false
+    ; Some "checksum:v1:4c07439063f40db4", true, false
     ; None, false, false
-    ; Some "checksum:v1:verified", true, false
-    ; Some "checksum:v1:wrong", true, true
+    ; Some "checksum:v1:wrong", true, false
     ]
 ;;
 
@@ -949,7 +976,7 @@ let existing_checkpoint_checksum_policy () =
               | D.Service_blocked (D.Protocol_failure _) -> true
               | _ -> false)
             fixture.statuses))
-    [ "checksum:v1:wrong", true; "checksum:v1:verified", false ]
+    [ "checksum:v1:wrong", false; "checksum:v1:verified", false ]
 ;;
 
 let pull_checksum_policy () =
@@ -957,11 +984,12 @@ let pull_checksum_policy () =
     (fun (expected, blocked) ->
        let fixture = fixture () in
        fixture.remote <- cursor 1L;
+       fixture.expected_checksum <- Some (ok (T.Checksum.of_string "checksum:v1:head"));
        fixture.pull_checksum
        <- Option.map (fun value -> ok (T.Checksum.of_string value)) expected;
        check_success (run fixture);
        check_count fixture "apply" 1;
-       check_count fixture "verify-checksum" 0;
+       check_count fixture "verify-checksum" 1;
        let relevant =
          List.filter
            (fun event -> List.mem event [ "apply"; "verify-checksum" ])
@@ -969,7 +997,7 @@ let pull_checksum_policy () =
        in
        Alcotest.(check (list string))
          "checksum validation belongs to atomic authoritative application"
-         [ "apply" ]
+         [ "apply"; "verify-checksum" ]
          relevant;
        Alcotest.(check bool)
          "authoritative Pull checksum"
@@ -979,7 +1007,7 @@ let pull_checksum_policy () =
               | D.Service_blocked (D.Protocol_failure _) -> true
               | _ -> false)
             fixture.statuses))
-    [ Some "checksum:v1:verified", false; None, false ]
+    [ Some "checksum:v1:verified", false; Some "checksum:v1:wrong", false; None, false ]
 ;;
 
 let no_progress_checksum_policy () =
@@ -1001,15 +1029,16 @@ let no_progress_checksum_policy () =
            (match fixture.status with
             | D.Service_blocked _ -> true
             | _ -> false)
-           || count fixture "sleep:0.125" > 0
+           || count fixture "sleep:0.125" >= if ahead then 1 else 2
          then Some D.Stop_requested
          else None
        in
        check_success (run ~input fixture);
+       check_count fixture "pull" (if ahead then 1 else 2);
        check_count
          fixture
          "verify-checksum"
-         (if Option.is_some expected && not ahead then 1 else 0);
+         (if Option.is_some expected && not ahead then 2 else 0);
        Alcotest.(check bool)
          "empty Pull checksum applies only at its cursor"
          blocked
@@ -1018,7 +1047,7 @@ let no_progress_checksum_policy () =
               | D.Service_blocked (D.Protocol_failure _) -> true
               | _ -> false)
             fixture.statuses))
-    [ Some "checksum:v1:wrong", false, true
+    [ Some "checksum:v1:wrong", false, false
     ; Some "checksum:v1:verified", false, false
     ; None, false, false
     ; Some "checksum:v1:wrong", true, false

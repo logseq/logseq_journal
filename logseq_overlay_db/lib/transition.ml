@@ -5,7 +5,6 @@ let acceptance_barriers_equal
       (right : Types.acceptance_barrier)
   =
   Types.Server_cursor.equal left.through right.through
-  && Types.Checksum.equal left.checksum right.checksum
 ;;
 
 let uuid_lists_equal left right =

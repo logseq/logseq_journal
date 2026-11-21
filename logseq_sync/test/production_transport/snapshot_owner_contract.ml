@@ -853,11 +853,8 @@ let protected_append_echo database ~path ~protect ~unprotect ~duplicate =
        | _ -> Alcotest.fail "AES echo lost the complete tree")
 ;;
 
-let encrypted_snapshot_activation ?echo () =
+let synthetic_crypto_backend () =
   let module Crypto = Logseq_sync_crypto.Core in
-  let module Owner = Logseq_sync_execute_owners.Database_owner in
-  let module Database = Logseq_overlay_db.Database in
-  let module Types = Logseq_overlay_db.Types in
   let module Aes = Mirage_crypto.AES.GCM in
   let backend : Crypto.backend =
     { unlock = (fun ~identity:_ ~wrapped_graph_key:_ -> Ok (String.make 32 'k'))
@@ -877,6 +874,15 @@ let encrypted_snapshot_activation ?echo () =
         }
     }
   in
+  backend
+;;
+
+let encrypted_snapshot_activation ?echo () =
+  let module Crypto = Logseq_sync_crypto.Core in
+  let module Owner = Logseq_sync_execute_owners.Database_owner in
+  let module Database = Logseq_overlay_db.Database in
+  let module Types = Logseq_overlay_db.Types in
+  let backend = synthetic_crypto_backend () in
   let crypto_limits = limits_with_items 2 in
   let crypto = Crypto.create ~identity ~limits:crypto_limits ~encrypted:true ~backend in
   let run operation =
@@ -965,13 +971,21 @@ let encrypted_snapshot_activation ?echo () =
              "rejected activation stays absent"
              true
              (get (Owner.database_if_open binding) = None);
+           let corrupt =
+             get
+               (D.snapshot
+                  ~resource:snapshot.resource
+                  ~through:snapshot.through
+                  ~checksum:"checksum:v1:ffffffffffffffff"
+                  ~encrypted:true)
+           in
            batches := [];
            ignore
              (get
                 (Owner.activate_snapshot
                    binding
                    ~check_current:(fun () -> Ok ())
-                   { snapshot
+                   { snapshot = corrupt
                    ; path = source.path
                    ; expected_rows = source.expected_rows
                    ; maximum_crypto_items = crypto_limits.maximum_items
@@ -1057,12 +1071,232 @@ let encrypted_snapshot_activation ?echo () =
                   echo))))
 ;;
 
-let native_service_bootstrap ?(checksum_mode = `Valid) () =
+let start_encrypted_native_fixture
+      ~environment
+      ~sw
+      ~root
+      ~dependencies
+      ~config
+      ~sqlite
+      ~on_change
+  =
+  let module X = Execute.Core in
+  let module T = Logseq_sync_transport.Core in
+  let module Crypto = Logseq_sync_crypto.Core in
+  let module Worker = Logseq_sync_worker_owner.Core in
+  let module Assets = Worker.Assets in
+  let module Service = Logseq_sync_sync_service.Core in
+  let module Database = Logseq_overlay_db.Database in
+  let module Types = Logseq_overlay_db.Types in
+  let identity = config.Service.identity in
+  let clock = Eio.Stdenv.mono_clock environment in
+  let deadlines : X.network_deadlines =
+    { setup_seconds = 2.
+    ; tls_handshake_seconds = 2.
+    ; http_response_seconds = 2.
+    ; download_seconds = 2.
+    }
+  in
+  let staging_directory = Filename.concat root "staging" in
+  Unix.mkdir staging_directory 0o700;
+  let transport =
+    get
+      (T.create_native
+         ~verify_snapshot:Database.inspect_snapshot_storage
+         ~sw
+         ~clock
+         ~network:(Eio.Stdenv.net environment)
+         ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+         ~identity
+         ~limits
+         ~deadlines
+         ~cleanup_seconds:2.
+         ~liveness:X.Peer_close_only
+         ~staging_directory
+         ~encrypted:true
+         ~token:(fun ~epoch:_ ~refresh:_ -> Ok "synthetic-fixture-token"))
+  in
+  let inspection =
+    Result.get_ok
+      (Database.inspect_mirror
+         ~application_support_directory:root
+         ~graph_id:
+           (Result.get_ok (Logseq_db_types.Graph_types.Uuid.of_string identity.graph)))
+  in
+  let owner =
+    get
+      (X.activation_owner
+         ~sw
+         ~dependencies
+         ~inspection
+         ~graph_name:"Anonymous encrypted bootstrap"
+         ~snapshot_source:(T.snapshot_source transport))
+  in
+  let crypto =
+    Crypto.create ~identity ~limits ~encrypted:true ~backend:(synthetic_crypto_backend ())
+  in
+  ignore
+    (get
+       (Crypto.run
+          crypto
+          ~identity
+          ~check_current:(fun () -> Ok ())
+          (D.Unlock (get (D.unlock_input ~wrapped_graph_key:"synthetic")))));
+  let assets =
+    get
+      (Assets.create
+         ~root:(Filename.concat root "assets")
+         ~identity
+         ~limits
+         ~crypto
+         ~key:(Assets.native_key ~identity ~crypto)
+         ~network:
+           { get =
+               (fun ~identity:_ ~asset:_ ~version:_ ~maximum_wire_bytes:_ ->
+                 Alcotest.fail "bootstrap must not fetch assets")
+           ; put =
+               (fun ~identity:_ ~asset:_ ~version:_ ~wire:_ ->
+                 Alcotest.fail "bootstrap must not upload assets")
+           })
+  in
+  let bound = ref None in
+  let worker =
+    Worker.create
+      ~clock
+      ~namespace:(String.make 64 'a')
+      ~assets
+      ~store:(Worker.store sqlite)
+      ~notify_outbox_changed:(fun ~owner ~identity ->
+        (Option.get !bound).Service.outbox_committed ~owner ~identity)
+  in
+  let gate = ref D.Closed in
+  let checkpoint () =
+    Option.map
+      (fun database ->
+         Types.sync_view_checkpoint (Result.get_ok (Database.inspect_sync database)))
+      (get (X.database_if_open owner))
+  in
+  let caps : X.capabilities =
+    { validate_identity =
+        (fun actual -> if actual = identity then Ok () else Error D.Stale_context)
+    ; validate_limits =
+        (fun actual ->
+          if actual = limits then Ok () else Error (D.Invalid_input "fixture limits"))
+    ; websocket_liveness = X.Peer_close_only
+    ; network_deadlines = deadlines
+    ; cleanup_seconds = 2.
+    ; acquire = (fun _ -> Ok ())
+    ; fence_network =
+        (fun identity ->
+          gate := D.Closed;
+          T.fence transport ~identity)
+    ; close_network = (fun identity -> T.close_network transport ~identity)
+    ; authorize_network =
+        (fun identity ~epoch ->
+          get (T.authorize transport ~identity ~epoch);
+          gate := D.Open { authorization_epoch = epoch };
+          Ok ())
+    ; validate_resource = T.validate_resource transport
+    ; restore =
+        (fun ~scope _ ->
+          get (X.check_current scope);
+          Ok
+            { D.keys = Crypto.status crypto
+            ; checkpoint = checkpoint ()
+            ; recovery_pending = false
+            })
+    ; worker_owner = Worker.worker_owner worker
+    ; dispatch =
+        { database =
+            (fun ~owner:_ ~scope:_ ~identity:_ _ ->
+              Alcotest.fail "Execute owns database dispatch")
+        ; transport =
+            (fun ~scope ~identity operation ->
+              T.dispatch transport ~scope ~identity operation)
+        ; crypto =
+            (fun ~scope ~identity operation ->
+              Worker.crypto_dispatch worker ~scope ~identity operation)
+        ; assets = (fun ~scope:_ ~identity:_ _ -> Alcotest.fail "unexpected assets")
+        }
+    ; observe =
+        (fun identity ->
+          Ok
+            { D.identity
+            ; keys = Crypto.status crypto
+            ; network = !gate
+            ; checkpoint = checkpoint ()
+            ; pending_submissions = 0
+            ; pending_assets = 0
+            ; cleanup_pending = 0
+            ; last_failure = None
+            })
+    ; fence =
+        (fun identity ->
+          Assets.fence assets;
+          Worker.fence worker ~identity)
+    ; retire =
+        (fun identity ->
+          get (Worker.await_quiescent worker ~identity);
+          get (Assets.close assets);
+          Crypto.retire crypto;
+          Ok ())
+    ; release_file = (fun identity file -> Assets.release_file assets ~identity file)
+    ; release_lease = (fun identity lease -> Assets.release_lease assets ~identity lease)
+    ; release_snapshot =
+        (fun identity snapshot -> T.release_snapshot transport ~identity snapshot)
+    }
+  in
+  let service =
+    get
+      (Service.start
+         ~sw
+         ~config
+         ~dependencies:
+           { clock
+           ; database_owner = owner
+           ; capabilities = caps
+           ; bind_ingress = (fun ingress -> bound := Some ingress)
+           }
+         ~on_change)
+  in
+  ( owner
+  , (fun reconnect ->
+      if reconnect
+      then (
+        get (Service.set_network service D.Closed);
+        get (Service.set_network service (D.Open { authorization_epoch = 2L })))
+      else get ((Option.get !bound).Service.outbox_committed ~owner ~identity))
+  , fun () ->
+      Service.close service;
+      Option.iter
+        (fun database -> ignore (Database.close database))
+        (get (X.database_if_open owner)) )
+;;
+
+let native_service_bootstrap ?(checksum_mode = `Valid) ?(new_head = false) () =
   let module App = Journal_sync_lifecycle.Core in
   let module X = Execute.Core in
   let module Database = Logseq_overlay_db.Database in
   let module Types = Logseq_overlay_db.Types in
-  let wire, rows, checksum = remote_graph_fixture () in
+  let protected_titles =
+    if checksum_mode <> `Invalid
+    then []
+    else (
+      let plaintext =
+        Transit_native.Transit.Json.to_string
+          (Transit_core.Json.String "Anonymous encrypted title")
+      in
+      let iv, ciphertext =
+        Result.get_ok
+          ((synthetic_crypto_backend ()).crypto.encrypt_aes_gcm
+             ~key:(String.make 32 'k')
+             ~plaintext)
+      in
+      [ Transit_native.Transit.Json.to_string
+          (Transit_core.Json.Array [ Binary iv; Binary ciphertext ])
+      ])
+  in
+  let wire, rows, checksum = remote_graph_fixture ~protected_titles () in
   let metadata =
     wire_response
       "Content-Type: application/json\r\nContent-Length: {{LENGTH}}\r\n"
@@ -1095,19 +1329,33 @@ let native_service_bootstrap ?(checksum_mode = `Valid) () =
   let frame =
     String.make 1 (Char.chr 0x81) ^ String.make 1 (Char.chr (String.length hello)) ^ hello
   in
-  let socket =
+  let socket ?(parallel = true) frame =
     match Tls_peer.case ~ws:true "" with
     | `Assoc fields ->
       `Assoc
-        (("parallel", `Bool true)
+        (("parallel", `Bool parallel)
          :: ("lifetime", `Int 10)
          :: ("reply_text", `String (Tls_peer.hex frame))
          :: fields)
     | _ -> assert false
   in
+  let later_hello =
+    Result.get_ok
+      (Protocol.encode_server_message
+         (Protocol.Server.Hello { t = cursor; checksum = Some "1234567890abcdef" }))
+  in
+  let later_frame =
+    String.make 1 (Char.chr 0x81)
+    ^ String.make 1 (Char.chr (String.length later_hello))
+    ^ later_hello
+  in
   let report =
     Tls_peer.with_peer
-      [ socket; Tls_peer.case ~eof:true metadata; Tls_peer.case ~eof:true artifact ]
+      ([ socket frame
+       ; Tls_peer.case ~eof:true metadata
+       ; Tls_peer.case ~eof:true artifact
+       ]
+       @ if new_head then [ socket ~parallel:false later_frame ] else [])
       (fun ~environment ~sw ~support ~origin ->
          let identity =
            get
@@ -1167,85 +1415,167 @@ let native_service_bootstrap ?(checksum_mode = `Valid) () =
               in
               let errors = ref [] in
               let observed_checkpoint = ref None in
+              let online = ref false in
               let returned = ref false in
-              let service =
-                get
-                  (App.start_owned_native
-                     ~sw
-                     ~clock:(Eio.Stdenv.mono_clock environment)
-                     ~network:(Eio.Stdenv.net environment)
-                     ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
-                     ~config
-                     ~deadlines:
-                       { X.setup_seconds = 2.
-                       ; tls_handshake_seconds = 2.
-                       ; http_response_seconds = 2.
-                       ; download_seconds = 2.
-                       }
-                     ~liveness:X.Peer_close_only
-                     ~cleanup_seconds:2.
-                     ~root
-                     ~dependencies
-                     ~graph_name:"Synthetic native bootstrap"
-                     ~upload_store:(Logseq_sync_worker_owner.Core.store sqlite)
-                     ~namespace:(String.make 64 'a')
-                     ~encrypted:false
-                     ~token:(fun ~epoch:_ ~refresh:_ -> Ok "synthetic-fixture-token")
-                     ~on_change:(fun status ->
-                       Alcotest.(check bool)
-                         "startup callback follows return"
-                         true
-                         !returned;
-                       let observation =
-                         status.Logseq_sync_sync_service.Core.observation
-                       in
-                       observed_checkpoint := observation.state.checkpoint;
-                       match observation.status with
-                       | D.Service_blocked error -> errors := error :: !errors
-                       | _ -> ())
-                     ~on_error:(fun error -> errors := error :: !errors))
+              let on_change (status : Logseq_sync_sync_service.Core.status) =
+                Alcotest.(check bool) "startup callback follows return" true !returned;
+                let observation = status.observation in
+                observed_checkpoint := observation.state.checkpoint;
+                online := observation.status = D.Service_online;
+                match observation.status with
+                | D.Service_blocked error -> errors := error :: !errors
+                | _ -> ()
+              in
+              let owner, resample, close =
+                if checksum_mode = `Invalid
+                then
+                  start_encrypted_native_fixture
+                    ~environment
+                    ~sw
+                    ~root
+                    ~dependencies
+                    ~config
+                    ~sqlite
+                    ~on_change
+                else (
+                  let service =
+                    get
+                      (App.start_owned_native
+                         ~sw
+                         ~clock:(Eio.Stdenv.mono_clock environment)
+                         ~network:(Eio.Stdenv.net environment)
+                         ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+                         ~config
+                         ~deadlines:
+                           { X.setup_seconds = 2.
+                           ; tls_handshake_seconds = 2.
+                           ; http_response_seconds = 2.
+                           ; download_seconds = 2.
+                           }
+                         ~liveness:X.Peer_close_only
+                         ~cleanup_seconds:2.
+                         ~root
+                         ~dependencies
+                         ~graph_name:"Synthetic native bootstrap"
+                         ~upload_store:(Logseq_sync_worker_owner.Core.store sqlite)
+                         ~namespace:(String.make 64 'a')
+                         ~encrypted:false
+                         ~token:(fun ~epoch:_ ~refresh:_ -> Ok "synthetic-fixture-token")
+                         ~on_change
+                         ~on_error:(fun error -> errors := error :: !errors))
+                  in
+                  ( App.database_owner service
+                  , (fun _ -> get (App.projection_changed service))
+                  , fun () -> App.close service ))
               in
               returned := true;
-              Fun.protect
-                ~finally:(fun () -> App.close service)
-                (fun () ->
-                   if checksum_mode = `Invalid
-                   then (
-                     Tls_peer.wait (Eio.Stdenv.clock environment) (fun () ->
-                       !errors <> []
-                       || Option.is_some
-                            (get (X.database_if_open (App.database_owner service))));
-                     Alcotest.(check bool)
-                       "checksum mismatch blocks before activation"
-                       true
-                       (!errors <> []);
-                     Alcotest.(check bool)
-                       "invalid snapshot remains absent"
-                       true
-                       (get (X.database_if_open (App.database_owner service)) = None))
-                   else (
-                     Tls_peer.wait (Eio.Stdenv.clock environment) (fun () ->
-                       (match !errors with
-                        | D.Activation_failure (Types.Snapshot_parse_error message) :: _
-                          -> Alcotest.fail ("Activation parse: " ^ message)
-                        | D.Activation_failure Types.Snapshot_limit_exceeded :: _ ->
-                          Alcotest.fail "Activation limit exceeded"
-                        | D.Activation_failure
-                            (Types.Snapshot_commit_persistence_failed message)
-                          :: _ -> Alcotest.fail ("Activation persistence: " ^ message)
-                        | error :: _ -> Alcotest.fail (D.error_message error)
-                        | [] -> ());
-                       Option.is_some !observed_checkpoint);
-                     let database = get (X.database (App.database_owner service)) in
-                     let view = Result.get_ok (Database.inspect_sync database) in
-                     Alcotest.(check int64)
-                       "native service activates exact server checkpoint"
-                       3L
-                       (Types.sync_view_checkpoint view |> Types.Server_cursor.to_int64);
-                     Alcotest.(check int)
-                       "bootstrap subscription errors"
-                       0
-                       (List.length !errors)))))
+              Fun.protect ~finally:close (fun () ->
+                Tls_peer.wait (Eio.Stdenv.clock environment) (fun () ->
+                  (match !errors with
+                   | D.Activation_failure (Types.Snapshot_parse_error message) :: _ ->
+                     Alcotest.fail ("Activation parse: " ^ message)
+                   | D.Activation_failure Types.Snapshot_limit_exceeded :: _ ->
+                     Alcotest.fail "Activation limit exceeded"
+                   | D.Activation_failure
+                       (Types.Snapshot_commit_persistence_failed message)
+                     :: _ -> Alcotest.fail ("Activation persistence: " ^ message)
+                   | error :: _ -> Alcotest.fail (D.error_message error)
+                   | [] -> ());
+                  Option.is_some !observed_checkpoint && !online);
+                let database = get (X.database owner) in
+                Alcotest.(check (option bool))
+                  "actual snapshot digest is committed"
+                  (Some true)
+                  (Result.get_ok
+                     (Database.check_checkpoint_checksum
+                        database
+                        ~through:cursor
+                        ~expected:checksum));
+                let inspection =
+                  Result.get_ok
+                    (Database.inspect_mirror
+                       ~application_support_directory:root
+                       ~graph_id:
+                         (Result.get_ok
+                            (Logseq_db_types.Graph_types.Uuid.of_string identity.graph)))
+                in
+                Alcotest.(check bool)
+                  "activated mirror is locally available"
+                  true
+                  (match Database.mirror_presence inspection with
+                   | Types.Available _ -> true
+                   | Types.Absent _ -> false);
+                let durable_digest =
+                  Result.get_ok
+                    (Database.inspect_snapshot_storage
+                       ~check_current:(fun () -> ())
+                       ~scratch_bytes:33554432L
+                       ~encrypted:(checksum_mode = `Invalid)
+                       ~path:
+                         (Filename.concat
+                            root
+                            ("logseq-db-worker/synced-graphs/"
+                             ^ identity.graph
+                             ^ "/db.sqlite")))
+                in
+                Alcotest.(check string)
+                  "SQLite stores actual snapshot digest"
+                  (Types.Checksum.to_string checksum)
+                  (Types.Checksum.to_string durable_digest);
+                if checksum_mode = `Invalid
+                then (
+                  let expected =
+                    Result.get_ok
+                      (Types.Checksum.of_string
+                         ("checksum:v1:"
+                          ^
+                          if wire_checksum = "ffffffffffffffff"
+                          then "0000000000000000"
+                          else "ffffffffffffffff"))
+                  in
+                  Alcotest.(check (option bool))
+                    "Hello digest never forges the durable digest"
+                    (Some false)
+                    (Result.get_ok
+                       (Database.check_checkpoint_checksum
+                          database
+                          ~through:cursor
+                          ~expected));
+                  online := false;
+                  resample false;
+                  Tls_peer.wait (Eio.Stdenv.clock environment) (fun () ->
+                    match !errors with
+                    | error :: _ -> Alcotest.fail (D.error_message error)
+                    | [] -> !online));
+                let view = Result.get_ok (Database.inspect_sync database) in
+                Alcotest.(check int64)
+                  "native service activates exact server checkpoint"
+                  3L
+                  (Types.sync_view_checkpoint view |> Types.Server_cursor.to_int64);
+                Alcotest.(check int)
+                  "bootstrap subscription errors"
+                  0
+                  (List.length !errors);
+                if new_head
+                then (
+                  resample true;
+                  online := false;
+                  Tls_peer.wait (Eio.Stdenv.clock environment) (fun () ->
+                    match !errors with
+                    | error :: _ -> Alcotest.fail (D.error_message error)
+                    | [] -> !online);
+                  Alcotest.(check int)
+                    "new head remains online without errors"
+                    0
+                    (List.length !errors);
+                  Alcotest.(check (option bool))
+                    "diagnostic head preserves actual digest"
+                    (Some true)
+                    (Result.get_ok
+                       (Database.check_checkpoint_checksum
+                          database
+                          ~through:cursor
+                          ~expected:checksum))))))
   in
   check_retired report
 ;;
@@ -1786,8 +2116,10 @@ let () =
     ; ( "AES protected append duplicate operations retain exact datoms"
       , fun () -> encrypted_snapshot_activation ~echo:true () )
     ; ("App owned native absent mirror bootstrap", fun () -> native_service_bootstrap ())
-    ; ( "native bootstrap rejects wrong Hello checksum"
+    ; ( "encrypted native bootstrap admits mismatched Hello and retains actual digest"
       , fun () -> native_service_bootstrap ~checksum_mode:`Invalid () )
+    ; ( "encrypted native bootstrap warns and continues on a later mismatched head"
+      , fun () -> native_service_bootstrap ~checksum_mode:`Invalid ~new_head:true () )
     ; ( "native bootstrap accepts missing Hello checksum"
       , fun () -> native_service_bootstrap ~checksum_mode:`Missing () )
     ; "encryption metadata rejects and cleans", encryption_failure

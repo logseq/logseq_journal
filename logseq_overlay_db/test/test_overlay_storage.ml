@@ -879,8 +879,8 @@ let snapshot_commit_is_single_use () =
     | Ok _ -> Alcotest.fail "snapshot commit was applied twice")
 ;;
 
-let snapshot_checksum_mismatch_fails_before_activation () =
-  let behavior = "snapshot checksum mismatch fails before activation" in
+let snapshot_checksum_mismatch_allows_activation () =
+  let behavior = "snapshot checksum mismatch allows activation" in
   T.with_temp_directory "overlay-snapshot-checksum-" (fun root ->
     let support = Filename.concat root "target" in
     Unix.mkdir support 0o700;
@@ -895,19 +895,14 @@ let snapshot_checksum_mismatch_fails_before_activation () =
         ~expected_checksum:(Some (checksum "ffffffffffffffff"))
         ~expected_rows
     with
-    | Error (Snapshot_parse_error _) ->
-      (match Database.mirror_presence (inspect_mirror support behavior) with
-       | Absent _ -> ()
-       | Available _ -> Alcotest.fail "mismatching checksum published a mirror");
-      let staging_root = Filename.concat support "logseq-db-worker/synced-graphs" in
-      Alcotest.(check int)
-        "mismatch removed staging artifacts"
-        0
-        (Array.length (Sys.readdir staging_root))
-    | Error _ -> Alcotest.fail "checksum mismatch returned the wrong error"
+    | Error _ -> Alcotest.fail "state checksum mismatch blocked activation"
     | Ok prepared ->
-      Database.cancel_snapshot_activation prepared;
-      Alcotest.fail "checksum mismatch reached activation")
+      ignore (supply_snapshot_crypto ~behavior prepared 0);
+      ignore (Database.commit_snapshot_activation prepared |> T.require_ok ~behavior);
+      (match Database.mirror_presence (inspect_mirror support behavior) with
+       | Available { checkpoint; _ } ->
+         T.require (Server_cursor.equal checkpoint (server_cursor 0)) "activation cursor"
+       | Absent _ -> Alcotest.fail "checksum warning prevented local availability"))
 ;;
 
 let checksum_snapshot_fixture root ~e2ee ~empty ~duplicates ~title =
@@ -2673,31 +2668,28 @@ let authoritative_checkpoint_and_root_survive_reopen ?(mismatch = false) () =
         in
         Database.release_snapshot snapshot;
         let result = Database.apply_authoritative first prepared ~decrypted:None in
-        if mismatch
-        then (
-          T.require
-            (durable_state () = durable_before)
-            "checksum mismatch changed durable checkpoint, outbox or receipts";
-          (match result with
-           | Error Authoritative_checksum_mismatch -> ()
-           | Error _ -> Alcotest.fail "checksum mismatch returned the wrong error"
-           | Ok _ -> Alcotest.fail "checksum mismatch was committed");
-          let after = Database.inspect_sync first |> T.require_ok ~behavior in
-          T.require
-            (sync_token_equal (sync_view_token sync) (sync_view_token after))
-            "checksum rejection changed sync state")
-        else (
-          match T.require_ok ~behavior result with
-          | Authoritative_applied _ -> ()
-          | Authoritative_deferred _ -> Alcotest.fail "authoritative fixture was deferred");
+        (match T.require_ok ~behavior result with
+         | Authoritative_applied _ -> ()
+         | Authoritative_deferred _ -> Alcotest.fail "authoritative fixture was deferred");
+        T.require (durable_state () <> durable_before) "authoritative progress persisted";
+        let advanced = Database.inspect_sync first |> T.require_ok ~behavior in
+        T.require
+          (Server_cursor.equal (sync_view_checkpoint advanced) cursor)
+          "advanced cursor";
+        T.require
+          (Database.check_checkpoint_checksum
+             first
+             ~through:cursor
+             ~expected:(checksum "ffffffffffffffff")
+           |> T.require_ok ~behavior
+           = Some false)
+          "remote digest must not replace actual digest";
         Database.close first |> T.require_ok ~behavior;
         let refreshed = inspect_mirror location behavior in
         (match Database.mirror_presence refreshed with
          | Available { checkpoint; _ } ->
            T.require
-             (Server_cursor.equal
-                checkpoint
-                (if mismatch then sync_view_checkpoint sync else cursor))
+             (Server_cursor.equal checkpoint cursor)
              "reopen inspection lost authoritative checkpoint"
          | Absent _ -> Alcotest.fail "authoritative commit removed the mirror");
         let opening_inspection = refreshed in
@@ -2710,32 +2702,13 @@ let authoritative_checkpoint_and_root_survive_reopen ?(mismatch = false) () =
           Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
           |> T.require_ok ~behavior
         in
-        if mismatch
-        then (
-          let values blocks =
-            List.filter_map
-              (function
-                | Present_block { value; _ } -> Some value
-                | _ -> None)
-              blocks
-          in
-          T.require
-            (values after = values before)
-            "rejected checksum changed durable graph";
-          T.require
-            (durable_state () = durable_before)
-            "reopen changed rejected checkpoint, outbox or receipts";
-          let reopened = Database.inspect_sync second |> T.require_ok ~behavior in
-          T.require
-            (sync_view_submissions reopened = sync_view_submissions sync)
-            "reopen changed rejected outbox")
-        else (
-          match after with
-          | [ Present_block { value; _ } ] ->
-            T.require
-              (value.block.updated_at_ms = 1_704_067_200_456L)
-              "reopen lost authoritative block update"
-          | _ -> Alcotest.fail "reopen lost authoritative block");
+        T.require (after <> before) "authoritative graph changed";
+        (match after with
+         | [ Present_block { value; _ } ] ->
+           T.require
+             (value.block.updated_at_ms = 1_704_067_200_456L)
+             "reopen lost authoritative block update"
+         | _ -> Alcotest.fail "reopen lost authoritative block");
         Database.release_snapshot snapshot;
         Database.close second |> T.require_ok ~behavior)))
 ;;
@@ -4189,9 +4162,9 @@ let cases =
       `Quick
       unused_preparation_checksum_defers_invalid_utf8_without_publication
   ; Alcotest.test_case
-      "snapshot checksum mismatch fails before activation"
+      "snapshot checksum mismatch allows activation"
       `Quick
-      snapshot_checksum_mismatch_fails_before_activation
+      snapshot_checksum_mismatch_allows_activation
   ; Alcotest.test_case
       "mirror inspection is generation-bound"
       `Quick
@@ -4259,7 +4232,7 @@ let cases =
       `Quick
       (authoritative_checkpoint_and_root_survive_reopen ~mismatch:false)
   ; Alcotest.test_case
-      "checksum mismatch preserves durable authoritative state"
+      "checksum mismatch advances durable authoritative state"
       `Quick
       (authoritative_checkpoint_and_root_survive_reopen ~mismatch:true)
   ; Alcotest.test_case
