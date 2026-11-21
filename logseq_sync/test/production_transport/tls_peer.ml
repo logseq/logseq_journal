@@ -140,7 +140,12 @@ def serve_case(index,case,raw):
         os.replace(root+'/frame-count.tmp', root+'/frame-count')
         pending=pending[offset+4*masked+length:]
         if opcode==1 and case.get('reply_text'):
-          conn.sendall(bytes.fromhex(case['reply_text']))
+          reply=case['reply_text']
+          if case.get('reply_by_type'):
+            message=json.loads(payload)
+            if message.get('type')=='pull': assert message['since']==case['expected_pull_since']
+            reply=case['reply_by_type'].get(message.get('type'),reply)
+          conn.sendall(bytes.fromhex(reply))
         if opcode==8 and case.get('reply_close',True):
           time.sleep(case.get('close_delay',0))
           conn.sendall(bytes([0x88,len(payload)])+payload)

@@ -88,6 +88,7 @@ type fixture =
   ; mutable expected_checksum : T.checksum option
   ; mutable snapshot_checksum : string
   ; mutable snapshot_through : T.server_cursor option
+  ; mutable snapshot_failures : D.error list
   ; mutable unknown_pushes : int
   ; mutable defer : bool
   ; mutable pause_sleep : bool
@@ -120,6 +121,7 @@ let fixture ?(submissions = []) () =
   ; expected_checksum = None
   ; snapshot_checksum = "checksum:v1:verified"
   ; snapshot_through = None
+  ; snapshot_failures = []
   ; unknown_pushes = 0
   ; defer = false
   ; pause_sleep = false
@@ -300,17 +302,22 @@ let rec transport
   | D.Retire_connection _ ->
     record fixture "retire";
     Some (Ok ())
-  | D.Fetch_snapshot through ->
+  | D.Fetch_snapshot ->
     record fixture "snapshot";
-    let resource = ok (D.resource ~owner:identity ~token:"staging") in
-    Some
-      (Ok
-         (ok
-            (D.snapshot
-               ~resource
-               ~through:(Option.value fixture.snapshot_through ~default:through)
-               ~checksum:fixture.snapshot_checksum
-               ~encrypted:(fixture.keys = D.Key_available))))
+    (match fixture.snapshot_failures with
+     | error :: rest ->
+       fixture.snapshot_failures <- rest;
+       Some (Error error)
+     | [] ->
+       let resource = ok (D.resource ~owner:identity ~token:"staging") in
+       Some
+         (Ok
+            (ok
+               (D.snapshot
+                  ~resource
+                  ~through:(Option.value fixture.snapshot_through ~default:fixture.remote)
+                  ~checksum:fixture.snapshot_checksum
+                  ~encrypted:(fixture.keys = D.Key_available)))))
   | D.Push actual ->
     Alcotest.(check bool)
       "push exposes actual submitting workflow"
@@ -505,6 +512,56 @@ let check_success = function
 
 let check_count fixture event expected =
   Alcotest.(check int) event expected (count fixture event)
+;;
+
+let metadata_initialization () =
+  List.iter
+    (fun baseline ->
+       let fixture = fixture () in
+       fixture.checkpoint <- None;
+       fixture.snapshot_through <- Some (cursor baseline);
+       fixture.remote <- cursor 9L;
+       fixture.connect_failures <- [ D.Authentication_failure "WS unavailable" ];
+       check_success (run fixture);
+       check_count fixture "activate" 1;
+       check_count fixture "release-snapshot" 1;
+       Alcotest.(check bool)
+         "metadata baseline available without WS"
+         true
+         (fixture.checkpoint = Some (cursor baseline));
+       let rec before = function
+         | "activate" :: _ -> true
+         | "connect" :: _ | [] -> false
+         | _ :: rest -> before rest
+       in
+       Alcotest.(check bool) "activation precedes connection" true (before fixture.trace))
+    [ 3L; 12L ];
+  let fixture = fixture () in
+  fixture.checkpoint <- None;
+  fixture.snapshot_through <- Some (cursor 3L);
+  fixture.remote <- cursor 9L;
+  check_success (run fixture);
+  check_count fixture "snapshot" 1;
+  check_count fixture "pull" 1;
+  Alcotest.(check bool)
+    "WS catches up from metadata"
+    true
+    (fixture.checkpoint = Some (cursor 9L))
+;;
+
+let snapshot_network_retry () =
+  let fixture = fixture () in
+  fixture.checkpoint <- None;
+  fixture.snapshot_failures <- List.init 3 (fun _ -> D.Network_failure "HTTP offline");
+  check_success (run fixture);
+  check_count fixture "snapshot" 3;
+  check_count fixture "connect" 0;
+  check_count fixture "abandon-outbox" 3;
+  check_count fixture "activate" 0;
+  Alcotest.(check bool)
+    "failed downloads leave mirror absent"
+    true
+    (fixture.checkpoint = None)
 ;;
 
 let normal () =
@@ -1206,7 +1263,9 @@ let retry_disabled () =
 let tests =
   List.map
     (fun (name, test) -> Alcotest.test_case name `Quick test)
-    [ "normal durable flow", normal
+    [ "metadata initialization before WebSocket", metadata_initialization
+    ; "snapshot network retry is bounded", snapshot_network_retry
+    ; "normal durable flow", normal
     ; "Submitted exact recovery", recovery
     ; "unknown outcome and Deferred reapply", unknown_recovery
     ; "non-network failures never retry", nonnetwork

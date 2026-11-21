@@ -54,8 +54,10 @@ repository.
 ### Bootstrap
 
 Creation of a local mirror for a managed graph that is not available locally.
-Bootstrap fetches metadata, downloads and validates a snapshot artifact, obtains
-the graph key when E2EE is enabled, and atomically activates the staged mirror.
+Bootstrap uses snapshot metadata as its baseline, validates and decrypts the artifact
+when E2EE is enabled, and atomically persists and activates the local mirror before
+opening a WebSocket. Incremental sync then catches up from that baseline; a locally
+available checkpoint is reused on restart rather than downloaded again.
 
 ### Capture
 

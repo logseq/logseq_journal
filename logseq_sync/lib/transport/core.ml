@@ -145,11 +145,10 @@ type t =
   ; backend : backend
   ; token : epoch:int64 -> refresh:bool -> (string, Dsl.error) result
   ; fetch_snapshot :
-      scope:scope -> epoch:int64 -> Cursor.t -> (Dsl.snapshot, Dsl.error) result
+      scope:scope -> epoch:int64 -> unit -> (Dsl.snapshot, Dsl.error) result
   ; snapshots : Snapshot.t option
   ; timeout : 'a. float -> (unit -> 'a) -> 'a
   ; connect_seconds : float
-  ; download_seconds : float
   ; response_seconds : float
   ; cleanup_seconds : float
   ; mutable epoch : int64 option
@@ -683,23 +682,8 @@ let scoped : type a. t -> scope -> entry -> a Dsl.transport -> (a, Dsl.error) re
          > t.limits.maximum_items
     then Error (Dsl.Capacity_exceeded "Submission transport bounds")
     else response t scope entry Push (Wire.submission batch) (Wire.push ~batch)
-  | Dsl.Fetch_snapshot through ->
-    bounded t scope entry ~seconds:t.download_seconds ~write:false (fun () ->
-      let snapshot_scope =
-        { scope with
-          check_current = (fun () -> check t scope entry)
-        ; admit_network =
-            (fun () ->
-              let* () = check t scope entry in
-              scope.admit_network ())
-        }
-      in
-      let* snapshot = t.fetch_snapshot ~scope:snapshot_scope ~epoch:entry.epoch through in
-      if
-        snapshot.Dsl.resource.owner <> t.identity
-        || not (Cursor.equal snapshot.through through)
-      then Error (Dsl.Protocol_failure "Snapshot source identity or baseline mismatch")
-      else Ok snapshot)
+  | Dsl.Fetch_snapshot ->
+    Error (Dsl.Invalid_input "Snapshot download is independent of connections")
   | Dsl.Connect | Receive _ | Retire_connection _ | On_connection _ ->
     Error (Dsl.Invalid_input "Invalid scoped transport")
 ;;
@@ -733,7 +717,32 @@ let run
      | Dsl.On_connection (handle, request) ->
        let* entry = find t handle in
        scoped t scope entry request
-     | Dsl.Head | Fetch_snapshot _ | Pull _ | Push _ ->
+     | Dsl.Fetch_snapshot ->
+       let* epoch =
+         match t.epoch with
+         | None -> Error Dsl.Network_closed
+         | Some epoch -> Ok epoch
+       in
+       let check_current () =
+         let* () = scope.check_current () in
+         if t.epoch = Some epoch then Ok () else Error Dsl.Stale_context
+       in
+       let snapshot_scope =
+         { scope with
+           check_current
+         ; admit_network =
+             (fun () ->
+               let* () = check_current () in
+               scope.admit_network ())
+         }
+       in
+       let* () = snapshot_scope.admit_network () in
+       let* snapshot = t.fetch_snapshot ~scope:snapshot_scope ~epoch () in
+       let* () = check_current () in
+       if snapshot.Dsl.resource.owner <> t.identity
+       then Error (Dsl.Protocol_failure "Snapshot source identity mismatch")
+       else Ok snapshot
+     | Dsl.Head | Pull _ | Push _ ->
        let live = List.filter (fun entry -> not entry.retiring) t.entries in
        (match live with
         | [ entry ] -> scoped t scope entry operation
@@ -816,7 +825,6 @@ let create_owner
           (fun seconds callback ->
             Eio.Time.Timeout.run_exn (Eio.Time.Timeout.seconds clock seconds) callback)
       ; connect_seconds
-      ; download_seconds
       ; response_seconds
       ; cleanup_seconds
       ; epoch = None
@@ -860,7 +868,7 @@ let create
     ~backend
     ~token
     ~snapshots:None
-    ~fetch_snapshot:(fun ~scope ~epoch:_ through -> fetch_snapshot ~scope through)
+    ~fetch_snapshot:(fun ~scope ~epoch:_ () -> fetch_snapshot ~scope ())
 ;;
 
 let create_native
@@ -913,7 +921,7 @@ let create_native
     ~backend
     ~token
     ~snapshots:(Some snapshots)
-    ~fetch_snapshot:(fun ~scope ~epoch through ->
+    ~fetch_snapshot:(fun ~scope ~epoch () ->
       Snapshot.acquire
         snapshots
         ~scope:
@@ -922,7 +930,7 @@ let create_native
           }
         ~epoch
         ~handoff:scope.handoff
-        through)
+        ())
 ;;
 
 let snapshot_source t snapshot =

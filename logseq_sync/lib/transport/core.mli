@@ -47,10 +47,7 @@ val create
   -> cleanup_seconds:float
   -> backend:backend
   -> token:(epoch:int64 -> refresh:bool -> (string, Dsl.error) result)
-  -> fetch_snapshot:
-       (scope:scope
-        -> Dsl.Overlay.Types.server_cursor
-        -> (Dsl.snapshot, Dsl.error) result)
+  -> fetch_snapshot:(scope:scope -> unit -> (Dsl.snapshot, Dsl.error) result)
   -> (t, Dsl.error) result
 
 val create_native

@@ -176,7 +176,7 @@ let metadata body =
   | Yojson.Json_error _ | Invalid_argument _ -> invalid ()
 ;;
 
-let acquire t ~scope ~epoch ~handoff through =
+let acquire t ~scope ~epoch ~handoff () =
   let* () = scope.Http_client.check_current () in
   if t.closed
   then Error Dsl.Network_closed
@@ -215,11 +215,6 @@ let acquire t ~scope ~epoch ~handoff through =
             Http.snapshot_metadata ~base_url ~graph_id ~token:(Option.get token))
         in
         let* uri, baseline = metadata response.body in
-        let* () =
-          if Cursor.equal baseline through
-          then Ok ()
-          else Error (Dsl.Protocol_failure "Snapshot baseline changed")
-        in
         let* () = scope.check_current () in
         let path = Filename.temp_file ~temp_dir:t.root "snapshot-" "" in
         Sys.remove path;

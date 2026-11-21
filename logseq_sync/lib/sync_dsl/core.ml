@@ -192,7 +192,7 @@ type _ transport =
   | Retire_connection : connection -> unit transport
   | On_connection : connection * 'a transport -> 'a transport
   | Head : remote_head transport
-  | Fetch_snapshot : Overlay.Types.server_cursor -> snapshot transport
+  | Fetch_snapshot : snapshot transport
   | Pull : Overlay.Types.server_cursor -> pull_result transport
   | Push : Overlay.Types.submission_batch -> submission_reply transport
 
@@ -1246,15 +1246,13 @@ let rec round config connection head target check =
        else task_return (checkpoint view))
 ;;
 
-let rec activate_initial config connection head =
+let rec activate_initial () =
   let* observation = task_effect Task_observe in
   match observation.checkpoint with
   | Some _ -> task_return ()
-  | None when not head.snapshot_available ->
-    task_fail (Protocol_failure "remote snapshot unavailable")
   | None ->
     let* check = task_effect Await_outbox_changed in
-    let* fetched = capture_task (request connection (Fetch_snapshot head.through)) in
+    let* fetched = capture_task (capacity_task_effect (Task_transport Fetch_snapshot)) in
     let* staged =
       match fetched with
       | Ok staged -> task_return staged
@@ -1270,7 +1268,7 @@ let rec activate_initial config connection head =
     in
     (match activation with
      | Activated _ -> task_return ()
-     | Activation_deferred _ -> activate_initial config connection head)
+     | Activation_deferred _ -> activate_initial ())
 ;;
 
 type demand_wait =
@@ -1377,6 +1375,7 @@ let demand_task config receipt ~attempts ~retries ~retry =
 ;;
 
 type policy_event =
+  | Policy_initial
   | Policy_connected of connection
   | Policy_head of remote_head
   | Policy_round of Types.server_cursor
@@ -1388,6 +1387,7 @@ type policy_event =
   | Policy_unlocked of key_status
 
 type job_kind =
+  | Initial_job
   | Connecting_job
   | Head_job
   | Round_job
@@ -1419,6 +1419,7 @@ type policy_state =
   ; target : Types.server_cursor option
   ; checked : outbox_check option
   ; initialized : bool
+  ; snapshot_ready : bool
   ; dirty : bool
   ; failure : error option
   ; retries : int
@@ -1432,6 +1433,7 @@ type policy_state =
 
 let same_kind first second =
   match first, second with
+  | Initial_job, Initial_job
   | Connecting_job, Connecting_job
   | Head_job, Head_job
   | Round_job, Round_job
@@ -1538,6 +1540,19 @@ let schedule config scope state =
       || state.backoff <> None
       || has_job state Retry_job
     then task_return state
+    else if not state.snapshot_ready
+    then
+      if has_job state Initial_job
+      then task_return state
+      else
+        add_job
+          scope
+          state
+          Initial_job
+          (let* () = task_effect (Publish_status Service_pulling) in
+           let* () = task_effect Resample_outbox in
+           let* () = activate_initial () in
+           task_return Policy_initial)
     else (
       match state.connection with
       | None ->
@@ -1597,7 +1612,6 @@ let schedule config scope state =
              in
              let task =
                let* () = task_effect (Publish_status Service_pulling) in
-               let* () = activate_initial config connection head in
                mapped (round config connection head target state.checked) (fun cursor ->
                  Policy_round cursor)
              in
@@ -1692,8 +1706,13 @@ let disconnect state =
     List.partition
       (fun job ->
          match job.kind with
-         | Connecting_job | Head_job | Round_job | Receive_job | Outbox_job | Retry_job ->
-           true
+         | Initial_job
+         | Connecting_job
+         | Head_job
+         | Round_job
+         | Receive_job
+         | Outbox_job
+         | Retry_job -> true
          | Capacity_job | Unlock_job | Demand_job _ -> false)
       state.jobs
   in
@@ -1842,6 +1861,7 @@ let policy_task config =
       ; target = None
       ; checked = None
       ; initialized = false
+      ; snapshot_ready = Option.is_some observation.checkpoint
       ; dirty = true
       ; failure = None
       ; retries = 0
@@ -1976,7 +1996,7 @@ let policy_task config =
                | _ ->
                  let retries =
                    if
-                     same_kind job.kind Connecting_job
+                     (same_kind job.kind Connecting_job || same_kind job.kind Initial_job)
                      && state.retry_pending
                      && error <> Network_closed
                      && error <> Locked
@@ -1987,6 +2007,7 @@ let policy_task config =
                  loop state)
             | Ok event ->
               (match event with
+               | Policy_initial -> loop { state with snapshot_ready = true }
                | Policy_capacity -> loop state
                | Policy_timer -> loop { state with retry_pending = true }
                | Policy_connected connection ->
