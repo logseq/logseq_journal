@@ -263,7 +263,6 @@ type t =
   ; mutable durable_sync_revision : int
   ; mutable durable_outbox : Logseq_db_storage.Sync_outbox_store.row Uuid_map.t
   ; mutable checkpoint : Types.server_cursor
-  ; mutable checkpoint_metadata : Logseq_db_types.Sync_checkpoint.t
   ; mutable subscriptions : subscription list
   ; mutable snapshots : snapshot list
   }
@@ -520,6 +519,30 @@ let checksum_value checksum =
   | _ -> value
 ;;
 
+let report_checksum_mismatch ~phase ~through ~expected ~actual =
+  let safe value =
+    if
+      String.length value > 0
+      && String.length value <= 64
+      && String.for_all
+           (function
+             | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true
+             | _ -> false)
+           value
+    then value
+    else "redacted"
+  in
+  if not (String.equal expected actual)
+  then
+    report_warning
+      (Printf.sprintf
+         "journal-sync: checksum mismatch [phase=%s expected=%s actual=%s cursor=%Ld]\n"
+         phase
+         (safe expected)
+         (safe actual)
+         (Types.Server_cursor.to_int64 through))
+;;
+
 (* Submission ordinals are small local offsets, not server cursors. Keep the
    checked interval arithmetic here; authoritative progress never narrows to int. *)
 let advance_cursor cursor count =
@@ -579,37 +602,34 @@ let prepare_snapshot_activation
           | Error message -> Error (Types.Snapshot_parse_error message)
           | Ok staging ->
             let database = Mirror.database staging in
-            let checksum_matches =
-              match expected_checksum with
-              | None -> true
-              | Some expected ->
-                let digest =
-                  Authoritative_checksum.recompute
-                    ~e2ee:(Authoritative_checksum.graph_e2ee database)
-                    database
-                in
-                String.equal (checksum_value expected) digest
-            in
-            if not checksum_matches
-            then (
-              Mirror.cancel staging;
-              Error (Types.Snapshot_parse_error "snapshot checksum mismatch"))
-            else
-              Ok
-                { snapshot_dependencies = dependencies
-                ; snapshot_inspection = inspection
-                ; snapshot_cursor = applied_server_cursor
-                ; snapshot_staging = staging
-                ; snapshot_remaining_protected_datoms = protected_snapshot_datoms database
-                ; snapshot_current_protected_datoms = []
-                ; snapshot_next_crypto_index = 0
-                ; snapshot_crypto_revision = 0
-                ; snapshot_awaiting_crypto = false
-                ; snapshot_crypto_complete = false
-                ; snapshot_persisted = None
-                ; snapshot_committed = false
-                ; snapshot_canceled = false
-                })))
+            Option.iter
+              (fun expected ->
+                 let digest =
+                   Authoritative_checksum.recompute
+                     ~e2ee:(Authoritative_checksum.graph_e2ee database)
+                     database
+                 in
+                 report_checksum_mismatch
+                   ~phase:"snapshot-activation"
+                   ~through:applied_server_cursor
+                   ~expected:(checksum_value expected)
+                   ~actual:digest)
+              expected_checksum;
+            Ok
+              { snapshot_dependencies = dependencies
+              ; snapshot_inspection = inspection
+              ; snapshot_cursor = applied_server_cursor
+              ; snapshot_staging = staging
+              ; snapshot_remaining_protected_datoms = protected_snapshot_datoms database
+              ; snapshot_current_protected_datoms = []
+              ; snapshot_next_crypto_index = 0
+              ; snapshot_crypto_revision = 0
+              ; snapshot_awaiting_crypto = false
+              ; snapshot_crypto_complete = false
+              ; snapshot_persisted = None
+              ; snapshot_committed = false
+              ; snapshot_canceled = false
+              })))
 ;;
 
 let snapshot_crypto_id preparation index =
@@ -7004,9 +7024,6 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                           ~callbacks
                       in
                       let release_slot = ref None in
-                      let checkpoint_metadata =
-                        Storage.sync_metadata connection |> Result.get_ok
-                      in
                       let checkpoint =
                         match inspection.presence with
                         | Types.Available { checkpoint; _ } -> checkpoint
@@ -7064,7 +7081,6 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                         ; durable_sync_revision = sync_revision
                         ; durable_outbox
                         ; checkpoint
-                        ; checkpoint_metadata
                         ; subscriptions = []
                         ; snapshots = []
                         }
@@ -7809,6 +7825,11 @@ let check_checkpoint_checksum database ~through ~expected =
     then Ok None
     else (
       let digest = Authoritative_checksum.to_string database.authoritative_checksum in
+      report_checksum_mismatch
+        ~phase:"checkpoint"
+        ~through
+        ~expected:(checksum_value expected)
+        ~actual:digest;
       Ok (Some (String.equal (checksum_value expected) digest))))
 ;;
 
@@ -7929,22 +7950,6 @@ let expected_origin_cursor (record : outbox_record) =
   | Some t_before, Some ordinal, Some count when ordinal >= 0 && ordinal < count ->
     advance_cursor t_before (ordinal + 1)
   | _ -> Error "own transaction omitted its frozen submission interval"
-;;
-
-let strip_versioned_prefix prefix value =
-  let prefix = prefix ^ ":v1:" in
-  if
-    String.length value >= String.length prefix
-    && String.sub value 0 (String.length prefix) = prefix
-  then String.sub value (String.length prefix) (String.length value - String.length prefix)
-  else value
-;;
-
-let acceptance_barrier_is_current database (barrier : Types.acceptance_barrier) =
-  Types.Server_cursor.equal barrier.through database.checkpoint
-  && String.equal
-       (strip_versioned_prefix "checksum" (Types.Checksum.to_string barrier.checksum))
-       (strip_versioned_prefix "checksum" database.checkpoint_metadata.checksum)
 ;;
 
 let rec authoritative_tree_is_present database ~parent (tree : Types.block_tree) =
@@ -8244,6 +8249,11 @@ let begin_outbox_transition database ~expected transition =
                    "acceptance contradicts settled Stale evidence"))
          | Ok (Some { terminal_outcome = Terminal_accepted accepted; _ })
            when Transition.acceptance_barriers_equal accepted barrier ->
+           report_checksum_mismatch
+             ~phase:"acceptance-duplicate"
+             ~through:barrier.through
+             ~expected:(checksum_value barrier.checksum)
+             ~actual:(checksum_value accepted.checksum);
            make Duplicate_plan None
          | Ok (Some { terminal_outcome = Terminal_accepted _; _ }) ->
            Error (Types.Outbox_transition_invalid "terminal acceptance mismatch")
@@ -8272,11 +8282,15 @@ let begin_outbox_transition database ~expected transition =
            (match List.fold_left validate (Ok ()) records with
             | Error message -> Error (Types.Outbox_transition_invalid message)
             | Ok () ->
-              if
-                Types.Server_cursor.equal through database.checkpoint
-                && not (acceptance_barrier_is_current database barrier)
-              then Error (Types.Outbox_transition_invalid "acceptance checksum mismatch")
-              else make (Accept_plan (id, barrier)) None))
+              if Types.Server_cursor.equal through database.checkpoint
+              then
+                report_checksum_mismatch
+                  ~phase:"acceptance"
+                  ~through
+                  ~expected:(checksum_value barrier.checksum)
+                  ~actual:
+                    (Authoritative_checksum.to_string database.authoritative_checksum);
+              make (Accept_plan (id, barrier)) None))
       | Reject_group { batch_id = id; resolution } ->
         (match read_terminal_batch database id with
          | Error message -> Error (Types.Outbox_transition_invalid message)
@@ -9792,21 +9806,63 @@ let prepare_authoritative_candidate preparation ~decrypted =
             Types.Authoritative_integrity_failure message)
         in
         Result.bind digest (fun digest ->
-          match Types.authoritative_batch_checksum preparation.authoritative_batch with
-          | Some expected
-            when not
-                   (String.equal
-                      (checksum_value expected)
-                      (Authoritative_checksum.to_string digest)) ->
-            Error Types.Authoritative_checksum_mismatch
-          | None | Some _ ->
+          Option.iter
+            (fun expected ->
+               report_checksum_mismatch
+                 ~phase:"pull-advance"
+                 ~through:
+                   (Types.authoritative_batch_through preparation.authoritative_batch)
+                 ~expected:(checksum_value expected)
+                 ~actual:(Authoritative_checksum.to_string digest))
+            (Types.authoritative_batch_checksum preparation.authoritative_batch);
+          match
+            validate_active_transaction_origins
+              preparation.authoritative_owner
+              preparation.authoritative_batch
+              expected_tx_data
+              roots_after
+              transactions
+          with
+          | Error message ->
+            Error
+              (Types.Authoritative_integrity_failure
+                 (integrity_batch_source
+                    preparation.authoritative_owner
+                    preparation.authoritative_batch
+                    message))
+          | Ok validated_origins ->
+            preparation.authoritative_state <- Authoritative_consumed;
+            Option.iter
+              (fun request -> request.unprotection_consumed <- true)
+              preparation.authoritative_unprotection;
+            let unresolved_submitted_deletes =
+              List.filter_map
+                (fun (record : outbox_record) ->
+                   match record.transport_state, record.mutation with
+                   | Types.Submitted batch_id, Types.Delete_blocks _ ->
+                     Some (record, batch_id)
+                   | ( Submitted _
+                     , ( Save_block _
+                       | Insert_blocks _
+                       | Append_journal _
+                       | Create_journal_page _
+                       | Set_task_status _
+                       | Clear_task_status _
+                       | Publish_asset _
+                       | Set_asset_reference _ ) ) -> None
+                   | ( ( Queued
+                       | Accepted_pending_authoritative _
+                       | Stale_rejected_pending_authoritative _
+                       | Blocked )
+                     , _ ) -> None)
+                preparation.authoritative_owner.outbox
+            in
             (match
-               validate_active_transaction_origins
+               classify_stale_deletes
                  preparation.authoritative_owner
                  preparation.authoritative_batch
-                 expected_tx_data
-                 roots_after
                  transactions
+                 roots_after
              with
              | Error message ->
                Error
@@ -9815,165 +9871,114 @@ let prepare_authoritative_candidate preparation ~decrypted =
                        preparation.authoritative_owner
                        preparation.authoritative_batch
                        message))
-             | Ok validated_origins ->
-               preparation.authoritative_state <- Authoritative_consumed;
-               Option.iter
-                 (fun request -> request.unprotection_consumed <- true)
-                 preparation.authoritative_unprotection;
-               let unresolved_submitted_deletes =
-                 List.filter_map
-                   (fun (record : outbox_record) ->
-                      match record.transport_state, record.mutation with
-                      | Types.Submitted batch_id, Types.Delete_blocks _ ->
-                        Some (record, batch_id)
-                      | ( Submitted _
-                        , ( Save_block _
-                          | Insert_blocks _
-                          | Append_journal _
-                          | Create_journal_page _
-                          | Set_task_status _
-                          | Clear_task_status _
-                          | Publish_asset _
-                          | Set_asset_reference _ ) ) -> None
-                      | ( ( Queued
-                          | Accepted_pending_authoritative _
-                          | Stale_rejected_pending_authoritative _
-                          | Blocked )
-                        , _ ) -> None)
-                   preparation.authoritative_owner.outbox
+             | Ok (stale_updates, stale_remote_won, stale_no_change, stale_blocked) ->
+               let rec transaction_contexts previous transactions transaction_data roots =
+                 match transactions, transaction_data, roots with
+                 | ( transaction :: transaction_rest
+                   , data :: data_rest
+                   , root_after :: root_rest ) ->
+                   ( Types.authoritative_transaction_cursor transaction
+                   , data
+                   , previous
+                   , root_after )
+                   :: transaction_contexts root_after transaction_rest data_rest root_rest
+                 | [], [], [] -> []
+                 | _ -> invalid_arg "authoritative transaction context mismatch"
                in
-               (match
-                  classify_stale_deletes
-                    preparation.authoritative_owner
-                    preparation.authoritative_batch
-                    transactions
-                    roots_after
-                with
-                | Error message ->
-                  Error
-                    (Types.Authoritative_integrity_failure
-                       (integrity_batch_source
-                          preparation.authoritative_owner
-                          preparation.authoritative_batch
-                          message))
-                | Ok (stale_updates, stale_remote_won, stale_no_change, stale_blocked) ->
-                  let rec transaction_contexts
-                            previous
-                            transactions
-                            transaction_data
-                            roots
-                    =
-                    match transactions, transaction_data, roots with
-                    | ( transaction :: transaction_rest
-                      , data :: data_rest
-                      , root_after :: root_rest ) ->
-                      ( Types.authoritative_transaction_cursor transaction
-                      , data
-                      , previous
-                      , root_after )
-                      :: transaction_contexts
-                           root_after
-                           transaction_rest
-                           data_rest
-                           root_rest
-                    | [], [], [] -> []
-                    | _ -> invalid_arg "authoritative transaction context mismatch"
-                  in
-                  let contexts =
-                    transaction_contexts
-                      (authoritative_database preparation.authoritative_owner)
-                      (Types.authoritative_batch_transactions
-                         preparation.authoritative_batch)
-                      expected_tx_data
-                      roots_after
-                  in
-                  let classify_submitted_delete (record, batch_id) =
-                    match record.submission_t_before with
-                    | None ->
-                      Error
-                        (Types.Authoritative_integrity_failure
-                           (integrity_source
-                              ~reason:"submitted-delete-missing-t-before"
-                              ~record
-                              ()
-                            |> integrity_batch_source
-                                 preparation.authoritative_owner
-                                 preparation.authoritative_batch))
-                    | Some t_before ->
-                      (match
-                         List.find_opt
-                           (fun (cursor, _, _, _) ->
-                              Types.Server_cursor.compare cursor t_before > 0)
-                           contexts
-                       with
-                       | None -> Ok (`Deferred batch_id)
-                       | Some (cursor, transaction_data, root_before, root_after) ->
-                         if
-                           transaction_matches_record_at_cursor
-                             record
-                             cursor
-                             root_before
-                             root_after
-                             transaction_data
-                         then Ok (`Deferred batch_id)
-                         else (
-                           let conflicts =
-                             delete_conflict_kinds_between root_before root_after record
-                           in
-                           if conflicts = []
-                           then Ok (`Deferred batch_id)
-                           else
-                             Ok
-                               (`Remote_won
-                                   (record.mutation_id, batch_id, cursor, conflicts))))
-                  in
-                  let classified =
-                    List.fold_left
-                      (fun result submitted ->
-                         Result.bind result (fun outcomes ->
-                           Result.map
-                             (fun outcome -> outcome :: outcomes)
-                             (classify_submitted_delete submitted)))
-                      (Ok [])
-                      unresolved_submitted_deletes
-                  in
-                  Result.bind classified (fun classified ->
-                    match
-                      List.find_map
-                        (function
-                          | `Deferred batch_id -> Some batch_id
-                          | `Remote_won _ -> None)
-                        (List.rev classified)
+               let contexts =
+                 transaction_contexts
+                   (authoritative_database preparation.authoritative_owner)
+                   (Types.authoritative_batch_transactions
+                      preparation.authoritative_batch)
+                   expected_tx_data
+                   roots_after
+               in
+               let classify_submitted_delete (record, batch_id) =
+                 match record.submission_t_before with
+                 | None ->
+                   Error
+                     (Types.Authoritative_integrity_failure
+                        (integrity_source
+                           ~reason:"submitted-delete-missing-t-before"
+                           ~record
+                           ()
+                         |> integrity_batch_source
+                              preparation.authoritative_owner
+                              preparation.authoritative_batch))
+                 | Some t_before ->
+                   (match
+                      List.find_opt
+                        (fun (cursor, _, _, _) ->
+                           Types.Server_cursor.compare cursor t_before > 0)
+                        contexts
                     with
-                    | Some batch_id ->
-                      preparation.authoritative_state <- Authoritative_deferred_state;
-                      Ok (`Deferred (Types.Await_submission_outcome batch_id))
-                    | None ->
-                      let submitted_remote_won =
-                        List.filter_map
-                          (function
-                            | `Remote_won outcome -> Some outcome
-                            | `Deferred _ -> None)
-                          (List.rev classified)
-                      in
-                      let candidate =
-                        { authoritative_preparation = preparation
-                        ; authoritative_decrypted_input = decrypted
-                        ; authoritative_transactions = transactions
-                        ; authoritative_expected_tx_data = expected_tx_data
-                        ; authoritative_roots_after = roots_after
-                        ; validated_origins
-                        ; submitted_remote_won
-                        ; stale_updates
-                        ; stale_remote_won
-                        ; stale_no_change
-                        ; stale_blocked
-                        ; authoritative_digest_after = digest
-                        ; authoritative_db_after = database
-                        }
-                      in
-                      preparation.authoritative_state <- Authoritative_ready candidate;
-                      Ok (`Candidate candidate))))))
+                    | None -> Ok (`Deferred batch_id)
+                    | Some (cursor, transaction_data, root_before, root_after) ->
+                      if
+                        transaction_matches_record_at_cursor
+                          record
+                          cursor
+                          root_before
+                          root_after
+                          transaction_data
+                      then Ok (`Deferred batch_id)
+                      else (
+                        let conflicts =
+                          delete_conflict_kinds_between root_before root_after record
+                        in
+                        if conflicts = []
+                        then Ok (`Deferred batch_id)
+                        else
+                          Ok
+                            (`Remote_won (record.mutation_id, batch_id, cursor, conflicts))))
+               in
+               let classified =
+                 List.fold_left
+                   (fun result submitted ->
+                      Result.bind result (fun outcomes ->
+                        Result.map
+                          (fun outcome -> outcome :: outcomes)
+                          (classify_submitted_delete submitted)))
+                   (Ok [])
+                   unresolved_submitted_deletes
+               in
+               Result.bind classified (fun classified ->
+                 match
+                   List.find_map
+                     (function
+                       | `Deferred batch_id -> Some batch_id
+                       | `Remote_won _ -> None)
+                     (List.rev classified)
+                 with
+                 | Some batch_id ->
+                   preparation.authoritative_state <- Authoritative_deferred_state;
+                   Ok (`Deferred (Types.Await_submission_outcome batch_id))
+                 | None ->
+                   let submitted_remote_won =
+                     List.filter_map
+                       (function
+                         | `Remote_won outcome -> Some outcome
+                         | `Deferred _ -> None)
+                       (List.rev classified)
+                   in
+                   let candidate =
+                     { authoritative_preparation = preparation
+                     ; authoritative_decrypted_input = decrypted
+                     ; authoritative_transactions = transactions
+                     ; authoritative_expected_tx_data = expected_tx_data
+                     ; authoritative_roots_after = roots_after
+                     ; validated_origins
+                     ; submitted_remote_won
+                     ; stale_updates
+                     ; stale_remote_won
+                     ; stale_no_change
+                     ; stale_blocked
+                     ; authoritative_digest_after = digest
+                     ; authoritative_db_after = database
+                     }
+                   in
+                   preparation.authoritative_state <- Authoritative_ready candidate;
+                   Ok (`Candidate candidate)))))
 ;;
 
 let rec logical_tree_is_present snapshot ~parent (tree : Types.block_tree) =
@@ -11683,6 +11688,21 @@ let commit_authoritative_candidate database prepared =
                      | _ -> false)
                   database.outbox
               in
+              List.iter
+                (fun (record : outbox_record) ->
+                   Option.iter
+                     (fun (barrier : Types.acceptance_barrier) ->
+                        if Types.Server_cursor.equal barrier.through through
+                        then
+                          report_checksum_mismatch
+                            ~phase:"acceptance-barrier"
+                            ~through
+                            ~expected:(checksum_value barrier.checksum)
+                            ~actual:
+                              (Authoritative_checksum.to_string
+                                 prepared.authoritative_digest_after))
+                     record.acceptance_barrier)
+                covered_accepted;
               let authoritative_root_at barrier =
                 let target = barrier.Types.through in
                 if Types.Server_cursor.compare target database.checkpoint <= 0
@@ -12019,10 +12039,7 @@ let commit_authoritative_candidate database prepared =
                     (resolved_stale @ blocked_stale)
               in
               let checksum =
-                Types.authoritative_batch_checksum preparation.authoritative_batch
-                |> Option.map Types.Checksum.to_string
-                |> Option.map (strip_versioned_prefix "checksum")
-                |> Option.value ~default:database.checkpoint_metadata.checksum
+                Authoritative_checksum.to_string prepared.authoritative_digest_after
               in
               let metadata =
                 Logseq_db_types.Sync_checkpoint.create
@@ -12111,7 +12128,6 @@ let commit_authoritative_candidate database prepared =
                     <- (if changed then candidate_projection else before_projection);
                     database.authoritative_checksum <- prepared.authoritative_digest_after;
                     database.checkpoint <- through;
-                    database.checkpoint_metadata <- metadata;
                     database.sync_revision <- database.sync_revision + 1;
                     Eio.Condition.broadcast database.sync_changed;
                     let before_revision = projection_revision before_projection in

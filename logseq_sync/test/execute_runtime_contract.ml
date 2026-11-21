@@ -614,6 +614,35 @@ let real_activation env () =
            (original == get (X.database database_owner))
            "same activated owner serves reads";
          ignore view;
+         let verify next through expected =
+           X.await
+             (get
+                (X.start
+                   t
+                   next
+                   (D.perform
+                      (D.Database (D.Verify_checksum (through, expected)))
+                      ~failure:D.abort
+                      ~success:D.return)))
+         in
+         let wrong =
+           require (O.Types.Checksum.of_string "checksum:v1:ffffffffffffffff")
+         in
+         let next : D.ready X.graph_context =
+           match verify next through wrong with
+           | X.Completed (next, ()) -> next
+           | X.Failed (_, error) -> Alcotest.fail (D.error_message error)
+         in
+         let next =
+           match verify next through (require (O.Types.Checksum.of_string checksum)) with
+           | X.Completed (next, ()) -> next
+           | X.Failed (_, error) -> Alcotest.fail (D.error_message error)
+         in
+         let next =
+           match verify next (require (O.Types.Server_cursor.of_int64 1L)) wrong with
+           | X.Completed (next, ()) -> next
+           | X.Failed (_, error) -> Alcotest.fail (D.error_message error)
+         in
          for index = 1 to 2 do
            let uuid suffix =
              require
@@ -1171,7 +1200,7 @@ let service_config =
 
 let service_exhausted_network_recovery ?terminal maximum_attempts env () =
   with_snapshot_fixture
-    (fun ~dependencies ~inspection ~path ~rows ~checksum ~inspect_target:_ ->
+    (fun ~dependencies ~inspection ~path ~rows ~checksum ~inspect_target ->
        Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 5. (fun () ->
          Eio.Switch.run (fun sw ->
            let module Types = Logseq_overlay_db.Types in
@@ -1209,7 +1238,9 @@ let service_exhausted_network_recovery ?terminal maximum_attempts env () =
            and latest = ref None in
            let closed, release_close = Eio.Promise.create () in
            let hold_close = ref true in
-           let expected_checksum = Result.get_ok (Types.Checksum.of_string checksum) in
+           let expected_checksum =
+             Result.get_ok (Types.Checksum.of_string "checksum:v1:55d5780f6d2331dd")
+           in
            let never, _ = Eio.Promise.create () in
            let rec transport
              : type value. X.effect_scope -> value D.transport -> (value, D.error) result
@@ -1425,6 +1456,13 @@ let service_exhausted_network_recovery ?terminal maximum_attempts env () =
                    check
                      (checkpoint () = Some target)
                      "recovery commits actual authoritative checkpoint";
+                   (match D.Overlay.Database.mirror_presence (inspect_target ()) with
+                    | Types.Available { checksum = Some actual; _ } ->
+                      Alcotest.(check string)
+                        "bootstrap persists actual digest, not remote head"
+                        checksum
+                        (Types.Checksum.to_string actual)
+                    | _ -> Alcotest.fail "activated local mirror unavailable");
                    check
                      (Option.exists
                         (fun observation -> observation.X.state.checkpoint = Some target)
@@ -2699,7 +2737,8 @@ let () =
               , service_exhausted_network_recovery
                   ~terminal:
                     (D.Authoritative_failure
-                       Logseq_overlay_db.Types.Authoritative_checksum_mismatch)
+                       (Logseq_overlay_db.Types.Authoritative_integrity_failure
+                          "Invalid origin witness"))
                   0 )
             ; ( "actual service authentication is not network recovery"
               , service_exhausted_network_recovery

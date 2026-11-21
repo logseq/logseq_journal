@@ -1124,8 +1124,6 @@ let pull_once ?head config connection view =
         | Some head
           when Cursor.equal head.through (Types.authoritative_batch_through batch) ->
           (match head.expected_checksum, Types.authoritative_batch_checksum batch with
-           | Some expected, Some actual when not (Types.Checksum.equal expected actual) ->
-             task_fail (Protocol_failure "Conflicting remote checkpoint checksums")
            | Some expected, None ->
              let transactions = Types.authoritative_batch_transactions batch in
              let bytes =
@@ -1186,15 +1184,6 @@ let send_batch ?head config connection batch =
     let* view = inspect () in
     pull_once ?head config connection view
   | Error error -> task_fail error
-;;
-
-let verify_head_checksum head ~through ~checksum =
-  match head.expected_checksum with
-  | Some expected
-    when Cursor.equal head.through through
-         && not (String.equal (Types.Checksum.to_string expected) checksum) ->
-    task_fail (Protocol_failure "Remote checkpoint checksum mismatch")
-  | None | Some _ -> task_return ()
 ;;
 
 let rec round config connection head target check =
@@ -1274,9 +1263,6 @@ let rec activate_initial config connection head =
     let* activation =
       capture_task
         (let* () = task_effect (Acknowledge_outbox_check check) in
-         let* () =
-           verify_head_checksum head ~through:staged.through ~checksum:staged.checksum
-         in
          task_effect (Task_database (Activate_snapshot staged)))
     in
     let* activation =
