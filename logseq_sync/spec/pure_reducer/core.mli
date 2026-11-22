@@ -48,6 +48,15 @@ val limits
   -> submission_batch_size:int
   -> (limits, config_error) result
 
+(** Set the authoritative WebSocket input bound independently of the response bound.
+    {!limits} uses [maximum_response_bytes] for both. *)
+val limits_with_websocket_downlink
+  :  maximum_response_bytes:int
+  -> maximum_websocket_downlink_bytes:int
+  -> maximum_artifact_bytes:int
+  -> submission_batch_size:int
+  -> (limits, config_error) result
+
 val config : managed_sync_origin:Uri.t -> limits:limits -> (config, config_error) result
 
 (** {1 Capability details} *)

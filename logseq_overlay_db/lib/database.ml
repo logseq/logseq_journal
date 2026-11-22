@@ -7978,8 +7978,7 @@ let begin_authoritative database ~expected batch =
               Some
                 { unprotection_owner =
                     Authoritative_unprotection (database, database.sync_revision)
-                ; unprotection_limit_bytes =
-                    database.dependencies.limits.wire_batch_max_bytes
+                ; unprotection_limit_bytes = Logseq_db_types.Limits.maximum_sync_websocket_downlink_bytes
                 ; unprotection_items =
                     List.mapi
                       (fun index value ->
@@ -8831,7 +8830,16 @@ let prepare_authoritative_candidate preparation ~decrypted =
       | Some request, Some (actual_request, plaintexts) when actual_request == request ->
         (match validate_decrypted_values ~request ~plaintexts with
          | Error error -> Error (Types.Authoritative_crypto_error error)
-         | Ok () -> Ok (List.map snd plaintexts))
+         | Ok () ->
+           let rec within remaining = function
+             | [] -> true
+             | (_, value) :: rest ->
+               let bytes = String.length value in
+               bytes <= remaining && within (remaining - bytes) rest
+           in
+           if within request.unprotection_limit_bytes plaintexts
+           then Ok (List.map snd plaintexts)
+           else Error (Types.Authoritative_crypto_error Types.Crypto_result_limit_exceeded))
       | Some _, Some _ -> Error Types.Authoritative_crypto_unexpected
     in
     Result.bind decrypted_values (fun plaintexts ->

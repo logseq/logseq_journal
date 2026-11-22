@@ -1263,7 +1263,8 @@ let submit_nonasset t instruction =
                       ~sw:t.sw
                       ~uri:request.uri
                       ~token
-                      ~maximum_frame_bytes:Logseq_db_types.Limits.maximum_response_bytes
+                      ~maximum_frame_bytes:
+                        Logseq_db_types.Limits.maximum_sync_websocket_downlink_bytes
                       ~on_message:(fun payload ->
                         if (not t.closed) && not operation.cancelled
                         then (

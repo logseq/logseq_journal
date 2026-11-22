@@ -2235,16 +2235,27 @@ let unprotect_request t key request =
   match key with
   | None -> Error (effect_error "The graph key is unavailable for protected values.")
   | Some key ->
-    let rec decrypt reversed = function
-      | [] -> Ok (List.rev reversed)
+    let maximum = Logseq_db_types.Limits.maximum_sync_websocket_downlink_bytes in
+    let limit_error () = Error (effect_error "Authoritative crypto byte limit exceeded") in
+    let items = Database.unprotection_ciphertexts request in
+    let rec within remaining = function
+      | [] -> true
+      | (_, ciphertext) :: rest ->
+        let bytes = String.length ciphertext in
+        bytes <= remaining && within (remaining - bytes) rest
+    in
+    let rec decrypt remaining reversed = function
+      | [] -> Ok (request, List.rev reversed)
       | (id, ciphertext) :: rest ->
         (match decrypt_protected_value t key ciphertext with
          | Error message -> Error (effect_error message)
-         | Ok plaintext -> decrypt ((id, plaintext) :: reversed) rest)
+         | Ok plaintext ->
+           let bytes = String.length plaintext in
+           if bytes > remaining
+           then limit_error ()
+           else decrypt (remaining - bytes) ((id, plaintext) :: reversed) rest)
     in
-    (match decrypt [] (Database.unprotection_ciphertexts request) with
-     | Error _ as error -> error
-     | Ok plaintexts -> Ok (request, plaintexts))
+    if within maximum items then decrypt maximum [] items else limit_error ()
 ;;
 
 let authoritative_transition_error error =
