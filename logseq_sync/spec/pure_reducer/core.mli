@@ -574,22 +574,27 @@ type mirror_inspection =
   | Mirror_available of mirror_request
   | Mirror_absent of graph_scope
 
-type outbox_transition_request =
-  { expected : Logseq_overlay_db.Types.sync_token
+type outbox_attempt_id
+type authoritative_attempt_id
+
+type outbox_transition_request = private
+  { attempt_id : outbox_attempt_id
+  ; expected : Logseq_overlay_db.Types.sync_token
   ; key : graph_key_handle option
   ; scope : graph_scope
   ; transition : Logseq_overlay_db.Types.outbox_transition
   }
 
-(** Failure of the exact delegated outbox request. The original scope, transition,
-    and expected Sync token fence failures from superseded requests. *)
+(** Workers return the original delegated request for every outcome. Core assigns
+    a fresh attempt identity for each application, independent of the durable token. *)
 type outbox_transition_failure =
   { request : outbox_transition_request
   ; message : string
   }
 
-type authoritative_batch =
-  { input : Logseq_overlay_db.Types.authoritative_batch
+type authoritative_batch = private
+  { attempt_id : authoritative_attempt_id
+  ; input : Logseq_overlay_db.Types.authoritative_batch
   ; key : graph_key_handle option
   ; scope : connection_scope
   ; presentation_generation : presentation_generation
@@ -639,18 +644,18 @@ type sync_inspection =
   }
 
 type authoritative_commit_result =
-  { scope : graph_scope
+  { request : authoritative_batch
   ; commit : Logseq_overlay_db.Types.authoritative_commit
   ; sync : Logseq_overlay_db.Types.sync_view
   }
 
 type authoritative_deferred_result =
-  { scope : graph_scope
+  { request : authoritative_batch
   ; defer : Logseq_overlay_db.Types.authoritative_defer
   }
 
 type outbox_transition_result =
-  { scope : graph_scope
+  { request : outbox_transition_request
   ; commit : Logseq_overlay_db.Types.outbox_commit
   ; sync : Logseq_overlay_db.Types.sync_view
   }
@@ -721,7 +726,7 @@ type event =
   | Outbox_transition_failed of outbox_transition_failure
   | Authoritative_batch_applied of authoritative_commit_result
   | Authoritative_batch_deferred of authoritative_deferred_result
-  | Authoritative_batch_failed of scoped_error
+  | Authoritative_batch_failed of { request : authoritative_batch; message : string }
   | Snapshot_activated of snapshot_activation
   | Snapshot_activation_failed of snapshot_activation_error
   | Runner_completed of runner_completion

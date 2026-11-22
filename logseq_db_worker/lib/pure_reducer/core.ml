@@ -603,7 +603,7 @@ let step state event =
                  (Sync.step
                     state.sync_core
                     (Sync.Authoritative_batch_failed
-                       { scope = Sync.effect_scope_of_graph request.scope.graph; message }))
+                       { request; message }))
                  state
              in
              let origin = (Logseq_db_worker_contract.Error.trace error).origin in

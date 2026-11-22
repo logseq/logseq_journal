@@ -741,8 +741,12 @@ type mirror_inspection =
   | Mirror_available of mirror_request
   | Mirror_absent of graph_scope
 
+type outbox_attempt_id = int
+type authoritative_attempt_id = int
+
 type outbox_transition_request =
-  { expected : Overlay.sync_token
+  { attempt_id : outbox_attempt_id
+  ; expected : Overlay.sync_token
   ; key : graph_key_handle option
   ; scope : graph_scope
   ; transition : Overlay.outbox_transition
@@ -754,7 +758,8 @@ type outbox_transition_failure =
   }
 
 type authoritative_batch =
-  { input : Overlay.authoritative_batch
+  { attempt_id : authoritative_attempt_id
+  ; input : Overlay.authoritative_batch
   ; key : graph_key_handle option
   ; scope : connection_scope
   ; presentation_generation : presentation_generation
@@ -804,18 +809,18 @@ type sync_inspection =
   }
 
 type authoritative_commit_result =
-  { scope : graph_scope
+  { request : authoritative_batch
   ; commit : Overlay.authoritative_commit
   ; sync : Overlay.sync_view
   }
 
 type authoritative_deferred_result =
-  { scope : graph_scope
+  { request : authoritative_batch
   ; defer : Overlay.authoritative_defer
   }
 
 type outbox_transition_result =
-  { scope : graph_scope
+  { request : outbox_transition_request
   ; commit : Overlay.outbox_commit
   ; sync : Overlay.sync_view
   }
@@ -879,7 +884,7 @@ type event =
   | Outbox_transition_failed of outbox_transition_failure
   | Authoritative_batch_applied of authoritative_commit_result
   | Authoritative_batch_deferred of authoritative_deferred_result
-  | Authoritative_batch_failed of scoped_error
+  | Authoritative_batch_failed of { request : authoritative_batch; message : string }
   | Snapshot_activated of snapshot_activation
   | Snapshot_activation_failed of snapshot_activation_error
   | Runner_completed of runner_completion
@@ -1887,6 +1892,21 @@ let rejection_message (rejection : Sync_protocol.rejection) =
       rejection.error_detail
 ;;
 
+let pending_outbox_matches core (request : outbox_transition_request) =
+  graph_scope_is_current core request.scope
+  && Option.exists
+       (fun (pending : outbox_transition_request) -> pending.attempt_id = request.attempt_id)
+       core.pending_outbox_transition
+;;
+
+let pending_authoritative_matches core (request : authoritative_batch) =
+  graph_scope_is_current core request.scope.graph
+  && Option.is_none core.deferred_authoritative_owner
+  && Option.exists
+       (fun (pending : authoritative_batch) -> pending.attempt_id = request.attempt_id)
+       core.active_authoritative_batch
+;;
+
 let plan_submission core =
   if not (network_allowed core) then unchanged core else
   match core.sync_view, core.current_graph_scope, core.websocket_live with
@@ -1919,7 +1939,8 @@ let plan_submission core =
     in
     let request transition =
       let request =
-        { expected = Overlay.sync_view_token sync
+        { attempt_id = core.next_effect_id
+         ; expected = Overlay.sync_view_token sync
         ; key = core.graph_key
         ; scope
         ; transition
@@ -1927,7 +1948,8 @@ let plan_submission core =
       in
       let next =
         set_snapshot
-          { core with pending_outbox_transition = Some request }
+          { core with pending_outbox_transition = Some request
+          ; next_effect_id = core.next_effect_id + 1 }
           { core.public_state.snapshot with sync_phase = Submitting }
       in
       { next; effects = [ publish next; Delegate (Apply_outbox_transition request) ] }
@@ -2105,14 +2127,8 @@ let pull_no_progress core (connection : connection_scope) =
 
 let outbox_transition_applied core (result : outbox_transition_result) =
   if
-    (not (graph_scope_is_current core result.scope))
-    || not
-         (Option.fold
-            ~none:false
-            ~some:(fun (request : outbox_transition_request) ->
-              request.scope = result.scope
-              && request.transition = result.commit.transition)
-            core.pending_outbox_transition)
+    not (pending_outbox_matches core result.request)
+    || result.request.transition <> result.commit.transition
   then unchanged core
   else (
     let transition_batch_id =
@@ -2141,10 +2157,14 @@ let outbox_transition_applied core (result : outbox_transition_result) =
           (if resumes_deferred then None else core.deferred_authoritative_owner)
       }
     in
-    let resume_effects =
+    let core, resume_effects =
       match resumes_deferred, core.active_authoritative_batch with
-      | true, Some batch -> [ Delegate (Apply_authoritative_batch batch) ]
-      | false, _ | true, None -> []
+      | true, Some batch ->
+        let batch = { batch with attempt_id = core.next_effect_id } in
+        ( { core with active_authoritative_batch = Some batch
+                    ; next_effect_id = core.next_effect_id + 1 }
+        , [ Delegate (Apply_authoritative_batch batch) ] )
+      | false, _ | true, None -> core, []
     in
     match result.commit.submission_batch, core.current_graph_scope with
     | Some _, Some _ when not core.websocket_live -> unchanged core
@@ -2285,6 +2305,7 @@ let authoritative_input core t checksum_value txs =
 ;;
 
 let enqueue_authoritative core batch =
+  let core = { core with next_effect_id = core.next_effect_id + 1 } in
   match core.active_authoritative_batch with
   | None ->
     { next = { core with active_authoritative_batch = Some batch }
@@ -2303,7 +2324,8 @@ let apply_accept core owner t checksum_value =
      | Ok checksum ->
        let core = note_remote_cursor core owner.connection.graph (Some t) in
        let request =
-         { expected = Overlay.sync_view_token sync
+         { attempt_id = core.next_effect_id
+         ; expected = Overlay.sync_view_token sync
          ; key = core.graph_key
          ; scope = owner.connection.graph
          ; transition =
@@ -2314,6 +2336,7 @@ let apply_accept core owner t checksum_value =
        { next =
            { core with
              pending_outbox_transition = Some request
+          ; next_effect_id = core.next_effect_id + 1
            ; submission_owner =
                Some { owner with accepted_through = Some t; response_timer = None }
            }
@@ -2393,7 +2416,8 @@ let apply_rejection core owner rejection =
      | Ok resolution ->
        let core = note_remote_cursor core owner.connection.graph rejection.t in
        let request =
-         { expected = Overlay.sync_view_token sync
+         { attempt_id = core.next_effect_id
+         ; expected = Overlay.sync_view_token sync
          ; key = core.graph_key
          ; scope = owner.connection.graph
          ; transition = Overlay.Reject_group { batch_id = owner.batch_id; resolution }
@@ -2402,6 +2426,7 @@ let apply_rejection core owner rejection =
        let next =
          { core with
            pending_outbox_transition = Some request
+          ; next_effect_id = core.next_effect_id + 1
          ; submission_owner = Some { owner with response_timer = None }
          }
        in
@@ -2470,7 +2495,8 @@ let websocket_message core connection message =
           in
           enqueue_authoritative
             core
-            { input
+            { attempt_id = core.next_effect_id
+            ; input
             ; key = core.graph_key
             ; scope = connection
             ; presentation_generation =
@@ -2494,8 +2520,7 @@ let websocket_message core connection message =
 
 let authoritative_applied core (result : authoritative_commit_result) =
   if
-    (not (graph_scope_is_current core result.scope))
-    || Option.is_none core.active_authoritative_batch
+    not (pending_authoritative_matches core result.request)
   then unchanged core
   else (
     let applied_server_t = result.commit.checkpoint in
@@ -2580,8 +2605,7 @@ let authoritative_applied core (result : authoritative_commit_result) =
 
 let authoritative_deferred core (result : authoritative_deferred_result) =
   if
-    (not (graph_scope_is_current core result.scope))
-    || Option.is_none core.active_authoritative_batch
+    not (pending_authoritative_matches core result.request)
   then unchanged core
   else (
     let (Overlay.Await_submission_outcome batch_id) = result.defer in
@@ -3460,8 +3484,11 @@ let step core event =
          when pending = error.activation && graph_scope_is_current core pending.scope ->
          fail core During_bootstrap error.message
        | _ -> unchanged core)
+    | Authoritative_batch_failed { request; message }
+      when pending_authoritative_matches core request ->
+      fail { core with active_authoritative_batch = None; queued_authoritative_batch = None }
+        (if core.public_state.snapshot.startup.restoring_local then During_local_restore else During_bootstrap) message
     | Graph_attachment_failed error
-    | Authoritative_batch_failed error
       when scoped_error_is_current core error ->
       fail core (if core.public_state.snapshot.startup.restoring_local then During_local_restore else During_bootstrap) error.message
     | Graph_attachment_failed _
@@ -3483,9 +3510,7 @@ let step core event =
        | _ -> unchanged core)
     | Outbox_transition_superseded {request;sync} ->
       (match core.pending_outbox_transition with
-       | Some pending when graph_scope_is_current core request.scope
-           && pending.scope=request.scope && pending.transition=request.transition
-           && Overlay.sync_token_equal pending.expected request.expected
+       | Some _ when pending_outbox_matches core request
            && not(Overlay.sync_token_equal request.expected(Overlay.sync_view_token sync))->
          (* An independently completed inspection may already have replaced the
             preparation's view. Tokens are opaque: retain that observation
@@ -3499,17 +3524,15 @@ let step core event =
           | Accept_group _ | Reject_group _ ->
             (* Keep the exact server outcome. Replanning submission here could
                discard an accepted prefix or repeat already executed work. *)
-            let request={request with expected=Overlay.sync_view_token sync} in
-            {next={core with pending_outbox_transition=Some request};
+            let request = { request with attempt_id = core.next_effect_id
+                                        ; expected = Overlay.sync_view_token sync } in
+            {next={core with pending_outbox_transition=Some request
+                           ; next_effect_id = core.next_effect_id + 1};
              effects=[Delegate(Apply_outbox_transition request)]})
        | Some _ | None -> unchanged core)
     | Outbox_transition_failed { request; message } ->
       (match core.pending_outbox_transition with
-       | Some pending
-         when graph_scope_is_current core request.scope
-              && pending.scope = request.scope
-              && pending.transition = request.transition
-              && Overlay.sync_token_equal pending.expected request.expected ->
+       | Some _ when pending_outbox_matches core request ->
          let close =
            match core.current_graph_scope with
            | Some graph when core.websocket_live ->
@@ -3524,6 +3547,7 @@ let step core event =
              { core with
                websocket_live = false
              ; submission_owner = None
+             ; pending_outbox_transition = None
              ; connection_generation = core.connection_generation + 1
              }
              During_catalog
@@ -4446,10 +4470,13 @@ let event_graph_scope core = function
   | Protected_requested {protected_scope=scope;_} | Graph_detached (scope,_)
   | Mirror_inspected (Mirror_absent scope) -> Some scope
   | Mirror_inspected (Mirror_available {scope;_}) | Graph_attached {scope;_}
-  | Sync_inspected {scope;_} | Outbox_transition_applied {scope;_}
-  | Authoritative_batch_applied {scope;_} | Authoritative_batch_deferred {scope;_}
+  | Sync_inspected {scope;_}
+  | Outbox_transition_applied {request={scope;_};_}
   | Outbox_transition_superseded {request={scope;_};_}
   | Outbox_transition_failed {request={scope;_};_} -> Some scope
+  | Authoritative_batch_applied {request;_}
+  | Authoritative_batch_deferred {request;_}
+  | Authoritative_batch_failed {request;_} -> Some request.scope.graph
   | Snapshot_activated activation -> Some activation.scope
   | Snapshot_activation_failed error -> Some error.activation.scope
   | Websocket_opened {graph;_} | Websocket_message ({graph;_},_)
@@ -4460,7 +4487,7 @@ let event_graph_scope core = function
       (remember_current core).resident_sessions with
      | Some session->Some session.saved_identity | None->Some connection.graph)
   | E2ee_password_submitted (challenge,_) -> Some challenge.challenge_scope
-  | Graph_attachment_failed {scope;_} | Authoritative_batch_failed {scope;_} ->
+  | Graph_attachment_failed {scope;_} ->
     Option.map (fun s -> s.saved_identity) (session_for_effect core scope)
   | Runner_completed (Completion (ticket,_)) ->
     List.find_map (fun session->if List.exists (fun (Pending_effect pending)->

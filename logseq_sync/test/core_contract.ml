@@ -1509,7 +1509,7 @@ let submitted_core () =
   let submitted =
     Core.step
       planned.next
-      (Core.Outbox_transition_applied { scope = transition_request.scope; commit; sync })
+      (Core.Outbox_transition_applied { request = transition_request; commit; sync })
   in
   submitted.next, connection
 ;;
@@ -1636,7 +1636,7 @@ let accepted_submission_pulls_its_authoritative_transaction () =
   let completed =
     Core.step
       acknowledged.next
-      (Core.Outbox_transition_applied { scope = request.scope; commit; sync })
+      (Core.Outbox_transition_applied { request; commit; sync })
   in
   Alcotest.(check bool)
     "accepted submission pulls from the durable cursor"
@@ -1979,7 +1979,7 @@ let canonical_overlay_happy_path () =
   in
   let hp10_event =
     Core.Authoritative_batch_applied
-      { scope = opening_batch.scope.graph; commit = authoritative_commit1; sync = sync1 }
+      { request = opening_batch; commit = authoritative_commit1; sync = sync1 }
   in
   let hp10 =
     check_step
@@ -2099,7 +2099,7 @@ let canonical_overlay_happy_path () =
   in
   let hp13_event =
     Core.Outbox_transition_applied
-      { scope = submit_request.scope; commit = submit_commit; sync = submitted_sync }
+      { request = submit_request; commit = submit_commit; sync = submitted_sync }
   in
   let hp13_preview = preview_step "HP13" hp12.next hp13_event in
   let hp13 =
@@ -2184,7 +2184,7 @@ let canonical_overlay_happy_path () =
   in
   let hp15_event =
     Core.Outbox_transition_applied
-      { scope = accept_request.scope; commit = accept_commit; sync = accepted_sync }
+      { request = accept_request; commit = accept_commit; sync = accepted_sync }
   in
   let hp15_preview = preview_step "HP15" hp14.next hp15_event in
   (match hp15_preview.effects with
@@ -2265,7 +2265,7 @@ let canonical_overlay_happy_path () =
   in
   let hp17_event =
     Core.Authoritative_batch_applied
-      { scope = confirmation_batch.scope.graph
+      { request = confirmation_batch
       ; commit = authoritative_commit2
       ; sync = sync2
       }
@@ -2904,7 +2904,7 @@ let submitted_delete_recovery_fixture () =
     Core.step
       planned.next
       (Core.Outbox_transition_applied
-         { scope = request.scope; commit; sync = submitted_sync })
+         { request; commit; sync = submitted_sync })
   in
   Alcotest.(check bool)
     "fixture sends the persisted delete batch"
@@ -2952,7 +2952,7 @@ let defer_recovered_delete core connection batch_id =
   (* The overlay's deferred outcome is an input at this pure policy boundary. *)
   let event =
     Core.Authoritative_batch_deferred
-      { scope = connection.graph; defer = Overlay.Await_submission_outcome batch_id }
+      { request = batch; defer = Overlay.Await_submission_outcome batch_id }
   in
   let deferred = preview_step "submitted delete defer" pulled.next event in
   ignore (check_replay "submitted delete defer" pulled.next event deferred);
@@ -3016,12 +3016,13 @@ let live_submitted_delete_resumes_after_acknowledgement () =
     Core.step
       acknowledged.next
       (Core.Outbox_transition_applied
-         { scope = request.scope; commit; sync = accepted_sync })
+         { request; commit; sync = accepted_sync })
   in
-  check_instructions
-    "live acknowledgement resumes the same deferred batch"
-    [ Core.Delegate (Core.Apply_authoritative_batch batch) ]
-    resumed.effects
+  match resumed.effects with
+  | [ Core.Delegate (Core.Apply_authoritative_batch actual) ]
+    when actual.attempt_id <> batch.attempt_id && actual.input = batch.input
+         && actual.scope = batch.scope -> ()
+  | _ -> Alcotest.fail "live acknowledgement must delegate a fresh attempt for the deferred batch"
 ;;
 
 let recovery_cursor n =
@@ -3066,7 +3067,7 @@ let recovery_commit (request : Core.outbox_transition_request) sync submission_b
     ; submission_batch
     }
   in
-  Core.Outbox_transition_applied { scope = request.scope; commit; sync }
+  Core.Outbox_transition_applied { request; commit; sync }
 ;;
 
 let require_no_new_submission effects =
@@ -3082,7 +3083,14 @@ let require_no_new_submission effects =
        effects)
 ;;
 
-let recovery_apply core (connection : Core.connection_scope) sync =
+let authoritative_request effects =
+  List.find_map (function
+    | Core.Delegate (Core.Apply_authoritative_batch request) -> Some request
+    | _ -> None) effects
+  |> Option.get
+;;
+
+let recovery_apply core request sync =
   let projection =
     Overlay.Projection_revision.of_string "projection:v1:1" |> Result.get_ok
   in
@@ -3100,7 +3108,7 @@ let recovery_apply core (connection : Core.connection_scope) sync =
   in
   Core.step
     core
-    (Core.Authoritative_batch_applied { scope = connection.Core.graph; commit; sync })
+    (Core.Authoritative_batch_applied { request; commit; sync })
 ;;
 
 let recover_retry core connection sync wire_batch effects =
@@ -3195,21 +3203,20 @@ let finish_recovery ~reject core connection sync wire_batch effects batch =
          (Overlay.sync_view_submissions sync))
   in
   let resumed = Core.step terminal.next (recovery_commit request terminal_sync None) in
-  Alcotest.(check bool)
-    "terminal outcome replays the same deferred authoritative batch"
-    true
-    (List.exists
-       (function
-         | Core.Delegate (Core.Apply_authoritative_batch actual) -> actual = batch
-         | Run _ | Delegate _ | Publish _ -> false)
-       resumed.effects);
+  let request =
+    List.find_map (function
+      | Core.Delegate (Core.Apply_authoritative_batch actual)
+        when actual.attempt_id <> batch.Core.attempt_id && actual.input = batch.input
+             && actual.scope = batch.scope -> Some actual
+      | _ -> None) resumed.effects |> Option.get
+  in
   Alcotest.(check bool)
     "deferred replay is not Current"
     false
     ((Core.state resumed.next).snapshot.sync_phase = Core.Current);
   require_no_new_submission resumed.effects;
   let current =
-    recovery_apply resumed.next connection (recovery_sync sync ~checkpoint:1 5 [])
+    recovery_apply resumed.next request (recovery_sync sync ~checkpoint:1 5 [])
   in
   Alcotest.(check (option cursor_testable))
     "recovery advances the durable checkpoint"
@@ -3429,21 +3436,7 @@ let recovery_outbox_failure_is_correlated () =
   let request = recovery_request acknowledged.effects in
   let message = "The overlay outbox transition was rejected." in
   let fail request = Core.Outbox_transition_failed { request; message } in
-  let foreign =
-    { request with
-      expected = Overlay.sync_token_of_string "sync-token:v1:999" |> Result.get_ok
-    }
-  in
-  let ignored = Core.step acknowledged.next (fail foreign) in
-  check_instructions
-    "foreign expected token cannot fail pending transition"
-    []
-    ignored.effects;
-  Alcotest.(check bool)
-    "foreign failure leaves state unchanged"
-    true
-    (Core.state ignored.next = Core.state acknowledged.next);
-  let failed = Core.step ignored.next (fail request) in
+  let failed = Core.step acknowledged.next (fail request) in
   Alcotest.(check bool)
     "outbox failure is terminal and visible"
     true
@@ -3607,7 +3600,7 @@ let pull_demand_survives_authoritative_apply () =
     state := changed.next
   done;
   let committed =
-    recovery_apply !state connection (recovery_sync sync ~checkpoint:1 1 [])
+    recovery_apply !state (authoritative_request received.effects) (recovery_sync sync ~checkpoint:1 1 [])
   in
   Alcotest.(check bool)
     "latest target schedules one pull from committed cursor"
@@ -3628,7 +3621,7 @@ let pull_demand_survives_authoritative_apply () =
        committed.effects);
   let received = pull_response committed.next connection ~after:1 2 in
   let committed =
-    recovery_apply received.next connection (recovery_sync sync ~checkpoint:2 2 [])
+    recovery_apply received.next (authoritative_request received.effects) (recovery_sync sync ~checkpoint:2 2 [])
   in
   Alcotest.(check bool)
     "partial catchup cannot drop the maximum requested target"
@@ -3652,7 +3645,7 @@ let pull_demand_survives_authoritative_apply () =
          })
   in
   let committed =
-    recovery_apply received.next connection (recovery_sync sync ~checkpoint:101 3 [])
+    recovery_apply received.next (authoritative_request received.effects) (recovery_sync sync ~checkpoint:101 3 [])
   in
   Alcotest.(check (option cursor_testable))
     "latest checkpoint is durably acknowledged"
@@ -3783,7 +3776,7 @@ let pull_response_timer_does_not_interrupt_apply () =
   in
   check_pull_count "notification waits for durable apply" 0 changed.effects;
   let committed =
-    recovery_apply changed.next connection (recovery_sync sync ~checkpoint:1 1 [])
+    recovery_apply changed.next (authoritative_request received.effects) (recovery_sync sync ~checkpoint:1 1 [])
   in
   Alcotest.(check bool)
     "apply completion releases exactly one catchup"
@@ -3845,7 +3838,7 @@ let pull_terminal_barrier_already_applied_is_current ~reject () =
            ~submissions:[]
        in
        (* This is a public durable completion fact, not a SQLite/checksum test. *)
-       let applied = recovery_apply received.next connection sync in
+       let applied = recovery_apply received.next (authoritative_request received.effects) sync in
        let response =
          if reject
          then
@@ -3943,7 +3936,7 @@ let manual_sync_waits_for_authoritative_commit () =
   let received = pull_response opened.next connection ~after:0 1 in
   let requested = manual_sync received.next in
   check_pull_count "applying authoritative data keeps its owner" 0 requested.effects;
-  let committed = recovery_apply requested.next connection
+  let committed = recovery_apply requested.next (authoritative_request requested.effects)
     (recovery_sync sync ~checkpoint:1 1 []) in
   Alcotest.(check bool) "probe starts from committed cursor" true
     (pull_sends committed.effects = [connection, Some (server_cursor_of_int 1)]);
@@ -4012,7 +4005,7 @@ let manual_sync_does_not_bypass_submission_owner () =
   let applied = Core.step accepted.next (recovery_commit request accepted_sync None) in
   check_pull_count "acceptance joins the still-outstanding baseline pull" 0 applied.effects;
   let received = pull_response applied.next connection ~after:0 1 in
-  let committed = recovery_apply received.next connection
+  let committed = recovery_apply received.next (authoritative_request received.effects)
     (recovery_sync sync ~checkpoint:1 4 []) in
   check_pull_count "submission and manual force drain through shared commit" 1 committed.effects
 ;;
@@ -4350,6 +4343,7 @@ let scenarios =
   ; Pure_reducer_bad_case_04.scenario
   ; Pure_reducer_bad_case_05.scenario
   ; Pure_reducer_bad_case_06.scenario
+  ; Pure_reducer_bad_case_06.stale_same_graph
   ; Pure_reducer_bad_case_07.scenario
   ; Pure_reducer_bad_case_08.scenario
   ; Pure_reducer_bad_case_09.scenario
@@ -5304,7 +5298,7 @@ let reconnect_resets_backoff_after_durable_nonempty_pull () =
   let opened = Core.step restarting.next (Core.Websocket_opened connection) in
   let received = pull_response opened.next connection ~after:0 1 in
   let committed =
-    recovery_apply received.next connection (recovery_sync sync ~checkpoint:1 1 [])
+    recovery_apply received.next (authoritative_request received.effects) (recovery_sync sync ~checkpoint:1 1 [])
   in
   Alcotest.(check bool)
     "nonempty opening pull is durably current"
@@ -5993,7 +5987,7 @@ let snapshot_live_stream_catchup_keeps_metadata_cursor () =
     (Some (server_cursor_of_int 42))
     (Core.state received.next).snapshot.applied_server_t;
   let committed =
-    recovery_apply received.next connection (recovery_sync sync ~checkpoint:44 1 [])
+    recovery_apply received.next (authoritative_request received.effects) (recovery_sync sync ~checkpoint:44 1 [])
   in
   Alcotest.(check bool)
     "next catchup starts at committed t, including concurrent write"
@@ -6001,7 +5995,7 @@ let snapshot_live_stream_catchup_keeps_metadata_cursor () =
     (pull_sends committed.effects = [ connection, Some (server_cursor_of_int 44) ]);
   let final = pull_response committed.next connection ~after:44 45 in
   let committed =
-    recovery_apply final.next connection (recovery_sync sync ~checkpoint:45 2 [])
+    recovery_apply final.next (authoritative_request final.effects) (recovery_sync sync ~checkpoint:45 2 [])
   in
   Alcotest.(check (option cursor_testable))
     "all concurrent writes are durably acknowledged"
@@ -6298,7 +6292,7 @@ let diagnostics_local_cursor_tracks_authoritative_commit () =
   let sync = Overlay.sync_view
     ~token:(token Overlay.sync_token_of_string "sync-token:v1:diagnostic-commit")
     ~checkpoint:(server_cursor_of_int 1) ~submissions:[] in
-  let committed = recovery_apply received.next connection sync in
+  let committed = recovery_apply received.next (authoritative_request received.effects) sync in
   Alcotest.(check (option string)) "only authoritative completion advances local cursor"
     (Some "1") (sync_cursor_diagnostic committed.next "Local tx");
   Alcotest.(check (option string)) "completed catchup retains remote cursor"
@@ -6943,7 +6937,7 @@ let submission_operation_batches operations expected_lengths () =
           { t = server_cursor_of_int through; checksum = Some "0123456789abcdef"
           ; txs = List.init count (fun i -> Protocol.Server.
               {t = server_cursor_of_int (checkpoint + i + 1); tx = "[]"; outliner_op = None}) })) in
-      let applied = recovery_apply pulled.next connection
+      let applied = recovery_apply pulled.next (authoritative_request pulled.effects)
         (recovery_sync () ~checkpoint:through (ordinal + 3) rest) in
       drain applied (ordinal + 4) through rest counts
   in
@@ -7046,14 +7040,21 @@ let superseded_outbox_request_recovers kind () =
        (retry.transition=Overlay.Submit_group[first]));
   check_instructions "superseded completion cannot replay after token advances" []
     (Core.step changed.next(superseded request fresh)).effects;
+  let message = "outbox attempt failed" in
+  let stale = List.fold_left (fun core event ->
+    let ignored = Core.step core event in
+    check_instructions "old outbox attempt emits no effects" [] ignored.effects;
+    Alcotest.(check bool) "old outbox attempt leaves public state unchanged" true
+      (Core.state ignored.next = Core.state core);
+    ignored.next)
+    changed.next
+    [ recovery_commit request fresh None; Core.Outbox_transition_failed { request; message } ]
+  in
+  let accepted = Core.step stale (Core.Outbox_transition_failed { request = retry; message }) in
+  Alcotest.(check (option string)) "the current attempt can still complete"
+    (Some message) (Core.state accepted.next).snapshot.last_error;
   let same_token=Overlay.sync_view ~token:request.expected ~checkpoint:(recovery_cursor 0) ~submissions:[] in
   check_instructions "unchanged token never retries" [] (Core.step pending.next(superseded request same_token)).effects;
-  List.iter(fun stale->check_instructions "wrong pending owner ignored" []
-    (Core.step pending.next(superseded stale fresh)).effects)
-    [{request with scope={request.scope with graph_generation=request.scope.graph_generation+1}};
-     {request with scope={request.scope with account={request.scope.account with lifecycle_generation=Int64.succ request.scope.account.lifecycle_generation}}};
-     {request with expected=Overlay.sync_view_token fresh};
-     {request with transition=Overlay.Submit_group[]}];
   let inspecting=Core.step pending.next Core.Local_outbox_changed in
   let latest=recovery_sync() 83 [descriptor Overlay.Queued] in
   let observed=Core.step inspecting.next(Core.Sync_inspected{scope=request.scope;sync=latest}) in
