@@ -110,6 +110,10 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
   let resident_mode = ref false in
   let baseline = ref None in
   let stopped = ref false in
+  let intents = Queue.create () in
+  let intent_wake = Eio.Condition.create () in
+  let pending_foreground = ref None in
+  let ordered_ahead = ref 0 in
   let account_lock = Eio.Mutex.create () in
   let with_account action = Eio.Mutex.use_rw ~protect:true account_lock action in
   let updates = Eio.Condition.create () in
@@ -912,8 +916,8 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
       Option.iter (fun worker -> Worker.post worker event) !worker;
       Ok ()
   in
-  let unlock scope password =
-    checked (fun () ->
+  let unlock_with check scope password =
+    check (fun () ->
       match find scope with
       | None -> Error Dsl.Stale_context
       | Some entry ->
@@ -1046,7 +1050,11 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
         try
           match Account.logout account with
           | Error error -> raise (Failure (error_message error))
-          | Ok () -> ()
+          | Ok () ->
+            Queue.clear intents;
+            pending_foreground := None;
+            ordered_ahead := 0;
+            Eio.Condition.broadcast intent_wake
         with
         | error ->
           stopped := false;
@@ -1120,13 +1128,27 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
         loop ())
     in
     loop ());
-  let intents = Eio.Stream.create 256 in
+  let take_intent () =
+    Eio.Condition.loop_no_mutex intent_wake (fun () ->
+      if !stopped then Some None
+      else
+        match !pending_foreground with
+        | Some value when !ordered_ahead = 0 ->
+          pending_foreground := None;
+          Some (Some (Pure.Foreground_intent value))
+        | _ when not (Queue.is_empty intents) ->
+          if !ordered_ahead > 0 then decr ordered_ahead;
+          Some (Some (Queue.take intents))
+        | _ -> None)
+  in
   Eio.Fiber.fork ~sw (fun () ->
     let rec loop () =
-      let intent = Eio.Stream.take intents in
+      match take_intent () with
+      | None -> ()
+      | Some intent ->
       (match intent with
        | Pure.Sync_intent (Sync.E2ee_password_submitted (challenge, password)) ->
-         ignore (unlock (Sync.unlock_challenge_scope challenge) password)
+         ignore (unlock_with checked (Sync.unlock_challenge_scope challenge) password)
        | Sync_intent value -> ignore (event (Pure.Sync_event value))
        | Foreground_intent foreground -> ignore (event (Pure.Set_foreground foreground))
        | Stop_intent -> shutdown ());
@@ -1137,11 +1159,18 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
   let lifecycle intent =
     if not !stopped
     then
-      if Eio.Stream.length intents >= 256
-      then (
+      match intent with
+      | Pure.Foreground_intent value
+        when Option.is_some !pending_foreground || Queue.length intents >= 256 ->
+        pending_foreground := Some value;
+        ordered_ahead := Queue.length intents;
+        Eio.Condition.broadcast intent_wake
+      | _ when Queue.length intents >= 256 ->
         failure := Some (Dsl.Capacity_exceeded "The account command queue is full.");
-        notify ())
-      else Eio.Stream.add intents intent
+        notify ()
+      | _ ->
+        Queue.add intent intents;
+        Eio.Condition.broadcast intent_wake
   in
   let services : Runner.services =
     { post = lifecycle
@@ -1170,7 +1199,7 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
           notify ())
     ; post = (fun value -> Option.iter (fun worker -> Worker.post worker value) !worker)
     ; lifecycle
-    ; unlock
+    ; unlock = unlock_with with_account
     ; shutdown
     }
 ;;

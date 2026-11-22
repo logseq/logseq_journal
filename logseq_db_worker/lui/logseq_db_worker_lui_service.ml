@@ -962,6 +962,7 @@ let create_with_network ~network ~(dependencies : dependencies) =
     type t =
       { worker : Db.t
       ; post_client : client_command -> unit
+      ; unlock_native : Sync.graph_scope -> string -> (unit, string) result
       ; validate_network : Journal_sync_registration.network_control -> (unit, Sync_dsl.Core.error) result
       ; delete_local : account_generation:int -> graph_id:graph_id -> (unit,string) result
       ; application_support_directory : string
@@ -1122,9 +1123,6 @@ let create_with_network ~network ~(dependencies : dependencies) =
                | Ok worker ->
                  Option.iter(fun bridge->bridge.Journal_sync_registration.bind worker)!registration;
                  let post_client command=match !registration,command with
-                   | Some bridge,Submit_native_password(scope,password)->
-                     bridge.Journal_sync_registration.unlock scope password
-                     |> Result.fold ~ok:Fun.id ~error:failwith
                    | Some bridge,_->bridge.Journal_sync_registration.post(client_event command)
                    | None,_->Db.post worker(client_event command) in
                  let delete_local ~account_generation ~graph_id=
@@ -1163,6 +1161,10 @@ let create_with_network ~network ~(dependencies : dependencies) =
                    Session.
                      { worker
                      ; post_client
+                     ; unlock_native = (fun scope password ->
+                         match !registration with
+                         | Some bridge -> bridge.Journal_sync_registration.unlock scope password
+                         | None -> Error "Native unlock requires the lifecycle registration")
                      ; validate_network=(fun control -> match !registration with
                          | Some bridge -> bridge.Journal_sync_registration.validate_control control
                          | None -> Error Sync_dsl.Core.Stale_context)
@@ -1552,6 +1554,9 @@ let create_with_network ~network ~(dependencies : dependencies) =
             | Request_sign_in _ when !(session.auth_seen) -> session.queue_auth !(session.authenticated_user)
             | _ -> ());
            Ok Client_command_completed)
+      | Client_command (Submit_native_password (scope, password)) ->
+        session.Session.unlock_native scope password
+        |> Result.map (fun () -> Client_command_completed)
       | Client_command command ->
         (match command with Submit_e2ee_password _ -> unlock_queue_log context | _ -> ());
         session.Session.post_client command;

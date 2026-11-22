@@ -5275,7 +5275,33 @@ let with_observation_service
        f client ~call ~send ~wait ~replies ~notices ~baseline ~owner ~registration)
 ;;
 
-let test_native_registration_network_epochs ?terminal ?(confirmation_first = false) () =
+let test_native_unlock_request_failure () =
+  let terminal = ref false in
+  with_observation_service
+    (fun client ~call ~send ~wait ~replies ~notices:_ ~baseline ~owner:_ ~registration:_ ->
+       Mailbox.on_event client (function Terminal _ -> terminal := true | _ -> ());
+       let scope, _ = List.hd (Option.get !baseline).baseline.state.residents in
+       let stale : Sync.graph_scope = { scope with graph_generation = max_int } in
+       let unlock = send (Service.Client_command (Submit_native_password (stale, "synthetic-input"))) in
+       let read = send Service.Get_graph_state in
+       wait (fun () -> Hashtbl.mem replies unlock);
+       require
+         (Hashtbl.find replies unlock = Mailbox.Failed "Stale context")
+         "native unlock rejection did not retain its request-local reason";
+       wait (fun () -> Hashtbl.mem replies read);
+       require
+         (match Hashtbl.find replies read with
+          | Mailbox.Completed (Service.Graph_state _) -> true
+          | _ -> false)
+         "queued graph read failed after native unlock rejection";
+       require (not !terminal) "native unlock rejection terminated the worker";
+       require
+         (call (Service.Client_command (Set_foreground true))
+          = Mailbox.Completed Service.Client_command_completed)
+         "worker did not process a subsequent command after rejected unlock")
+;;
+
+let test_native_registration_network_epochs ?terminal ?(confirmation_first = false) ?(saturation = false) () =
   let module Registration = Logseq_db_worker_lui.Journal_sync_registration in
   let module Pure = Logseq_db_worker.Pure_reducer in
   let exception Finished in
@@ -5288,6 +5314,9 @@ let test_native_registration_network_epochs ?terminal ?(confirmation_first = fal
               let epochs = ref [] in
               let platform_user = ref None in
               let expected_generation = ref 1 in
+              let entered, signal_entered = Eio.Promise.create () in
+              let released, release = Eio.Promise.create () in
+              let block_token = ref false in
               let bridge =
                 Registration.create
                   ~sw
@@ -5297,6 +5326,10 @@ let test_native_registration_network_epochs ?terminal ?(confirmation_first = fal
                   ~config
                   ~overlay:fixture.overlay
                   ~token:(fun ~user ~account_generation ~epoch ~refresh:_ ->
+                    if !block_token then (
+                      block_token := false;
+                      Eio.Promise.resolve signal_entered ();
+                      Eio.Promise.await released);
                     epochs := epoch :: !epochs;
                     require
                       (account_generation = !expected_generation)
@@ -5430,6 +5463,26 @@ let test_native_registration_network_epochs ?terminal ?(confirmation_first = fal
                      platform_user := Some "user-1";
                      intent (Sync.Account_authenticated { user_id = Some "user-1" }));
                    require (!epochs <> []) "native registration did not request a token";
+                   if saturation then (
+                     block_token := true;
+                     bridge.lifecycle (Pure.Sync_intent (Sync.Catalog_refresh_requested scope));
+                     Eio.Time.with_timeout_exn (Eio.Stdenv.clock environment) 5. (fun () ->
+                       Eio.Promise.await entered);
+                     let stale = { scope with account_generation = max_int } in
+                     for _ = 1 to 256 do
+                       bridge.lifecycle (Pure.Sync_intent (Sync.Catalog_refresh_requested stale))
+                     done;
+                     Db.post worker (Pure.Set_foreground true);
+                     Db.post worker (Pure.Set_foreground false);
+                     settle ();
+                     Eio.Promise.resolve release ();
+                     for _ = 1 to 2000 do Eio.Fiber.yield () done;
+                     let graph = List.hd (Db.graph_scopes worker) in
+                     require
+                       (bridge.unlock graph "synthetic-input"
+                        = Error "Network closed")
+                       "the last background intent was dropped while the account queue was full";
+                     raise Finished);
                    let expected_error =
                      match terminal with
                      | Some "protocol" -> "Protocol failure: Original protocol diagnostic"
@@ -8683,6 +8736,14 @@ let test_physical_outbox_failure_carries_unknown_reason () =
 ;;
 
 let () =
+  if Array.mem "--native-unlock-request-only" Sys.argv then (
+    test_native_unlock_request_failure ();
+    exit 0);
+  if Array.mem "--foreground-saturation-only" Sys.argv then (
+    test_native_registration_network_epochs ~saturation:true ();
+    exit 0);
+  test_native_unlock_request_failure ();
+  test_native_registration_network_epochs ~saturation:true ();
   List.iter
     (fun terminal -> test_native_registration_network_epochs ~terminal ())
     [ "protocol"; "storage"; "crypto"; "integrity"; "authentication" ];
