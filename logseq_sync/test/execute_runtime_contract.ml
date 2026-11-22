@@ -725,6 +725,113 @@ let nested_unlock env () =
     | X.Failed (_, e) -> Alcotest.fail (D.error_message e))
 ;;
 
+let unlock_request_lifecycle env () =
+  Eio.Switch.run (fun sw ->
+    let entered, enter = Eio.Promise.create () in
+    let released, release = Eio.Promise.create () in
+    let base = (capabilities ()).dispatch in
+    let dispatch =
+      { base with
+        crypto =
+          (fun (type a) ~scope:_ ~identity:_ (op : a D.crypto) : (a, D.error) result ->
+            match op with
+            | D.Unlock input ->
+              Eio.Promise.resolve enter (D.wrapped_graph_key input);
+              Eio.Promise.await released;
+              Error (D.Crypto_failure "fixture unlock failure")
+            | _ -> Error D.Locked)
+      }
+    in
+    let t, cold, _ = fixture env ~sw ~dispatch () in
+    let consume =
+      D.task_bind (task D.Next_input) (function
+        | D.Unlock_requested receipt ->
+          D.task_perform (D.Consume_unlock receipt)
+            ~success:(fun _ -> D.task_return ())
+            ~failure:(fun _ -> D.task_return ())
+        | _ -> D.task_fail (D.Invalid_input "Expected unlock"))
+    in
+    let running =
+      get (X.start t (ready t cold) (D.perform (D.Run_task consume) ~success:D.return ~failure:D.abort))
+    in
+    Eio.Fiber.yield ();
+    let submit ~valid_for value =
+      X.submit_unlock t ~identity ~valid_for (get (D.unlock_input ~wrapped_graph_key:value))
+    in
+    let await request =
+      Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 2. (fun () -> X.await_unlock request)
+    in
+    let replaced = get (submit ~valid_for:10. "replaced") in
+    let admitted = get (submit ~valid_for:10. "admitted") in
+    check (Result.is_error (submit ~valid_for:0. "rejected")) "invalid submission rejected";
+    check (await replaced = Error D.Stale_context) "only the replaced request is stale";
+    check (Eio.Promise.await entered = "admitted") "rejection leaves current payload intact";
+    let cancelled_wait =
+      Eio.Time.with_timeout (Eio.Stdenv.clock env) 0.001
+        (fun () -> Ok (X.await_unlock admitted))
+    in
+    check (cancelled_wait = Error `Timeout) "waiting can be cancelled independently";
+    let waiter = Eio.Fiber.fork_promise ~sw (fun () -> await admitted) in
+    let expires = get (submit ~valid_for:0.001 "expires") in
+    check (await expires = Error D.Stale_context) "queued request expires during admitted crypto";
+    check (not (Eio.Promise.is_resolved waiter)) "expiry does not complete admitted work";
+    let stopped = get (submit ~valid_for:10. "stopped") in
+    get (X.request_stop t);
+    check (await stopped = Error D.Cancelled) "stop completes pending input";
+    check (not (Eio.Promise.is_resolved waiter)) "stop does not misreport admitted crypto";
+    let scope_exit = get (submit ~valid_for:10. "scope-exit") in
+    Eio.Promise.resolve release ();
+    check
+      (Eio.Promise.await_exn waiter = Error (D.Crypto_failure "fixture unlock failure"))
+      "admitted request gets its own crypto failure";
+    (match X.await running with
+     | X.Completed (_, ()) -> ()
+     | X.Failed (_, error) -> Alcotest.fail (D.error_message error));
+    check (await scope_exit = Error D.Cancelled) "scope exit completes remaining input")
+;;
+
+let rejected_unlock_status ~initial ~(reported : D.key_status) env () =
+  Eio.Switch.run (fun sw ->
+    let base = (capabilities ()).dispatch in
+    let dispatch =
+      { base with
+        crypto =
+          (fun (type a) ~scope:_ ~identity:_ (op : a D.crypto) : (a, D.error) result ->
+            match op with
+            | D.Unlock _ -> Ok reported
+            | _ -> Error D.Locked)
+      }
+    in
+    let restore ~scope:_ _ =
+      Ok { D.keys = initial; checkpoint = None; recovery_pending = false }
+    in
+    let t, cold, _ = fixture env ~sw ~dispatch ~restore () in
+    let consume =
+      D.task_bind (task D.Next_input) (function
+        | D.Unlock_requested receipt ->
+          D.task_perform (D.Consume_unlock receipt)
+            ~success:(fun status -> D.task_return (Ok status))
+            ~failure:(fun error -> D.task_return (Error error))
+        | _ -> D.task_fail (D.Invalid_input "Expected unlock"))
+    in
+    let running =
+      get (X.start t (ready t cold) (D.perform (D.Run_task consume) ~success:D.return ~failure:D.abort))
+    in
+    Eio.Fiber.yield ();
+    let request =
+      get (X.submit_unlock t ~identity ~valid_for:10. (get (D.unlock_input ~wrapped_graph_key:"wrapped")))
+    in
+    let completion = X.await_unlock request in
+    let consumed =
+      match X.await running with
+      | X.Completed (_, result) -> result
+      | X.Failed (_, error) -> Alcotest.fail (D.error_message error)
+    in
+    let keys = (get (X.observe_runtime t)).state.keys in
+    check (keys = initial && consumed = completion && completion = Error D.Locked)
+      "rejected wrapped unlock preserves keys and returns the same Locked result to both callers")
+;;
+
 let cancelled_subtree env () =
   Eio.Switch.run (fun sw ->
     let entered = ref false
@@ -1513,7 +1620,7 @@ let service_receipts_and_consumer ?(withdraw = false) env () =
             match operation with
             | D.Unlock _ ->
               incr unlocked;
-              Ok D.Unencrypted
+              Ok D.Key_available
             | _ -> Error D.Locked)
       ; assets =
           (fun (type a)
@@ -1553,6 +1660,8 @@ let service_receipts_and_consumer ?(withdraw = false) env () =
       }
     in
     let ingress, bind = Eio.Promise.create () in
+    let accepting, accept = Eio.Promise.create () in
+    let first = ref true in
     let statuses = ref [] in
     let service =
       get
@@ -1574,18 +1683,33 @@ let service_receipts_and_consumer ?(withdraw = false) env () =
                      "binder precedes policy input scope";
                    Eio.Promise.resolve bind value)
              }
-           ~on_change:(fun status -> statuses := status.lifecycle :: !statuses))
+           ~on_change:(fun status ->
+             statuses := status.lifecycle :: !statuses;
+             if !first
+             then (
+               first := false;
+               let ingress = Eio.Promise.await ingress in
+               check
+                 (ingress.submit_unlock ~identity ~valid_for:10.
+                    (get (D.unlock_input ~wrapped_graph_key:"first-observation"))
+                  = Error D.Stale_context)
+                 "first observation precedes the active input scope");
+             (match status.observation.status with
+              | D.Service_waiting_unlock | Service_waiting_network ->
+                ignore (Eio.Promise.try_resolve accept () : bool)
+              | _ -> ())))
     in
     let ingress = Eio.Promise.await ingress in
-    for _ = 1 to 12 do
-      Eio.Fiber.yield ()
-    done;
-    ignore
-      (get
-         (ingress.submit_unlock
-            ~identity
-            ~valid_for:10.
-            (get (D.unlock_input ~wrapped_graph_key:"wrapped"))));
+    Eio.Promise.await accepting;
+    let request =
+      get
+        (ingress.submit_unlock
+           ~identity
+           ~valid_for:10.
+           (get (D.unlock_input ~wrapped_graph_key:"wrapped")))
+    in
+    let completion = Service.await_unlock request in
+    let completed_at_await = completion = Ok D.Key_available && !unlocked = 1 in
     ignore (get (ingress.update_demand demand_change));
     let rec available () =
       let output = get (ingress.receive_demand ()) in
@@ -1624,7 +1748,71 @@ let service_receipts_and_consumer ?(withdraw = false) env () =
       "physical lease before file once"
       [ "lease"; "file" ]
       !released;
-    check (List.mem Service.Closed !statuses) "closed callback follows retirement")
+    check (List.mem Service.Closed !statuses) "closed callback follows retirement";
+    check completed_at_await "await resolves after the accepted cached unlock is installed")
+;;
+
+let service_unlock_close_race env () =
+  Eio.Switch.run (fun sw ->
+    let bound, bind = Eio.Promise.create () in
+    let accepting, accept = Eio.Promise.create () in
+    let entered, enter = Eio.Promise.create () in
+    let fencing, fenced = Eio.Promise.create () in
+    let release_fence, release = Eio.Promise.create () in
+    let base = (capabilities ()).dispatch in
+    let dispatch =
+      { base with
+        crypto =
+          (fun (type a) ~scope:_ ~identity:_ (op : a D.crypto) : (a, D.error) result ->
+            match op with
+            | D.Unlock _ ->
+              Eio.Promise.resolve enter ();
+              Eio.Fiber.await_cancel ()
+            | _ -> Error D.Locked)
+      }
+    in
+    let restore ~scope:_ _ =
+      Ok { D.keys = D.Key_locked; checkpoint = None; recovery_pending = false }
+    in
+    let caps =
+      { (capabilities ~dispatch ~restore ()) with
+        fence_network = (fun _ ->
+          Eio.Promise.resolve fenced ();
+          Eio.Promise.await release_fence;
+          Ok ())
+      }
+    in
+    let config = { service_config with network = D.Open { authorization_epoch = 7L } } in
+    let service =
+      get (Service.start ~sw ~config
+        ~dependencies:
+          { clock = Eio.Stdenv.mono_clock env
+          ; database_owner = owner ~sw
+          ; capabilities = caps
+          ; bind_ingress = Eio.Promise.resolve bind
+          }
+        ~on_change:(fun status ->
+          if status.observation.status = D.Service_waiting_unlock
+          then ignore (Eio.Promise.try_resolve accept () : bool)))
+    in
+    Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 3. (fun () ->
+      let ingress = Eio.Promise.await bound in
+      Eio.Promise.await accepting;
+      let submit wrapped_graph_key =
+        ingress.submit_unlock ~identity ~valid_for:10. (get (D.unlock_input ~wrapped_graph_key))
+      in
+      let admitted = get (submit "admitted") in
+      Eio.Promise.await entered;
+      let queued = get (submit "queued") in
+      let closing = Eio.Fiber.fork_promise ~sw (fun () -> Service.close service) in
+      Eio.Promise.await fencing;
+      let late = submit "closing" in
+      Eio.Promise.resolve release ();
+      Eio.Promise.await_exn closing;
+      check (late = Error D.Stale_context) "closing service rejects its saved ingress";
+      check (Service.await_unlock admitted = Error D.Cancelled) "admitted crypto joins cancellation";
+      check (Service.await_unlock queued = Error D.Cancelled) "queued unlock is not superseded during close";
+      check (submit "closed" = Error D.Stale_context) "closed service rejects its saved ingress"))
 ;;
 
 let service_callback_failure env () =
@@ -2752,11 +2940,17 @@ let () =
               , service_exhausted_network_recovery
                   ~terminal:(D.Authentication_failure "Original auth diagnostic")
                   0 )
+            ; "actual service unlock close race", service_unlock_close_race
             ; "actual service callback failure cleanup", service_callback_failure
             ; "callback capacity before start", callback_capacity
             ; "callback terminal capacity rejection", callback_terminal_capacity_rejection
             ; "terminal cancellation rejects", terminal_cancel_rejected
             ; "released delivery metadata remains bounded", delivery_metadata_bounded
+            ; "unlock request lifecycle", unlock_request_lifecycle
+            ; ( "wrapped unlock rejects locked status"
+              , rejected_unlock_status ~initial:D.Key_available ~reported:D.Key_locked )
+            ; ( "wrapped unlock rejects unencrypted status"
+              , rejected_unlock_status ~initial:D.Key_locked ~reported:D.Unencrypted )
             ] )
       ])
 ;;

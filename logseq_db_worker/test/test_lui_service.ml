@@ -1568,6 +1568,50 @@ let test_restore_error_reaches_diagnostics () =
           | _ -> ()); !cleared)))
 ;;
 
+let test_missing_local_unlock_credentials () =
+  let module Core = Logseq_sync_domain.Core in
+  let module G = Logseq_db_types.Graph_types in
+  T.with_managed (fun fixture ->
+    let root = fixture.config.Logseq_db_worker.Config.application_support_directory in
+    let graph_id = G.Uuid.of_string "94000000-0000-4000-8000-000000000910" |> Result.get_ok in
+    let graph : Core.graph =
+      { graph_id; name = "Synthetic encrypted graph"; encrypted = true
+      ; schema = { major = 65; minor = 33; exact = true } }
+    in
+    let user = Filename.basename root in
+    let worker = Filename.concat root "logseq-db-worker" in
+    Unix.mkdir worker 0o700;
+    let catalogs = Filename.concat worker "sync-catalogs" in
+    Unix.mkdir catalogs 0o700;
+    let name = Digestif.SHA256.digest_string (user ^ "\000https://api.logseq.io") |> Digestif.SHA256.to_hex in
+    let cache = Core.catalog_cache ~user_id:user ~graphs:[graph] ~selected_graph:(Some graph_id) in
+    Out_channel.with_open_bin (Filename.concat catalogs (name ^ ".json"))
+      (fun out -> output_string out (Core.encode_catalog_cache cache));
+    with_client fixture.config (fun client ->
+      let restore user_id =
+        ignore
+          (Worker.send client (Service.Client_command (Restore_local_account { user_id }))
+           |> accepted)
+      in
+      let wait_snapshot description matches =
+        let found = ref None in
+        control_wait description (fun () ->
+          Worker.For_testing.drain_events client ~max_events:64 |> List.iter (function
+            | Worker.Push { payload = Service.Client_state_changed state; _ }
+              when matches state.snapshot -> found := Some state.snapshot
+            | _ -> ());
+          Option.is_some !found);
+        Option.get !found
+      in
+      restore user;
+      let locked = wait_snapshot "missing local credentials leave the real Worker waiting for a password"
+        (fun snapshot -> snapshot.selected_graph = Some graph_id && snapshot.startup.awaiting_e2ee_password) in
+      restore (user ^ "-replacement");
+      ignore (wait_snapshot "switching account clears the previous unlock state"
+        (fun snapshot -> snapshot.startup.account_generation <> locked.startup.account_generation
+          && snapshot.selected_graph = None && not snapshot.startup.awaiting_e2ee_password))))
+;;
+
 (* The row allowlist belongs to the service publisher, not the pure reducer. *)
 let test_authoritative_diagnostic_rows () =
   List.iter (fun (category, expected) ->
@@ -1971,6 +2015,7 @@ let () =
     ; T.case
         "managed worker starts without query authority"
         test_managed_worker_starts_without_query_authority
+    ; T.case "missing local unlock credentials and account replacement" test_missing_local_unlock_credentials
     ; T.case "ignored unlock is diagnosed without secrets" test_unlock_ignored_logging
     ; T.case "managed client command is accepted" test_managed_client_command_is_accepted
     ]

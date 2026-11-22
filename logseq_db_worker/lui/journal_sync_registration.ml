@@ -17,13 +17,19 @@ let error_message = function
 
 let storage_error message = Dsl.Storage_failure message
 
+type local_key_restore =
+  | Not_attempted
+  | Restoring of Lifecycle.Service.unlock_request
+  | Installed
+  | Finished
+
 type entry =
   { scope : Sync.graph_scope
   ; core : Lifecycle.t
   ; mutable opened : Pure.database_opened option
   ; mutable attachment_error : Dsl.error option
   ; mutable status : Lifecycle.Service.status option
-  ; mutable local_key_attempted : bool
+  ; mutable local_key_restore : local_key_restore
   ; mutable retiring : bool
   }
 
@@ -124,26 +130,51 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
     let* input = Dsl.unlock_input ~wrapped_graph_key:wrapped in
     let* ingress = Lifecycle.ingress entry.core in
     ingress.submit_unlock ~identity:(Lifecycle.identity entry.core) ~valid_for:30. input
-    |> Result.map (fun _ -> ())
+  in
+  let locked entry =
+    Option.fold
+      ~none:false
+      ~some:(fun status -> status.Lifecycle.Service.observation.state.keys = Dsl.Key_locked)
+      entry.status
   in
   let restore_key entry =
-    if
-      (not entry.local_key_attempted)
-      && Option.fold
-           ~none:false
-           ~some:(fun status ->
-             status.Lifecycle.Service.observation.state.keys = Dsl.Key_locked)
-           entry.status
-    then (
-      entry.local_key_attempted <- true;
-      match
-        Logseq_sync_native_crypto.Platform_crypto.load_wrapped_graph_key
-          ~managed_sync_origin:entry.scope.account.managed_sync_origin
-          ~user_id:entry.scope.account.user_id
-          ~graph_id:entry.scope.graph_id
-      with
-      | Error _ -> ()
-      | Ok wrapped -> ignore (install_key entry wrapped))
+    let accepting =
+      match entry.status with
+      | Some { Lifecycle.Service.lifecycle = Running; observation; _ } ->
+        (match observation.status with
+         | Dsl.Service_waiting_unlock | Service_waiting_network -> true
+         | _ -> false)
+      | _ -> false
+    in
+    match entry.local_key_restore with
+    | Installed when not (locked entry) -> entry.local_key_restore <- Finished
+    | Not_attempted when accepting && locked entry ->
+      (match
+         Logseq_sync_native_crypto.Platform_crypto.load_wrapped_graph_key
+           ~managed_sync_origin:entry.scope.account.managed_sync_origin
+           ~user_id:entry.scope.account.user_id
+           ~graph_id:entry.scope.graph_id
+       with
+       | Error _ -> entry.local_key_restore <- Finished
+       | Ok wrapped ->
+         (match install_key entry wrapped with
+          | Error Dsl.Stale_context -> ()
+          | Error _ -> entry.local_key_restore <- Finished
+          | Ok request ->
+            entry.local_key_restore <- Restoring request;
+            Eio.Fiber.fork_daemon ~sw (fun () ->
+              let result = Lifecycle.Service.await_unlock request in
+              (match entry.local_key_restore, find entry.scope with
+               | Restoring current, Some live
+                 when current == request && live == entry && not !stopped ->
+                 entry.local_key_restore <-
+                   (match result with
+                    | Ok Dsl.Key_available when locked entry -> Installed
+                    | _ -> Finished);
+                 notify ()
+               | _ -> ());
+              `Stop_daemon)))
+    | _ -> ()
   in
   let publish () =
     match !worker, !baseline, !controller with
@@ -238,10 +269,7 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
                then Some Sync.During_bootstrap
                else initial.snapshot.startup.failure)
           ; awaiting_e2ee_password =
-              Option.fold
-                ~none:false
-                ~some:(fun observed -> observed.Execute.Core.state.keys = Dsl.Key_locked)
-                observed
+              locked entry && entry.local_key_restore = Finished
           }
         in
         { Sync.diagnostics =
@@ -454,7 +482,7 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
             ; opened = None
             ; attachment_error = None
             ; status = !pending
-            ; local_key_attempted = false
+            ; local_key_restore = Not_attempted
             ; retiring = false
             }
           in
@@ -975,7 +1003,7 @@ let create ~sw ~clock ~network ~authenticator ~config ~overlay ~token () =
             ~encrypted_graph_key:wrapped
           |> Result.map_error (fun message -> Dsl.Crypto_failure message)
         in
-        install_key entry wrapped)
+        install_key entry wrapped |> Result.map (fun _ -> ()))
     |> Result.map_error error_message
   in
   let await_io ~(scope : Sync.effect_scope) =

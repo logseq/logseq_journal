@@ -346,16 +346,19 @@ type ingress_ack =
   | Queued
   | Replaced
 
-(** Wrapped-only active Run_task ingress, including Locked/Closed; otherwise Stale_context.
-    valid_for is monotonic (0,300] seconds. Reserve before copy; one pending revision.
-    Replacement invalidates unconsumed receipt, not admitted work; rejection retains old input/caller ownership.
-    Expiry/stop/scope exit discards unconsumed payload. ACK means queued, not unlocked; never log secrets. *)
+type unlock_request
+
+(** Active Run_task ingress, including Locked/Closed. The monotonic queue deadline
+    is (0, 300] seconds. Replacement affects only unconsumed input; rejection leaves it intact. *)
 val submit_unlock
   :  t
   -> identity:Dsl.identity
   -> valid_for:float
   -> Dsl.unlock_input
-  -> (ingress_ack, Dsl.error) result
+  -> (unlock_request, Dsl.error) result
+
+(** Suspends until installation or failure. Cancelling the waiter does not cancel the request. *)
+val await_unlock : unlock_request -> (Dsl.key_status, Dsl.error) result
 
 val update_demand : t -> Dsl.demand_change -> (ingress_ack, Dsl.error) result
 val receive_demand : t -> (Dsl.demand_output, Dsl.error) result

@@ -9,11 +9,15 @@ type config =
   ; network : Dsl.network_gate
   ; policy : Dsl.policy_config }
 
+type unlock_request = Execute.unlock_request
+
+val await_unlock : unlock_request -> (Dsl.key_status, Dsl.error) result
+
 type ingress =
   { outbox_committed : owner:Execute.database_owner -> identity:Dsl.identity
       -> (unit, Dsl.error) result
   ; submit_unlock : identity:Dsl.identity -> valid_for:float -> Dsl.unlock_input
-      -> (Execute.ingress_ack, Dsl.error) result
+      -> (unlock_request, Dsl.error) result
   ; update_demand : Dsl.demand_change -> (Execute.ingress_ack, Dsl.error) result
   ; receive_demand : unit -> (Dsl.demand_output, Dsl.error) result
   ; demand_status : Dsl.demand_delivery -> (Execute.delivery_status, Dsl.error) result

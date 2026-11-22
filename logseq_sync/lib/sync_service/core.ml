@@ -8,6 +8,10 @@ type config =
   ; policy : Dsl.policy_config
   }
 
+type unlock_request = Execute.unlock_request
+
+let await_unlock = Execute.await_unlock
+
 type ingress =
   { outbox_committed :
       owner:Execute.database_owner -> identity:Dsl.identity -> (unit, Dsl.error) result
@@ -15,7 +19,7 @@ type ingress =
       identity:Dsl.identity
       -> valid_for:float
       -> Dsl.unlock_input
-      -> (Execute.ingress_ack, Dsl.error) result
+      -> (unlock_request, Dsl.error) result
   ; update_demand : Dsl.demand_change -> (Execute.ingress_ack, Dsl.error) result
   ; receive_demand : unit -> (Dsl.demand_output, Dsl.error) result
   ; demand_status : Dsl.demand_delivery -> (Execute.delivery_status, Dsl.error) result
@@ -273,7 +277,9 @@ let start ~sw ~config ~dependencies ~on_change =
                     Execute.notify_outbox_changed runtime ~owner ~identity)
               ; submit_unlock =
                   (fun ~identity ~valid_for input ->
-                    Execute.submit_unlock runtime ~identity ~valid_for input)
+                    match State.lifecycle t.state with
+                    | Running -> Execute.submit_unlock runtime ~identity ~valid_for input
+                    | Closing | Closed -> Error Dsl.Stale_context)
               ; update_demand = Execute.update_demand runtime
               ; receive_demand = (fun () -> Execute.receive_demand runtime)
               ; demand_status = Execute.demand_status runtime

@@ -218,6 +218,7 @@ type capabilities =
   }
 
 type version = unit ref
+type unlock_request = (Dsl.key_status, Dsl.error) result Eio.Promise.t
 
 type t =
   { sw : Eio.Switch.t
@@ -335,7 +336,8 @@ and unlock =
   { mutable receipt : Dsl.unlock_receipt
   ; input : Dsl.unlock_input
   ; expires : float
-  ; mutable queued : bool
+  ; mutable delivered_to : task_scope option
+  ; complete : (Dsl.key_status, Dsl.error) result Eio.Promise.u
   }
 
 and demand_entry =
@@ -885,6 +887,16 @@ let active_scope (t : t) =
   | _ -> Error Dsl.Stale_context
 ;;
 
+let await_unlock = Eio.Promise.await
+
+let finish_pending_unlock (t : t) error =
+  Option.iter
+    (fun pending ->
+      t.unlock <- None;
+      Eio.Promise.resolve pending.complete (Error error))
+    t.unlock
+;;
+
 let submit_unlock (t : t) ~identity ~valid_for input =
   let* scope = active_scope t in
   if identity <> t.id
@@ -895,10 +907,23 @@ let submit_unlock (t : t) ~identity ~valid_for input =
   then Error (Dsl.Capacity_exceeded "Unlock bytes")
   else
     let* receipt = Dsl.Producer.unlock_receipt t.producer scope.handle in
-    let ack = if Option.is_some t.unlock then Replaced else Queued in
-    t.unlock <- Some { receipt; input; expires = t.now () +. valid_for; queued = true };
+    let request, complete = Eio.Promise.create () in
+    let pending = { receipt; input; expires = t.now () +. valid_for; delivered_to = None; complete } in
+    finish_pending_unlock t Dsl.Stale_context;
+    t.unlock <- Some pending;
+    Eio.Fiber.fork_daemon ~sw:t.sw (fun () ->
+      Eio.Fiber.first
+        (fun () -> ignore (await_unlock request : (Dsl.key_status, Dsl.error) result))
+        (fun () ->
+          t.sleep (max 0. (pending.expires -. t.now ()));
+          match t.unlock with
+          | Some current when current == pending ->
+            finish_pending_unlock t Dsl.Stale_context;
+            pulse t
+          | _ -> ());
+      `Stop_daemon);
     pulse t;
-    Ok ack
+    Ok request
 ;;
 
 let demand_id = function
@@ -1225,6 +1250,7 @@ let receive_demand (t : t) =
 let request_stop (t : t) =
   let* _ = active_scope t in
   t.stop <- true;
+  finish_pending_unlock t Dsl.Cancelled;
   pulse t;
   Ok ()
 ;;
@@ -1318,6 +1344,10 @@ let cleanup_scope (t : t) (scope : task_scope) =
       scope.children;
     scope.children <- [];
     scope.live <- false;
+    (match t.unlock with
+     | Some { delivered_to = Some owner; _ } when owner == scope ->
+       finish_pending_unlock t Dsl.Stale_context
+     | _ -> ());
     ignore (Dsl.Producer.close_scope t.producer scope.handle : (unit, Dsl.error) result);
     List.iter
       (fun d ->
@@ -1349,9 +1379,13 @@ let perform_crypto : type a. t -> unit ref -> a Dsl.crypto -> (a, Dsl.error) res
     let* () = check_current scope in
     match operation with
     | Dsl.Unlock _ ->
-      t.keys <- result;
-      mark_dirty t;
-      Ok result
+      (match result with
+       | Dsl.Key_available ->
+         t.keys <- result;
+         mark_dirty t;
+         Ok result
+       | Dsl.Key_locked -> Error Dsl.Locked
+       | Dsl.Unencrypted -> Ok result)
     | Dsl.Encrypt_values values ->
       if Rrbvec.length result <> Rrbvec.length values
       then Error (Dsl.Crypto_failure "Encryption cardinality")
@@ -1707,15 +1741,19 @@ let take_input (t : t) (scope : task_scope) =
       Some (Ok (Dsl.Network_changed gate))
     | None ->
       (match t.unlock with
-       | Some u when u.expires <= t.now () ->
-         t.unlock <- None;
-         None
-       | Some u when u.queued ->
+       | Some u when u.expires <= t.now () -> finish_pending_unlock t Dsl.Stale_context
+       | _ -> ());
+      (match t.unlock with
+       | Some u when Option.is_none u.delivered_to ->
          Some
-           (let* receipt = Dsl.Producer.unlock_receipt t.producer scope.handle in
-            u.receipt <- receipt;
-            u.queued <- false;
-            Ok (Dsl.Unlock_requested receipt))
+           (match Dsl.Producer.unlock_receipt t.producer scope.handle with
+            | Error error ->
+              finish_pending_unlock t error;
+              Error error
+            | Ok receipt ->
+              u.receipt <- receipt;
+              u.delivered_to <- Some scope;
+              Ok (Dsl.Unlock_requested receipt))
        | _ ->
          (match
             List.find_opt
@@ -1928,12 +1966,35 @@ let task_operation
   | Dsl.Task_crypto operation -> perform_crypto t token operation
   | Dsl.Task_assets operation -> perform_assets t token operation
   | Dsl.Consume_unlock receipt ->
-    let* () = Dsl.Producer.check_unlock_receipt t.producer scope.handle receipt in
+    let checked = Dsl.Producer.check_unlock_receipt t.producer scope.handle receipt in
     (match t.unlock with
-     | Some u when u.receipt == receipt && u.expires > t.now () ->
-       t.unlock <- None;
-       perform_crypto t token (Dsl.Unlock u.input)
-     | _ -> Error Dsl.Stale_context)
+     | Some u when u.receipt == receipt ->
+       let admission =
+         let* () = checked in
+         if u.expires <= t.now () then Error Dsl.Stale_context else Ok ()
+       in
+       (match admission with
+        | Error error ->
+          finish_pending_unlock t error;
+          Error error
+        | Ok () ->
+          t.unlock <- None;
+          (match
+             Result.bind (perform_crypto t token (Dsl.Unlock u.input)) (function
+               | Dsl.Key_available as keys -> Ok keys
+               | Dsl.Key_locked | Dsl.Unencrypted -> Error Dsl.Locked)
+           with
+           | result ->
+             Eio.Promise.resolve u.complete result;
+             result
+           | exception exn ->
+             let backtrace = Printexc.get_raw_backtrace () in
+             let error = match exn with Forced error -> error | _ -> Dsl.Cancelled in
+             Eio.Promise.resolve u.complete (Error error);
+             Printexc.raise_with_backtrace exn backtrace))
+     | _ ->
+       let* () = checked in
+       Error Dsl.Stale_context)
   | Dsl.Publish_demand (receipt, availability) ->
     publish_demand t scope receipt availability
   | Dsl.Finish_demand receipt ->
@@ -2309,7 +2370,6 @@ let run_task (t : t) token task =
   t.active <- Some root;
   t.stop <- false;
   t.network_input <- None;
-  t.unlock <- None;
   mark_dirty t;
   let result =
     try task_interpret t token root task Task_done 0 with
@@ -2320,14 +2380,14 @@ let run_task (t : t) token task =
           (List.filter (fun s -> s != root) t.scopes);
         ignore (cleanup_scope t root : (unit, Dsl.error) result);
         t.active <- None;
-        t.unlock <- None;
+        finish_pending_unlock t Dsl.Cancelled;
         t.outbox_check <- None;
         pulse t);
       raise exn
   in
   let joined = cleanup_scope t root in
   t.active <- None;
-  t.unlock <- None;
+  finish_pending_unlock t Dsl.Cancelled;
   t.outbox_check <- None;
   t.demands <- [];
   pulse t;
