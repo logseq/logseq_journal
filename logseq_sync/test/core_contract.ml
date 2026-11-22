@@ -2815,7 +2815,7 @@ let recovery_delete_transaction =
   "[[\"~:db/retractEntity\",[\"~:block/uuid\",\"~u11111111-1111-4111-8111-111111111111\"]]]"
 ;;
 
-let submitted_delete_recovery_fixture () =
+let pending_delete_submission_fixture () =
   let mutation_id = List.hd mutation_ids in
   let cursor =
     Overlay.Server_cursor.of_int64 0L
@@ -2900,12 +2900,13 @@ let submitted_delete_recovery_fixture () =
     ; submission_batch = Some batch
     }
   in
-  let submitted =
-    Core.step
-      planned.next
-      (Core.Outbox_transition_applied
-         { request; commit; sync = submitted_sync })
-  in
+  let receipt = Core.Outbox_transition_applied { request; commit; sync = submitted_sync } in
+  planned.next, connection, submitted_sync, batch, receipt
+;;
+
+let submitted_delete_recovery_fixture () =
+  let planned, connection, submitted_sync, batch, receipt = pending_delete_submission_fixture () in
+  let submitted = Core.step planned receipt in
   Alcotest.(check bool)
     "fixture sends the persisted delete batch"
     true
@@ -3261,6 +3262,35 @@ let restart_after_retirement core connection =
     |> Option.get
   in
   Core.step retired.next (Core.Timer_elapsed timer.id)
+;;
+
+let offline_submit_receipt_allows_recovery () =
+  let pending, connection, sync, batch, receipt = pending_delete_submission_fixture () in
+  let closed =
+    Core.step pending
+      (Core.Websocket_closed
+         (connection, Core.Recoverable_close { message = None; attention = Requires_attention }))
+  in
+  let applied = Core.step closed.next receipt in
+  check_instructions "offline receipt does not send or schedule" [] applied.effects;
+  let restarting = restart_after_retirement applied.next connection in
+  let reconnected = recovery_connection restarting.effects in
+  let opened = Core.step restarting.next (Core.Websocket_opened reconnected) in
+  let inspecting = Core.step opened.next Core.Local_outbox_changed in
+  check_instructions "reconnected core requests a fresh inspection"
+    [ Core.Delegate (Core.Inspect_sync reconnected.graph) ] inspecting.effects;
+  let recovered =
+    Core.step inspecting.next (Core.Sync_inspected { scope = reconnected.graph; sync })
+  in
+  let retry = recovery_request recovered.effects in
+  Alcotest.(check bool) "persisted submission delegates its retry on reconnect" true
+    (retry.transition = Overlay.Retry_group (Overlay.submission_batch_id batch)
+     && retry.scope = reconnected.graph
+     && retry.expected = Overlay.sync_view_token sync);
+  let replayed = Core.step recovered.next receipt in
+  check_instructions "old submit receipt replay is inert" [] replayed.effects;
+  Alcotest.(check bool) "old submit receipt replay preserves public state" true
+    (Core.state replayed.next = Core.state recovered.next)
 ;;
 
 let submitted_delete_survives_disconnect_reconnect () =
@@ -3934,9 +3964,10 @@ let manual_sync_busy_force_is_coalesced () =
 let manual_sync_waits_for_authoritative_commit () =
   let opened, connection, sync = pull_fixture () in
   let received = pull_response opened.next connection ~after:0 1 in
+  let request = authoritative_request received.effects in
   let requested = manual_sync received.next in
   check_pull_count "applying authoritative data keeps its owner" 0 requested.effects;
-  let committed = recovery_apply requested.next (authoritative_request requested.effects)
+  let committed = recovery_apply requested.next request
     (recovery_sync sync ~checkpoint:1 1 []) in
   Alcotest.(check bool) "probe starts from committed cursor" true
     (pull_sends committed.effects = [connection, Some (server_cursor_of_int 1)]);
@@ -4073,6 +4104,10 @@ let sync_recovery_reproductions =
       "live submitted delete resumes after acknowledgement"
       `Quick
       live_submitted_delete_resumes_after_acknowledgement
+  ; Alcotest.test_case
+      "offline submit receipt allows recovery"
+      `Quick
+      offline_submit_receipt_allows_recovery
   ; Alcotest.test_case
       "M02 submitted delete survives disconnect and reconnect"
       `Quick
