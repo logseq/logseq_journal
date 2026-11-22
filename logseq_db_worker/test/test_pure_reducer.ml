@@ -1035,7 +1035,7 @@ let snapshot_activation () =
   let download = List.find_map (function
     | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_snapshot_metadata _)) ->
       Some (Core.step missing.next (Sync_event (Sync.Runner_completed
-        (Sync.Completion (ticket, Ok {|{"ok":true,"t":42,"url":"https://example.invalid/snapshot"}|})))))
+        (Sync.Completion (ticket, (Sync.decode_snapshot_metadata {|{"ok":true,"t":42,"url":"https://example.invalid/snapshot"}|} |> Result.map_error (fun message -> Sync.Effect_failed message)))))))
     | _ -> None) missing.effects |> Option.get in
   let activation = List.find_map (function
     | Core.Run_sync (Sync.Request (ticket, Sync.Download_snapshot download_request)) ->

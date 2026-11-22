@@ -11,6 +11,11 @@ let cursor_testable =
 
 module Core = Logseq_sync_pure_reducer.Core
 
+let snapshot_metadata_result source =
+  Core.decode_snapshot_metadata source
+  |> Result.map_error (fun message -> Core.Effect_failed message)
+;;
+
 type observed =
   { state : Core.state
   ; admitted_graph_scope : Core.graph_scope option
@@ -137,8 +142,7 @@ let snapshot_metadata_ready (transition : Core.transition) =
              (Core.Runner_completed
                 (Core.Completion
                    ( ticket
-                   , Ok
-                       {|{"ok":true,"t":42,"key":"stream/graph.snapshot","url":"https://example.com/sync/graph/snapshot/stream","content-encoding":"gzip"}|}
+                   , (snapshot_metadata_result {|{"ok":true,"t":42,"key":"stream/graph.snapshot","url":"https://example.com/sync/graph/snapshot/stream","content-encoding":"gzip"}|})
                    ))))
       | _ -> None)
     transition.effects
@@ -172,7 +176,7 @@ let encrypted_snapshot_metadata_precedes_key_access () =
                (Core.Runner_completed
                   (Core.Completion
                      ( ticket
-                     , Ok {|{"ok":true,"t":-1,"url":"https://example.com/snapshot"}|} ))))
+                     , (snapshot_metadata_result {|{"ok":true,"t":-1,"url":"https://example.com/snapshot"}|}) ))))
         | _ -> None)
       absent.effects
     |> Option.get
@@ -1154,7 +1158,7 @@ let snapshot_activation_fixture () =
   let downloading = List.find_map (function
     | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
       Some (Core.step requested.next (Core.Runner_completed (Core.Completion
-        (ticket, Ok {|{"ok":true,"t":42,"url":"https://example.com/synthetic"}|}))))
+        (ticket, (snapshot_metadata_result {|{"ok":true,"t":42,"url":"https://example.com/synthetic"}|})))))
     | _ -> None) requested.effects |> Option.get in
   let activating = List.find_map (function
     | Core.Run (Core.Request (ticket, Core.Download_snapshot request)) ->
@@ -1186,7 +1190,7 @@ let snapshot_catchup_fixture () =
                (Core.Runner_completed
                   (Core.Completion
                      ( ticket
-                     , Ok {|{"ok":true,"t":42,"url":"https://example.com/snapshot.sqlite"}|} ))))
+                     , (snapshot_metadata_result {|{"ok":true,"t":42,"url":"https://example.com/snapshot.sqlite"}|}) ))))
         | Run _ | Delegate _ | Publish _ -> None)
       requested.effects
     |> Option.get
@@ -1339,7 +1343,7 @@ let invalid_snapshot_metadata_fails_bootstrap () =
             (Core.step
                requested.next
                (Core.Runner_completed
-                  (Core.Completion (ticket, Ok {|{"ok":true,"t":-1,"url":"https://example.com/snapshot"}|}))))
+                  (Core.Completion (ticket, (snapshot_metadata_result {|{"ok":true,"t":-1,"url":"https://example.com/snapshot"}|})))))
         | Run _ | Delegate _ | Publish _ -> None)
       requested.effects
     |> Option.get
@@ -2500,7 +2504,7 @@ let local_cache_deletion_rejects_unopened_graphs () =
                (Core.Runner_completed
                   (Core.Completion
                      ( ticket
-                     , Ok {|{"ok":true,"t":42,"url":"https://example.com/snapshot.sqlite"}|} ))))
+                     , (snapshot_metadata_result {|{"ok":true,"t":42,"url":"https://example.com/snapshot.sqlite"}|}) ))))
         | _ -> None)
       absent.effects
     |> Option.get
@@ -5460,7 +5464,7 @@ let snapshot_metadata_open_fields_keep_declared_constraints () =
                Some
                  (Core.step
                     requested.next
-                    (Core.Runner_completed (Core.Completion (ticket, Ok body))))
+                    (Core.Runner_completed (Core.Completion (ticket, snapshot_metadata_result body))))
              | _ -> None)
            requested.effects
          |> Option.get
@@ -5772,7 +5776,7 @@ let cancellation_fences_deferred_catalog_and_snapshot () =
   List.iter (function
     | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
       let late = Core.step cancelled.next (Core.Runner_completed
-        (Core.Completion (ticket, Ok {|{"ok":true,"t":42,"url":"https://example.com/snapshot"}|}))) in
+        (Core.Completion (ticket, (snapshot_metadata_result {|{"ok":true,"t":42,"url":"https://example.com/snapshot"}|})))) in
       check_instructions "cancelled snapshot metadata completion" [] late.effects
     | _ -> ()) requested.effects;
   let facts = (Core.state cancelled.next).snapshot.startup in
@@ -6029,8 +6033,7 @@ let snapshot_failure_and_retry_keep_cursor_uncommitted () =
                     (Core.Runner_completed
                        (Core.Completion
                           ( ticket
-                          , Ok
-                              {|{"ok":true,"t":42,"key":"stream/graph.snapshot","url":"https://example.com/snapshot","content-encoding":"gzip"}|}
+                          , (snapshot_metadata_result {|{"ok":true,"t":42,"key":"stream/graph.snapshot","url":"https://example.com/snapshot","content-encoding":"gzip"}|})
                           ))))
              | _ -> None)
            requested.effects
@@ -6132,7 +6135,7 @@ let replaced_snapshot_completions_are_inert () =
     let old_owner, successes, failure =
       if download_pending then (
         let downloading = Core.step requested.next
-          (metadata (Ok {|{"ok":true,"t":42,"url":"https://example.com/old"}|})) in
+          (metadata ((snapshot_metadata_result {|{"ok":true,"t":42,"url":"https://example.com/old"}|}))) in
         List.find_map (function
           | Core.Run (Core.Request (ticket, Core.Download_snapshot download_request)) ->
             let artifact = Core.stage_snapshot_download download_request ~path:"/tmp/synthetic-old" ~expected_rows:1 |> Result.get_ok in
@@ -6142,8 +6145,8 @@ let replaced_snapshot_completions_are_inert () =
                 (ticket, Error (Core.Effect_failed "obsolete stream"))))
           | _ -> None) downloading.effects |> Option.get)
       else requested.next,
-        [metadata (Ok {|{"ok":true,"t":42,"url":"https://example.com/old"}|});
-         metadata (Ok {|{"ok":true,"url":"https://example.com/invalid"}|})],
+        [metadata ((snapshot_metadata_result {|{"ok":true,"t":42,"url":"https://example.com/old"}|}));
+         metadata ((snapshot_metadata_result {|{"ok":true,"url":"https://example.com/invalid"}|}))],
         metadata (Error (Core.Effect_failed "obsolete metadata")) in
     let selected = Core.step old_owner (Core.Graph_selected other.graph_id) in
     let inspection = inspect_mirror_request selected.effects in
@@ -6157,7 +6160,7 @@ let replaced_snapshot_completions_are_inert () =
       let fresh = List.find_map (function
         | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
           Some (Core.step late.next (Core.Runner_completed (Core.Completion
-            (ticket, Ok {|{"ok":true,"t":84,"url":"https://example.com/current"}|}))))
+            (ticket, (snapshot_metadata_result {|{"ok":true,"t":84,"url":"https://example.com/current"}|})))))
         | _ -> None) current.effects |> Option.get in
       List.find_map (function
         | Core.Run (Core.Request (ticket, Core.Download_snapshot request)) ->
@@ -6185,7 +6188,7 @@ let snapshot_artifact_from_retried_attempt_is_rejected () =
     List.find_map (function
       | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
         Some (Core.step origin.next (Core.Runner_completed (Core.Completion
-          (ticket, Ok (Printf.sprintf "{\"ok\":true,\"t\":%d,\"url\":\"https://example.com/snapshot\"}" cursor)))))
+          (ticket, (Core.decode_snapshot_metadata (Printf.sprintf "{\"ok\":true,\"t\":%d,\"url\":\"https://example.com/snapshot\"}" cursor) |> Result.map_error (fun message -> Core.Effect_failed message))))))
       | _ -> None) origin.effects |> Option.get in
   let old = metadata requested 42 in
   let failed, old_artifact, old_scope = List.find_map (function
@@ -6859,7 +6862,7 @@ let snapshot_metadata_keeps_safe_field_cause () =
     let requested, _ = begin_snapshot_bootstrap () in
     let failed = List.find_map (function
       | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
-        Some (Core.step requested.next (Core.Runner_completed (Core.Completion (ticket, Ok source))))
+        Some (Core.step requested.next (Core.Runner_completed (Core.Completion (ticket, snapshot_metadata_result source))))
       | _ -> None) requested.effects |> Option.get in
     Alcotest.(check (option string)) "metadata parser publishes field cause without URL"
       (Some expected) (Core.state failed.next).snapshot.last_error)
@@ -7295,7 +7298,7 @@ let cancelled_snapshot_remote_phase phase () =
             restarted.next
             (Core.Runner_completed
                (Core.Completion
-                  (ticket, Ok {|{"ok":true,"t":999,"url":"https://example.com/old"}|})))
+                  (ticket, (snapshot_metadata_result {|{"ok":true,"t":999,"url":"https://example.com/old"}|}))))
         in
         check_instructions "old metadata cannot replace resumed metadata" [] late.effects
       | Core.Run (Core.Request (ticket, Core.Download_snapshot download)) ->

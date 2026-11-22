@@ -275,7 +275,7 @@ let operation ?artifact_uri ?limits ~download origin =
             Some
               (Core.step
                  transition.next
-                 (Core.Runner_completed (Core.Completion (ticket, Ok response))))
+                 (Core.Runner_completed (Core.Completion (ticket, Core.decode_snapshot_metadata response |> Result.map_error (fun message -> Core.Effect_failed message)))))
           | _ -> None)
         transition.effects
       |> Option.get
@@ -570,6 +570,17 @@ let response ?(status = 200) ?(headers = "Content-Length: 1\r\n") body =
     body
 ;;
 
+let metadata_body = {|{"ok":true,"t":42,"url":"https://example.invalid/artifact"}|}
+
+let metadata_response ?(connection = "") () =
+  response ~headers:(Printf.sprintf "Content-Length: %d\r\n%s" (String.length metadata_body) connection) metadata_body
+;;
+
+let metadata_chunked () =
+  response ~headers:"Transfer-Encoding: chunked\r\n"
+    (Printf.sprintf "%x\r\n%s\r\n0\r\n\r\n" (String.length metadata_body) metadata_body)
+;;
+
 let check_retired report =
   let rows = Yojson.Basic.Util.to_list report in
   List.iter
@@ -818,7 +829,13 @@ let scenarios =
             Alcotest.test_case
               ((if download then "download " else "HTTP ") ^ name)
               `Quick
-              (http_test ~download ~success ~eof wire))
+              (let wire =
+                 if download || not success then wire
+                 else if eof then response ~headers:"" metadata_body
+                 else if name = "plain chunked" then metadata_chunked ()
+                 else metadata_response ()
+               in
+               http_test ~download ~success ~eof wire))
          http_cases)
     [ false; true ]
   @ List.map
@@ -868,7 +885,7 @@ let scenarios =
            ~download:false
            ~success:true
            ~segment:1
-           (response ~headers:"Transfer-Encoding: chunked\r\n" "1\r\nx\r\n0\r\n\r\n"))
+           (metadata_chunked ()))
     ; Alcotest.test_case
         "WebSocket segmented Upgrade and frame"
         `Quick
@@ -947,7 +964,7 @@ let test_cancelled_attempt ~download () =
 let test_http_retry ~download () =
   let report =
     with_peer
-      [ case (response ~status:401 "x"); case (response "x") ]
+      [ case (response ~status:401 "x"); case (if download then response "x" else metadata_response ()) ]
       (fun ~environment ~sw ~support ~origin ->
          let posted = ref []
          and invalidations = ref 0 in
@@ -983,7 +1000,7 @@ let test_redirect ~download ~cross_origin () =
       "x"
   in
   let cases =
-    if cross_origin then [ case redirect ] else [ case redirect; case (response "x") ]
+    if cross_origin then [ case redirect ] else [ case redirect; case (if download then response "x" else metadata_response ()) ]
   in
   let report =
     with_peer cases (fun ~environment ~sw ~support ~origin ->
@@ -1460,7 +1477,7 @@ let test_setup_cancel ~websocket ~dns () =
 ;;
 
 let test_alternate_address ~websocket () =
-  let config = if websocket then case ~ws:true "" else case (response "x") in
+  let config = if websocket then case ~ws:true "" else case (metadata_response ()) in
   let report =
     with_peer
       [ `Assoc [ "stall_tls", `Bool true ]; config ]
@@ -1617,7 +1634,7 @@ let delayed_network ?(destination = Fun.id) network before_connect =
 let test_stalled_tcp ?(network_only = false) ~cancel () =
   let report =
     with_peer
-      (if cancel then [] else [ case (response "x") ])
+      (if cancel then [] else [ case (metadata_response ()) ])
       (fun ~environment ~sw ~support ~origin ->
          let clock = Eio.Stdenv.clock environment in
          let transport_clock = scaled_clock clock 10. in
@@ -2661,7 +2678,7 @@ let submitted_authentication_policy
   Queue.add "token-2" tokens;
   let report =
     with_peer
-      (List.map (fun status -> case (response ~status "x")) statuses)
+      (List.map (fun status -> case (if status = 200 then metadata_response () else response ~status "x")) statuses)
       (fun ~environment ~sw ~support ~origin ->
          let posted = ref [] in
          let acquire _ =
@@ -3329,7 +3346,7 @@ let delayed_case ?(tls_delay = 0.) ?(response_delay = 0.) wire =
 let test_tls_slow_legal_handshake () =
   let report =
     with_peer
-      [ delayed_case ~tls_delay:1.1 (response "x") ]
+      [ delayed_case ~tls_delay:1.1 (metadata_response ()) ]
       (fun ~environment ~sw ~support ~origin ->
          let posted = ref []
          and invalidations = ref 0 in
@@ -3349,7 +3366,7 @@ let test_tls_slow_legal_handshake () =
 let test_phased_response_deadline () =
   let report =
     with_peer
-      [ delayed_case ~tls_delay:0.3 ~response_delay:0.9 (response "x") ]
+      [ delayed_case ~tls_delay:0.3 ~response_delay:0.9 (metadata_response ()) ]
       (fun ~environment ~sw ~support ~origin ->
          let clock = scaled_clock (Eio.Stdenv.clock environment) 20. in
          let network =
@@ -4015,7 +4032,7 @@ let scenarios =
 let test_failed_dial_retires_allocated_socket_before_fallback () =
   let report =
     with_peer
-      [ `Assoc [ "stall_tls", `Bool true ]; case (response "x") ]
+      [ `Assoc [ "stall_tls", `Bool true ]; case (metadata_response ()) ]
       (fun ~environment ~sw ~support ~origin ->
          let peaks =
            { sockets = 0
@@ -4064,7 +4081,7 @@ let scenarios =
 let test_absent_dns_family_preserves_dial_budget () =
   let report =
     with_peer
-      [ case (response "x") ]
+      [ case (metadata_response ()) ]
       (fun ~environment ~sw ~support ~origin ->
          let real_clock = Eio.Stdenv.clock environment in
          let addresses =
@@ -4412,6 +4429,7 @@ let test_external_http_contract ?expected_error kind ~success body () =
                   | _ -> None)
                 auth.effects
               |> Option.get
+            | `Snapshot_metadata -> operation ~download:false origin
             | `Graph_key -> snd (unlock_classification_effect origin)
             | `User_keys ->
               let keys, _ = unlock_classification_effect origin in
@@ -4465,6 +4483,12 @@ let test_external_http_contract ?expected_error kind ~success body () =
 let scenarios =
   scenarios
   @ [ Alcotest.test_case
+        "HTTP snapshot metadata rejects an invalid download URL"
+        `Quick
+        (test_external_http_contract `Snapshot_metadata ~success:false
+           ~expected_error:"snapshot download URL is invalid"
+           {|{"ok":true,"url":"http://example.com/artifact","t":42}|})
+    ; Alcotest.test_case
         "HTTP graph key ignores external extensions"
         `Quick
         (test_external_http_contract
@@ -4536,7 +4560,7 @@ let test_default_connection_sequence () =
     response ~headers:"Content-Length: 3\r\nConnection: keep-alive\r\n" "abc"
   in
   let report =
-    with_peer [ case wire; case wire ] (fun ~environment ~sw ~support ~origin ->
+    with_peer [ case (metadata_response ~connection:"Connection: keep-alive\r\n" ()); case wire ] (fun ~environment ~sw ~support ~origin ->
       let posted = ref [] and invalidations = ref 0 in
       let t = runner ~environment ~sw ~support ~posted ~invalidations () in
       Fun.protect ~finally:(fun () -> Runner.shutdown t) (fun () ->

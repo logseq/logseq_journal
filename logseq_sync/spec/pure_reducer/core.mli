@@ -305,8 +305,10 @@ type decryption_batch =
   }
 
 type decrypted_values = string list
-type snapshot_baseline = string
-type snapshot_metadata = string
+type snapshot_baseline = Logseq_db_types.Server_cursor.t
+type snapshot_metadata
+
+val decode_snapshot_metadata : string -> (snapshot_metadata, string) result
 
 type graph_key_request =
   { scope : graph_scope

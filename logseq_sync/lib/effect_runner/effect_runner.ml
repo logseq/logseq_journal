@@ -719,21 +719,25 @@ let execute_request
            observe_unlock_failure Decode;
            Core.Effect_failed message))
   | Fetch_snapshot_baseline graph ->
-    Result.map
-      (fun response -> response.Http_eio.body)
+    Result.bind
       (perform_authenticated_http t graph.account (fun token ->
          Http.snapshot_baseline
            ~base_url:graph.account.managed_sync_origin
            ~graph_id:graph.graph_id
            ~token))
+      (fun response ->
+         Sync_protocol.decode_snapshot_baseline response.Http_eio.body
+         |> Result.map_error (fun error -> Core.Effect_failed (Sync_protocol.error_to_string error)))
   | Fetch_snapshot_metadata graph ->
-    Result.map
-      (fun response -> response.Http_eio.body)
+    Result.bind
       (perform_authenticated_http t graph.account (fun token ->
          Http.snapshot_metadata
            ~base_url:graph.account.managed_sync_origin
            ~graph_id:graph.graph_id
            ~token))
+      (fun response ->
+         Core.decode_snapshot_metadata response.Http_eio.body
+         |> Result.map_error (fun message -> Core.Effect_failed message))
   | Fetch_e2ee_graph_key graph ->
     Result.bind
       (perform_authenticated_http t graph.account (fun token ->

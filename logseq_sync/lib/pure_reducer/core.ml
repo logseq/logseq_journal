@@ -397,8 +397,8 @@ type decryption_batch =
   }
 
 type decrypted_values = string list
-type snapshot_baseline = string
-type snapshot_metadata = string
+type snapshot_baseline = Server_cursor.t
+type snapshot_metadata = { uri : Uri.t; cursor : Server_cursor.t }
 
 type graph_key_request =
   { scope : graph_scope
@@ -1399,11 +1399,6 @@ let authoritative_input_error_message = function
 
 let checksum value = Overlay.Checksum.of_string ("checksum:v1:" ^ value)
 
-let decode_snapshot_baseline source =
-  Sync_protocol.decode_snapshot_baseline source
-  |> Result.map_error Sync_protocol.error_to_string
-;;
-
 type snapshot_uri_response =
   { ok : bool
   ; url : string
@@ -1411,7 +1406,7 @@ type snapshot_uri_response =
   }
 [@@deriving of_yojson { strict = false }]
 
-let decode_snapshot_uri source =
+let decode_snapshot_metadata source =
   try
     match
       Logseq_db_types.Json_codec.decode
@@ -1425,7 +1420,7 @@ let decode_snapshot_uri source =
        | Ok server_t ->
          (match Uri.scheme uri, Uri.host uri, Uri.userinfo uri, Uri.fragment uri with
           | Some "https", Some host, None, None when String.length host > 0 ->
-            Ok (uri, server_t)
+            Ok { uri; cursor = server_t }
           | _ -> Error "snapshot download URL is invalid"))
     | Ok _ -> Error "snapshot metadata: server reported ok=false"
     | Error message ->
@@ -2888,14 +2883,13 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
   | Save_catalog_kind -> deletion_selection_saved core
   | Fetch_catalog_kind -> apply_fetched_catalog core value
   | Fetch_snapshot_baseline_kind ->
-    (match decode_snapshot_baseline value, bootstrap_scope core.bootstrap with
-     | Ok _, Some scope when graph_scope_is_current core scope ->
-       begin_snapshot_bootstrap core scope
-     | Error message, _ -> fail core During_bootstrap message
+    (match bootstrap_scope core.bootstrap with
+     | Some scope when graph_scope_is_current core scope -> begin_snapshot_bootstrap core scope
      | _ -> unchanged core)
   | Fetch_snapshot_metadata_kind ->
-    (match decode_snapshot_uri value, core.bootstrap with
-     | Ok (uri, metadata_cursor), Awaiting_snapshot_metadata (scope, attempt_id) ->
+    (match core.bootstrap with
+     | Awaiting_snapshot_metadata (scope, attempt_id) ->
+       let { uri; cursor = metadata_cursor } = value in
        let core = note_remote_cursor core scope (Some metadata_cursor) in
        let request =
          { scope; uri; metadata_cursor; attempt_id; download_id = core.next_effect_id
@@ -2912,7 +2906,6 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
              let next, key_request = issue_request core (Load_and_unlock_graph_key scope) in
              { next; effects = [ Run key_request ] })
         | Some _ | None -> begin_snapshot_download core request)
-     | Error message, _ -> fail core During_bootstrap message
      | _ -> unchanged core)
   | Download_snapshot_kind ->
     (match core.bootstrap, core.selected_graph_value with
