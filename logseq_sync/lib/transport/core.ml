@@ -36,14 +36,14 @@ let native_error = function
     Dsl.Authentication_failure "WebSocket authorization failed"
   | Native.Authentication_failed _ ->
     Dsl.Authentication_failure "WebSocket TLS authentication failed"
-  | Native.Protocol_failed _ -> Dsl.Protocol_failure "WebSocket protocol failed"
+  | Native.Protocol_failed message -> Dsl.Protocol_failure message
   | Native.Connection_failed { message; _ } -> Dsl.Network_failure message
 ;;
 
 let native_end = function
   | Domain.Local_close -> Dsl.Locally_closed
   | Authentication_failure _ -> Dsl.Access_revoked "WebSocket authentication failed"
-  | Protocol_failure _ -> Dsl.Invalid_protocol "WebSocket protocol failed"
+  | Protocol_failure message -> Dsl.Invalid_protocol message
   | Recoverable_close { message = None; _ } -> Dsl.Remote_closed
   | Recoverable_close { message = Some message; _ } -> Dsl.Network_lost message
 ;;
@@ -85,7 +85,7 @@ let native_backend
             ~setup_seconds:deadlines.Execute.Core.setup_seconds
             ~tls_handshake_seconds:deadlines.tls_handshake_seconds
             ~http_response_seconds:deadlines.http_response_seconds
-            ~maximum_frame_bytes:(min limits.Dsl.maximum_message_bytes (8 * 1024 * 1024))
+            ~maximum_frame_bytes:limits.Dsl.maximum_websocket_downlink_bytes
             ~on_message
             ~on_close:(fun reason -> on_close (native_end reason))
           |> Result.map_error (function
@@ -234,7 +234,7 @@ let notify t entry message =
 let on_message t entry wire =
   if (not entry.retiring) && entry.terminal = None
   then
-    if String.length wire > t.limits.maximum_message_bytes
+    if String.length wire > t.limits.maximum_websocket_downlink_bytes
     then
       terminal entry (Dsl.Protocol_failure "WebSocket message exceeds configured bound")
     else (

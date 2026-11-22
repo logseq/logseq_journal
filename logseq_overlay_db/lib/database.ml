@@ -8372,6 +8372,12 @@ let validate_protected_values ~request ~encrypted =
 
 let unprotection_ciphertexts request = request.unprotection_items
 
+let authoritative_unprotection_budget request =
+  match request.unprotection_owner with
+  | Authoritative_unprotection _ -> Some request.unprotection_limit_bytes
+  | Snapshot_unprotection _ -> None
+;;
+
 let validate_decrypted_values ~request ~plaintexts =
   if request.unprotection_consumed
   then Error Types.Crypto_result_stale

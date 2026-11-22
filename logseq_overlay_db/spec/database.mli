@@ -757,6 +757,9 @@ val apply_outbox_transition
 
 (** {2 Receiving authoritative history} *)
 
+(** Total ciphertext and plaintext bytes, each bounded separately for authoritative requests. *)
+val authoritative_unprotection_budget : unprotection_request -> int option
+
 type authoritative_preparation
 
 type authoritative_application =

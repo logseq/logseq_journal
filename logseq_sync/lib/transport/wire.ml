@@ -66,13 +66,13 @@ let pull ~limits ~since = function
              | Some cursor -> Cursor.compare entry.t cursor <= 0
              | None -> false)
             || Cursor.compare entry.t t > 0
-            || length > limits.maximum_message_bytes
-            || bytes > limits.maximum_bytes - length
+            || length > limits.maximum_websocket_downlink_bytes
+            || bytes > limits.maximum_websocket_downlink_bytes - length
           then invalid "Invalid authoritative transaction sequence"
           else
             let* encoded =
               O.encoded_transaction_of_string
-                ~maximum_bytes:limits.maximum_message_bytes
+                ~maximum_bytes:limits.maximum_websocket_downlink_bytes
                 entry.tx
               |> Result.map_error (fun _ ->
                 Dsl.Protocol_failure "Invalid authoritative transaction")
@@ -94,7 +94,7 @@ let pull ~limits ~since = function
         let* batch =
           O.authoritative_batch
             ~maximum_count:limits.maximum_items
-            ~maximum_bytes:limits.maximum_bytes
+            ~maximum_bytes:limits.maximum_websocket_downlink_bytes
             ~transactions
             ~through:t
             ~checksum

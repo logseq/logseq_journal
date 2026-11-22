@@ -369,7 +369,7 @@ let pull_validation () =
             { t = cursor 3L
             ; checksum = None
             ; txs =
-                [ { t = cursor 2L; tx = "wire-2"; outliner_op = None }
+                [ { t = cursor 2L; tx = String.make (256 * 1024 + 1) 'x'; outliner_op = None }
                 ; { t = cursor 3L; tx = "wire-3"; outliner_op = None }
                 ]
             };

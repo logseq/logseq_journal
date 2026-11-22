@@ -58,6 +58,7 @@ type limits =
   ; maximum_tasks : int
   ; maximum_messages : int
   ; maximum_message_bytes : int
+  ; maximum_websocket_downlink_bytes : int
   ; maximum_demands : int
   ; maximum_active_assets : int
   ; foreground_reserve : int
@@ -593,6 +594,8 @@ let limits
       ; maximum_tasks
       ; maximum_messages
       ; maximum_message_bytes
+      ; maximum_websocket_downlink_bytes =
+          Logseq_db_types.Limits.maximum_sync_websocket_downlink_bytes
       ; maximum_demands
       ; maximum_active_assets
       ; foreground_reserve

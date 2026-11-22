@@ -79,6 +79,7 @@ type limits = private
   ; maximum_tasks : int
   ; maximum_messages : int
   ; maximum_message_bytes : int
+  ; maximum_websocket_downlink_bytes : int
   ; maximum_demands : int
   ; maximum_active_assets : int
   ; foreground_reserve : int

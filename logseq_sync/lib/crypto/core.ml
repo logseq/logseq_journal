@@ -94,21 +94,23 @@ let run (type a) t ~check_current ~identity (operation : a Dsl.crypto)
       | Dsl.Encrypt_values _ | Dsl.Decrypt_value _ | Dsl.Protect _ | Dsl.Unprotect _ ->
         if t.encrypted && Option.is_none t.key then Error Dsl.Locked else Ok ()
     in
-    let bounded_lengths values =
+    let bounded_lengths ?(maximum_bytes = t.limits.maximum_bytes) values =
       if List.length values > t.limits.maximum_items
       then Error (Dsl.Capacity_exceeded "Crypto items")
       else
         List.fold_left
           (fun total value ->
              let* total = total in
-             if value > t.limits.maximum_bytes - total
+             if value > maximum_bytes - total
              then Error (Dsl.Capacity_exceeded "Crypto bytes")
              else Ok (total + value))
           (Ok 0)
           values
         |> Result.map (fun _ -> ())
     in
-    let bounded values = bounded_lengths (List.map String.length values) in
+    let bounded ?maximum_bytes values =
+      bounded_lengths ?maximum_bytes (List.map String.length values)
+    in
     let native callback =
       let* () = current () in
       let result = callback () in
@@ -120,8 +122,8 @@ let run (type a) t ~check_current ~identity (operation : a Dsl.crypto)
       | Some key -> Ok (Bytes.to_string key)
       | None -> Error Dsl.Locked
     in
-    let decrypt source =
-      let* () = bounded [ source ] in
+    let decrypt ?maximum_bytes source =
+      let* () = bounded ?maximum_bytes [ source ] in
       let* value =
         if t.encrypted
         then
@@ -140,7 +142,7 @@ let run (type a) t ~check_current ~identity (operation : a Dsl.crypto)
       in
       match value with
       | Transit_core.Json.String plaintext ->
-        let* () = bounded [ plaintext ] in
+        let* () = bounded ?maximum_bytes [ plaintext ] in
         Ok plaintext
       | _ -> Error (Dsl.Crypto_failure "Protected value must be a string")
     in
@@ -233,18 +235,20 @@ let run (type a) t ~check_current ~identity (operation : a Dsl.crypto)
           let* () = bounded (List.map snd encrypted) in
           Ok encrypted
       | Dsl.Unprotect request ->
-        let items = Logseq_overlay_db.Database.unprotection_ciphertexts request in
-        let* () = bounded (List.map snd items) in
-        let* plaintexts =
-          traverse
-            (fun (id, source) ->
-               let* plaintext = decrypt source in
-               Ok (id, plaintext))
-            []
-            items
+        let module Database = Logseq_overlay_db.Database in
+        let items = Database.unprotection_ciphertexts request in
+        let maximum_bytes = Database.authoritative_unprotection_budget request in
+        let* () = bounded ?maximum_bytes (List.map snd items) in
+        let rec unprotect remaining reversed = function
+          | [] -> Ok (List.rev reversed)
+          | (id, source) :: rest ->
+            let* plaintext = decrypt ?maximum_bytes source in
+            let bytes = String.length plaintext in
+            if bytes > remaining
+            then Error (Dsl.Capacity_exceeded "Crypto bytes")
+            else unprotect (remaining - bytes) ((id, plaintext) :: reversed) rest
         in
-        let* () = bounded (List.map snd plaintexts) in
-        Ok plaintexts
+        unprotect (Option.value maximum_bytes ~default:t.limits.maximum_bytes) [] items
     in
     perform operation)
 ;;

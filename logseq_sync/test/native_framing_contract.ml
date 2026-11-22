@@ -147,6 +147,7 @@ let ws_test
       ?(maximum_frame_bytes = 1024)
       ?expected_messages
       ?expected_pong
+      ?expected_failure
       ~messages
       ~terminal
       wire
@@ -202,6 +203,11 @@ let ws_test
                 expected_messages;
               if not terminal then Ws.close socket);
            Ws.await_retired socket;
+           Option.iter (fun expected ->
+             match !closed with
+             | [Native.Transport_domain.Protocol_failure actual] ->
+               Alcotest.(check string) "terminal budget diagnostic" expected actual
+             | _ -> Alcotest.fail "expected a protocol failure") expected_failure;
            Alcotest.(check int) "one terminal notification" 1 (List.length !closed))
   in
   check_retired report;
@@ -293,6 +299,39 @@ let scenarios =
            `Quick
            (ws_test ~messages ~terminal wire))
       ws_cases
+  @ (let maximum = 4 * 1024 * 1024 in
+     let prefix = {|{"type":"pull/ok","t":1,"txs":[{"t":1,"tx":"|} in
+     let suffix = {|"}]}|} in
+     let payload = prefix ^ String.make (maximum - String.length prefix - String.length suffix) 'x' ^ suffix in
+     let fragmented tail =
+       let split = maximum / 2 in
+       frame ~fin:false 1 (String.sub payload 0 split)
+       ^ frame 0 (String.sub payload split (maximum - split) ^ tail)
+     in
+     [ Alcotest.test_case
+         "WebSocket drains exact-limit frames and fragments"
+         `Quick
+         (ws_test ~maximum_frame_bytes:maximum ~messages:3 ~terminal:false
+            (frame 1 payload ^ fragmented "" ^ frame 1 payload))
+     ; Alcotest.test_case
+         "WebSocket rejects over-limit fragmented message"
+         `Quick
+         (ws_test ~maximum_frame_bytes:maximum
+            ~expected_failure:"WebSocket message payload is at least 4194305 bytes (limit: 4194304 bytes)"
+            ~messages:0 ~terminal:true (fragmented " "))
+     ; Alcotest.test_case
+         "WebSocket rejects over-limit single frame"
+         `Quick
+         (ws_test ~maximum_frame_bytes:maximum
+            ~expected_failure:"WebSocket frame payload is 4194305 bytes (limit: 4194304 bytes)"
+            ~messages:0 ~terminal:true (frame 1 (payload ^ " ")))
+     ; Alcotest.test_case
+         "WebSocket rejects unsigned length without waiting for payload"
+         `Quick
+         (ws_test ~maximum_frame_bytes:maximum ~segment:1
+            ~expected_failure:"WebSocket frame payload is 18446744073709551615 bytes (limit: 4194304 bytes)"
+            ~messages:0 ~terminal:true ("\x81\x7f" ^ String.make 8 '\xff'))
+     ])
   @ [ Alcotest.test_case
         "HTTP segmented supported chunked response"
         `Quick

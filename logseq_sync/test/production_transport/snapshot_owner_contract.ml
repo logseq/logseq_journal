@@ -1078,6 +1078,7 @@ let start_encrypted_native_fixture
       ~config
       ~sqlite
       ~on_change
+      ~on_crypto_error
   =
   let module X = Execute.Core in
   let module T = Logseq_sync_transport.Core in
@@ -1214,7 +1215,11 @@ let start_encrypted_native_fixture
               T.dispatch transport ~scope ~identity operation)
         ; crypto =
             (fun ~scope ~identity operation ->
-              Worker.crypto_dispatch worker ~scope ~identity operation)
+              let result = Worker.crypto_dispatch worker ~scope ~identity operation in
+              (match result with
+               | Error error -> on_crypto_error error
+               | Ok _ -> ());
+              result)
         ; assets = (fun ~scope:_ ~identity:_ _ -> Alcotest.fail "unexpected assets")
         }
     ; observe =
@@ -1278,14 +1283,17 @@ let native_service_bootstrap
       ?(no_ws = false)
       ?(baseline = 3)
       ?(catchup = false)
+      ?(large_encrypted_pull = false)
+      ?(tamper_pull = false)
       ()
   =
   let module App = Journal_sync_lifecycle.Core in
   let module X = Execute.Core in
   let module Database = Logseq_overlay_db.Database in
   let module Types = Logseq_overlay_db.Types in
+  let encrypted = checksum_mode = `Invalid || large_encrypted_pull in
   let protected_titles =
-    if checksum_mode <> `Invalid
+    if not encrypted
     then []
     else (
       let plaintext =
@@ -1340,6 +1348,33 @@ let native_service_bootstrap
   let frame =
     String.make 1 (Char.chr 0x81) ^ String.make 1 (Char.chr (String.length hello)) ^ hello
   in
+  let tx =
+    if not large_encrypted_pull
+    then "[]"
+    else (
+      let module Codec = Transit_native.Transit.Json in
+      let module J = Transit_core.Json in
+      let plaintext = Codec.to_string (J.String (String.make 800_000 'x')) in
+      let iv, ciphertext =
+        Result.get_ok
+          ((synthetic_crypto_backend ()).crypto.encrypt_aes_gcm
+             ~key:(String.make 32 'k')
+             ~plaintext)
+      in
+      let ciphertext =
+        if tamper_pull then String.mapi (fun index byte ->
+          if index = String.length ciphertext - 1
+          then Char.chr (Char.code byte lxor 1)
+          else byte) ciphertext
+        else ciphertext
+      in
+      let protected = Codec.to_string (J.Array [ Binary iv; Binary ciphertext ]) in
+      Alcotest.(check bool) "ciphertext exceeds general crypto budget" true
+        (String.length protected > limits.maximum_bytes);
+      Codec.to_string
+        (J.Array
+           [ Array [ Keyword "db/add"; Int 100; Keyword "block/title"; String protected ] ]))
+  in
   let pull =
     Result.get_ok
       (Protocol.encode_server_message
@@ -1347,11 +1382,18 @@ let native_service_bootstrap
             { t = final_cursor
             ; checksum = None
             ; txs =
-                [ { Protocol.Server.t = final_cursor; tx = "[]"; outliner_op = None } ]
+                [ { Protocol.Server.t = final_cursor; tx; outliner_op = None } ]
             }))
   in
   let pull_frame =
-    String.make 1 (Char.chr 0x81) ^ String.make 1 (Char.chr (String.length pull)) ^ pull
+    if not large_encrypted_pull
+    then String.make 1 (Char.chr 0x81) ^ String.make 1 (Char.chr (String.length pull)) ^ pull
+    else (
+      let header = Bytes.make 10 '\000' in
+      Bytes.set_uint8 header 0 0x81;
+      Bytes.set_uint8 header 1 127;
+      Bytes.set_int64_be header 2 (Int64.of_int (String.length pull));
+      Bytes.to_string header ^ pull)
   in
   let socket ?(parallel = true) frame =
     match Tls_peer.case ~ws:true "" with
@@ -1458,7 +1500,7 @@ let native_service_bootstrap
                 | _ -> ()
               in
               let owner, resample, close =
-                if checksum_mode = `Invalid
+                if encrypted
                 then
                   start_encrypted_native_fixture
                     ~environment
@@ -1468,6 +1510,8 @@ let native_service_bootstrap
                     ~config
                     ~sqlite
                     ~on_change
+                    ~on_crypto_error:(fun error ->
+                      if large_encrypted_pull then errors := error :: !errors)
                 else (
                   let service =
                     get
@@ -1501,6 +1545,35 @@ let native_service_bootstrap
               in
               returned := true;
               Fun.protect ~finally:close (fun () ->
+                if tamper_pull then (
+                  Tls_peer.wait (Eio.Stdenv.clock environment) (fun () -> !errors <> []);
+                  Alcotest.(check bool) "AES-GCM authentication failure is surfaced" true
+                    (List.exists (function D.Crypto_failure _ -> true | _ -> false) !errors);
+                  let database = get (X.database owner) in
+                  let view = Result.get_ok (Database.inspect_sync database) in
+                  Alcotest.(check int64) "invalid ciphertext keeps the baseline"
+                    (Int64.of_int baseline)
+                    (Types.sync_view_checkpoint view |> Types.Server_cursor.to_int64);
+                  let path =
+                    Filename.concat root
+                      ("logseq-db-worker/synced-graphs/" ^ identity.graph ^ "/db.sqlite")
+                  in
+                  let db = Sqlite3.db_open ~mode:`READONLY path in
+                  Fun.protect ~finally:(fun () -> ignore (Sqlite3.db_close db)) (fun () ->
+                    let checkpoint = ref None in
+                    Sqlite3.Rc.check (Sqlite3.exec db
+                      ~cb:(fun row _ -> checkpoint := row.(0))
+                      "SELECT applied_server_t FROM sync_meta WHERE singleton = 1");
+                    Alcotest.(check (option string)) "SQLite checkpoint remains at baseline"
+                      (Some (string_of_int baseline)) !checkpoint;
+                    let titles = ref None in
+                    Sqlite3.Rc.check (Sqlite3.exec db
+                      ~cb:(fun row _ -> titles := Some (row.(0), row.(1)))
+                      "SELECT EXISTS (SELECT 1 FROM kvs WHERE instr(content, 'Anonymous encrypted title') > 0), \
+                       EXISTS (SELECT 1 FROM kvs WHERE instr(content, replace(hex(zeroblob(400000)), '0', 'x')) > 0)");
+                    Alcotest.(check bool) "SQLite keeps baseline title and no rejected plaintext"
+                      true (!titles = Some (Some "1", Some "0"))))
+                else (
                 Tls_peer.wait (Eio.Stdenv.clock environment) (fun () ->
                   (match !errors with
                    | D.Activation_failure (Types.Snapshot_parse_error message) :: _ ->
@@ -1543,7 +1616,7 @@ let native_service_bootstrap
                     (Database.inspect_snapshot_storage
                        ~check_current:(fun () -> ())
                        ~scratch_bytes:33554432L
-                       ~encrypted:(checksum_mode = `Invalid)
+                       ~encrypted
                        ~path:
                          (Filename.concat
                             root
@@ -1551,10 +1624,22 @@ let native_service_bootstrap
                              ^ identity.graph
                              ^ "/db.sqlite")))
                 in
-                Alcotest.(check string)
-                  "SQLite stores actual snapshot digest"
-                  (Types.Checksum.to_string checksum)
-                  (Types.Checksum.to_string durable_digest);
+                if large_encrypted_pull then (
+                  let path = Filename.concat root ("logseq-db-worker/synced-graphs/" ^ identity.graph ^ "/db.sqlite") in
+                  let db = Sqlite3.db_open ~mode:`READONLY path in
+                  Fun.protect ~finally:(fun () -> ignore (Sqlite3.db_close db)) (fun () ->
+                    let found = ref false in
+                    Sqlite3.Rc.check (Sqlite3.exec db
+                      ~cb:(fun row _ -> found := row.(0) = Some "1")
+                      ("SELECT EXISTS (SELECT 1 FROM kvs WHERE instr(content, '" ^ String.make 800_000 'x' ^ "') > 0)"));
+                    Alcotest.(check bool) "SQLite stores decrypted title" true !found);
+                  Alcotest.(check (option bool)) "SQLite digest matches committed view" (Some true)
+                    (Result.get_ok (Database.check_checkpoint_checksum database ~through:final_cursor ~expected:durable_digest)))
+                else
+                  Alcotest.(check string)
+                    "SQLite stores actual snapshot digest"
+                    (Types.Checksum.to_string checksum)
+                    (Types.Checksum.to_string durable_digest);
                 if checksum_mode = `Invalid && not no_ws
                 then (
                   let expected =
@@ -1620,7 +1705,7 @@ let native_service_bootstrap
                        (Database.check_checkpoint_checksum
                           database
                           ~through:cursor
-                          ~expected:checksum))))))
+                          ~expected:checksum)))))))
   in
   check_retired report
 ;;
@@ -2152,12 +2237,63 @@ let native_error_cause kind () =
   check_retired report
 ;;
 
+let native_websocket_budget_diagnostic () =
+  let module Transport = Logseq_sync_transport.Core in
+  let expected = "WebSocket frame payload is 4194305 bytes (limit: 4194304 bytes)" in
+  let wire = "\x81\x7f\x00\x00\x00\x00\x00\x40\x00\x01" in
+  let report =
+    Tls_peer.with_peer [ Tls_peer.case ~ws:true wire ]
+      (fun ~environment ~sw ~support:_ ~origin ->
+         let identity =
+           get (D.identity ~origin:(Uri.to_string origin) ~account:"synthetic"
+             ~graph:"60000000-0000-4000-8000-000000000001"
+             ~account_generation:0L ~graph_generation:0L)
+         in
+         let deadlines : Execute.Core.network_deadlines =
+           { setup_seconds = 5.; tls_handshake_seconds = 5.
+           ; http_response_seconds = 5.; download_seconds = 5. }
+         in
+         let backend = Transport.native_backend ~sw ~identity ~limits ~deadlines
+           ~liveness:Execute.Core.Peer_close_only
+           ~clock:(Eio.Stdenv.mono_clock environment)
+           ~network:(Eio.Stdenv.net environment)
+           ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+         in
+         let ended, end_connection = Eio.Promise.create () in
+         let check error =
+           Alcotest.(check string) "user-visible protocol failure"
+             ("Protocol failure: " ^ expected) (D.error_message error)
+         in
+         match backend.connect ~token:"synthetic"
+                 ~on_message:(fun _ -> Alcotest.fail "unexpected application data")
+                 ~on_close:(Eio.Promise.resolve end_connection) with
+         | Error (Transport.Failed error) -> check error
+         | Error Transport.Unauthorized -> Alcotest.fail "unexpected authorization failure"
+         | Ok socket ->
+           (match socket.activate () with
+            | Error error -> check error
+            | Ok () ->
+              Tls_peer.wait (Eio.Stdenv.clock environment)
+                (fun () -> Option.is_some (Eio.Promise.peek ended));
+              (match Eio.Promise.await ended with
+               | D.Invalid_protocol message -> check (D.Protocol_failure message)
+               | _ -> Alcotest.fail "expected invalid protocol termination"));
+           socket.await_stopped ())
+  in
+  check_retired report
+;;
+
 let () =
   let tests =
-    [ ( "native HTTP initializes locally without WS at advanced metadata"
+    [ "native WebSocket exposes its budget diagnostic", native_websocket_budget_diagnostic
+    ; ( "native HTTP initializes locally without WS at advanced metadata"
       , fun () -> native_service_bootstrap ~no_ws:true ~baseline:12 () )
     ; ( "native WS pulls from metadata baseline to advanced head"
       , fun () -> native_service_bootstrap ~catchup:true () )
+    ; ( "large encrypted native pull reaches SQLite"
+      , fun () -> native_service_bootstrap ~catchup:true ~large_encrypted_pull:true () )
+    ; ( "tampered encrypted native pull keeps the baseline"
+      , fun () -> native_service_bootstrap ~catchup:true ~large_encrypted_pull:true ~tamper_pull:true () )
     ; ( "encrypted HTTP initializes locally without WS"
       , fun () -> native_service_bootstrap ~checksum_mode:`Invalid ~no_ws:true () )
     ; ( "encrypted native snapshot activation respects crypto bounds"
