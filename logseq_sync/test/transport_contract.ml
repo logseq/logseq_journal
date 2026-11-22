@@ -80,6 +80,11 @@ try:
       request+=part
     time.sleep(case.get('response_delay',0))
     wire=bytes.fromhex(case.get('wire',''))
+    if case.get('large_snapshot'):
+      payload=b'[]'+b' '*(1024*1024-2)
+      frame=struct.pack('>I',len(payload))+payload
+      body=frame*65
+      wire=wire.replace(b'{{LENGTH}}',str(len(body)).encode())+body
     if case.get('ws'):
       headers=dict(line.split(b':',1) for line in request.split(b'\r\n')[1:] if b':' in line)
       nonce=next(v.strip() for k,v in headers.items() if k.lower()==b'sec-websocket-key')
@@ -208,9 +213,9 @@ let with_peer cases f =
 
 let graph = { Core_contract.graph with name = "Transport fixture" }
 
-let bootstrap ?(mirror_absent = true) ?(user_id = "fixture") origin =
+let bootstrap ?(mirror_absent = true) ?(user_id = "fixture") ?(limits = Core_contract.limits ()) origin =
   let initial =
-    Core.config ~managed_sync_origin:origin ~limits:(Core_contract.limits ())
+    Core.config ~managed_sync_origin:origin ~limits
     |> Result.get_ok
     |> Core.initial
     |> Result.get_ok
@@ -244,8 +249,8 @@ let bootstrap ?(mirror_absent = true) ?(user_id = "fixture") origin =
   , scope )
 ;;
 
-let operation ?artifact_uri ~download origin =
-  let transition, _scope = bootstrap origin in
+let operation ?artifact_uri ?limits ~download origin =
+  let transition, _scope = bootstrap ?limits origin in
   if not download
   then
     List.find_map
@@ -1772,6 +1777,39 @@ let test_snapshot_collision ~success ~concurrent () =
   in
   check_retired report
 ;;
+let test_large_snapshot_download () =
+  let wire = response ~headers:"Content-Length: {{LENGTH}}\r\n" "" in
+  let large =
+    match case wire with
+    | `Assoc fields -> `Assoc (("large_snapshot", `Bool true) :: fields)
+    | _ -> assert false
+  in
+  let report =
+    with_peer [ large ] (fun ~environment ~sw ~support ~origin ->
+      let posted = ref [] and invalidations = ref 0 in
+      let runner = runner ~environment ~sw ~support ~posted ~invalidations () in
+      Fun.protect ~finally:(fun () -> Runner.shutdown runner) (fun () ->
+        let limits =
+          Core.limits ~maximum_response_bytes:Logseq_db_types.Limits.maximum_response_bytes
+            ~maximum_artifact_bytes:(1024 * 1024 * 1024) ~submission_batch_size:32
+          |> Result.get_ok
+        in
+        Runner.submit runner (operation ~limits ~download:true origin);
+        wait (Eio.Stdenv.clock environment) (fun () -> Option.is_some (completed !posted));
+        Alcotest.(check bool) "production staging completed" true
+          (completed !posted = Some (Ok ()));
+        let staging = Filename.concat support "staging" in
+        let rec largest path =
+          if Sys.is_directory path then
+            Array.fold_left (fun size name -> max size (largest (Filename.concat path name)))
+              0 (Sys.readdir path)
+          else (Unix.stat path).st_size
+        in
+        Alcotest.(check int) "decoded staged bytes" (65 * (1024 * 1024 + 4)) (largest staging)))
+  in
+  check_retired report
+;;
+
 let test_artifact_publication_failure () =
   let report =
     with_peer
@@ -1829,6 +1867,7 @@ let scenarios =
         "download publication failure preserves destination"
         `Quick
         test_artifact_publication_failure
+    ; Alcotest.test_case "large snapshot download stages all frames" `Quick test_large_snapshot_download
     ; Alcotest.test_case "snapshot collision success concurrent" `Quick
         (test_snapshot_collision ~success:true ~concurrent:true)
     ; Alcotest.test_case "snapshot collision success restart" `Quick
@@ -4418,7 +4457,7 @@ let test_external_http_contract ?expected_error kind ~success body () =
                  let actual = List.find_map (function
                    | Core.Runner_completed (Core.Completion (_, Error (Core.Effect_failed message | Core.Crypto_failed (_, message)))) -> Some message
                    | _ -> None) !posted in
-                 Alcotest.(check (option string)) "safe decoder field cause reaches caller"
+                 Alcotest.(check (option string)) "specific HTTP failure reaches caller"
                    (Some expected) actual) expected_error))
      : Yojson.Basic.t)
 ;;
@@ -4439,6 +4478,24 @@ let scenarios =
            `User_keys
            ~success:true
            {|{"public-key":"synthetic","encrypted-private-key":"synthetic","future":{"nested":[1,null]}}|})
+    ; Alcotest.test_case
+        "HTTP catalog accepts a response above 256 KiB"
+        `Quick
+        (test_external_http_contract `Catalog ~success:true
+           ({|{"graphs":[],"future":"|} ^ String.make (256 * 1024) 'x' ^ {|"}|}))
+    ; Alcotest.test_case
+        "HTTP catalog rejects a response above 1 MiB"
+        `Quick
+        (test_external_http_contract `Catalog ~success:false
+           ~expected_error:"HTTP body exceeds its configured bound"
+           ({|{"graphs":[],"future":"|} ^ String.make (1024 * 1024) 'x' ^ {|"}|}))
+    ; Alcotest.test_case
+        "HTTP key response retains the 256 KiB cap"
+        `Quick
+        (test_external_http_contract `Graph_key ~success:false
+           ~expected_error:"HTTP body exceeds its configured bound"
+           ({|{"encrypted-aes-key":"synthetic","future":"|}
+            ^ String.make (256 * 1024) 'x' ^ {|"}|}))
     ; Alcotest.test_case
         "HTTP catalog ignores nested external extensions"
         `Quick

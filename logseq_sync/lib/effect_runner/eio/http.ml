@@ -59,7 +59,9 @@ let graph_path graph_id suffix =
   Printf.sprintf "/sync/%s/%s" (Graph_types.Uuid.to_string graph_id) suffix
 ;;
 
-let catalog ~base_url ~token = create ~base_url ~path:"/graphs" ~query:[] ~token ()
+let catalog ~base_url ~token =
+  create ~base_url ~path:"/graphs" ~query:[] ~token ~maximum_response_bytes:(1024 * 1024) ()
+;;
 
 let snapshot_baseline ~base_url ~graph_id ~token =
   create

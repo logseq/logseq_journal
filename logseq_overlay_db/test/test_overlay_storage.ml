@@ -135,10 +135,11 @@ let rec supply_snapshot_crypto ~behavior prepared batch_count =
     supply_snapshot_crypto ~behavior prepared (batch_count + 1)
 ;;
 
-let prepare_snapshot ?wire_batch_max_bytes ~behavior root support =
+let prepare_snapshot ?wire_batch_max_bytes ?(extend = fun _ -> ()) ~behavior root support =
   let path, applied_server_cursor, expected_checksum, expected_rows =
     snapshot_input_for root
   in
+  extend path;
   let dependencies, location, inspection = absent_inspection ~behavior support in
   let dependencies =
     match wire_batch_max_bytes with
@@ -415,13 +416,24 @@ let snapshot_import_error_does_not_disclose_payload () =
       Alcotest.fail "malformed snapshot was admitted")
 ;;
 
-let snapshot_activation_installs_queryable_mirror () =
+let extend_large_snapshot path =
+  let payload = "[]" ^ String.make (1024 * 1024 - 2) ' ' in
+  let channel = open_out_gen [ Open_wronly; Open_append; Open_binary ] 0o600 path in
+  Fun.protect ~finally:(fun () -> close_out channel) (fun () ->
+    for _ = 1 to 65 do
+      output_binary_int channel (String.length payload);
+      output_string channel payload
+    done);
+  T.require ((Unix.stat path).st_size > 64 * 1024 * 1024) "fixture is not above 64 MiB"
+;;
+
+let snapshot_activation_installs_queryable_mirror ?extend () =
   let behavior = "snapshot activation installs one queryable mirror" in
   T.with_temp_directory "overlay-snapshot-activation-" (fun root ->
     let support = Filename.concat root "target" in
     Unix.mkdir support 0o700;
     let dependencies, _location, prepared =
-      prepare_snapshot ~wire_batch_max_bytes:128 ~behavior root support
+      prepare_snapshot ?extend ~wire_batch_max_bytes:128 ~behavior root support
     in
     let batches = supply_snapshot_crypto ~behavior prepared 0 in
     T.require
@@ -440,6 +452,10 @@ let snapshot_activation_installs_queryable_mirror () =
          "activated inspection returned the wrong checkpoint";
        T.require (Option.is_some checksum) "activated inspection omitted the checksum"
      | Absent _ -> Alcotest.fail "committed snapshot remained absent");
+    let inspection =
+      Database.inspect_mirror ~application_support_directory:support ~graph_id:T.graph_uuid
+      |> T.require_ok ~behavior
+    in
     Eio_main.run (fun _environment ->
       Eio.Switch.run (fun sw ->
         let database =
@@ -3151,7 +3167,11 @@ let cases =
   ; Alcotest.test_case
       "snapshot activation installs a queryable mirror"
       `Quick
-      snapshot_activation_installs_queryable_mirror
+      (fun () -> snapshot_activation_installs_queryable_mirror ())
+  ; Alcotest.test_case
+      "snapshot above 64 MiB activates and reopens from disk"
+      `Quick
+      (snapshot_activation_installs_queryable_mirror ~extend:extend_large_snapshot)
   ; Alcotest.test_case
       "snapshot cancellation removes temporary artifacts"
       `Quick
