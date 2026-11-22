@@ -891,9 +891,8 @@ let publish ~lifecycle context =
 ;;
 
 let sync_limits config =
-  Sync.limits_with_websocket_downlink
+  Sync.limits
     ~maximum_response_bytes:config.Db.Config.response_budget_bytes
-    ~maximum_websocket_downlink_bytes:Logseq_db_types.Limits.maximum_sync_websocket_downlink_bytes
     ~maximum_artifact_bytes:(1024 * 1024 * 1024)
     ~submission_batch_size:32
 ;;
