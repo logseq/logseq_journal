@@ -56,18 +56,24 @@ let check_step test_id origin event expected effects =
   check_replay test_id origin event first
 ;;
 
-let limits () =
-  Core.limits
-    ~maximum_response_bytes:Logseq_db_types.Limits.maximum_response_bytes
+let limits ?(maximum_response_bytes = Logseq_db_types.Limits.maximum_response_bytes)
+      ?maximum_websocket_downlink_bytes () =
+  let construct = match maximum_websocket_downlink_bytes with
+    | None -> Core.limits
+    | Some maximum_websocket_downlink_bytes ->
+      Core.limits_with_websocket_downlink ~maximum_websocket_downlink_bytes
+  in
+  construct
+    ~maximum_response_bytes
     ~maximum_artifact_bytes:(1024 * 1024)
     ~submission_batch_size:32
   |> Result.get_ok
 ;;
 
-let raw_initial () =
+let raw_initial ?maximum_response_bytes ?maximum_websocket_downlink_bytes () =
   Core.config
     ~managed_sync_origin:(Uri.of_string "https://api.logseq.io")
-    ~limits:(limits ())
+    ~limits:(limits ?maximum_response_bytes ?maximum_websocket_downlink_bytes ())
   |> Result.get_ok
   |> Core.initial
   |> Result.get_ok
@@ -81,7 +87,9 @@ let timeline_scope core : Core.timeline_scope =
   let s=(Core.state core).snapshot in
   {startup=startup_scope core;graph_id=Option.get s.selected_graph;graph_generation=s.startup.graph_generation}
 ;;
-let initial () = (Core.step (raw_initial ()) (Core.Sign_in_requested (startup_scope (raw_initial ())))).next
+let initial ?maximum_response_bytes ?maximum_websocket_downlink_bytes () =
+  let core = raw_initial ?maximum_response_bytes ?maximum_websocket_downlink_bytes () in
+  (Core.step core (Core.Sign_in_requested (startup_scope core))).next
 ;;
 
 let graph_id =
@@ -99,9 +107,9 @@ let graph : Core.graph =
 
 let encrypted_graph = { graph with encrypted = true }
 
-let selected_graph selected_graph =
+let selected_graph ?maximum_response_bytes ?maximum_websocket_downlink_bytes selected_graph =
   let authenticated =
-    Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
+    Core.step (initial ?maximum_response_bytes ?maximum_websocket_downlink_bytes ()) (Core.Account_authenticated { user_id = Some "user" })
   in
   let catalog =
     List.find_map
@@ -3509,8 +3517,8 @@ let pull_timer effects =
   List.hd timers
 ;;
 
-let pull_fixture () =
-  let selected, _ = selected_graph graph in
+let pull_fixture ?maximum_response_bytes ?maximum_websocket_downlink_bytes () =
+  let selected, _ = selected_graph ?maximum_response_bytes ?maximum_websocket_downlink_bytes graph in
   let mirror = inspect_mirror_request selected.effects in
   let inspected =
     Core.step selected.next (Core.Mirror_inspected (Core.Mirror_available mirror))
@@ -6752,6 +6760,59 @@ let local_deletion_preserves_cause () =
 ;;
 let scenarios = scenarios @ [Alcotest.test_case "local deletion preserves concrete safe cause"
   `Quick local_deletion_preserves_cause]
+;;
+
+let authoritative_input_rejects_oversized_pull () =
+  let opened, connection, _ = pull_fixture () in
+  let tx = "[\"" ^ String.make (256 * 1024 + 1) 'x' ^ "\"]" in
+  let through = server_cursor_of_int 1 in
+  let event =
+    Core.Websocket_message
+      (connection, Protocol.Server.Pull_ok
+         { t = through
+         ; checksum = None
+         ; txs = [ { t = through; tx; outliner_op = None } ]
+         })
+  in
+  let result = Core.step opened.next event in
+  let delegated =
+    List.find_map (function
+      | Core.Delegate (Core.Apply_authoritative_batch batch) -> Some batch
+      | _ -> None) result.effects
+  in
+  Alcotest.(check bool) "oversized pull is not delegated" true (Option.is_none delegated);
+  Alcotest.(check (option string)) "caller byte limit is enforced"
+    (Some "authoritative transaction exceeds the byte limit")
+    (Core.state result.next).snapshot.last_error;
+  let opened, connection, _ = pull_fixture ~maximum_response_bytes:8
+    ~maximum_websocket_downlink_bytes:32 () in
+  let result = Core.step opened.next (Core.Websocket_message
+    (connection, Protocol.Server.Pull_ok
+       { t = through; checksum = None
+       ; txs = [ { t = through; tx = {|["123456789"]|}; outliner_op = None } ] })) in
+  Alcotest.(check bool) "independent downlink budget allows transaction" true
+    (List.exists (function Core.Delegate (Core.Apply_authoritative_batch _) -> true
+       | _ -> false) result.effects);
+  let message = "WebSocket frame payload is 4194305 bytes (limit: 4194304 bytes)" in
+  let closed = Core.step opened.next (Core.Websocket_closed
+    (connection, Core.Protocol_failure message)) in
+  Alcotest.(check (option string)) "budget reason survives into caller-visible state"
+    (Some message) (Core.state closed.next).snapshot.last_error;
+  let transaction t tx = Protocol.Server.{ t = server_cursor_of_int t; tx; outliner_op = None } in
+  List.iter (fun (txs, through, error) ->
+    let opened, connection, _ = pull_fixture ~maximum_response_bytes:8 () in
+    let result = Core.step opened.next (Core.Websocket_message
+      (connection, Protocol.Server.Pull_ok { t = server_cursor_of_int through; checksum = None; txs })) in
+    Alcotest.(check (option string)) "caller can tighten WS budget" (Some error)
+      (Core.state result.next).snapshot.last_error)
+    [ [transaction 1 {|["12345"]|}], 1, "authoritative transaction exceeds the byte limit"
+    ; [transaction 1 {|["1"]|}; transaction 2 {|["2"]|}], 2,
+      "authoritative batch exceeds its transaction count or byte limit"
+    ]
+;;
+
+let scenarios = scenarios @ [Alcotest.test_case "oversized pull respects the caller limit"
+  `Quick authoritative_input_rejects_oversized_pull]
 ;;
 
 let authoritative_input_retains_validation_cause () =

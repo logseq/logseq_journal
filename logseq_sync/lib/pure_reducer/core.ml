@@ -183,11 +183,10 @@ type state =
   }
 
 type limits =
-  { maximum_response_bytes : int
+  { maximum_websocket_downlink_bytes : int
   ; maximum_artifact_bytes : int
   ; submission_batch_size : int
   }
-[@@warning "-69"]
 
 type config =
   { managed_sync_origin : Uri.t
@@ -196,7 +195,9 @@ type config =
 
 type config_error = Invalid_config of string
 
-let limits ~maximum_response_bytes ~maximum_artifact_bytes ~submission_batch_size =
+let limits_with_websocket_downlink
+      ~maximum_response_bytes ~maximum_websocket_downlink_bytes
+      ~maximum_artifact_bytes ~submission_batch_size =
   if
     maximum_response_bytes <= 0
     || maximum_response_bytes > Logseq_db_types.Limits.maximum_response_bytes
@@ -205,7 +206,16 @@ let limits ~maximum_response_bytes ~maximum_artifact_bytes ~submission_batch_siz
   then Error (Invalid_config "maximum artifact bytes must be positive")
   else if submission_batch_size <= 0 || submission_batch_size > 4096
   then Error (Invalid_config "submission batch size is outside the supported bound")
-  else Ok { maximum_response_bytes; maximum_artifact_bytes; submission_batch_size }
+  else if maximum_websocket_downlink_bytes <= 0
+          || maximum_websocket_downlink_bytes > Logseq_db_types.Limits.maximum_sync_websocket_downlink_bytes
+  then Error (Invalid_config "maximum WebSocket downlink bytes are outside the supported bound")
+  else Ok { maximum_websocket_downlink_bytes; maximum_artifact_bytes; submission_batch_size }
+;;
+
+let limits ~maximum_response_bytes ~maximum_artifact_bytes ~submission_batch_size =
+  limits_with_websocket_downlink ~maximum_response_bytes
+    ~maximum_websocket_downlink_bytes:maximum_response_bytes
+    ~maximum_artifact_bytes ~submission_batch_size
 ;;
 
 let config ~managed_sync_origin ~limits =
@@ -2253,7 +2263,7 @@ let authoritative_input core t checksum_value txs =
       | tx :: rest ->
         (match
            Overlay.encoded_transaction_of_string
-             ~maximum_bytes:core.config.limits.maximum_response_bytes
+             ~maximum_bytes:core.config.limits.maximum_websocket_downlink_bytes
              tx.Sync_protocol.Server.tx
          with
          | Error failure -> Error (authoritative_input_error_message failure)
@@ -2271,7 +2281,7 @@ let authoritative_input core t checksum_value txs =
       Result.bind checksum (fun checksum ->
         Overlay.authoritative_batch
           ~maximum_count:4096
-          ~maximum_bytes:core.config.limits.maximum_response_bytes
+          ~maximum_bytes:core.config.limits.maximum_websocket_downlink_bytes
           ~transactions
           ~through:t
           ~checksum

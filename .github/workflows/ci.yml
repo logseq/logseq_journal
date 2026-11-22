@@ -61,7 +61,10 @@ jobs:
           exit "$result"
       - name: Prepare native system libraries before cache lookup
         run: |
-          brew install pkg-config gmp sqlite zlib zstd
+          brew install pkg-config gmp sqlite zlib zstd openssl@3
+          openssl_bin="$(brew --prefix openssl@3)/bin"
+          "$openssl_bin/openssl" version
+          echo "$openssl_bin" >> "$GITHUB_PATH"
           echo "PKG_CONFIG_PATH=$(brew --prefix gmp)/lib/pkgconfig:$(brew --prefix sqlite)/lib/pkgconfig:$(brew --prefix zlib)/lib/pkgconfig:$(brew --prefix zstd)/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: Prepare optional controlled SQLite provider
         run: python3 .agents/skills/journal-build/scripts/prepare_ci_sqlite.py
@@ -139,9 +142,13 @@ jobs:
           JOURNAL_TEST_SWITCH: ${{ github.workspace }}
           PYTHONDONTWRITEBYTECODE: 1
         run: |
+          test_venv="$(mktemp -d "${RUNNER_TEMP}/journal-test-python.XXXXXX")"
+          trap 'rm -rf "$test_venv"' EXIT
+          python3 -m venv "$test_venv"
+          "$test_venv/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: 'cryptography==46.0.5'
           (
             opam exec -- dune build @all app/native_embed.exe.o &&
-            opam exec -- dune runtest --force
+            PATH="$test_venv/bin:$PATH" opam exec -- dune runtest --force
           ) &
           regression_pid=$!
           result=0

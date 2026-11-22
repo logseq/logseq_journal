@@ -2016,7 +2016,12 @@ let authoritative_crypto_is_correlated_and_applied database =
          when T.crypto_result_error_equal expected_error actual_error -> ()
        | Error _ -> Alcotest.failf "%s authoritative crypto returned the wrong error" name
        | Ok _ -> Alcotest.failf "%s authoritative crypto was accepted" name)
-    (T.malformed_crypto_results ~maximum_value_bytes:(4 * 1_024 * 1_024) plaintexts);
+    (let maximum = Logseq_db_types.Limits.maximum_sync_websocket_downlink_bytes in
+     let large = String.make ((maximum / 2) + 1) 'x' in
+     ( "aggregate plaintext overflow"
+     , Crypto_result_limit_exceeded
+     , List.map (fun (id, _) -> id, large) plaintexts )
+     :: T.malformed_crypto_results ~maximum_value_bytes:maximum plaintexts);
   let second_prepared, second_request =
     match
       Database.begin_authoritative database ~expected:(sync_view_token sync) batch

@@ -111,7 +111,7 @@ let error context path kind =
 
 let maximum_wire_bytes = function
   | Client -> Logseq_db_types.Limits.maximum_request_bytes
-  | Server -> Logseq_db_types.Limits.maximum_response_bytes
+  | Server -> Logseq_db_types.Limits.maximum_sync_websocket_downlink_bytes
 ;;
 
 let maximum_metadata_bytes = 4_096

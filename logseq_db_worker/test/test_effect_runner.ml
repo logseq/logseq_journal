@@ -2683,11 +2683,73 @@ let authoritative_detail_cases =
   ]
 ;;
 
-let test_authoritative_rejection_diagnostics kind () =
+let fixture_aes_gcm root mode ~key ~iv input =
+  let input_path = Filename.concat root "aes-input" in
+  let output_path = Filename.concat root "aes-output" in
+  Out_channel.with_open_bin input_path (fun channel -> output_string channel input);
+  let script = {python|
+import base64, sys
+from pathlib import Path
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+mode, key, iv, source, target = sys.argv[1:]
+cipher = AESGCM(key.encode())
+try:
+    result = getattr(cipher, mode)(iv.encode(), Path(source).read_bytes(), None)
+except InvalidTag:
+    sys.exit(2)
+Path(target).write_bytes(base64.b64encode(result) if mode == 'encrypt' else result)
+|python} in
+  let pid = Unix.create_process "python3" [| "python3"; "-c"; script; mode; key; iv; input_path; output_path |]
+    Unix.stdin Unix.stdout Unix.stderr in
+  let rec wait () =
+    try snd (Unix.waitpid [] pid) with Unix.Unix_error (Unix.EINTR, _, _) -> wait ()
+  in
+  match wait () with
+  | Unix.WEXITED 0 -> Ok (In_channel.with_open_bin output_path In_channel.input_all)
+  | Unix.WEXITED 2 -> Error "AES-GCM authentication failed"
+  | _ -> Alcotest.fail "fixture AES-GCM subprocess failed"
+;;
+
+let encrypted_pull_peer = {python|
+import base64, hashlib, os, socket, ssl, struct, subprocess, sys
+root = sys.argv[1]
+cert, key = root+'/cert.pem', root+'/key.pem'
+subprocess.run(['openssl','req','-x509','-newkey','ec','-pkeyopt','ec_paramgen_curve:P-256',
+                '-nodes','-keyout',key,'-out',cert,'-days','1','-subj','/CN=localhost'],
+               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(cert,key)
+with socket.create_server(('127.0.0.1',0)) as server:
+    server.settimeout(10)
+    with open(root+'/ready.tmp','w') as ready: ready.write(str(server.getsockname()[1]))
+    os.replace(root+'/ready.tmp',root+'/ready')
+    raw,_ = server.accept()
+    raw.settimeout(10)
+    with ctx.wrap_socket(raw,server_side=True) as conn:
+        stream = conn.makefile('rb')
+        headers = {}
+        assert stream.readline().startswith(b'GET ')
+        while (line := stream.readline()) != b'\r\n':
+            name,value = line.split(b':',1)
+            headers[name.lower()] = value.strip()
+        accept = base64.b64encode(hashlib.sha1(headers[b'sec-websocket-key'] +
+                    b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest())
+        conn.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n'
+                     b'Connection: Upgrade\r\nSec-WebSocket-Accept: '+accept+b'\r\n\r\n')
+        hello = b'{"type":"hello","t":1}'
+        conn.sendall(bytes([129,len(hello)])+hello)
+        with open(root+'/pull.json','rb') as pull: payload = pull.read()
+        conn.sendall(struct.pack('!BBQ',129,127,len(payload))+payload)
+        while conn.recv(16384): pass
+|python}
+;;
+
+let test_authoritative_rejection_diagnostics ?tamper kind () =
   let module G = Logseq_db_types.Graph_types in
   let module Error = Logseq_db_worker.Error in
   T.with_managed (fun fixture ->
-    Eio_main.run (fun _ ->
+    Eio_main.run (fun env ->
       Eio.Switch.run (fun sw ->
         let graph_id =
           G.Uuid.of_string "94000000-0000-4000-8000-000000000707" |> Result.get_ok
@@ -2695,7 +2757,7 @@ let test_authoritative_rejection_diagnostics kind () =
         let graph : Sync.graph =
           { graph_id
           ; name = "Synthetic authoritative diagnostics"
-          ; encrypted = false
+          ; encrypted = Option.is_some tamper
           ; schema = { major = 65; minor = 33; exact = true }
           }
         in
@@ -2744,8 +2806,8 @@ let test_authoritative_rejection_diagnostics kind () =
         |> Result.get_ok;
         Logseq_db_storage.Sync_outbox_store.initialize_database sqlite |> Result.get_ok;
         ignore (Sqlite3.db_close sqlite);
-        (match kind with
-         | `Integrity ->
+        (match tamper, kind with
+         | None, `Integrity ->
            let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
            let module Session = Logseq_db_storage.Storage_session in
            let storage =
@@ -2862,15 +2924,50 @@ let test_authoritative_rejection_diagnostics kind () =
         let limits =
           Sync.limits
             ~maximum_response_bytes:
-              (match kind with
-               | `Detail ("application-bounded-stats", _, _) -> 16384
-               | _ -> 1024)
+              (match tamper, kind with
+               | Some _, _ -> Logseq_db_types.Limits.maximum_response_bytes
+               | None, `Detail ("application-bounded-stats", _, _) -> 16384
+               | None, _ -> 1024)
             ~maximum_artifact_bytes:1048576
             ~submission_batch_size:32
           |> Result.get_ok
         in
+        let clock = Eio.Stdenv.clock env in
+        let title = String.make 150_000 'x' in
+        let graph_key = String.make 32 'k' in
+        let origin, peer =
+          match tamper with
+          | None -> Uri.of_string "https://api.logseq.io", None
+          | Some tamper ->
+            let module P = Logseq_sync_pure_reducer.Sync_protocol in
+            let json = Yojson.Safe.to_string in
+            let plaintext = json (`String title) in
+            let iv = String.make 12 'i' in
+            let ciphertext = fixture_aes_gcm root "encrypt" ~key:graph_key ~iv plaintext |> Result.get_ok in
+            let ciphertext =
+              if tamper then
+                (if ciphertext.[0] = 'A' then "B" else "A") ^ String.sub ciphertext 1 (String.length ciphertext - 1)
+              else ciphertext
+            in
+            let envelope = json (`List [ `String "~baWlpaWlpaWlpaWlp"; `String ("~b" ^ ciphertext) ]) in
+            let tx = json (`List [ `List
+              [ `String "~:db/add"; `Int 100; `String "~:block/title"; `String envelope ] ]) in
+            let t = cursor 1L in
+            let payload = P.encode_server_message
+              (P.Server.Pull_ok { t; checksum = None; txs = [ { t; tx; outliner_op = None } ] })
+              |> Result.get_ok in
+            Out_channel.with_open_bin (Filename.concat root "pull.json")
+              (fun channel -> output_string channel payload);
+            let process = Eio.Process.spawn ~sw (Eio.Stdenv.process_mgr env)
+              [ "python3"; "-c"; encrypted_pull_peer; root ] in
+            let ready = Filename.concat root "ready" in
+            Eio.Time.with_timeout_exn clock 5. (fun () ->
+              while not (Sys.file_exists ready) do Eio.Time.sleep clock 0.01 done);
+            let port = In_channel.with_open_bin ready In_channel.input_all in
+            Uri.of_string ("https://localhost:" ^ port), Some process
+        in
         let sync =
-          Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits
+          Sync.config ~managed_sync_origin:origin ~limits
           |> Result.get_ok
         in
         let state =
@@ -2881,9 +2978,39 @@ let test_authoritative_rejection_diagnostics kind () =
         and failures = ref []
         and connection = ref None in
         let post event = Queue.add event events in
+        let authenticated_failures = ref 0 in
+        let native = Option.map (fun _ ->
+          let module R = Sync_runner in
+          let auth ?ip:_ ~host:_ = function
+            | [ _ ] -> Ok None
+            | _ -> Alcotest.fail "expected a single loopback fixture certificate"
+          in
+          let runtime = R.runtime ~fork:Eio.Fiber.fork ~sleep:(Eio.Time.sleep clock) |> Result.get_ok in
+          let transport = R.transport ~tls_authenticator:(R.tls_authenticator auth)
+            ~websocket_liveness:R.Disabled ~network:(Eio.Stdenv.net env) ~clock |> Result.get_ok in
+          let local_store = R.local_store ~application_support_directory:root () |> Result.get_ok in
+          let artifact_store = R.artifact_store ~staging_directory:(Filename.concat root "staging") |> Result.get_ok in
+          let secrets = R.secrets
+            ~unlock_private_key:(fun ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ -> Error "unused")
+            ~unlock_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ -> Ok graph_key)
+            ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ -> Ok "fixture")
+            ~verify_and_save_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ -> Error "unused")
+            ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ()) |> Result.get_ok in
+          let crypto = R.crypto ~encrypt_aes_gcm:(fun ~key:_ ~plaintext:_ -> Error "unused")
+            ~decrypt_aes_gcm:(fun ~key ~iv ~ciphertext ->
+              match fixture_aes_gcm root "decrypt" ~key ~iv ciphertext with
+              | Ok _ as result -> result
+              | Error _ as error -> incr authenticated_failures; error) |> Result.get_ok in
+          let id_token_provider = R.id_token_provider
+            ~acquire:(fun account ->
+              if account.Sync.managed_sync_origin = origin then Ok "fixture" else Error "not loopback")
+            ~invalidate:(fun _ ~token:_ -> ()) in
+          let deps = R.dependencies ~runtime ~transport ~local_store ~artifact_store ~secrets ~crypto ~id_token_provider |> Result.get_ok in
+          R.create ~sw deps ~post:(fun event -> post (Core.Sync_event event)) |> Result.get_ok) peer in
+        let submit instruction = Option.iter (fun runner -> Sync_runner.submit runner instruction) native in
         let sync_runner =
           Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture")
-            ~shutdown:(fun () -> ())
+            ~shutdown:(fun () -> Option.iter Sync_runner.shutdown native)
             ~submit:(function
               | Sync.Request (ticket, Sync.Fetch_catalog _) ->
                 post
@@ -2893,15 +3020,18 @@ let test_authoritative_rejection_diagnostics kind () =
                 post
                   (Core.Sync_event
                      (Sync.Runner_completed (Sync.Completion (ticket, Ok ()))))
-              | Sync.Start_websocket request -> connection := Some request.scope
-              | _ -> ())
+              | Sync.Start_websocket request as instruction ->
+                connection := Some request.scope; submit instruction
+              | Sync.Schedule_timer _ -> ()
+              | instruction -> submit instruction)
             ()
         in
         let dependencies =
           Runner.dependencies
             ~runtime:
-              (Runner.runtime ~fork:(fun ~sw:_ task -> task ()) ~sleep:(fun _ -> ())
-               |> Result.get_ok)
+              (Runner.runtime
+                 ~fork:(if Option.is_some peer then Eio.Fiber.fork else fun ~sw:_ task -> task ())
+                 ~sleep:(Eio.Time.sleep clock) |> Result.get_ok)
             ~config:fixture.config
             ~overlay:fixture.overlay
             ~sync_runner
@@ -2918,8 +3048,7 @@ let test_authoritative_rejection_diagnostics kind () =
             ~asset_current:(fun _ -> false)
           |> Result.get_ok
         in
-        let drive event =
-          post event;
+        let drain () =
           while not (Queue.is_empty events) do
             let event = Queue.take events in
             (match event with
@@ -2937,6 +3066,7 @@ let test_authoritative_rejection_diagnostics kind () =
               transition.effects
           done
         in
+        let drive event = post event; drain () in
         Fun.protect
           ~finally:(fun () -> Runner.shutdown runner)
           (fun () ->
@@ -2948,6 +3078,33 @@ let test_authoritative_rejection_diagnostics kind () =
                (Core.Sync_event
                   (Sync.Account_authenticated { user_id = Some "synthetic-user" }));
              drive (Core.Sync_event (Sync.Graph_selected graph_id));
+             match tamper with
+             | Some tamper ->
+               let expected = cursor (if tamper then 0L else 1L) in
+               Eio.Time.with_timeout_exn clock 5. (fun () ->
+                 let settled () =
+                   if tamper then !failures <> []
+                   else (Core.view !state).sync.snapshot.applied_server_t = Some expected
+                 in
+                 while not (settled ()) do
+                   drain ();
+                   if not (settled ()) then Eio.Time.sleep clock 0.005
+                 done);
+               Alcotest.(check int) "AES-GCM authentication failures"
+                 (if tamper then 1 else 0) !authenticated_failures;
+               let sqlite = Sqlite3.db_open ~mode:`READONLY (Filename.concat directory "db.sqlite") in
+               Fun.protect ~finally:(fun () -> ignore (Sqlite3.db_close sqlite)) (fun () ->
+                 let found = ref false in
+                 Sqlite3.Rc.check (Sqlite3.exec sqlite
+                   ~cb:(fun row _ -> found := row.(0) = Some "1")
+                   ("SELECT EXISTS (SELECT 1 FROM kvs WHERE instr(content, '" ^ title ^ "') > 0)"));
+                 Alcotest.(check bool) "SQLite contains decrypted title" (not tamper) !found;
+                 let durable = Logseq_db_storage.Sync_checkpoint_store.read_database sqlite |> Result.get_ok in
+                 Alcotest.(check bool) "SQLite checkpoint" true
+                   (durable.applied_server_t = expected));
+               Alcotest.(check bool) "checkpoint" true
+                 ((Core.view !state).sync.snapshot.applied_server_t = Some expected)
+             | None ->
              Alcotest.(check bool)
                "actual mirror opens"
                true
@@ -3466,6 +3623,9 @@ let () =
     ; ( "durable sync notification", [
         Alcotest.test_case "single graph commit and replay" `Quick (test_durable_commit_notifies_own_graph ~resident:false);
         Alcotest.test_case "hidden resident commit and replay" `Quick (test_durable_commit_notifies_own_graph ~resident:true) ])
+    ; ( "encrypted TLS pull",
+        [ Alcotest.test_case "encrypted pull reaches SQLite" `Quick (test_authoritative_rejection_diagnostics ~tamper:false `Integrity)
+        ; Alcotest.test_case "tampered pull preserves SQLite baseline" `Quick (test_authoritative_rejection_diagnostics ~tamper:true `Integrity) ])
     ; ( "authoritative diagnostics", [
         Alcotest.test_case "real own echo mismatch retains safe integrity reason" `Quick (test_authoritative_rejection_diagnostics `Integrity);
         Alcotest.test_case "real cursor rejection reaches Diagnostics" `Quick (test_authoritative_rejection_diagnostics `Cursor);

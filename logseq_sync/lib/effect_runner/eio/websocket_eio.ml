@@ -254,6 +254,44 @@ let read_loop t ~maximum_frame_bytes flow protocol =
   let module Client = Httpun_ws.Client_connection in
   let capacity = 16384 in
   let buffer = Bigstringaf.create capacity in
+  let frame_remaining = ref 0 in
+  let fragment_bytes = ref 0 in
+  let byte offset = Char.code (Bigstringaf.unsafe_get buffer offset) in
+  let frame_input retained =
+    if retained < 2 then 0, 0, !fragment_bytes
+    else (
+      let flags = byte 0 and size = byte 1 in
+      let short = size land 127 in
+      let extension = if short = 127 then 8 else if short = 126 then 2 else 0 in
+      let header = 2 + extension + (if size land 128 = 0 then 0 else 4) in
+      if retained < header then 0, 0, !fragment_bytes
+      else (
+        let length =
+          match extension with
+          | 8 -> Bigstringaf.unsafe_get_int64_be buffer 2
+          | 2 -> Int64.of_int ((byte 2 lsl 8) lor byte 3)
+          | _ -> Int64.of_int short
+        in
+        if Int64.unsigned_compare length (Int64.of_int maximum_frame_bytes) > 0
+        then protocol_error (Printf.sprintf
+          "WebSocket frame payload is %Lu bytes (limit: %d bytes)"
+          length maximum_frame_bytes);
+        let length = Int64.to_int length in
+        let accumulated =
+          match flags land 15 with
+          | 0 ->
+            if length > maximum_frame_bytes - !fragment_bytes
+            then protocol_error (Printf.sprintf
+              "WebSocket message payload is at least %Ld bytes (limit: %d bytes)"
+              (Int64.add (Int64.of_int !fragment_bytes) (Int64.of_int length))
+              maximum_frame_bytes);
+            if flags land 128 = 0 then !fragment_bytes + length else 0
+          | 1 | 2 -> if flags land 128 = 0 then length else 0
+          | _ -> !fragment_bytes
+        in
+        let total = header + length in
+        min retained total, total, accumulated))
+  in
   let rec loop retained parse =
     if t.terminal = None
     then (
@@ -279,9 +317,20 @@ let read_loop t ~maximum_frame_bytes flow protocol =
       | `Read ->
         if parse || t.read_progress <> before
         then (
-          let consumed = Client.read protocol buffer ~off:0 ~len:retained in
-          if consumed < 0 || consumed > retained
+          let is_websocket = Option.is_some t.descriptor in
+          let offered, frame_bytes, accumulated =
+            if not is_websocket then retained, 0, 0
+            else if !frame_remaining > 0
+            then min retained !frame_remaining, !frame_remaining, !fragment_bytes
+            else frame_input retained
+          in
+          let consumed = Client.read protocol buffer ~off:0 ~len:offered in
+          if consumed < 0 || consumed > offered
           then protocol_error "invalid WebSocket parser progress";
+          if is_websocket && consumed > 0
+          then (
+            frame_remaining := frame_bytes - consumed;
+            fragment_bytes := accumulated);
           let remaining = retained - consumed in
           if remaining > 0 && consumed > 0
           then Bigstringaf.blit buffer ~src_off:consumed buffer ~dst_off:0 ~len:remaining;

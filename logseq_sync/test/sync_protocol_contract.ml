@@ -308,7 +308,11 @@ let test_protocol_validation_is_fail_closed () =
     "negative typed cursor cannot be encoded"
     true
     (Result.is_error (Logseq_db_types.Server_cursor.of_int64 (-1L)));
-  let oversized = String.make (Logseq_db_types.Limits.maximum_response_bytes + 1) 'x' in
+  let maximum = 4 * 1024 * 1024 in
+  let pull payload = Printf.sprintf {|{"type":"pull/ok","t":1,"txs":[{"t":1,"tx":"%s"}]}|} payload in
+  let at_limit = pull (String.make (maximum - String.length (pull "")) 'x') in
+  ignore (Protocol.decode_server_message at_limit |> require_ok "exact downlink limit");
+  let oversized = at_limit ^ " " in
   let error =
     Protocol.decode_server_message oversized |> require_error "oversized server message"
   in
@@ -317,7 +321,7 @@ let test_protocol_validation_is_fail_closed () =
     "oversized frame is classified before JSON parsing"
     true
     (error.kind
-     = Protocol.Limit_exceeded { maximum = Logseq_db_types.Limits.maximum_response_bytes }
+     = Protocol.Limit_exceeded { maximum }
     )
 ;;
 
