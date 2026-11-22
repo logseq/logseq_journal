@@ -4641,7 +4641,7 @@ let asset_cancelled_completion_cleans_resources () =
          true
          (List.exists
             (function
-              | Core.Run (Core.Asset_io (_, io)) -> io.action = cleanup
+              | Core.Run (Core.Asset_cleanup_io ticket) -> (Core.asset_cleanup_request ticket).action = cleanup
               | _ -> false)
             late.effects))
     [ ( Core.Fetch_asset
@@ -4674,7 +4674,7 @@ let asset_scope_switch_cleans_late_resources () =
          true
          (List.exists
             (function
-              | Core.Run (Core.Asset_io (_, io)) -> io.action = cleanup
+              | Core.Run (Core.Asset_cleanup_io ticket) -> (Core.asset_cleanup_request ticket).action = cleanup
               | _ -> false)
             late.effects))
     [ ( Core.Fetch_asset
@@ -4716,8 +4716,8 @@ let asset_mismatched_completion_cleans_resource () =
     true
     (List.exists
        (function
-         | Core.Run (Core.Asset_io (_, io)) ->
-           io.action = Core.Release_staged_file "unexpected-stage"
+         | Core.Run (Core.Asset_cleanup_io ticket) ->
+           (Core.asset_cleanup_request ticket).action = Core.Release_staged_file "unexpected-stage"
          | _ -> false)
        wrong.effects)
 ;;
@@ -4740,20 +4740,29 @@ let asset_retry_completion_is_consumed_once () =
 let asset_scope_close_keeps_pending_release () =
   List.iter(fun action->
     let core,scope=asset_fixture() in
-    let releasing,ticket,request=asset_issue core scope "preview-release" action in
+    let request : Core.asset_request = {scope; operation="preview-release"; action} in
+    let releasing=Core.step core (Core.Asset_requested request) in
+    let completion=List.find_map (function
+      | Core.Run (Core.Asset_cleanup_io ticket) ->
+        (match Core.asset_cleanup_io ticket with
+         | Core.Release_file _ -> Some (Core.Asset_cleanup_completion (ticket, Ok Core.File_released))
+         | Core.Release_stage _ -> Some (Core.Asset_cleanup_completion (ticket, Ok Core.Stage_released))
+         | _ -> None)
+      | _ -> None) releasing.effects |> Option.get in
     let acquiring,_,acquire=asset_issue releasing.next scope "preview-retain" (Core.Retain_asset_file "preview") in
-    let closing,_,_=asset_issue acquiring.next scope "scope-close" Core.Close_asset_scope in
+    let closing=Core.step acquiring.next (Core.Asset_requested
+      {scope; operation="scope-close"; action=Core.Close_asset_scope}) in
     Alcotest.(check bool) "closing a scope cannot cancel its physical release ACK" false
       (List.exists(fun(output:Core.asset_output)->output.request.operation=request.operation)
         (asset_outputs closing.effects));
     Alcotest.(check bool) "closing still cancels an in-flight acquisition" true
       (List.exists(fun(output:Core.asset_output)->output.request=acquire && output.result=Error Core.Asset_cancelled)
         (asset_outputs closing.effects));
-    let completed=asset_complete closing.next ticket(Ok Core.Asset_unit) in
+    let completed=Core.step closing.next (Core.Runner_completed completion) in
     Alcotest.(check bool) "actual release completion reaches its original owner" true
       (asset_outputs completed.effects=[{Core.request;result=Ok Core.Asset_unit}]);
     check_instructions "release terminal is consumed once" []
-      (asset_complete completed.next ticket(Ok Core.Asset_unit)).effects)
+      (Core.step completed.next (Core.Runner_completed completion)).effects)
     [Core.Release_asset_file "preview";Core.Release_staged_file "staged-preview"]
 ;;
 
@@ -4804,7 +4813,8 @@ let asset_cleanup_requires_admitted_scope () =
          true
          (List.exists
             (function
-              | Core.Run (Core.Asset_io (_, io)) ->
+              | Core.Run (Core.Asset_cleanup_io ticket) ->
+                let io = Core.asset_cleanup_request ticket in
                 io.context.scope = scope && io.action = action
               | _ -> false)
             accepted.effects))
@@ -4846,7 +4856,8 @@ let asset_deletion_cancels_stage core scope deletion_scope action =
     true
     (List.exists
        (function
-         | Core.Run (Core.Asset_io (_, io)) ->
+         | Core.Run (Core.Asset_cleanup_io ticket) ->
+           let io = Core.asset_cleanup_request ticket in
            io.context.scope = scope
            && io.action = Core.Release_staged_file "late-deleted-stage"
          | _ -> false)
@@ -6665,9 +6676,17 @@ let resident_reopened_lifetime_finishes_owned_retirement () =
  check_instructions "retired outbox cannot request work in new lifetime" [] stale.effects;
  let late=asset_complete stale.next ticket (Ok(Core.Asset_retained(Some("late-resident-lease","synthetic-path")))) in
  Alcotest.(check int) "retired success never publishes the resource" 0 (List.length(asset_outputs late.effects));
- let cleanup=List.find_map(function Core.Run(Core.Asset_io(ticket,request)) when request.action=Core.Release_asset_file "late-resident-lease"->Some ticket|_->None) late.effects in
+ Alcotest.(check bool) "retired release cannot use legacy asset I/O" false
+  (List.exists (function Core.Run (Core.Asset_io (_, { action = Core.Release_asset_file _; _ })) -> true | _ -> false) late.effects);
+ let cleanup=List.find_map (function
+   | Core.Run (Core.Asset_cleanup_io ticket) ->
+     (match Core.asset_cleanup_io ticket with
+      | Core.Release_file "late-resident-lease" ->
+        Some (Core.Asset_cleanup_completion (ticket, Ok Core.File_released))
+      | _ -> None)
+   | _ -> None) late.effects in
  Alcotest.(check bool) "new lifetime retains exact old asset cleanup owner" true (Option.is_some cleanup);
- let released=asset_complete late.next (Option.get cleanup) (Ok Core.Asset_unit) in
+ let released=Core.step late.next (Core.Runner_completed (Option.get cleanup)) in
  let duplicate=asset_complete released.next ticket (Ok(Core.Asset_retained(Some("late-resident-lease","synthetic-path")))) in
  check_instructions "retired asset completion is consumed once" [] duplicate.effects;
  let attaching=Core.step duplicate.next (Core.Mirror_inspected(Core.Mirror_available mirror)) in

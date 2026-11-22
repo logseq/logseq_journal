@@ -437,6 +437,27 @@ type asset_io_request =
 
 type asset_ticket
 
+type _ asset_cleanup_io =
+  | Release_file : string -> [ `File_released ] asset_cleanup_io
+  | Release_stage : string -> [ `Stage_released ] asset_cleanup_io
+  | Close_scope : [ `Scope_closed ] asset_cleanup_io
+  | Await_operations : [ `Operations_awaited ] asset_cleanup_io
+
+type _ asset_cleanup_ack =
+  | File_released : [ `File_released ] asset_cleanup_ack
+  | Stage_released : [ `Stage_released ] asset_cleanup_ack
+  | Scope_closed : [ `Scope_closed ] asset_cleanup_ack
+  | Operations_awaited : [ `Operations_awaited ] asset_cleanup_ack
+
+type 'a asset_cleanup_result = ('a asset_cleanup_ack, asset_failure) result
+
+(** Core issues a scope- and operation-bound ticket. Complete it once with the
+    matching ACK after physical execution, or with the execution failure. *)
+type 'a asset_cleanup_ticket
+
+val asset_cleanup_request : 'a asset_cleanup_ticket -> asset_io_request
+val asset_cleanup_io : 'a asset_cleanup_ticket -> 'a asset_cleanup_io
+
 val asset_ticket_id : asset_ticket -> string
 
 type asset_output =
@@ -529,6 +550,7 @@ type runner_effect = private
       filesystem or data-admission permission is granted. *)
   | Await_io of int64 * effect_scope
   | Asset_io of asset_ticket * asset_io_request
+  | Asset_cleanup_io : 'a asset_cleanup_ticket -> runner_effect
   | Protected_io of protected_ticket * protected_request
   | Request : 'a effect_ticket * 'a runner_request -> runner_effect
   | Start_websocket of websocket_request
@@ -542,6 +564,7 @@ type runner_effect = private
 
 type runner_completion =
   | Asset_completion of asset_ticket * asset_result
+  | Asset_cleanup_completion : 'a asset_cleanup_ticket * 'a asset_cleanup_result -> runner_completion
   | Protected_completion of protected_ticket * protected_result
   | Completion : 'a effect_ticket * ('a, effect_error) result -> runner_completion
 

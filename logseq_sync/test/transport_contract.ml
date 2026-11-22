@@ -4969,7 +4969,7 @@ let run ()=with_support(fun root->
     | _->());Eio.Stream.add events event) |> Result.get_ok in
  let run=function
    | C.Await_io _ | Start_websocket _ | Send_websocket _ | Close_websocket _ | Cancel_effects _ | Cancel_network_effects _ | Schedule_timer _ as op->R.submit runner op
-   | Request _ | Asset_io _ | Protected_io _ -> () in
+   | Request _ | Asset_io _ | Asset_cleanup_io _ | Protected_io _ -> () in
  let running=ref true in
  Eio.Fiber.fork ~sw (fun()->while !running do
    let event=Eio.Stream.take events in

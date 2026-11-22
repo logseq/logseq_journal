@@ -3726,7 +3726,7 @@ let submit t = function
           (Core.Sync_event
              (Sync.Runner_completed
                 (Sync.Completion (ticket, Error (Sync.Effect_failed message))))))
-  | Run_sync (Sync.Asset_io _ as sync_effect) ->
+  | Run_sync ((Sync.Asset_io _ | Sync.Asset_cleanup_io _) as sync_effect) ->
     t.dependencies.sync_runner.submit sync_effect
   | Run_sync sync_effect ->
     if not t.stopped then t.dependencies.sync_runner.submit sync_effect

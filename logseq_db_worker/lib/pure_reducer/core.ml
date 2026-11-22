@@ -509,7 +509,7 @@ let step state event =
     match event with
     | Sync_event
         (( Sync.Asset_requested _ | Sync.Protected_requested _ | Sync.Shutdown
-         | Sync.Runner_completed (Sync.Asset_completion _ | Sync.Protected_completion _)
+         | Sync.Runner_completed (Sync.Asset_completion _ | Sync.Asset_cleanup_completion _ | Sync.Protected_completion _)
            ) as event) -> translate_sync (Sync.step state.sync_core event) state
     | _ -> no_effects state)
   else (
