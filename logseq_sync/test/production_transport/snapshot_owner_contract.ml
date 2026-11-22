@@ -21,7 +21,7 @@ let identity =
 
 let cursor = Result.get_ok (Logseq_overlay_db.Types.Server_cursor.of_int64 3L)
 
-let limits_with_items maximum_items =
+let limits_with_items ?(large_snapshot = false) maximum_items =
   get
     (D.limits
        ~maximum_items
@@ -40,9 +40,9 @@ let limits_with_items maximum_items =
        ~asset_cache_budget_bytes:4096L
        ~asset_maximum_file_bytes:1024
        ~asset_pending_budget_bytes:4096L
-       ~snapshot_maximum_artifact_bytes:8388608L
-       ~snapshot_staging_budget_bytes:33554432L
-       ~snapshot_scratch_budget_bytes:33554432L)
+       ~snapshot_maximum_artifact_bytes:(if large_snapshot then 1073741824L else 8388608L)
+       ~snapshot_staging_budget_bytes:(if large_snapshot then 2147483648L else 33554432L)
+       ~snapshot_scratch_budget_bytes:(if large_snapshot then 2147483648L else 33554432L))
 ;;
 
 let limits = limits_with_items 1024
@@ -362,6 +362,48 @@ let native_client
 ;;
 
 let wire_response headers body = "HTTP/1.1 200 OK\r\n" ^ headers ^ "\r\n" ^ body
+
+let native_catalog ~success padding () =
+  let body =
+    {|{"graphs":[{"graph-id":"60000000-0000-4000-8000-000000000001","graph-name":"synthetic","graph-ready-for-use?":true}],"future":"|}
+    ^ String.make padding 'x' ^ {|"}|}
+  in
+  ignore
+    (Tls_peer.with_peer
+       [ Tls_peer.case
+           (wire_response
+              (Printf.sprintf "Content-Type: application/json\r\nContent-Length: %d\r\n"
+                 (String.length body))
+              body)
+       ]
+       (fun ~environment ~sw ~support ~origin ->
+          let module Account = Journal_sync_lifecycle.Account in
+          let catalog =
+            Account.native_catalog
+              ~sw
+              ~clock:(Eio.Stdenv.mono_clock environment)
+              ~network:(Eio.Stdenv.net environment)
+              ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+              ~deadlines:
+                { setup_seconds = 1.; tls_handshake_seconds = 1.
+                ; http_response_seconds = 3.; download_seconds = 3. }
+              ~token:(fun ~account:_ ~epoch:_ ~refresh:_ -> Ok "synthetic-bearer")
+          in
+          let result =
+            catalog
+              ~account:{ origin = Uri.to_string origin; account = "synthetic"; root = support }
+              ~check_current:(fun () -> Ok ())
+              ~gate:(fun () -> D.Open { authorization_epoch = 1L })
+          in
+          if success
+          then Alcotest.(check int) "decoded graph count" 1 (List.length (get result))
+          else
+            expect
+              (function
+                | D.Protocol_failure "HTTP body exceeds its configured bound" -> true
+                | _ -> false)
+              result))
+;;
 
 let check_retired report =
   let open Yojson.Basic.Util in
@@ -1285,6 +1327,7 @@ let native_service_bootstrap
       ?(catchup = false)
       ?(large_encrypted_pull = false)
       ?(tamper_pull = false)
+      ?(large_snapshot = false)
       ()
   =
   let module App = Journal_sync_lifecycle.Core in
@@ -1420,7 +1463,10 @@ let native_service_bootstrap
   let report =
     Tls_peer.with_peer
       ([ Tls_peer.case ~eof:true metadata
-       ; Tls_peer.case ~eof:true artifact
+       ; (match Tls_peer.case ~eof:true artifact with
+          | `Assoc fields when large_snapshot ->
+            `Assoc (("large_snapshot", `Bool true) :: fields)
+          | artifact -> artifact)
        ; (if no_ws
           then
             Tls_peer.case
@@ -1476,7 +1522,7 @@ let native_service_bootstrap
               in
               let config : Logseq_sync_sync_service.Core.config =
                 { identity
-                ; limits
+                ; limits = limits_with_items ~large_snapshot 1024
                 ; network = D.Open { authorization_epoch = 1L }
                 ; policy =
                     get
@@ -1525,7 +1571,7 @@ let native_service_bootstrap
                            { X.setup_seconds = 2.
                            ; tls_handshake_seconds = 2.
                            ; http_response_seconds = 2.
-                           ; download_seconds = 2.
+                           ; download_seconds = (if large_snapshot then 8. else 2.)
                            }
                          ~liveness:X.Peer_close_only
                          ~cleanup_seconds:2.
@@ -1574,7 +1620,10 @@ let native_service_bootstrap
                     Alcotest.(check bool) "SQLite keeps baseline title and no rejected plaintext"
                       true (!titles = Some (Some "1", Some "0"))))
                 else (
-                Tls_peer.wait (Eio.Stdenv.clock environment) (fun () ->
+                Tls_peer.wait
+                  ~seconds:(if large_snapshot then 15. else 5.)
+                  (Eio.Stdenv.clock environment)
+                  (fun () ->
                   (match !errors with
                    | D.Activation_failure (Types.Snapshot_parse_error message) :: _ ->
                      Alcotest.fail ("Activation parse: " ^ message)
@@ -2303,6 +2352,8 @@ let () =
     ; ( "AES protected append duplicate operations retain exact datoms"
       , fun () -> encrypted_snapshot_activation ~echo:true () )
     ; ("App owned native absent mirror bootstrap", fun () -> native_service_bootstrap ())
+    ; ( "App native bootstrap above 64 MiB"
+      , fun () -> native_service_bootstrap ~large_snapshot:true () )
     ; ( "encrypted native bootstrap admits mismatched Hello and retains actual digest"
       , fun () -> native_service_bootstrap ~checksum_mode:`Invalid () )
     ; ( "encrypted native bootstrap warns and continues on a later mismatched head"
@@ -2315,6 +2366,8 @@ let () =
     ; "framing rejects and cleans", framing_failure
     ; "row count rejects and cleans", row_failure
     ; "handoff failure cleans", handoff_failure
+    ; "native catalog accepts a response above 256 KiB", native_catalog ~success:true (256 * 1024)
+    ; "native catalog rejects a response above 1 MiB", native_catalog ~success:false (1024 * 1024)
     ; "HTTP refresh once", auth
     ; "HTTP status classification", http_status_policy
     ; "native response phase deadline", native_response_deadline

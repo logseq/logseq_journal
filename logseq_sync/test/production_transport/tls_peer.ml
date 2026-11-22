@@ -83,6 +83,9 @@ def serve_case(index,case,raw):
     request+=part
   time.sleep(case.get('response_delay',0))
   wire=bytes.fromhex(case.get('wire','')).replace(b'{{ORIGIN}}', ('https://localhost:'+str(listener.getsockname()[1])).encode())
+  if case.get('large_snapshot'):
+    payload=b'[]'+b' '*(1024*1024-2)
+    wire+=(struct.pack('>I',len(payload))+payload)*65
   if case.get('gzip_layers'):
     headers,body=wire.split(b'\r\n\r\n',1)
     for _ in range(case['gzip_layers']): body=gzip.compress(body)
@@ -188,8 +191,8 @@ let case ?(ws = false) ?(extra = "") ?(segment = 16384) ?(eof = false) wire =
     ]
 ;;
 
-let wait clock predicate =
-  Eio.Time.with_timeout_exn clock 5. (fun () ->
+let wait ?(seconds = 5.) clock predicate =
+  Eio.Time.with_timeout_exn clock seconds (fun () ->
     while not (predicate ()) do
       Eio.Time.sleep clock 0.005
     done)
