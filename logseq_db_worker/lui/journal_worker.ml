@@ -298,8 +298,8 @@ type packed_startup =
 type packed_client =
   | Packed_client : ('request, 'response, 'push) client -> packed_client
 
-let request_capacity = 32
-let response_capacity = 32
+let request_capacity = 128
+let response_capacity = 128
 let injected_capacity = 1024
 let no_duration = -1L
 let now_ns () = Mtime_clock.elapsed_ns ()

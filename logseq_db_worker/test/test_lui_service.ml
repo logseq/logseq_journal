@@ -628,12 +628,19 @@ let with_control_fixture ?crash run =
 
 let test_control_bypasses_full_data_and_waiting_handlers () =
   with_control_fixture (fun client ticket replies _ _ ->
-    let ids = List.init 32 (fun i -> Worker.send client (Data i) |> accepted) in
+    let capacity = 128 in
+    let ids = List.init capacity (fun i ->
+      let value = i + 1 in
+      match Worker.send client (Data value) with
+      | Worker.Accepted id -> id
+      | Worker.Full -> T.fail "request %d refused as Full" value
+      | result -> accepted result)
+    in
     control_wait "all data permits are occupied" (fun () ->
       let metrics = Worker.Private.metrics (Worker.Private.pack_client client) in
-      metrics.active_handlers = 2 && metrics.waiting_request_fibers = 30);
+      metrics.active_handlers = 2 && metrics.waiting_request_fibers = capacity - 2);
     T.require
-      (Worker.send client (Data 32) = Worker.Full)
+      (Worker.send client (Data (capacity + 1)) = Worker.Full)
       "data backpressure remains Full";
     T.require
       (Worker.send_control client (Reply (ticket, 1)) = Worker.Control_accepted)
@@ -648,11 +655,19 @@ let test_control_bypasses_full_data_and_waiting_handlers () =
       (Worker.For_testing.pending_control_count client <= 2)
       "control storage is bounded";
     control_wait "all data responds without draining first" (fun () ->
-      Worker.For_testing.pending_output_count client = 32);
+      Worker.For_testing.pending_output_count client = capacity);
     T.require
-      (Worker.send client (Data 33) = Worker.Full)
+      (Worker.send client (Data (capacity + 1)) = Worker.Full)
       "control did not steal or enlarge data reservations";
-    let events = Worker.For_testing.drain_events client ~max_events:64 in
+    let first = Worker.For_testing.drain_events client ~max_events:1 in
+    T.require (List.length first = 1) "drain recovers exactly one response slot";
+    let replacement = Worker.send client (Data (capacity + 1)) |> accepted in
+    T.require
+      (Worker.send client (Data (capacity + 2)) = Worker.Full)
+      "one drained response allows exactly one new admission";
+    control_wait "replacement responds" (fun () ->
+      Worker.For_testing.pending_output_count client = capacity);
+    let events = first @ Worker.For_testing.drain_events client ~max_events:capacity in
     let completed =
       List.filter_map
         (function
@@ -661,11 +676,11 @@ let test_control_bypasses_full_data_and_waiting_handlers () =
           | _ -> None)
         events
     in
-    T.require (List.length completed = 32) "every accepted data request completes once";
+    T.require (List.length completed = capacity + 1) "every accepted data request completes once";
     List.iteri
       (fun i id ->
-         T.require (List.mem (id, i) completed) "ordinary response identities survive")
-      ids;
+         T.require (List.mem (id, i + 1) completed) "ordinary response identities survive")
+      (ids @ [ replacement ]);
     T.require (Atomic.get replies = 1) "first answer wins")
 ;;
 
@@ -1232,7 +1247,7 @@ let test_real_auth_control ~transition () =
                | Worker.Response { request_id; outcome = Cancelled; _ } ->
                  cancelled := request_id :: !cancelled
                | _ -> ())
-             (Worker.For_testing.drain_events client ~max_events:64)
+             (Worker.For_testing.drain_events client ~max_events:256)
          in
          let permit_online () =
            let startup : Service.startup_facts = Option.get !current_startup in
@@ -1321,7 +1336,7 @@ let test_real_auth_control ~transition () =
                  |> accepted);
             let full = ref false
             and admissions = ref 0 in
-            while (not !full) && !admissions < 32 do
+            while (not !full) && !admissions <= 128 do
               match Worker.send client Service.Get_graph_state with
               | Worker.Accepted _ -> incr admissions
               | Worker.Full -> full := true

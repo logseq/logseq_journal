@@ -6719,7 +6719,7 @@ let test_pending_auth_never_replays_older_identity ~newer_accepted () =
       match W.send client Service.Get_graph_state with
       | Accepted request_id -> filled_requests := request_id :: !filled_requests; fill (remaining - 1)
       | Full -> () | _ -> failwith "fixture stopped" in
-    fill 128;
+    fill 129;
     hooks.platform_event (payload "A"); ignore (hooks.pump ());
     Alcotest.(check bool) "older native identity reached Full admission" true (List.mem (Some "A") !observed);
     hooks.platform_event (payload "B");
@@ -7209,11 +7209,12 @@ let test_application_token_control ~saturated ~failure () =
        let packet = Journal_platform.id_token_request request |> Bytes.to_string in
        if saturated
        then (
-         for _ = 1 to 32 do
+         let capacity = 128 in
+         for _ = 1 to capacity do
            send S.Get_graph_state
          done;
-         wait "32 undrained data responses" (fun () ->
-           W.For_testing.pending_output_count client = 32);
+         wait "128 undrained data responses" (fun () ->
+           W.For_testing.pending_output_count client = capacity);
          Alcotest.(check bool)
            "ordinary lane is Full"
            true
