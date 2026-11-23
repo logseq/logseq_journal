@@ -930,16 +930,48 @@ struct JournalSheetDismissButton: SwiftUI.View {
     }
 
     private var selectionIndicator: some SwiftUI.View {
+      Group {
+        if reduceMotion {
+          selectionPill
+            .offset(x: indicatorOffset(favorites))
+            .transition(.identity)
+        } else {
+          selectionPill
+            .modifier(SlidingSelection(favorites: favorites, offset: indicatorOffset))
+            .transition(.identity)
+        }
+      }
+      .animation(nil, value: reduceMotion)
+      .environment(\.layoutDirection, .leftToRight)
+      .allowsHitTesting(false)
+      .accessibilityHidden(true)
+    }
+
+    private var selectionPill: some SwiftUI.View {
       Capsule()
         .fill(reduceTransparency ? Color(uiColor: .tertiarySystemBackground) : Color.clear)
         .frame(width: slotWidth - 10, height: height - 10)
         .glassEffect(reduceTransparency ? .identity : .regular, in: Capsule())
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.2)) { indicator in
-          indicator.offset(x: (favorites == (layoutDirection == .leftToRight) ? 1 : -1) * slotWidth / 2)
-        }
-        .environment(\.layoutDirection, .leftToRight)
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
+    }
+
+    private func indicatorOffset(_ favorites: Bool) -> CGFloat {
+      (favorites == (layoutDirection == .leftToRight) ? 1 : -1) * slotWidth / 2
+    }
+
+    private struct SlidingSelection: ViewModifier {
+      let favorites: Bool
+      let offset: (Bool) -> CGFloat
+      @State private var indicatorFavorites: Bool?
+
+      func body(content: Content) -> some SwiftUI.View {
+        content
+          .offset(x: offset(indicatorFavorites ?? favorites))
+          .onChange(of: favorites, initial: true) { oldValue, newValue in
+            withAnimation(oldValue == newValue ? nil : .easeOut(duration: 0.2)) {
+              indicatorFavorites = newValue
+            }
+          }
+      }
     }
 
     private func destination(_ label: String, icon: String, id: String, selected: Bool,
