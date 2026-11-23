@@ -34,27 +34,31 @@ final class JournalIPhoneAcceptance: XCTestCase {
   @MainActor func testBottomBarNavigationAndInlineCapture() {
     continueAfterFailure = false
     let app = application(relaunch: true)
-    let timeline = app.buttons["journal-bottom-timeline"]
-    let favorites = app.buttons["journal-bottom-favorites"]
+    let timeline = app.tabBars.buttons["Journals"]
+    let favorites = app.tabBars.buttons["Favorites"]
     let capture = app.buttons["journal-capture-open"]
     XCTAssertTrue(timeline.waitForExistence(timeout: 25))
     XCTAssertTrue(timeline.isSelected)
-    XCTAssertEqual(timeline.frame.width, 95, accuracy: 0.5)
-    XCTAssertEqual(favorites.frame.width, 95, accuracy: 0.5)
-    XCTAssertEqual(timeline.frame.height, 60.7, accuracy: 0.5)
+    XCTAssertTrue(favorites.isHittable)
+    XCTAssertTrue(capture.isHittable)
+    let destinations = timeline.frame.union(favorites.frame)
+    XCTAssertLessThan(destinations.maxX, capture.frame.minX)
+    XCTAssertEqual(destinations.midY, capture.frame.midY, accuracy: 2)
     XCTAssertEqual(capture.frame.width, 60.7, accuracy: 0.5)
     XCTAssertEqual(capture.frame.height, 60.7, accuracy: 0.5)
     record("Bottom bar Timeline", app)
 
-    favorites.tap()
+    favorites.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5)).tap()
     XCTAssertTrue(app.staticTexts["favorites-header-title"].waitForExistence(timeout: 10))
     XCTAssertTrue(favorites.isSelected)
     XCTAssertFalse(timeline.isSelected)
     XCTAssertFalse(capture.exists)
     record("Bottom bar Favorites", app)
 
-    timeline.tap()
+    timeline.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).tap()
     XCTAssertTrue(capture.waitForExistence(timeout: 10))
+    XCTAssertTrue(timeline.isSelected)
+    XCTAssertFalse(favorites.isSelected)
     capture.tap()
     let editor = app.textFields["field.composer"]
     XCTAssertTrue(editor.waitForExistence(timeout: 10), app.debugDescription)

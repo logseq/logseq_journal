@@ -890,21 +890,36 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let send: (String) -> Void
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @ScaledMetric(relativeTo: .body) private var destinationIcon = 22.0
     @ScaledMetric(relativeTo: .body) private var captureIcon = 28.0
     private let height: CGFloat = 60.7
-    private let slotWidth: CGFloat = 95
+
+    private enum Destination: String {
+      case journals, favorites
+    }
+
+    private var selection: Binding<Destination> {
+      Binding(
+        get: { favorites ? .favorites : .journals },
+        set: { send($0.rawValue) }
+      )
+    }
 
     var body: some SwiftUI.View {
       HStack(spacing: 0) {
-        HStack(spacing: 0) {
-          destination("Journals", icon: "calendar", id: "timeline", selected: !favorites, action: "journals")
-          destination("Favorites", icon: "star", id: "favorites", selected: favorites, action: "favorites")
+        TabView(selection: selection) {
+          Tab(value: Destination.journals) { Color.clear } label: {
+            Label("Journals", systemImage: "calendar")
+              .labelStyle(.iconOnly)
+              .accessibilityLabel("Journals")
+          }
+          Tab(value: Destination.favorites) { Color.clear } label: {
+            Label("Favorites", systemImage: "star")
+              .labelStyle(.iconOnly)
+              .accessibilityLabel("Favorites")
+          }
         }
-        .background {
-          if reduceTransparency { Capsule().fill(Color(uiColor: .secondarySystemBackground)) }
-        }
-        .glassEffect(reduceTransparency ? .identity : .regular, in: Capsule())
+        .tint(.primary)
+        .frame(width: 190, height: height)
         Spacer(minLength: 0)
         if !favorites {
           Button { send("capture") } label: {
@@ -921,28 +936,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .disabled(!captureEnabled)
           .accessibilityLabel("Capture")
           .accessibilityIdentifier("journal-capture-open")
+          .offset(y: -22)
         }
       }
       .foregroundStyle(Color.primary)
-    }
-
-    private func destination(_ label: String, icon: String, id: String, selected: Bool,
-                             action: String) -> some SwiftUI.View {
-      Button { send(action) } label: {
-        Image(systemName: icon)
-          .font(.system(size: min(destinationIcon, 40), weight: selected ? .semibold : .regular))
-          .frame(width: slotWidth - 10, height: height - 10)
-          .background {
-            if selected && reduceTransparency { Capsule().fill(Color(uiColor: .systemFill)) }
-          }
-          .glassEffect(selected && !reduceTransparency ? .regular : .identity, in: Capsule())
-          .frame(width: slotWidth, height: height)
-          .contentShape(Rectangle())
-      }
-      .buttonStyle(.plain)
-      .accessibilityLabel(Text(label))
-      .accessibilityAddTraits(selected ? .isSelected : [])
-      .accessibilityIdentifier("journal-bottom-" + id)
     }
   }
   #endif
