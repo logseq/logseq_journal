@@ -56,7 +56,8 @@ final class JournalIPhoneAcceptance: XCTestCase {
     timeline.tap()
     XCTAssertTrue(capture.waitForExistence(timeout: 10))
     capture.tap()
-    XCTAssertTrue(app.textViews.firstMatch.waitForExistence(timeout: 10))
+    let editor = app.textFields["field.composer"]
+    XCTAssertTrue(editor.waitForExistence(timeout: 10), app.debugDescription)
     XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
     XCTAssertTrue(timeline.exists)
     XCTAssertTrue(capture.exists)
