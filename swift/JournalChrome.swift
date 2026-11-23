@@ -890,8 +890,11 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let send: (String) -> Void
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.journalContainerBottomInset) private var containerBottomInset
     @ScaledMetric(relativeTo: .body) private var captureIcon = 28.0
     private let height: CGFloat = 60.7
+    private let controlScale: CGFloat = 0.9
+    private let captureLift: CGFloat = 22
 
     private struct NativeTabs: UIViewControllerRepresentable {
       enum Destination: Int, CaseIterable {
@@ -950,6 +953,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
       HStack(spacing: 0) {
         NativeTabs(selection: favorites ? .favorites : .journals, send: send)
           .frame(width: 190, height: height)
+          .scaleEffect(controlScale, anchor: UnitPoint(x: 0, y: (height - captureLift) / height))
         Spacer(minLength: 0)
         if !favorites {
           Button { send("capture") } label: {
@@ -966,10 +970,12 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .disabled(!captureEnabled)
           .accessibilityLabel("Capture")
           .accessibilityIdentifier("journal-capture-open")
-          .offset(y: -22)
+          .scaleEffect(controlScale, anchor: .bottomTrailing)
+          .offset(y: -captureLift)
         }
       }
       .foregroundStyle(Color.primary)
+      .offset(y: min(29, containerBottomInset - 3))
     }
   }
   #endif
@@ -1176,6 +1182,17 @@ extension EnvironmentValues {
   var journalContainerTopInset: CGFloat {
     get { self[JournalContainerTopInsetKey.self] }
     set { self[JournalContainerTopInsetKey.self] = newValue }
+  }
+}
+
+private struct JournalContainerBottomInsetKey: EnvironmentKey {
+  static let defaultValue: CGFloat = 0
+}
+
+extension EnvironmentValues {
+  var journalContainerBottomInset: CGFloat {
+    get { self[JournalContainerBottomInsetKey.self] }
+    set { self[JournalContainerBottomInsetKey.self] = newValue }
   }
 }
 

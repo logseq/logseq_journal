@@ -55,6 +55,7 @@ struct JournalRuntimeHost: View {
       GeometryReader { container in
         content
           .environment(\.journalContainerTopInset, container.safeAreaInsets.top)
+          .environment(\.journalContainerBottomInset, container.safeAreaInsets.bottom)
           .environment(\.journalStartupContainerFrame, container.frame(in: .global))
       }
       #else
