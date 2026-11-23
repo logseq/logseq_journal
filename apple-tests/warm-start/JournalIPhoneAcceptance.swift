@@ -47,19 +47,22 @@ final class JournalIPhoneAcceptance: XCTestCase {
     XCTAssertEqual(capture.frame.width, 60.7, accuracy: 0.5)
     XCTAssertEqual(capture.frame.height, 60.7, accuracy: 0.5)
     record("Bottom bar Timeline", app)
+    if app.frame.width == 402 {
+      XCTAssertEqual(app.frame.maxY - capture.frame.maxY, 35, accuracy: 1)
+    }
 
-    favorites.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5)).tap()
+    favorites.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.94)).tap()
     XCTAssertTrue(app.staticTexts["favorites-header-title"].waitForExistence(timeout: 10))
     XCTAssertTrue(favorites.isSelected)
     XCTAssertFalse(timeline.isSelected)
     XCTAssertFalse(capture.exists)
     record("Bottom bar Favorites", app)
 
-    timeline.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).tap()
+    timeline.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.94)).tap()
     XCTAssertTrue(capture.waitForExistence(timeout: 10))
     XCTAssertTrue(timeline.isSelected)
     XCTAssertFalse(favorites.isSelected)
-    capture.tap()
+    capture.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.94)).tap()
     let editor = app.textFields["field.composer"]
     XCTAssertTrue(editor.waitForExistence(timeout: 10), app.debugDescription)
     XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))

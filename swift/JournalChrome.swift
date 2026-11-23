@@ -970,6 +970,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
         }
       }
       .foregroundStyle(Color.primary)
+      .offset(y: 29)
     }
   }
   #endif
