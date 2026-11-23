@@ -890,6 +890,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let send: (String) -> Void
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.layoutDirection) private var layoutDirection
     @ScaledMetric(relativeTo: .body) private var destinationIcon = 22.0
     @ScaledMetric(relativeTo: .body) private var captureIcon = 28.0
     private let height: CGFloat = 60.7
@@ -901,6 +903,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           destination("Journals", icon: "calendar", id: "timeline", selected: !favorites, action: "journals")
           destination("Favorites", icon: "star", id: "favorites", selected: favorites, action: "favorites")
         }
+        .background { selectionIndicator }
         .background {
           if reduceTransparency { Capsule().fill(Color(uiColor: .secondarySystemBackground)) }
         }
@@ -926,16 +929,24 @@ struct JournalSheetDismissButton: SwiftUI.View {
       .foregroundStyle(Color.primary)
     }
 
+    private var selectionIndicator: some SwiftUI.View {
+      Capsule()
+        .fill(reduceTransparency ? Color(uiColor: .tertiarySystemBackground) : Color.clear)
+        .frame(width: slotWidth - 10, height: height - 10)
+        .glassEffect(reduceTransparency ? .identity : .regular, in: Capsule())
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.2)) { indicator in
+          indicator.offset(x: (favorites == (layoutDirection == .leftToRight) ? 1 : -1) * slotWidth / 2)
+        }
+        .environment(\.layoutDirection, .leftToRight)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
     private func destination(_ label: String, icon: String, id: String, selected: Bool,
                              action: String) -> some SwiftUI.View {
       Button { send(action) } label: {
         Image(systemName: icon)
           .font(.system(size: min(destinationIcon, 40), weight: selected ? .semibold : .regular))
-          .frame(width: slotWidth - 10, height: height - 10)
-          .background {
-            if selected && reduceTransparency { Capsule().fill(Color(uiColor: .systemFill)) }
-          }
-          .glassEffect(selected && !reduceTransparency ? .regular : .identity, in: Capsule())
           .frame(width: slotWidth, height: height)
           .contentShape(Rectangle())
       }
