@@ -893,6 +893,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
     @Environment(\.journalContainerBottomInset) private var containerBottomInset
     @ScaledMetric(relativeTo: .body) private var captureIcon = 28.0
     private let height: CGFloat = 60.7
+    private let controlScale: CGFloat = 0.9
+    private let captureLift: CGFloat = 22
 
     private struct NativeTabs: UIViewControllerRepresentable {
       enum Destination: Int, CaseIterable {
@@ -951,6 +953,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
       HStack(spacing: 0) {
         NativeTabs(selection: favorites ? .favorites : .journals, send: send)
           .frame(width: 190, height: height)
+          .scaleEffect(controlScale, anchor: UnitPoint(x: 0, y: (height - captureLift) / height))
         Spacer(minLength: 0)
         if !favorites {
           Button { send("capture") } label: {
@@ -967,7 +970,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .disabled(!captureEnabled)
           .accessibilityLabel("Capture")
           .accessibilityIdentifier("journal-capture-open")
-          .offset(y: -22)
+          .scaleEffect(controlScale, anchor: .bottomTrailing)
+          .offset(y: -captureLift)
         }
       }
       .foregroundStyle(Color.primary)

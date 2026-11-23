@@ -44,8 +44,12 @@ final class JournalIPhoneAcceptance: XCTestCase {
     let destinations = timeline.frame.union(favorites.frame)
     XCTAssertLessThan(destinations.maxX, capture.frame.minX)
     XCTAssertEqual(destinations.midY, capture.frame.midY, accuracy: 2)
-    XCTAssertEqual(capture.frame.width, 60.7, accuracy: 0.5)
-    XCTAssertEqual(capture.frame.height, 60.7, accuracy: 0.5)
+    XCTAssertEqual(capture.frame.width, 54.6, accuracy: 0.5)
+    XCTAssertEqual(capture.frame.height, 54.6, accuracy: 0.5)
+    for destination in [timeline, favorites] {
+      XCTAssertGreaterThanOrEqual(destination.frame.width, 44)
+      XCTAssertGreaterThanOrEqual(destination.frame.height, 44)
+    }
     record("Bottom bar Timeline", app)
     let captureGap = app.frame.maxY - capture.frame.maxY
     XCTAssertEqual(captureGap, 33.5, accuracy: 1.5)
