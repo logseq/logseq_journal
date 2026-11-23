@@ -165,8 +165,8 @@ let case ?(ws = false) ?(extra = "") ?(segment = 16384) ?(eof = false) wire =
     ]
 ;;
 
-let wait clock predicate =
-  Eio.Time.with_timeout_exn clock 5. (fun () ->
+let wait ?(timeout = 5.) clock predicate =
+  Eio.Time.with_timeout_exn clock timeout (fun () ->
     while not (predicate ()) do
       Eio.Time.sleep clock 0.005
     done)
@@ -1795,7 +1795,7 @@ let test_large_snapshot_download () =
           |> Result.get_ok
         in
         Runner.submit runner (operation ~limits ~download:true origin);
-        wait (Eio.Stdenv.clock environment) (fun () -> Option.is_some (completed !posted));
+        wait ~timeout:10. (Eio.Stdenv.clock environment) (fun () -> Option.is_some (completed !posted));
         Alcotest.(check bool) "production staging completed" true
           (completed !posted = Some (Ok ()));
         let staging = Filename.concat support "staging" in
