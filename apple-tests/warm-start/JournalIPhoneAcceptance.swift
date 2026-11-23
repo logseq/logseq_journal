@@ -39,8 +39,8 @@ final class JournalIPhoneAcceptance: XCTestCase {
     let capture = app.buttons["journal-capture-open"]
     XCTAssertTrue(timeline.waitForExistence(timeout: 25))
     XCTAssertTrue(timeline.isSelected)
-    XCTAssertEqual(timeline.frame.width, 110, accuracy: 0.5)
-    XCTAssertEqual(favorites.frame.width, 110, accuracy: 0.5)
+    XCTAssertEqual(timeline.frame.width, 95, accuracy: 0.5)
+    XCTAssertEqual(favorites.frame.width, 95, accuracy: 0.5)
     XCTAssertEqual(timeline.frame.height, 60.7, accuracy: 0.5)
     XCTAssertEqual(capture.frame.width, 60.7, accuracy: 0.5)
     XCTAssertEqual(capture.frame.height, 60.7, accuracy: 0.5)

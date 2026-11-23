@@ -893,7 +893,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     @ScaledMetric(relativeTo: .body) private var destinationIcon = 22.0
     @ScaledMetric(relativeTo: .body) private var captureIcon = 28.0
     private let height: CGFloat = 60.7
-    private let slotWidth: CGFloat = 110
+    private let slotWidth: CGFloat = 95
 
     var body: some SwiftUI.View {
       HStack(spacing: 0) {
