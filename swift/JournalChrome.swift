@@ -893,33 +893,63 @@ struct JournalSheetDismissButton: SwiftUI.View {
     @ScaledMetric(relativeTo: .body) private var captureIcon = 28.0
     private let height: CGFloat = 60.7
 
-    private enum Destination: String {
-      case journals, favorites
-    }
+    private struct NativeTabs: UIViewControllerRepresentable {
+      enum Destination: Int, CaseIterable {
+        case journals, favorites
 
-    private var selection: Binding<Destination> {
-      Binding(
-        get: { favorites ? .favorites : .journals },
-        set: { send($0.rawValue) }
-      )
+        var action: String { self == .journals ? "journals" : "favorites" }
+        var label: String { self == .journals ? "Journals" : "Favorites" }
+        var symbol: String { self == .journals ? "calendar" : "star" }
+      }
+
+      let selection: Destination
+      let send: (String) -> Void
+
+      func makeCoordinator() -> Coordinator { Coordinator(tabs: self) }
+
+      func makeUIViewController(context: Context) -> UITabBarController {
+        let controller = UITabBarController()
+        controller.view.backgroundColor = .clear
+        controller.view.isOpaque = false
+        controller.viewControllers = Destination.allCases.map { destination in
+          let child = UIViewController()
+          child.view.backgroundColor = .clear
+          child.view.isOpaque = false
+          child.tabBarItem = UITabBarItem(title: nil,
+            image: UIImage(systemName: destination.symbol), selectedImage: nil)
+          child.tabBarItem.accessibilityLabel = destination.label
+          return child
+        }
+        controller.tabBar.tintColor = .label
+        controller.selectedIndex = selection.rawValue
+        controller.delegate = context.coordinator
+        return controller
+      }
+
+      func updateUIViewController(_ controller: UITabBarController, context: Context) {
+        context.coordinator.tabs = self
+        if controller.selectedIndex != selection.rawValue {
+          controller.selectedIndex = selection.rawValue
+        }
+      }
+
+      final class Coordinator: NSObject, UITabBarControllerDelegate {
+        var tabs: NativeTabs
+
+        init(tabs: NativeTabs) { self.tabs = tabs }
+
+        func tabBarController(_ controller: UITabBarController, didSelect viewController: UIViewController) {
+          guard let destination = Destination(rawValue: controller.selectedIndex),
+            destination != tabs.selection else { return }
+          tabs.send(destination.action)
+        }
+      }
     }
 
     var body: some SwiftUI.View {
       HStack(spacing: 0) {
-        TabView(selection: selection) {
-          Tab(value: Destination.journals) { Color.clear } label: {
-            Label("Journals", systemImage: "calendar")
-              .labelStyle(.iconOnly)
-              .accessibilityLabel("Journals")
-          }
-          Tab(value: Destination.favorites) { Color.clear } label: {
-            Label("Favorites", systemImage: "star")
-              .labelStyle(.iconOnly)
-              .accessibilityLabel("Favorites")
-          }
-        }
-        .tint(.primary)
-        .frame(width: 190, height: height)
+        NativeTabs(selection: favorites ? .favorites : .journals, send: send)
+          .frame(width: 190, height: height)
         Spacer(minLength: 0)
         if !favorites {
           Button { send("capture") } label: {
