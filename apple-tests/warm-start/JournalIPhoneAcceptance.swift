@@ -47,9 +47,10 @@ final class JournalIPhoneAcceptance: XCTestCase {
     XCTAssertEqual(capture.frame.width, 60.7, accuracy: 0.5)
     XCTAssertEqual(capture.frame.height, 60.7, accuracy: 0.5)
     record("Bottom bar Timeline", app)
-    if app.frame.width == 402 {
-      XCTAssertEqual(app.frame.maxY - capture.frame.maxY, 35, accuracy: 1)
-    }
+    let captureGap = app.frame.maxY - capture.frame.maxY
+    XCTAssertEqual(captureGap, 33.5, accuracy: 1.5)
+    let tabGap = app.frame.maxY - destinations.maxY
+    XCTAssertEqual(tabGap, captureGap + 3, accuracy: 1)
 
     favorites.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.94)).tap()
     XCTAssertTrue(app.staticTexts["favorites-header-title"].waitForExistence(timeout: 10))
@@ -57,6 +58,8 @@ final class JournalIPhoneAcceptance: XCTestCase {
     XCTAssertFalse(timeline.isSelected)
     XCTAssertFalse(capture.exists)
     record("Bottom bar Favorites", app)
+    XCTAssertEqual(app.frame.maxY - timeline.frame.union(favorites.frame).maxY,
+      tabGap, accuracy: 1)
 
     timeline.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.94)).tap()
     XCTAssertTrue(capture.waitForExistence(timeout: 10))

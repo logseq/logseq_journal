@@ -890,6 +890,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let send: (String) -> Void
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.journalContainerBottomInset) private var containerBottomInset
     @ScaledMetric(relativeTo: .body) private var captureIcon = 28.0
     private let height: CGFloat = 60.7
 
@@ -970,7 +971,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
         }
       }
       .foregroundStyle(Color.primary)
-      .offset(y: 29)
+      .offset(y: min(29, containerBottomInset - 3))
     }
   }
   #endif
@@ -1177,6 +1178,17 @@ extension EnvironmentValues {
   var journalContainerTopInset: CGFloat {
     get { self[JournalContainerTopInsetKey.self] }
     set { self[JournalContainerTopInsetKey.self] = newValue }
+  }
+}
+
+private struct JournalContainerBottomInsetKey: EnvironmentKey {
+  static let defaultValue: CGFloat = 0
+}
+
+extension EnvironmentValues {
+  var journalContainerBottomInset: CGFloat {
+    get { self[JournalContainerBottomInsetKey.self] }
+    set { self[JournalContainerBottomInsetKey.self] = newValue }
   }
 }
 
