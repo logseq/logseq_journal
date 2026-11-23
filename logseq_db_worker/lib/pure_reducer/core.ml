@@ -509,7 +509,7 @@ let step state event =
     match event with
     | Sync_event
         (( Sync.Asset_requested _ | Sync.Protected_requested _ | Sync.Shutdown
-         | Sync.Runner_completed (Sync.Asset_completion _ | Sync.Protected_completion _)
+         | Sync.Runner_completed (Sync.Asset_completion _ | Sync.Asset_cleanup_completion _ | Sync.Protected_completion _)
            ) as event) -> translate_sync (Sync.step state.sync_core event) state
     | _ -> no_effects state)
   else (
@@ -603,7 +603,7 @@ let step state event =
                  (Sync.step
                     state.sync_core
                     (Sync.Authoritative_batch_failed
-                       { scope = Sync.effect_scope_of_graph request.scope.graph; message }))
+                       { request; message }))
                  state
              in
              let origin = (Logseq_db_worker_contract.Error.trace error).origin in

@@ -719,21 +719,25 @@ let execute_request
            observe_unlock_failure Decode;
            Core.Effect_failed message))
   | Fetch_snapshot_baseline graph ->
-    Result.map
-      (fun response -> response.Http_eio.body)
+    Result.bind
       (perform_authenticated_http t graph.account (fun token ->
          Http.snapshot_baseline
            ~base_url:graph.account.managed_sync_origin
            ~graph_id:graph.graph_id
            ~token))
+      (fun response ->
+         Sync_protocol.decode_snapshot_baseline response.Http_eio.body
+         |> Result.map_error (fun error -> Core.Effect_failed (Sync_protocol.error_to_string error)))
   | Fetch_snapshot_metadata graph ->
-    Result.map
-      (fun response -> response.Http_eio.body)
+    Result.bind
       (perform_authenticated_http t graph.account (fun token ->
          Http.snapshot_metadata
            ~base_url:graph.account.managed_sync_origin
            ~graph_id:graph.graph_id
            ~token))
+      (fun response ->
+         Core.decode_snapshot_metadata response.Http_eio.body
+         |> Result.map_error (fun message -> Core.Effect_failed message))
   | Fetch_e2ee_graph_key graph ->
     Result.bind
       (perform_authenticated_http t graph.account (fun token ->
@@ -1175,7 +1179,7 @@ let submit_nonasset t instruction =
   if not t.closed
   then (
     match instruction with
-    | Core.Asset_io _ | Core.Protected_io _ | Core.Await_io _ ->
+    | Core.Asset_io _ | Core.Asset_cleanup_io _ | Core.Protected_io _ | Core.Await_io _ ->
       invalid_arg "Effect requires its dedicated interpreter"
     | Core.Request (ticket, request) -> submit_request t ticket request
     | Cancel_effects scope -> cancel_scope t scope
@@ -2025,12 +2029,9 @@ let capture_asset_jobs t (scope:Core.graph_scope) =
     if same owner then Rrbvec.push_back jobs finished else jobs)t.asset_jobs Rrbvec.empty
 ;;
 
-let execute_asset ?except_id ?(asset_snapshot=Rrbvec.empty) t (request : Core.asset_io_request) ~current =
+let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
   let scope = request.context.scope in
   let map_unit result = Result.map (fun () -> Core.Asset_unit) result in
-  let storage_result result =
-    Result.map_error (fun message -> Core.Asset_invalid_content message) result
-  in
   let cache action =
     Result.bind
       (scoped_asset_cache t scope |> Result.map_error (fun error ->
@@ -2134,18 +2135,11 @@ let execute_asset ?except_id ?(asset_snapshot=Rrbvec.empty) t (request : Core.as
       | Core.Asset_invalid_content _ ->
         Core.Asset_invalid_content "Attachment preview storage is unavailable"
       | failure -> failure)
-  | Release_asset_file handle ->
-    release_asset_file t ~scope ~handle |> map_unit
-  | Release_staged_file file ->
-    release_staged_asset t ~scope ~file |> storage_result |> map_unit
+  | Release_asset_file _ | Release_staged_file _ | Await_asset_operations | Close_asset_scope ->
+    Error (Core.Asset_invalid_content "Attachment cleanup requires an indexed ticket")
   | Prune_asset_staging keep ->
     prune_staged_assets t ~scope ~keep
     |> Result.map (fun count -> Core.Asset_pruned count)
-  | Await_asset_operations ->
-    Rrbvec.iter Eio.Promise.await asset_snapshot;
-    if t.closed then Error Core.Asset_cancelled else Ok Core.Asset_unit
-  | Close_asset_scope ->
-    close_asset_scope_checked ?except_id t scope |> Result.map_error asset_cache_failure |> map_unit
   | Prepare_graph_asset_deletion retirement ->
     prepare_graph_asset_deletion ?except_id t scope retirement ~current
   | Commit_graph_asset_deletion deletion -> finish_graph_asset_deletion t deletion ~commit:true
@@ -2201,9 +2195,9 @@ let fork_asset_task t id (request:Core.asset_io_request) task =
   with error->complete();raise error
 ;;
 
-let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
+let submit_asset_task t instruction (request : Core.asset_io_request) ~execute ~post =
   let id =
-    scoped_operation_id "asset" request.context.scope (Core.asset_ticket_id ticket)
+    scoped_operation_id "asset" request.context.scope (Core.runner_effect_diagnostic instruction)
   in
   if claim_operation t instruction
   then (
@@ -2213,8 +2207,7 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
         Hashtbl.mem t.preparing_retirements key
         || (match Hashtbl.find_opt t.asset_retirements key with Some other -> other <> retirement | None -> false)
       | _ -> false in
-    if busy then t.post (Core.Runner_completed (Core.Asset_completion (ticket,
-      Error (Core.Asset_invalid_content "Attachment retirement is already in progress."))))
+    if busy then post (Error (Core.Asset_invalid_content "Attachment retirement is already in progress."))
     else (
     (match request.action with
      | Core.Prepare_graph_asset_deletion retirement ->
@@ -2263,7 +2256,7 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
                  (fun () ->
                     if not (current ()) then raise Runner_cancelled;
                     with_asset_diagnostics t request ~current (fun () ->
-                      execute_asset ~except_id:id ~asset_snapshot t request ~current))
+                      execute ~id ~asset_snapshot ~current))
                  (fun () ->
                     Eio.Promise.await cancelled;
                     raise Runner_cancelled)
@@ -2274,7 +2267,61 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
       in
       (* A completed resource must reach the reducer even after cancellation.
          The reducer owns acceptance and issues cleanup for stale resources. *)
-      t.post (Core.Runner_completed (Core.Asset_completion (ticket, result))))))
+      post result)))
+;;
+
+let submit_asset_io t instruction ticket request =
+  submit_asset_task t instruction request
+    ~execute:(fun ~id ~asset_snapshot:_ ~current -> execute_asset ~except_id:id t request ~current)
+    ~post:(fun result -> t.post (Core.Runner_completed (Core.Asset_completion (ticket, result))))
+;;
+
+let execute_asset_cleanup : type ack.
+  t -> Core.graph_scope -> unit Eio.Promise.t Rrbvec.t -> ack Core.asset_cleanup_io ->
+  ack Core.asset_cleanup_result =
+  fun t scope snapshot action ->
+  match action with
+  | Core.Release_file handle ->
+    release_asset_file t ~scope ~handle |> Result.map (fun () -> Core.File_released)
+  | Core.Release_stage file ->
+    if asset_blocked t scope then Error Core.Asset_cancelled
+    else release_staged_asset t ~scope ~file
+         |> Result.map_error (fun message -> Core.Asset_invalid_content message)
+         |> Result.map (fun () -> Core.Stage_released)
+  | Core.Close_scope ->
+    if asset_blocked t scope then Error Core.Asset_cancelled
+    else close_asset_scope_checked t scope
+         |> Result.map_error asset_cache_failure
+         |> Result.map (fun () -> Core.Scope_closed)
+  | Core.Await_operations ->
+    Rrbvec.iter Eio.Promise.await snapshot;
+    if t.closed then Error Core.Asset_cancelled else Ok Core.Operations_awaited
+;;
+
+let submit_asset_cleanup : type ack. t -> Core.runner_effect -> ack Core.asset_cleanup_ticket -> unit =
+  fun t instruction ticket ->
+  let request = Core.asset_cleanup_request ticket in
+  let action = Core.asset_cleanup_io ticket in
+  let scope = request.context.scope in
+  let post result = t.post (Core.Runner_completed (Core.Asset_cleanup_completion (ticket, result))) in
+  match action with
+  | Core.Await_operations ->
+    if t.closed then post (Error Core.Asset_cancelled)
+    else submit_asset_task t instruction request ~post
+      ~execute:(fun ~id:_ ~asset_snapshot ~current:_ -> execute_asset_cleanup t scope asset_snapshot action)
+  | Core.Release_file _ | Core.Release_stage _ | Core.Close_scope ->
+    if claim_operation t instruction then (
+      let result =
+        try
+          Fun.protect
+            ~finally:(fun () -> if t.closed then close_asset_scope t scope)
+            (fun () -> with_asset_diagnostics t request ~current:(fun () -> not t.closed)
+              (fun () -> execute_asset_cleanup t scope Rrbvec.empty action))
+        with
+        | Eio.Cancel.Cancelled _ as error -> raise error
+        | error -> Error (asset_exception request error)
+      in
+      post result)
 ;;
 
 let execute_protected t (request : Core.protected_request) =
@@ -2338,11 +2385,7 @@ let submit_protected t instruction ticket (request : Core.protected_request) =
 ;;
 
 let cleanup_asset_action = function
-  | Core.Release_asset_file _
-  | Release_staged_file _
-  | Close_asset_scope
-  | Await_asset_operations
-  | Prepare_graph_asset_deletion _
+  | Core.Prepare_graph_asset_deletion _
   | Commit_graph_asset_deletion _
   | Cancel_graph_asset_deletion _
   | Delete_account_assets
@@ -2355,7 +2398,8 @@ let cleanup_asset_action = function
   | Retain_asset_file _
   | Retain_staged_file _
   | Prune_asset_staging _
-  | Asset_retry_after _ -> false
+  | Asset_retry_after _
+  | Release_asset_file _ | Release_staged_file _ | Close_asset_scope | Await_asset_operations -> false
 ;;
 
 let submit_io_fence t id scope =
@@ -2377,7 +2421,8 @@ let submit_io_fence t id scope =
 let submit t instruction =
   match instruction with
   |Core.Await_io(id,scope)->submit_io_fence t id scope
-  | Core.Asset_io (ticket, ({ action = (Core.Prepare_graph_asset_deletion _ | Await_asset_operations); _ } as request)) ->
+  | Core.Asset_cleanup_io ticket -> submit_asset_cleanup t instruction ticket
+  | Core.Asset_io (ticket, ({ action = Core.Prepare_graph_asset_deletion _; _ } as request)) ->
     (* Waiting must leave the serial event consumer free to deliver the I/O
        callbacks or native lease releases being joined. *)
     if t.closed

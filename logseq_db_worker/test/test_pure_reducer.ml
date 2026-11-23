@@ -696,7 +696,8 @@ let test_worker_shutdown_forwards_late_resource_cleanup () =
     true
     (List.exists
        (function
-         | Core.Run_sync (Sync.Asset_io (_, io)) ->
+         | Core.Run_sync (Sync.Asset_cleanup_io ticket) ->
+           let io = Sync.asset_cleanup_request ticket in
            io.context.scope = scope
            && io.action = Sync.Release_staged_file "late-staging-reference"
          | _ -> false)
@@ -1035,7 +1036,7 @@ let snapshot_activation () =
   let download = List.find_map (function
     | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_snapshot_metadata _)) ->
       Some (Core.step missing.next (Sync_event (Sync.Runner_completed
-        (Sync.Completion (ticket, Ok {|{"ok":true,"t":42,"url":"https://example.invalid/snapshot"}|})))))
+        (Sync.Completion (ticket, (Sync.decode_snapshot_metadata {|{"ok":true,"t":42,"url":"https://example.invalid/snapshot"}|} |> Result.map_error (fun message -> Sync.Effect_failed message)))))))
     | _ -> None) missing.effects |> Option.get in
   let activation = List.find_map (function
     | Core.Run_sync (Sync.Request (ticket, Sync.Download_snapshot download_request)) ->
@@ -2074,11 +2075,12 @@ let test_revoked_account_keeps_hidden_cleanup_owner () =
     {scope;operation;action=Release_asset_file "original-hidden-preview"})) in
   let released=release hidden "revoked-hidden-release" in
   Alcotest.(check bool) "old hidden owner retains cleanup-only IO authority after auth revocation" true
-    (List.exists(function Core.Run_sync(Sync.Asset_io(_,{context;action=Release_asset_file "original-hidden-preview";_}))->
+    (List.exists(function Core.Run_sync(Sync.Asset_cleanup_io ticket) when (Sync.asset_cleanup_request ticket).action=Sync.Release_asset_file "original-hidden-preview" ->
+      let context = (Sync.asset_cleanup_request ticket).context in
       context.scope=hidden|_->false)released.effects);
   let forged=release {hidden with graph_generation=hidden.graph_generation+100} "foreign-hidden-release" in
   Alcotest.(check bool) "revocation never creates implicit authority for an unknown execution" false
-    (List.exists(function Core.Run_sync(Sync.Asset_io _)->true|_->false)forged.effects);
+    (List.exists(function Core.Run_sync(Sync.Asset_io _ | Sync.Asset_cleanup_io _)->true|_->false)forged.effects);
   let acquire=Core.step revoked.next(Sync_event(Sync.Asset_requested
     {scope=hidden;operation="revoked-hidden-acquire";action=Retain_asset_file "original-hidden-preview"})) in
   Alcotest.(check bool) "retaining cleanup ownership does not restore old data/acquisition authority" false

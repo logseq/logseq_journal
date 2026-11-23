@@ -3,6 +3,13 @@ module Runner = Logseq_db_worker_effect_runner.Effect_runner
 module Sync = Logseq_sync_pure_reducer.Core
 module T = Logseq_db_worker_test_support.Test_support
 
+let cleanup_ack : type ack. ack Sync.asset_cleanup_io -> ack Sync.asset_cleanup_ack = function
+  | Sync.Release_file _ -> Sync.File_released
+  | Sync.Release_stage _ -> Sync.Stage_released
+  | Sync.Close_scope -> Sync.Scope_closed
+  | Sync.Await_operations -> Sync.Operations_awaited
+;;
+
 let account ?(generation = 1) user_id : Sync.account_scope =
   { managed_sync_origin = Uri.of_string "https://api.logseq.io"
   ; user_id
@@ -1128,9 +1135,12 @@ let test_observation_release_waits_for_initial_snapshot () =
           |Sync.Request(ticket,Sync.Load_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok(Some
              (Sync.catalog_cache ~user_id:"fixture-user" ~graphs:[graph] ~selected_graph:(Some graph.graph_id))))))
           |Sync.Request(ticket,Sync.Save_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok())))
+          |Sync.Asset_cleanup_io ticket ->
+            post (Sync.Runner_completed (Sync.Asset_cleanup_completion
+              (ticket, Ok (cleanup_ack (Sync.asset_cleanup_io ticket)))))
           |Sync.Asset_io(ticket,request)->let value=match request.Sync.action with
             |Sync.Prune_asset_staging _->Sync.Asset_pruned 0
-            |Close_asset_scope|Release_asset_file _|Release_staged_file _|Cancel_asset_operation _->Sync.Asset_unit
+            |Cancel_asset_operation _->Sync.Asset_unit
             |_->failwith "Unexpected asset operation in observation fixture"in
             post(Sync.Runner_completed(Sync.Asset_completion(ticket,Ok value)))
           |_->())()in
@@ -1718,7 +1728,8 @@ let test_db_shutdown_accepts_late_staging_completion () =
                 Eio.Promise.resolve scope_resolve scope
               | Sync.Request (_, Sync.Fetch_snapshot_baseline _)
               | Sync.Request (_, Sync.Download_snapshot _) -> ()
-              | Sync.Asset_io (_, request) as runnable ->
+              | Sync.Asset_cleanup_io ticket as runnable ->
+                let request = Sync.asset_cleanup_request ticket in
                 (match request.action with
                  | Sync.Release_staged_file _ ->
                    cleanup_actions := request.action :: !cleanup_actions
@@ -2485,6 +2496,9 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false)
           else held_cleanup := Some (ticket, deletion)
         | Sync.Asset_io (ticket, _) ->
           post (Sync.Runner_completed (Sync.Asset_completion (ticket, Ok Sync.Asset_unit)))
+        | Sync.Asset_cleanup_io ticket ->
+          post (Sync.Runner_completed (Sync.Asset_cleanup_completion
+            (ticket, Ok (cleanup_ack (Sync.asset_cleanup_io ticket)))))
         | _ -> ()) ~shutdown:(fun () -> ()) () in
       let dependencies = Runner.dependencies
           ~runtime:(Runner.runtime ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)

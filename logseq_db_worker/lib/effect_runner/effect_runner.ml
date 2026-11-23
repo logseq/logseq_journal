@@ -2918,8 +2918,7 @@ let handle_sync_worker_effect t = function
                    Ok
                      (sync_result
                         ~event:
-                          (Sync.Outbox_transition_applied
-                             { scope = request.scope; commit; sync })
+                          (Sync.Outbox_transition_applied { request; commit; sync })
                         ()))))))
   | Apply_authoritative_batch request ->
     (match attached_session t request.scope.graph with
@@ -2955,7 +2954,7 @@ let handle_sync_worker_effect t = function
                      (sync_result
                         ~event:
                           (Sync.Authoritative_batch_deferred
-                             { scope = request.scope.graph; defer })
+                             { request; defer })
                         ())
                  | Ok (Authoritative_applied commit) ->
                    (match Database.inspect_sync session.database with
@@ -2965,7 +2964,7 @@ let handle_sync_worker_effect t = function
                         (sync_result
                            ~event:
                              (Sync.Authoritative_batch_applied
-                                { scope = request.scope.graph; commit; sync })
+                                { request; commit; sync })
                            ())))))))
 ;;
 
@@ -3727,7 +3726,7 @@ let submit t = function
           (Core.Sync_event
              (Sync.Runner_completed
                 (Sync.Completion (ticket, Error (Sync.Effect_failed message))))))
-  | Run_sync (Sync.Asset_io _ as sync_effect) ->
+  | Run_sync ((Sync.Asset_io _ | Sync.Asset_cleanup_io _) as sync_effect) ->
     t.dependencies.sync_runner.submit sync_effect
   | Run_sync sync_effect ->
     if not t.stopped then t.dependencies.sync_runner.submit sync_effect

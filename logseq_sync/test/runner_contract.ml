@@ -482,7 +482,7 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
               ~id:("graph-key-" ^ Core.effect_id_to_string (Core.effect_ticket_id ticket))
               ~scope
           | Await_io _
-          | Asset_io _
+          | Asset_io _ | Asset_cleanup_io _
           | Protected_io _
           | Request _
           | Start_websocket _
@@ -620,7 +620,7 @@ let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
               ~id:("graph-key-" ^ Core.effect_id_to_string (Core.effect_ticket_id ticket))
               ~scope
           | Await_io _
-          | Asset_io _
+          | Asset_io _ | Asset_cleanup_io _
           | Protected_io _
           | Request _
           | Start_websocket _
@@ -1903,8 +1903,8 @@ let test_late_stage_cleanup_cannot_delete_a_replacement () =
           true
           (List.exists
              (function
-               | Core.Run (Core.Asset_io (_, io)) ->
-                 io.action = Core.Release_staged_file old_file
+               | Core.Run (Core.Asset_cleanup_io ticket) ->
+                 (Core.asset_cleanup_request ticket).action = Core.Release_staged_file old_file
                | _ -> false)
              late.effects);
         posted := [];

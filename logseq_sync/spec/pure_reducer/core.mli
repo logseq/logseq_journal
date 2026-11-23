@@ -305,8 +305,10 @@ type decryption_batch =
   }
 
 type decrypted_values = string list
-type snapshot_baseline = string
-type snapshot_metadata = string
+type snapshot_baseline = Logseq_db_types.Server_cursor.t
+type snapshot_metadata
+
+val decode_snapshot_metadata : string -> (snapshot_metadata, string) result
 
 type graph_key_request =
   { scope : graph_scope
@@ -435,6 +437,27 @@ type asset_io_request =
 
 type asset_ticket
 
+type _ asset_cleanup_io =
+  | Release_file : string -> [ `File_released ] asset_cleanup_io
+  | Release_stage : string -> [ `Stage_released ] asset_cleanup_io
+  | Close_scope : [ `Scope_closed ] asset_cleanup_io
+  | Await_operations : [ `Operations_awaited ] asset_cleanup_io
+
+type _ asset_cleanup_ack =
+  | File_released : [ `File_released ] asset_cleanup_ack
+  | Stage_released : [ `Stage_released ] asset_cleanup_ack
+  | Scope_closed : [ `Scope_closed ] asset_cleanup_ack
+  | Operations_awaited : [ `Operations_awaited ] asset_cleanup_ack
+
+type 'a asset_cleanup_result = ('a asset_cleanup_ack, asset_failure) result
+
+(** Core issues a scope- and operation-bound ticket. Complete it once with the
+    matching ACK after physical execution, or with the execution failure. *)
+type 'a asset_cleanup_ticket
+
+val asset_cleanup_request : 'a asset_cleanup_ticket -> asset_io_request
+val asset_cleanup_io : 'a asset_cleanup_ticket -> 'a asset_cleanup_io
+
 val asset_ticket_id : asset_ticket -> string
 
 type asset_output =
@@ -527,6 +550,7 @@ type runner_effect = private
       filesystem or data-admission permission is granted. *)
   | Await_io of int64 * effect_scope
   | Asset_io of asset_ticket * asset_io_request
+  | Asset_cleanup_io : 'a asset_cleanup_ticket -> runner_effect
   | Protected_io of protected_ticket * protected_request
   | Request : 'a effect_ticket * 'a runner_request -> runner_effect
   | Start_websocket of websocket_request
@@ -540,6 +564,7 @@ type runner_effect = private
 
 type runner_completion =
   | Asset_completion of asset_ticket * asset_result
+  | Asset_cleanup_completion : 'a asset_cleanup_ticket * 'a asset_cleanup_result -> runner_completion
   | Protected_completion of protected_ticket * protected_result
   | Completion : 'a effect_ticket * ('a, effect_error) result -> runner_completion
 
@@ -572,22 +597,27 @@ type mirror_inspection =
   | Mirror_available of mirror_request
   | Mirror_absent of graph_scope
 
-type outbox_transition_request =
-  { expected : Logseq_overlay_db.Types.sync_token
+type outbox_attempt_id
+type authoritative_attempt_id
+
+type outbox_transition_request = private
+  { attempt_id : outbox_attempt_id
+  ; expected : Logseq_overlay_db.Types.sync_token
   ; key : graph_key_handle option
   ; scope : graph_scope
   ; transition : Logseq_overlay_db.Types.outbox_transition
   }
 
-(** Failure of the exact delegated outbox request. The original scope, transition,
-    and expected Sync token fence failures from superseded requests. *)
+(** Workers return the original delegated request for every outcome. Core assigns
+    a fresh attempt identity for each application, independent of the durable token. *)
 type outbox_transition_failure =
   { request : outbox_transition_request
   ; message : string
   }
 
-type authoritative_batch =
-  { input : Logseq_overlay_db.Types.authoritative_batch
+type authoritative_batch = private
+  { attempt_id : authoritative_attempt_id
+  ; input : Logseq_overlay_db.Types.authoritative_batch
   ; key : graph_key_handle option
   ; scope : connection_scope
   ; presentation_generation : presentation_generation
@@ -637,18 +667,18 @@ type sync_inspection =
   }
 
 type authoritative_commit_result =
-  { scope : graph_scope
+  { request : authoritative_batch
   ; commit : Logseq_overlay_db.Types.authoritative_commit
   ; sync : Logseq_overlay_db.Types.sync_view
   }
 
 type authoritative_deferred_result =
-  { scope : graph_scope
+  { request : authoritative_batch
   ; defer : Logseq_overlay_db.Types.authoritative_defer
   }
 
 type outbox_transition_result =
-  { scope : graph_scope
+  { request : outbox_transition_request
   ; commit : Logseq_overlay_db.Types.outbox_commit
   ; sync : Logseq_overlay_db.Types.sync_view
   }
@@ -719,7 +749,7 @@ type event =
   | Outbox_transition_failed of outbox_transition_failure
   | Authoritative_batch_applied of authoritative_commit_result
   | Authoritative_batch_deferred of authoritative_deferred_result
-  | Authoritative_batch_failed of scoped_error
+  | Authoritative_batch_failed of { request : authoritative_batch; message : string }
   | Snapshot_activated of snapshot_activation
   | Snapshot_activation_failed of snapshot_activation_error
   | Runner_completed of runner_completion

@@ -8,7 +8,7 @@ let run () =
   let mismatched_commit = { fixture.commit with transition = Overlay.Submit_group [] } in
   let mismatched_event =
     Core.Outbox_transition_applied
-      { scope = fixture.request.scope
+      { request = fixture.request
       ; commit = mismatched_commit
       ; sync = fixture.result_sync
       }
@@ -18,7 +18,7 @@ let run () =
   in
   let exact_event =
     Core.Outbox_transition_applied
-      { scope = fixture.request.scope
+      { request = fixture.request
       ; commit = fixture.commit
       ; sync = fixture.result_sync
       }
