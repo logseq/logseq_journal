@@ -35,7 +35,12 @@ let chrome =
   Ui.Native_widget.Extension.create
     ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2103)
     ~encode_props:(fun props -> Json.props_to_yojson props |> Yojson.Safe.to_string |> Bytes.of_string)
-    ~decode_event:(fun ~event_id:_ _ -> Error "Chrome uses child control events")
+    ~decode_event:(fun ~event_id bytes ->
+      match Journal_ids.Native_widget.Event_id.to_int event_id, Bytes.to_string bytes with
+      | 1, "journals" -> Ok `Journals
+      | 1, "favorites" -> Ok `Favorites
+      | 1, "capture" -> Ok `Capture
+      | _ -> Error "Unknown Journal chrome event")
     ()
 ;;
 
@@ -233,14 +238,14 @@ let view_impl
                signal
            ])
   in
-  let reactive_widget ?key ~props_for ~children () =
+  let reactive_widget ?key ?(on_event = fun _ -> ()) ~props_for ~children () =
     match presentation_signal with
     | None ->
       Ui.Native_widget.widget
         chrome
         ?key
         ~props:(props_for initial)
-        ~on_event:(fun _ -> ())
+        ~on_event
         ~children
         ()
     | Some source ->
@@ -254,7 +259,7 @@ let view_impl
              ?key
              ~props:(props_for initial)
              ~props_signal
-             ~on_event:(fun _ -> ())
+             ~on_event
              ~children
              ())
           context
@@ -455,14 +460,30 @@ let view_impl
   in
   if platform <> "ios" || Option.is_none capture_expanded
   then
-    (* The native inset reserves scrolling space; each buttons composite
-       supplies its own glass without system toolbar chrome. *)
     bottom_controls
       ~key:"journal-bottom-controls"
       ~controls:
-        (V.row ~spacing:16.
-           ([ destinations; V.spacer () ]
-            @ (match context with Context.Journals -> [ capture ] | Favorites -> []))
+        ((if platform = "ios" then
+            V.row [reactive_widget
+              ~key:(Ui.Key.string ("journal-bottom-" ^ Context.semantics_label context))
+              ~props_for:(fun presentation ->
+                props ~mode:"bottom-bar" ~active:(context = Context.Favorites)
+                  ~controls:presentation.capture_enabled ())
+              ~on_event:(fun action ->
+                let invoke handler =
+                  Ui.Event.Handler.Private.invoke handler Ui.Event.Payload.Unit
+                in
+                match action with
+                | `Journals -> invoke on_journals
+                | `Favorites -> invoke on_favorites
+                | `Capture ->
+                  let current = Option.fold ~none:initial ~some:Signal.sample presentation_signal in
+                  if context = Context.Journals && current.capture_enabled then invoke on_capture)
+              ~children:[] () ]
+          else
+            V.row ~spacing:16.
+              ([ destinations; V.spacer () ]
+               @ (match context with Context.Journals -> [ capture ] | Favorites -> [])))
          |> test_id "journal-bottom-controls")
       body
   else body

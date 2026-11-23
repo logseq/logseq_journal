@@ -5997,13 +5997,26 @@ let test_root_capture_placement () =
           let has key value = List.exists (function
             | Lui_protocol.SetProp (_,p,Lui_protocol.StringValue text) -> p=key && text=value
             | _ -> false) !ops in
-          Alcotest.(check bool) "Capture is only mounted in Journals root" (not favorites)
-            (has AccessibilityIdentifier "journal-capture-open");
-          Alcotest.(check bool) "Favorites has no Capture action/semantics" (not favorites)
-            (has AccessibilityLabel "Capture");
-          List.iter (fun destination ->
-            Alcotest.(check bool) "destination navigation remains mounted" true
-              (has AccessibilityLabel destination)) ["Journals";"Favorites"])) [false;true])
+          if platform = "ios" then (
+            let bar = List.find_map (function
+              | Lui_protocol.SetExtensionProp (_, "payload", Lui_protocol.StringValue text) ->
+                let open Yojson.Safe.Util in
+                let json = Yojson.Safe.from_string text in
+                if member "mode" json = `String "bottom-bar" then Some json else None
+              | _ -> None) !ops |> Option.get in
+            let open Yojson.Safe.Util in
+            Alcotest.(check bool) "Favorites selection reaches the native bar" favorites
+              (bar |> member "active" |> to_bool);
+            Alcotest.(check bool) "Capture admission reaches the native bar" capture_enabled
+              (bar |> member "controls" |> to_bool))
+          else (
+            Alcotest.(check bool) "Capture is only mounted in Journals root" (not favorites)
+              (has AccessibilityIdentifier "journal-capture-open");
+            Alcotest.(check bool) "Favorites has no Capture action/semantics" (not favorites)
+              (has AccessibilityLabel "Capture");
+            List.iter (fun destination ->
+              Alcotest.(check bool) "destination navigation remains mounted" true
+                (has AccessibilityLabel destination)) ["Journals";"Favorites"]))) [false;true])
       [false;true]) ["ios";"macos"]
 ;;
 
