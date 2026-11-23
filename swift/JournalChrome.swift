@@ -936,6 +936,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .disabled(!captureEnabled)
           .accessibilityLabel("Capture")
           .accessibilityIdentifier("journal-capture-open")
+          .offset(y: -22)
         }
       }
       .foregroundStyle(Color.primary)
