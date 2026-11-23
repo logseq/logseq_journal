@@ -896,7 +896,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     private let slotWidth: CGFloat = 110
 
     var body: some SwiftUI.View {
-      HStack(spacing: 16) {
+      HStack(spacing: 0) {
         HStack(spacing: 0) {
           destination("Journals", icon: "calendar", id: "timeline", selected: !favorites, action: "journals")
           destination("Favorites", icon: "star", id: "favorites", selected: favorites, action: "favorites")

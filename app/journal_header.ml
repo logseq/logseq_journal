@@ -465,7 +465,7 @@ let view_impl
       ~controls:
         ((if platform = "ios" then
             V.row [reactive_widget
-              ~key:(Ui.Key.string ("journal-bottom-" ^ Context.semantics_label context))
+              ~key:(Ui.Key.string "journal-native-bottom-bar")
               ~props_for:(fun presentation ->
                 props ~mode:"bottom-bar" ~active:(context = Context.Favorites)
                   ~controls:presentation.capture_enabled ())

@@ -57,8 +57,9 @@ final class JournalIPhoneAcceptance: XCTestCase {
     XCTAssertTrue(capture.waitForExistence(timeout: 10))
     capture.tap()
     XCTAssertTrue(app.textViews.firstMatch.waitForExistence(timeout: 10))
-    XCTAssertFalse(timeline.exists)
-    XCTAssertFalse(capture.exists)
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+    XCTAssertTrue(timeline.exists)
+    XCTAssertTrue(capture.exists)
     record("Bottom bar inline Capture", app)
   }
 

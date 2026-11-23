@@ -6109,6 +6109,7 @@ let test_detail_empty_navigation_title () =
 
 let test_reactive_header_current_controls () =
   let props = Hashtbl.create 128 in
+  let bar_props = Hashtbl.create 1 in
   let track_teardown =
     track_wire_teardown (fun id ->
       Hashtbl.filter_map_inplace
@@ -6126,6 +6127,10 @@ let test_reactive_header_current_controls () =
                | Lui_protocol.SetProp (id, key, value) ->
                  Hashtbl.replace props (id, key) value
                | RemoveProp (id, key) -> Hashtbl.remove props (id, key)
+               | SetExtensionProp (id, "payload", StringValue text) ->
+                 let json = Yojson.Safe.from_string text in
+                 if Yojson.Safe.Util.member "mode" json = `String "bottom-bar"
+                 then Hashtbl.replace bar_props id json
                | _ -> ())
             batch.Lui_protocol.ops;
           true)
@@ -6183,7 +6188,20 @@ let test_reactive_header_current_controls () =
        Alcotest.(check bool) "reactive header mounts" true (Lui_app.start app);
        ignore (Lui_app.flush app);
        let body = Option.get (find TextValue "Persistent header body") in
-       let capture = Option.get (find AccessibilityLabel "Capture") in
+       let capture = Hashtbl.to_seq_keys bar_props |> Seq.uncons |> Option.get |> fst in
+       let check_capture_enabled expected =
+         Alcotest.(check bool) "native Capture enabled prop" expected
+           (Yojson.Safe.Util.member "controls" (Hashtbl.find bar_props capture)
+            |> Yojson.Safe.Util.to_bool)
+       in
+       let press_capture () =
+         let values = Lui_protocol.String_map.(empty
+           |> add "id" (Lui_protocol.IntValue 1)
+           |> add "payload" (Lui_protocol.StringValue "capture")) in
+         ignore (Lui_app.dispatch_event app
+           (Lui_protocol.ExtensionEvent (capture, "journal-chrome", "event", values)))
+       in
+       check_capture_enabled true;
        ignore
          (Lui_app.send
             app
@@ -6193,7 +6211,8 @@ let test_reactive_header_current_controls () =
             ; local_deletion_available = true
             });
        ignore (Lui_app.flush app);
-       ignore (Lui_app.dispatch_event app (Lui_protocol.Press capture));
+       check_capture_enabled false;
+       press_capture ();
        ignore (Lui_app.flush app);
        Alcotest.(check int) "Capture consults current disabled gate" 0 !capture_count;
        Alcotest.(check bool)
@@ -6211,7 +6230,8 @@ let test_reactive_header_current_controls () =
          !error_count;
        ignore (Lui_app.send app initial);
        ignore (Lui_app.flush app);
-       ignore (Lui_app.dispatch_event app (Press capture));
+       check_capture_enabled true;
+       press_capture ();
        ignore (Lui_app.flush app);
        Alcotest.(check int)
          "same Capture handler reads newly enabled gate"
