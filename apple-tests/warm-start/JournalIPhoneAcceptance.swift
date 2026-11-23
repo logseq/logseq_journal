@@ -31,6 +31,39 @@ final class JournalIPhoneAcceptance: XCTestCase {
     app.collectionViews.buttons.matching(NSPredicate(format: "label CONTAINS %@", marker)).firstMatch
   }
 
+  @MainActor func testBottomBarNavigationAndInlineCapture() {
+    continueAfterFailure = false
+    let app = application(relaunch: true)
+    let timeline = app.buttons["journal-bottom-timeline"]
+    let favorites = app.buttons["journal-bottom-favorites"]
+    let capture = app.buttons["journal-capture-open"]
+    XCTAssertTrue(timeline.waitForExistence(timeout: 25))
+    XCTAssertTrue(timeline.isSelected)
+    XCTAssertEqual(timeline.frame.width, 95, accuracy: 0.5)
+    XCTAssertEqual(favorites.frame.width, 95, accuracy: 0.5)
+    XCTAssertEqual(timeline.frame.height, 60.7, accuracy: 0.5)
+    XCTAssertEqual(capture.frame.width, 60.7, accuracy: 0.5)
+    XCTAssertEqual(capture.frame.height, 60.7, accuracy: 0.5)
+    record("Bottom bar Timeline", app)
+
+    favorites.tap()
+    XCTAssertTrue(app.staticTexts["favorites-header-title"].waitForExistence(timeout: 10))
+    XCTAssertTrue(favorites.isSelected)
+    XCTAssertFalse(timeline.isSelected)
+    XCTAssertFalse(capture.exists)
+    record("Bottom bar Favorites", app)
+
+    timeline.tap()
+    XCTAssertTrue(capture.waitForExistence(timeout: 10))
+    capture.tap()
+    let editor = app.textFields["field.composer"]
+    XCTAssertTrue(editor.waitForExistence(timeout: 10), app.debugDescription)
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+    XCTAssertTrue(timeline.exists)
+    XCTAssertTrue(capture.exists)
+    record("Bottom bar inline Capture", app)
+  }
+
   @MainActor func testCaptureSaveAndStatus() {
     continueAfterFailure = false
     let app = application(relaunch: true)

@@ -1991,6 +1991,28 @@ let run_favorites_native_visibility
       | None -> failwith ("fixture node has no " ^ key ^ " ancestor"))
   in
   let dispatch event = hooks.dispatch event |> consume in
+  let native_bar () =
+    Hashtbl.fold (fun id values found ->
+      match List.assoc_opt "_extension" values, List.assoc_opt "payload" values with
+      | Some (`String "journal-chrome"), Some (`String text) ->
+        let json = Yojson.Safe.from_string text in
+        if Yojson.Safe.Util.member "mode" json = `String "bottom-bar"
+        then Some (id, json) else found
+      | _ -> found) props None
+  in
+  let has_root label =
+    match native_bar () with
+    | Some (_, json) -> label <> "Capture" || Yojson.Safe.Util.member "active" json = `Bool false
+    | None -> Option.is_some (find "accessibility-label" label)
+  in
+  let press_root label =
+    match native_bar () with
+    | None -> dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" label)))
+    | Some (node, _) ->
+      hooks.extension_event node "event"
+        (Yojson.Safe.to_string (`Assoc ["id", `Int 1; "payload", `String (String.lowercase_ascii label)]))
+      |> consume
+  in
   let wait label predicate =
     let deadline = Unix.gettimeofday () +. 5. in
     while (not (predicate ())) && Unix.gettimeofday () < deadline do
@@ -2106,7 +2128,7 @@ let run_favorites_native_visibility
            (Option.is_some (find "_extension" "journal-chrome"));
          Atomic.set initial_feed_release true);
        wait "Journals mounted" (fun () ->
-         Option.is_some (find "accessibility-label" "Favorites")
+         has_root "Favorites"
          && Option.is_some (find "text" "Timeline fixture 2"));
        if check_asset_scan_owner || (Option.is_some asset_change && asset_change<>Some `Unconfigured) then (
          let settings=Option.get(find "_extension" "journal-asset-settings") in
@@ -2818,11 +2840,11 @@ let run_favorites_native_visibility
                  (* No public pure App reducer exposes this producer's event
                     choice. Favorites.Hide_target itself is intentionally
                     permanent, so exercise the mounted observation outlet. *)
-                 dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Favorites")));
+                 press_root "Favorites";
                  load_all_favorites "observation recovery refreshes Favorites";
                  wait "temporary observed absence does not permanently hide a favorite" (fun()->
                    Option.is_some(find "accessibility-identifier" ("favorite-open:"^G.Uuid.to_string(uuid 1001))));
-                 dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Journals")));
+                 press_root "Journals";
                  enter 0
                | Some `Failure->
                  let registrations=Atomic.get detail_observes and releases=Atomic.get detail_releases in
@@ -3228,7 +3250,7 @@ let run_favorites_native_visibility
                 Alcotest.(check bool) "completed Detail retires picker failure" true
                   (Option.is_none (find "text" "Fixture partial selection failed"));
                 collapse (); back ();
-                dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+                press_root "Capture";
                 wait "Timeline Composer opens" (fun () -> Option.is_some (find "accessibility-identifier" "journal-capture-composer"));
                 Alcotest.(check bool) "Detail picker failure cannot leak to Timeline" true
                   (Option.is_none (find "text" "Fixture partial selection failed")))))
@@ -3414,8 +3436,7 @@ let run_favorites_native_visibility
          send_copy list row;
          wait "replacement ignores cancelled request response" (fun () ->
            !clipboard_requests <> []);
-         dispatch
-           (Lui_protocol.Press (Option.get (find "accessibility-label" "Favorites")));
+         press_root "Favorites";
          load_all_favorites "copy Favorites loaded";
          clipboard_requests := [];
          let favorite_row_node=Option.get (find "accessibility-identifier"
@@ -3429,8 +3450,7 @@ let run_favorites_native_visibility
            ("favorite-open:" ^ G.Uuid.to_string (uuid 1000))) in
          Alcotest.(check bool) "page favorite has no Copy menu" false
            (Option.is_some (find ~accept:(below page_row) "text" "Copy"));
-         dispatch
-           (Lui_protocol.Press (Option.get (find "accessibility-label" "Journals")));
+         press_root "Journals";
          let root_list = Option.get (find "_extension" "journal-list") in
          Atomic.set detail_fixture true;
          let label = Option.get (find "text" "Timeline fixture 0") in
@@ -4540,8 +4560,7 @@ let run_favorites_native_visibility
              ; "media-item-notify"
              ; "media-item-build"
              ];
-           dispatch
-             (Lui_protocol.Press (Option.get (find "accessibility-label" "Favorites")));
+           press_root "Favorites";
            wait "unmount removes acquired images" (fun () ->
              all "path" "/tmp/targeted-media.png" = []);
            Hashtbl.clear regions;
@@ -4568,8 +4587,7 @@ let run_favorites_native_visibility
            (* Application owns the asynchronous import queue; its pure navigation
               reducer cannot observe Worker handler overlap or file release.
               Two Worker lanes make accidental parallel submission observable. *)
-           dispatch
-             (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+           press_root "Capture";
            dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Files")));
            let adapter =
              Hashtbl.fold
@@ -4707,8 +4725,8 @@ let run_favorites_native_visibility
            if edit_pending then (
              if capture_case=Some `Reopen_pending then (
                wait "new binding resumes the retained original creation"(fun()->Atomic.get typed_status_acks=1);
-               wait "settled new owner exposes the existing Capture action"(fun()->Option.is_some(find "accessibility-label" "Capture"));
-               dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Capture"))));
+               wait "settled new owner exposes the existing Capture action"(fun()->has_root "Capture");
+               press_root "Capture");
              wait "late original ACK preserves the edited native draft"(fun()->
                Option.is_some(find "text" "New draft while original settles"));
              Alcotest.(check bool) "original durable payload never uses the newer buffer" true
@@ -4791,8 +4809,18 @@ let run_favorites_native_visibility
              List.for_all (fun path -> not (Sys.file_exists path)) !staged_paths)));
          if check_ios_capture
          then (
-           dispatch
-             (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+           let bar_id = Option.get (native_bar ()) |> fst in
+           let check_destination active =
+             let current_id, json = Option.get (native_bar ()) in
+             Alcotest.(check int) "bar identity survives navigation" bar_id current_id;
+             Alcotest.(check bool) "native selection updates on the same bar" active
+               (Yojson.Safe.Util.member "active" json |> Yojson.Safe.Util.to_bool)
+           in
+           press_root "Favorites";
+           check_destination true;
+           press_root "Journals";
+           check_destination false;
+           press_root "Capture";
            let label = Option.get (find "text" "Timeline fixture 1") in
            dispatch (Lui_protocol.Appear (ancestor_property label "appear-enabled"));
            for _ = 1 to 10 do
@@ -4840,8 +4868,7 @@ let run_favorites_native_visibility
            dispatch (Lui_protocol.Press (Option.get dismiss));
            wait "iOS collapse removes editor" (fun () ->
              Option.is_none (find "style-class" "composer-input"));
-           dispatch
-             (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+           press_root "Capture";
            for _ = 1 to 10 do
              hooks.pump () |> consume;
              Unix.sleepf 0.001
@@ -5004,9 +5031,8 @@ let run_favorites_native_visibility
          (* A retained draft starts through the Journals opener; Favorites no longer
             has a Capture opener of its own. *)
          if check_draft then
-           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+           press_root "Capture";
          if not(List.mem capture_case [Some `Closed_import;Some `Closed_failed_import]) then (
-         let favorites = Option.get (find "accessibility-label" "Favorites") in
          if check_visible
          then (
            Hashtbl.clear regions;
@@ -5021,7 +5047,7 @@ let run_favorites_native_visibility
              0
              (Option.value (Hashtbl.find_opt regions "timeline") ~default:0));
          Hashtbl.clear regions;
-         dispatch (Lui_protocol.Press favorites);
+         press_root "Favorites";
          load_all_favorites "Favorites loaded";
          settle_worker ();
          if check_favorite_targets then (
@@ -5048,10 +5074,10 @@ let run_favorites_native_visibility
                find "accessibility-identifier" "favorites-native-list" = Some original);
              Alcotest.(check bool) "Back to Favorites still omits root Capture" true
                (Option.is_none (find "accessibility-identifier" "journal-capture-open"))) [0;1];
-           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Journals")));
+           press_root "Journals";
            wait "Timeline Capture returns after native Back" (fun () ->
              Option.is_some (find "accessibility-identifier" "journal-capture-open"));
-           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Favorites"))));
+           press_root "Favorites");
          if check_chrome
          then (
            Hashtbl.clear regions;
@@ -5997,13 +6023,26 @@ let test_root_capture_placement () =
           let has key value = List.exists (function
             | Lui_protocol.SetProp (_,p,Lui_protocol.StringValue text) -> p=key && text=value
             | _ -> false) !ops in
-          Alcotest.(check bool) "Capture is only mounted in Journals root" (not favorites)
-            (has AccessibilityIdentifier "journal-capture-open");
-          Alcotest.(check bool) "Favorites has no Capture action/semantics" (not favorites)
-            (has AccessibilityLabel "Capture");
-          List.iter (fun destination ->
-            Alcotest.(check bool) "destination navigation remains mounted" true
-              (has AccessibilityLabel destination)) ["Journals";"Favorites"])) [false;true])
+          if platform = "ios" then (
+            let bar = List.find_map (function
+              | Lui_protocol.SetExtensionProp (_, "payload", Lui_protocol.StringValue text) ->
+                let open Yojson.Safe.Util in
+                let json = Yojson.Safe.from_string text in
+                if member "mode" json = `String "bottom-bar" then Some json else None
+              | _ -> None) !ops |> Option.get in
+            let open Yojson.Safe.Util in
+            Alcotest.(check bool) "Favorites selection reaches the native bar" favorites
+              (bar |> member "active" |> to_bool);
+            Alcotest.(check bool) "Capture admission reaches the native bar" capture_enabled
+              (bar |> member "controls" |> to_bool))
+          else (
+            Alcotest.(check bool) "Capture is only mounted in Journals root" (not favorites)
+              (has AccessibilityIdentifier "journal-capture-open");
+            Alcotest.(check bool) "Favorites has no Capture action/semantics" (not favorites)
+              (has AccessibilityLabel "Capture");
+            List.iter (fun destination ->
+              Alcotest.(check bool) "destination navigation remains mounted" true
+                (has AccessibilityLabel destination)) ["Journals";"Favorites"]))) [false;true])
       [false;true]) ["ios";"macos"]
 ;;
 
@@ -6096,6 +6135,7 @@ let test_detail_empty_navigation_title () =
 
 let test_reactive_header_current_controls () =
   let props = Hashtbl.create 128 in
+  let bar_props = Hashtbl.create 1 in
   let track_teardown =
     track_wire_teardown (fun id ->
       Hashtbl.filter_map_inplace
@@ -6113,6 +6153,10 @@ let test_reactive_header_current_controls () =
                | Lui_protocol.SetProp (id, key, value) ->
                  Hashtbl.replace props (id, key) value
                | RemoveProp (id, key) -> Hashtbl.remove props (id, key)
+               | SetExtensionProp (id, "payload", StringValue text) ->
+                 let json = Yojson.Safe.from_string text in
+                 if Yojson.Safe.Util.member "mode" json = `String "bottom-bar"
+                 then Hashtbl.replace bar_props id json
                | _ -> ())
             batch.Lui_protocol.ops;
           true)
@@ -6170,7 +6214,20 @@ let test_reactive_header_current_controls () =
        Alcotest.(check bool) "reactive header mounts" true (Lui_app.start app);
        ignore (Lui_app.flush app);
        let body = Option.get (find TextValue "Persistent header body") in
-       let capture = Option.get (find AccessibilityLabel "Capture") in
+       let capture = Hashtbl.to_seq_keys bar_props |> Seq.uncons |> Option.get |> fst in
+       let check_capture_enabled expected =
+         Alcotest.(check bool) "native Capture enabled prop" expected
+           (Yojson.Safe.Util.member "controls" (Hashtbl.find bar_props capture)
+            |> Yojson.Safe.Util.to_bool)
+       in
+       let press_capture () =
+         let values = Lui_protocol.String_map.(empty
+           |> add "id" (Lui_protocol.IntValue 1)
+           |> add "payload" (Lui_protocol.StringValue "capture")) in
+         ignore (Lui_app.dispatch_event app
+           (Lui_protocol.ExtensionEvent (capture, "journal-chrome", "event", values)))
+       in
+       check_capture_enabled true;
        ignore
          (Lui_app.send
             app
@@ -6180,7 +6237,8 @@ let test_reactive_header_current_controls () =
             ; local_deletion_available = true
             });
        ignore (Lui_app.flush app);
-       ignore (Lui_app.dispatch_event app (Lui_protocol.Press capture));
+       check_capture_enabled false;
+       press_capture ();
        ignore (Lui_app.flush app);
        Alcotest.(check int) "Capture consults current disabled gate" 0 !capture_count;
        Alcotest.(check bool)
@@ -6198,7 +6256,8 @@ let test_reactive_header_current_controls () =
          !error_count;
        ignore (Lui_app.send app initial);
        ignore (Lui_app.flush app);
-       ignore (Lui_app.dispatch_event app (Press capture));
+       check_capture_enabled true;
+       press_capture ();
        ignore (Lui_app.flush app);
        Alcotest.(check int)
          "same Capture handler reads newly enabled gate"

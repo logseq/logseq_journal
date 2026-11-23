@@ -232,6 +232,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     case timelineHost = "timeline-host"
     case graphPicker = "graph-picker"
     case toolbarControl = "toolbar-control"
+    case bottomBar = "bottom-bar"
     case detailText = "detail-text"
     case boundedText = "bounded-text"
   }
@@ -882,6 +883,70 @@ struct JournalSheetDismissButton: SwiftUI.View {
     }
   }
 
+  #if os(iOS)
+  private struct BottomBar: SwiftUI.View {
+    let favorites: Bool
+    let captureEnabled: Bool
+    let send: (String) -> Void
+
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @ScaledMetric(relativeTo: .body) private var destinationIcon = 22.0
+    @ScaledMetric(relativeTo: .body) private var captureIcon = 28.0
+    private let height: CGFloat = 60.7
+    private let slotWidth: CGFloat = 95
+
+    var body: some SwiftUI.View {
+      HStack(spacing: 0) {
+        HStack(spacing: 0) {
+          destination("Journals", icon: "calendar", id: "timeline", selected: !favorites, action: "journals")
+          destination("Favorites", icon: "star", id: "favorites", selected: favorites, action: "favorites")
+        }
+        .background {
+          if reduceTransparency { Capsule().fill(Color(uiColor: .secondarySystemBackground)) }
+        }
+        .glassEffect(reduceTransparency ? .identity : .regular, in: Capsule())
+        Spacer(minLength: 0)
+        if !favorites {
+          Button { send("capture") } label: {
+            Image(systemName: "square.and.pencil")
+              .font(.system(size: min(captureIcon, 42)))
+              .frame(width: height, height: height)
+              .contentShape(Circle())
+          }
+          .buttonStyle(.plain)
+          .background {
+            if reduceTransparency { Circle().fill(Color(uiColor: .secondarySystemBackground)) }
+          }
+          .glassEffect(reduceTransparency ? .identity : .regular.interactive(), in: Circle())
+          .disabled(!captureEnabled)
+          .accessibilityLabel("Capture")
+          .accessibilityIdentifier("journal-capture-open")
+        }
+      }
+      .foregroundStyle(Color.primary)
+    }
+
+    private func destination(_ label: String, icon: String, id: String, selected: Bool,
+                             action: String) -> some SwiftUI.View {
+      Button { send(action) } label: {
+        Image(systemName: icon)
+          .font(.system(size: min(destinationIcon, 40), weight: selected ? .semibold : .regular))
+          .frame(width: slotWidth - 10, height: height - 10)
+          .background {
+            if selected && reduceTransparency { Capsule().fill(Color(uiColor: .systemFill)) }
+          }
+          .glassEffect(selected && !reduceTransparency ? .regular : .identity, in: Capsule())
+          .frame(width: slotWidth, height: height)
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel(Text(label))
+      .accessibilityAddTraits(selected ? .isSelected : [])
+      .accessibilityIdentifier("journal-bottom-" + id)
+    }
+  }
+  #endif
+
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
     @Environment(\.journalStartupContainerFrame) private var startupContainerFrame
@@ -983,6 +1048,14 @@ struct JournalSheetDismissButton: SwiftUI.View {
           let level = properties.level, context.childIDs.isEmpty {
           DetailText(text: JournalChrome.attributed(properties.runs, fallback: text), id: id, level: level)
         }
+      case .bottomBar:
+        #if os(iOS)
+        if let favorites = properties?.active, let captureEnabled = properties?.controls {
+          BottomBar(favorites: favorites, captureEnabled: captureEnabled) { action in
+            JournalExtensions.emit(context: context, payload: Data(action.utf8))
+          }
+        }
+        #endif
       case .toolbarControl:
         if context.childIDs.count == 1 {
           child(0).fixedSize()

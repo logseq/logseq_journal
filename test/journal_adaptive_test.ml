@@ -241,12 +241,8 @@ let test_ios_capsules_mount_outside_toolbars () =
                    |> List.sort_uniq Int.compare
                  in
                  require
-                   (List.length surfaces
-                    = (if Option.is_none capture_expanded
-                       then if has_capture then 2 else 1
-                       else 0)
-                      + if account_available || error_available then 1 else 0)
-                   "Each buttons composite must supply exactly one glass surface";
+                   (List.length surfaces = if account_available || error_available then 1 else 0)
+                   "Only the account/error cluster supplies legacy glass";
                  let rec in_toolbar node =
                    Hashtbl.mem toolbars node
                    || Option.fold
@@ -254,53 +250,27 @@ let test_ios_capsules_mount_outside_toolbars () =
                         ~some:in_toolbar
                         (Hashtbl.find_opt parents node)
                  in
-                 List.iter
-                   (fun label ->
-                      let nodes =
-                        List.filter_map
-                          (function
-                            | Lui_protocol.SetProp
-                                (node, AccessibilityLabel, StringValue value)
-                              when value = label -> Some node
-                            | _ -> None)
-                          ops
-                        |> List.sort_uniq Int.compare
-                      in
-                      let visible = Option.is_none capture_expanded
-                        && (label <> "Capture" || has_capture) in
-                      match visible, nodes with
-                      | false, [] -> ()
-                      | true, [ node ] ->
-                        require
-                          (not (in_toolbar node))
-                          "%s must render outside toolbar glass"
-                          label;
-                        List.iter
-                          (fun property ->
-                             require
-                               (List.exists
-                                  (function
-                                    | Lui_protocol.SetProp (id, key, IntValue 44) ->
-                                      id = node && key = property
-                                    | _ -> false)
-                                  ops)
-                               "%s must retain a 44pt hit cell"
-                               label)
-                          [ Lui_protocol.WidthValue; HeightValue ];
-                        require
-                          (Lui_app.dispatch_event app (Lui_protocol.Press node))
-                          "%s press was not delivered"
-                          label;
-                        ignore (Lui_app.flush app);
-                        require
-                          (List.mem label !presses
-                           = (label <> "Capture" || capture_enabled))
-                          "%s press guard changed"
-                          label
-                      | _ ->
-                        failwith
-                          (label ^ " has incorrect visibility for this header context"))
-                   [ "Journals"; "Favorites"; "Capture" ];
+                 let bars = List.filter_map (function
+                   | Lui_protocol.SetExtensionProp (node, "payload", StringValue text)
+                     when String.starts_with ~prefix:"{\"mode\":\"bottom-bar\"" text -> Some node
+                   | _ -> None) ops in
+                 (match capture_expanded, bars with
+                  | Some _, [] -> ()
+                  | None, [ node ] ->
+                    require (not (in_toolbar node)) "Native bar belongs outside toolbars";
+                    List.iter (fun (action, label, admitted) ->
+                      let values = Lui_protocol.String_map.(empty
+                        |> add "id" (Lui_protocol.IntValue 1)
+                        |> add "payload" (Lui_protocol.StringValue action)) in
+                      require (Lui_app.dispatch_event app
+                        (Lui_protocol.ExtensionEvent (node, "journal-chrome", "event", values)))
+                        "%s event was not delivered" label;
+                      ignore (Lui_app.flush app);
+                      require (List.mem label !presses = admitted) "%s guard changed" label)
+                      [ "journals", "Journals", true
+                      ; "favorites", "Favorites", true
+                      ; "capture", "Capture", has_capture && capture_enabled ]
+                  | _ -> failwith "Native bottom bar has incorrect visibility");
                  if error_available
                  then (
                    let error =
