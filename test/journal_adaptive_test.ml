@@ -252,8 +252,7 @@ let test_ios_capsules_mount_outside_toolbars () =
                  in
                  let bars = List.filter_map (function
                    | Lui_protocol.SetExtensionProp (node, "payload", StringValue text)
-                     when Yojson.Safe.Util.member "mode" (Yojson.Safe.from_string text)
-                          = `String "bottom-bar" -> Some node
+                     when String.starts_with ~prefix:"{\"mode\":\"bottom-bar\"" text -> Some node
                    | _ -> None) ops in
                  (match capture_expanded, bars with
                   | Some _, [] -> ()
