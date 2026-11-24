@@ -1228,6 +1228,7 @@ let receive : type a. ?session:Worker.session -> t -> ports:ports
               next_feed_batch t ~ports scan
             | None
               when next_cursor <> None
+                   && Option.is_some scan.root_skipped_day
                    && Rrbvec.for_all
                         (fun (p : Projection.page) ->
                            Option.fold
