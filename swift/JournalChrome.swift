@@ -4,6 +4,14 @@ import SwiftUI
 import UIKit
 #endif
 
+private enum JournalFilterAccessibilityTarget: Hashable {
+  case trigger, heading
+}
+
+private extension EnvironmentValues {
+  @Entry var journalFilterAccessibilityFocus: AccessibilityFocusState<JournalFilterAccessibilityTarget?>.Binding? = nil
+}
+
 /// One initial native layout handoff for this GraphPages lifetime, not per graph.
 /// Later routes may have no Timeline list; downloads never participate.
 struct JournalGraphInitialPresentation {
@@ -235,6 +243,26 @@ struct JournalSheetDismissButton: SwiftUI.View {
     case bottomBar = "bottom-bar"
     case detailText = "detail-text"
     case boundedText = "bounded-text"
+    case filterOverlay = "filter-overlay"
+    case filterTrigger = "filter-trigger"
+  }
+
+  private struct FilterChoice: Decodable, Identifiable {
+    let id: String
+    let label: String
+    let selected: Bool
+  }
+
+  private struct FilterChoices: Decodable {
+    let tags: [FilterChoice]
+    let statuses: [FilterChoice]
+    let times: [FilterChoice]
+    let results: [FilterChoice]
+  }
+
+  private struct FilterCustom: Decodable {
+    let count: String
+    let units: [FilterChoice]
   }
 
   private struct Properties: Decodable {
@@ -264,6 +292,316 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let loadingPageIDs: [String]?
     let ownerID: String?
     let visible: Bool?
+    let choices: FilterChoices?
+    let custom: FilterCustom?
+    let dateRange: [Int]?
+  }
+
+  private struct FilterChip: SwiftUI.View {
+    let label: String
+    let selected: Bool
+    var highlighted = false
+    let action: () -> Void
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some SwiftUI.View {
+      Button(action: action) {
+        HStack(spacing: 4) {
+          Text(label).lineLimit(1)
+          if selected { Image(systemName: "checkmark").font(.caption.weight(.semibold)) }
+        }
+        .font(.subheadline.weight(.semibold))
+        .foregroundStyle(selected || highlighted ? filterBlue(scheme) : Color.primary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(selected || highlighted ? filterBlue(scheme).opacity(0.12) : Color.primary.opacity(0.06), in: .capsule)
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+  }
+
+  private static func filterBlue(_ scheme: ColorScheme) -> Color {
+    scheme == .dark ? Color(red: 0.59, green: 0.74, blue: 1) : Color(red: 0.12, green: 0.31, blue: 0.63)
+  }
+
+  private struct FilterChipRows: Layout {
+    private func arrange(width: CGFloat, subviews: Subviews) -> ([CGRect], CGFloat) {
+      var x: CGFloat = 0
+      var y: CGFloat = 0
+      var rowHeight: CGFloat = 0
+      var frames: [CGRect] = []
+      for view in subviews {
+        let ideal = view.sizeThatFits(.unspecified)
+        let size = view.sizeThatFits(ProposedViewSize(width: min(width, ideal.width), height: nil))
+        if x > 0 && x + size.width > width {
+          x = 0
+          y += rowHeight
+          rowHeight = 0
+        }
+        frames.append(CGRect(origin: CGPoint(x: x, y: y), size: size))
+        x += size.width + 6
+        rowHeight = max(rowHeight, size.height)
+      }
+      return (frames, y + rowHeight)
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+      let width = proposal.width ?? subviews.reduce(0) { $0 + $1.sizeThatFits(.unspecified).width + 6 }
+      return CGSize(width: width, height: arrange(width: width, subviews: subviews).1)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+      for (view, frame) in zip(subviews, arrange(width: bounds.width, subviews: subviews).0) {
+        view.place(at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY),
+                   anchor: .topLeading, proposal: ProposedViewSize(frame.size))
+      }
+    }
+  }
+
+  private struct FilterPanel: SwiftUI.View {
+    let properties: Properties
+    let choices: FilterChoices
+    let send: (String) -> Void
+    let accessibilityFocus: AccessibilityFocusState<JournalFilterAccessibilityTarget?>.Binding
+    @State private var showsTags = false
+    @FocusState private var editing: Field?
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    private enum Field: Hashable { case tags, count }
+
+    private var surface: Color {
+      #if os(iOS)
+      Color(uiColor: .systemBackground)
+      #else
+      Color(nsColor: .windowBackgroundColor)
+      #endif
+    }
+
+    private func action(_ id: String, _ title: String) -> some SwiftUI.View {
+      Button { send(id) } label: { actionLabel(title) }
+        .buttonStyle(.plain)
+        .keyboardShortcut(id == "cancel" ? .cancelAction : nil)
+        .accessibilityIdentifier("journal-filter-\(id)")
+    }
+
+    private func actionLabel(_ title: String) -> some SwiftUI.View {
+      Text(title)
+        .font(.subheadline.weight(.semibold))
+        .foregroundStyle(filterBlue(scheme))
+        .frame(minWidth: 44, minHeight: 44)
+        .contentShape(Rectangle())
+    }
+
+    private func heading(_ title: String) -> some SwiftUI.View {
+      Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+        .accessibilityAddTraits(.isHeader)
+    }
+
+    private func chip(_ choice: FilterChoice) -> some SwiftUI.View {
+      FilterChip(label: choice.label, selected: choice.selected) { send(choice.id) }
+        .accessibilityIdentifier("journal-filter-\(choice.id)")
+    }
+
+    private func changeCount(_ count: String, by delta: Int) {
+      guard let value = Int(count) else { send("count:1"); return }
+      let (next, overflow) = value.addingReportingOverflow(delta)
+      if !overflow && next > 0 { send("count:\(next)") }
+    }
+
+    private func customControls(_ custom: FilterCustom) -> some SwiftUI.View {
+      let past = Text("Past").font(.subheadline.weight(.semibold))
+      let stepper = HStack(spacing: 0) {
+        Button { changeCount(custom.count, by: -1) } label: {
+          Image(systemName: "minus").frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .accessibilityLabel("Decrease count")
+        .disabled((Int(custom.count) ?? 0) <= 1)
+        TextField("Count", text: Binding(get: { custom.count }, set: { send("count:" + $0) }))
+          .textFieldStyle(.plain)
+          .multilineTextAlignment(.center)
+          .monospacedDigit()
+          .frame(minWidth: 44, idealWidth: 44, maxWidth: 64, minHeight: 44)
+          .focused($editing, equals: .count)
+          .accessibilityIdentifier("journal-filter-count")
+          #if os(iOS)
+          .keyboardType(.numberPad)
+          #endif
+        Button { changeCount(custom.count, by: 1) } label: {
+          Image(systemName: "plus").frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .accessibilityLabel("Increase count")
+      }
+      .buttonStyle(.plain)
+      .background(surface, in: .rect(cornerRadius: 9))
+      let units = Menu {
+        ForEach(custom.units) { unit in
+          Button { send(unit.id) } label: {
+            if unit.selected { Label(unit.label, systemImage: "checkmark") }
+            else { Text(unit.label) }
+          }
+          .accessibilityIdentifier("journal-filter-\(unit.id)")
+        }
+      } label: {
+        Text(custom.units.first(where: \.selected)?.label ?? "Units")
+          .font(.subheadline.weight(.semibold))
+          .frame(minWidth: 44, minHeight: 44)
+          .contentShape(Rectangle())
+      }
+      .tint(filterBlue(scheme))
+      .accessibilityIdentifier("journal-filter-unit")
+      return ViewThatFits(in: .horizontal) {
+        if !typeSize.isAccessibilitySize {
+          HStack(spacing: 8) {
+            past.fixedSize()
+            Spacer(minLength: 0)
+            stepper
+            Spacer(minLength: 0)
+            units.fixedSize()
+          }
+        }
+        VStack(alignment: .leading, spacing: 4) {
+          past
+          stepper
+          units
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.horizontal, 10)
+      .padding(.vertical, 4)
+      .background(Color.primary.opacity(0.06), in: .rect(cornerRadius: 13))
+    }
+
+    private var datePreview: String? {
+      guard let range = properties.dateRange, range.count == 2 else { return nil }
+      var calendar = Calendar(identifier: .gregorian)
+      calendar.timeZone = .gmt
+      let dates = range.compactMap { day in
+        calendar.date(from: DateComponents(year: day / 10000, month: day / 100 % 100, day: day % 100))
+      }
+      guard dates.count == 2 else { return nil }
+      let formatter = DateIntervalFormatter()
+      formatter.calendar = calendar
+      formatter.timeZone = calendar.timeZone
+      formatter.dateTemplate = range[0] / 10000 == range[1] / 10000 ? "MMMd" : "yMMMd"
+      return formatter.string(from: dates[0], to: dates[1]) + " · Includes today"
+    }
+
+    private var fields: some SwiftUI.View {
+      VStack(alignment: .leading, spacing: 6) {
+        heading("TAG · MATCH ANY")
+        FilterChipRows {
+          ForEach(choices.tags) { chip($0) }
+          FilterChip(label: showsTags ? "Hide tags" : "+ Tags", selected: false) { showsTags.toggle() }
+            .accessibilityIdentifier("journal-filter-add-tags")
+        }
+        if showsTags {
+          TextField("Search tags", text: Binding(get: { properties.text ?? "" }, set: { send("search:" + $0) }))
+            .textFieldStyle(.roundedBorder)
+            .focused($editing, equals: .tags)
+            .accessibilityIdentifier("journal-filter-tag-input")
+          if let message = properties.message { Text(message).font(.footnote).foregroundStyle(.secondary) }
+          FilterChipRows { ForEach(choices.results) { chip($0) } }
+        }
+        heading("STATUS · MATCH ANY")
+        FilterChipRows { ForEach(choices.statuses) { chip($0) } }
+        Text("Matches any selected tag or status.").font(.footnote).foregroundStyle(.secondary)
+        Divider().padding(.vertical, 4)
+        heading("RELATIVE TIME")
+        FilterChipRows { ForEach(choices.times) { chip($0) } }
+        if let custom = properties.custom { customControls(custom) }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    var body: some SwiftUI.View {
+      VStack(spacing: 8) {
+        Capsule().fill(.secondary.opacity(0.32)).frame(width: 34, height: 4)
+          .accessibilityHidden(true)
+        let title = Text("Filters").font(.headline)
+          .accessibilityAddTraits(.isHeader)
+          .accessibilityFocused(accessibilityFocus, equals: .heading)
+        if typeSize.isAccessibilitySize {
+          VStack(spacing: 0) {
+            title
+            HStack { action("cancel", "Cancel"); Spacer(); action("reset", "Reset") }
+          }
+        } else {
+          ZStack {
+            title
+            HStack { action("cancel", "Cancel"); Spacer(); action("reset", "Reset") }
+          }
+        }
+        ViewThatFits(in: .vertical) {
+          if !showsTags && properties.custom == nil {
+            fields.fixedSize(horizontal: false, vertical: true)
+          }
+          ScrollView { fields }
+            .scrollBounceBehavior(.basedOnSize)
+            .scrollDismissesKeyboard(.interactively)
+            .frame(maxHeight: 330)
+        }
+        VStack(spacing: 8) {
+          if let datePreview {
+            Text(datePreview).font(.footnote).foregroundStyle(.secondary)
+              .accessibilityIdentifier("journal-filter-date-preview")
+          } else if properties.custom != nil && properties.enabled != true {
+            Text("Enter a positive whole number within the supported range.")
+              .font(.footnote).foregroundStyle(.secondary)
+          }
+          let apply = Button { send("apply") } label: {
+            Text("Apply filters").font(.headline)
+              .foregroundStyle(.white)
+              .multilineTextAlignment(.center)
+              .fixedSize(horizontal: false, vertical: true)
+              .padding(.horizontal, 10)
+              .frame(maxWidth: .infinity, minHeight: 46)
+              .background(Color(red: 0.12, green: 0.31, blue: 0.63), in: .capsule)
+          }
+          .buttonStyle(.plain)
+          .disabled(properties.enabled != true)
+          .opacity(properties.enabled == true ? 1 : 0.45)
+          .accessibilityIdentifier("journal-filter-apply")
+          #if os(iOS)
+          if editing == .count {
+            HStack(spacing: 12) {
+              Button { editing = nil } label: { actionLabel("Done").fixedSize() }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("journal-filter-count-done")
+              apply
+            }
+          } else {
+            apply
+          }
+          #else
+          apply
+          #endif
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .layoutPriority(1)
+      }
+      .padding(.horizontal, 16)
+      .padding(.top, 9)
+      .padding(.bottom, 15)
+      .frame(maxWidth: 540)
+      .background(surface, in: .rect(cornerRadius: 24))
+      .overlay { RoundedRectangle(cornerRadius: 24).strokeBorder(Color.primary.opacity(0.12)) }
+      .accessibilityElement(children: .contain)
+      .accessibilityAddTraits(.isModal)
+      .accessibilityIdentifier("journal-filter-panel")
+      .accessibilityAction(.escape) { send("cancel") }
+      #if os(iOS)
+      .padding(.bottom, editing == nil ? 55 : 0)
+      #else
+      .padding(.bottom, 64)
+      #endif
+    }
+
   }
 
   /// Syntax and reference resolution belong to OCaml; this maps presentation data.
@@ -983,6 +1321,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
     @Environment(\.journalStartupContainerFrame) private var startupContainerFrame
+    @Environment(\.journalFilterAccessibilityFocus) private var filterAccessibilityFocus
+    @AccessibilityFocusState private var filterFocus: JournalFilterAccessibilityTarget?
+    @State private var presentedFilter = false
 
     private var properties: Properties? {
       JournalExtensions.decode(Properties.self, context: context)
@@ -1015,6 +1356,49 @@ struct JournalSheetDismissButton: SwiftUI.View {
         }
       case .timelineHost:
         if context.childIDs.count==1 {child(0)}
+      case .filterOverlay:
+        let isPresented = properties?.choices != nil
+        child(0)
+          .environment(\.journalFilterAccessibilityFocus, $filterFocus)
+          .accessibilityHidden(isPresented)
+          .allowsHitTesting(!isPresented)
+          .overlay(alignment: .bottom) {
+            if let properties, let choices = properties.choices {
+              ZStack(alignment: .bottom) {
+                Color.clear.contentShape(Rectangle())
+                  .onTapGesture { JournalExtensions.emit(context: context, payload: Data("cancel".utf8)) }
+                  .accessibilityHidden(true)
+                FilterPanel(properties: properties, choices: choices, send: { action in
+                  JournalExtensions.emit(context: context, payload: Data(action.utf8))
+                }, accessibilityFocus: $filterFocus)
+                .padding(.horizontal, 4)
+                .padding(.top, 8)
+              }
+            }
+          }
+          .task(id: isPresented) {
+            guard isPresented || presentedFilter else { return }
+            if isPresented { presentedFilter = true }
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            presentedFilter = isPresented
+            filterFocus = isPresented ? .heading : .trigger
+          }
+      case .filterTrigger:
+        if let properties {
+          let count = properties.level ?? 0
+          let trigger = FilterChip(label: count > 0 ? "Filters · \(count)" : "Filters",
+                     selected: false, highlighted: count > 0) {
+            JournalExtensions.emit(context: context, payload: Data("open".utf8))
+          }
+          .disabled(properties.enabled != true)
+          .accessibilityIdentifier("journal-filters")
+          if let filterAccessibilityFocus {
+            trigger.accessibilityFocused(filterAccessibilityFocus, equals: .trigger)
+          } else {
+            trigger
+          }
+        }
       case .page:
         if let properties, context.childIDs.count == 3,
           properties.connecting != nil, properties.controls != nil {

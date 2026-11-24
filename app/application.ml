@@ -598,7 +598,14 @@ let cleanup_batches batches =
   |> Rrbvec.of_seq
 ;;
 
+let cancel_filters state =
+  if state.modal = Filters_sheet
+  then { state with modal = No_modal; filters = Timeline_filter.cancel state.filters }
+  else state
+;;
+
 let select_destination state destination =
+  let state = cancel_filters state in
   if Journal_routes.destination state.routes = destination
   then (
     if destination = Journal_routes.Journals
@@ -2094,6 +2101,7 @@ module Root_navigation = struct
       match event with
       | Select destination -> select_destination state destination
       | Capture_opened ->
+        let state = cancel_filters state in
         let state =
           match state.direct_capture with
           | Some _ -> state
@@ -2804,22 +2812,23 @@ let composer_page ~on_close =
 
 let filters_page state dispatch filter_draft =
   let open Timeline_filter in
-  let button ?(enabled = true) id label action =
-    V.button ~enabled ~on_press:(bind_action dispatch action) ~child:(V.text label) ()
-    |> V.with_test_id (Ui.Test_id.string ("journal-filter-" ^ id))
+  let actions = ref [] in
+  let button ?(selected = false) id label action : Yojson.Safe.t =
+    actions := (id, action) :: !actions;
+    `Assoc [ "id", `String id; "label", `String label; "selected", `Bool selected ]
   in
-  let choice id label selected action =
-    button id (if selected then "✓ " ^ label else label) (Edit_filters action)
-  in
+  let choice id label selected action = button ~selected id label (Edit_filters action) in
   let time = draft_time filter_draft in
-  let custom_time = match time with Custom _ -> time | _ -> Custom { count_text = ""; unit_ = Days } in
-  let valid =
-    Result.is_ok (validate_draft_time filter_draft)
-    && (match apply state.filters, state.calendar with
-        | Ok filters, Some calendar ->
-          (try ignore (resolve_days (applied filters) ~today:(Journal_calendar.local_day calendar)); true
-           with Invalid_argument _ -> false)
-        | _ -> false)
+  let custom_time = match time with
+    | Custom _ -> time
+    | Preset Past_2_weeks -> Custom { count_text = "2"; unit_ = Weeks }
+    | Any_time | Preset Past_7_days -> Custom { count_text = "7"; unit_ = Days }
+  in
+  let range = match apply state.filters, state.calendar with
+    | Ok filters, Some calendar ->
+      (try Some (resolve_days (applied filters) ~today:(Journal_calendar.local_day calendar))
+       with Invalid_argument _ -> None)
+    | _ -> None
   in
   let statuses =
     Rrbvec.to_seq state.task_catalog.items
@@ -2838,43 +2847,56 @@ let filters_page state dispatch filter_draft =
     ; "custom", "Custom", custom_time, (match time with Custom _ -> true | _ -> false) ] in
   let custom = match time with
     | Custom { count_text; unit_ } ->
-      [ V.of_lui (Lui_elements.input ~key:"journal-filter-count" ~accessibility_identifier:"journal-filter-count"
-          ~label:"Count" ~text:count_text
-          ~on_input:(Lui_elements.on_input (fun edit -> dispatch.send (Edit_filters edit); true)
-            (fun count_text -> Set_time (Custom { count_text; unit_ }))) [])
-      ; V.row (List.map (fun (id, title, unit_choice) ->
-          choice id title (unit_choice = unit_) (Set_time (Custom { count_text; unit_ = unit_choice })))
-          [ "days", "Days", Days; "weeks", "Weeks", Weeks ]) ]
-      @ (if valid then [] else [ V.text "Enter a positive whole number within the supported range." ])
-    | Any_time | Preset _ -> []
+      let units = List.map (fun (id, label, unit_choice) ->
+        choice id label (unit_choice = unit_) (Set_time (Custom { count_text; unit_ = unit_choice })))
+        [ "days", "days", Days; "weeks", "weeks", Weeks ] in
+      `Assoc [ "count", `String count_text; "units", `List units ]
+    | Any_time | Preset _ -> `Null
   in
   let selected_tags = draft_tags filter_draft in
   let picker = state.filter_tag_picker in
-  let tag_input = V.of_lui (Lui_elements.input ~key:"journal-filter-tag-input"
-    ~accessibility_identifier:"journal-filter-tag-input" ~label:"Search tags" ~text:picker.prefix
-    ~on_input:(Lui_elements.on_input (fun command -> dispatch.send command; true)
-      (fun text -> Edit_filter_tag_text text)) []) in
   let selected = List.map (fun id ->
-    let title = List.assoc_opt id picker.labels |> Option.value ~default:("Unavailable tag · " ^ Uuid.to_string id) in
-    choice ("selected-tag-" ^ Uuid.to_string id) ("Remove " ^ title) true (Toggle_tag id)) selected_tags in
-  let results = match picker.page with
-    | Tag_loading -> [ V.text "Searching tags…" ]
-    | Tag_failed message -> [ V.text message; button "retry-tags" "Retry tag search" Retry_filter_tags ]
+    let title = List.assoc_opt id picker.labels
+      |> Option.value ~default:("Unavailable tag · " ^ Uuid.to_string id) in
+    choice ("selected-tag-" ^ Uuid.to_string id) ("#" ^ title) true (Toggle_tag id)) selected_tags in
+  let results, tag_message = match picker.page with
+    | Tag_loading -> [], Some "Searching tags…"
+    | Tag_failed message -> [ button "retry-tags" "Retry tag search" Retry_filter_tags ], Some message
     | Tag_results { items; next } ->
       let rows = List.filter_map (fun (tag : Logseq_db_types.Graph_types.tag_summary) ->
         if List.mem tag.uuid selected_tags then None
         else Some (button ("pick-tag-" ^ Uuid.to_string tag.uuid) tag.title (Pick_filter_tag tag))) items in
-      (if items = [] then [ V.text "No matching tags" ] else rows)
-      @ (if Option.is_some next then [ button "more-tags" "Next tags" More_filter_tags ] else []) in
-  let fields = [ V.text "Tags"; tag_input ] @ selected @ results
-    @ [ V.text "Task statuses" ] @ options @ [ V.text "Time range" ] @ times @ custom in
-  V.column ~spacing:12.
-    [ V.of_lui (Lui_elements.scroll [ Ui.mount (V.column ~spacing:8. fields) ])
-    ; V.row ~spacing:12.
-        [ button "cancel" "Cancel" Close_filters
-        ; button "reset" "Reset" (Edit_filters Reset)
-        ; button ~enabled:valid "apply" "Apply" Apply_filters ] ]
-  |> V.Body.static
+      rows @ (if Option.is_some next then [ button "more-tags" "Next tags" More_filter_tags ] else []),
+      (if rows = [] && Option.is_none next then Some "No matching tags" else None)
+  in
+  let date_range = match range with
+    | Some (Some (first, last)) -> `List [ `Int first; `Int last ]
+    | Some None | None -> `Null
+  in
+  let enabled = state.filters_restored && Option.is_some range in
+  let payload = Yojson.Safe.to_string (`Assoc
+    [ "mode", `String "filter-overlay"; "enabled", `Bool enabled
+    ; "choices", `Assoc [ "tags", `List selected; "statuses", `List options
+                        ; "times", `List times; "results", `List results ]
+    ; "custom", custom; "dateRange", date_range; "text", `String picker.prefix
+    ; "message", Option.fold ~none:`Null ~some:(fun text -> `String text) tag_message ]) in
+  let on_event event =
+    let raw = event.Journal_lui_native.payload in
+    match raw with
+    | "cancel" -> dispatch.send Close_filters
+    | "reset" -> dispatch.send (Edit_filters Reset)
+    | "apply" when enabled -> dispatch.send Apply_filters
+    | _ when String.starts_with ~prefix:"search:" raw ->
+      dispatch.send (Edit_filter_tag_text (String.sub raw 7 (String.length raw - 7)))
+    | _ when String.starts_with ~prefix:"count:" raw ->
+      (match time with
+       | Custom { unit_; _ } ->
+         let count_text = String.sub raw 6 (String.length raw - 6) in
+         dispatch.send (Edit_filters (Set_time (Custom { count_text; unit_ })))
+       | Any_time | Preset _ -> ())
+    | _ -> Option.iter dispatch.send (List.assoc_opt raw !actions)
+  in
+  payload, on_event
 ;;
 
 let timeline_page
@@ -2975,9 +2997,12 @@ let timeline_page
       timeline ()
       |> V.Body.toolbar
            ~items:[ V.Toolbar.item ~key:(Ui.Key.string "journal-filters") ~placement:Primary_action
-             (V.button ~enabled:interaction_enabled ~on_press:(bind_action on_account_action Open_filters)
-                ~child:(V.text (if filter_count = 0 then "Filters" else Printf.sprintf "Filters (%d)" filter_count)) ()
-              |> V.with_test_id (Ui.Test_id.string "journal-filters")) ]
+             (let payload = Yojson.Safe.to_string (`Assoc
+                [ "mode", `String "filter-trigger"; "level", `Int filter_count
+                ; "enabled", `Bool interaction_enabled ]) in
+              V.of_lui (Journal_lui_native.mount ~key:"journal-filters" ~payload ~children:[]
+                ~on_event:(fun _ -> on_account_action.send Open_filters)
+                Journal_lui_native.chrome_identifier)) ]
   in
   let destination_action index =
     Ui.Event.Handler.create (fun _ ->
@@ -8599,7 +8624,7 @@ let start
       in
       match state.modal with
       | No_modal -> None
-      | Filters_sheet -> Option.map (filters_page state dispatch) (Timeline_filter.sheet state.filters)
+      | Filters_sheet -> None
       | Capture_sheet ->
         if state.environment.platform = "ios"
         then None
@@ -8726,6 +8751,20 @@ let start
         ; settings
         ]
     in
+    let body = V.of_lui (fun context parent ->
+      let presentation = Signal.map (fun current ->
+        match current.modal, Timeline_filter.sheet current.filters with
+        | Filters_sheet, Some draft -> filters_page current dispatch draft
+        | _ -> {|{"mode":"filter-overlay"}|}, Fun.const ()) model_signal in
+      let payload = Signal.map fst presentation in
+      Signal.on_dispose context.Lui_ui.ui_scope (fun () ->
+        Signal.dispose_signal payload;
+        Signal.dispose_signal presentation);
+      Journal_lui_native.mount ~key:"journal-filter-overlay"
+        ~payload:(Signal.sample payload) ~payload_signal:payload
+        ~children:[ Journal_view.mount body ]
+        ~on_event:(fun event -> snd (Signal.sample presentation) event)
+        Journal_lui_native.chrome_identifier context parent) in
     V.Body.theme ~data:(application_theme ()) (V.Body.static body)
   in
   let show_graphs state =
