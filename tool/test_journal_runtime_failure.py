@@ -56,7 +56,8 @@ int32_t journal_ocaml_platform_failure(const char *d,int32_t n) { platform_calls
     executable = work / "runtime-tests"
     run(["xcrun", "swiftc", "-swift-version", "6", "-Xfrontend", "-disable-sandbox", "-I", str(work), "-L", str(work),
          "-lLUIAppleBackend", "-Xlinker", "-rpath", "-Xlinker", str(work),
-         "-module-cache-path", str(work / "modules"), str(ROOT / "swift/JournalSafeDiagnostic.swift"), str(ROOT / "swift/JournalPlatformWire.swift"), str(ROOT / "swift/JournalRuntime.swift"),
+         "-module-cache-path", str(work / "modules"), str(ROOT / "swift/JournalSafeDiagnostic.swift"), str(ROOT / "swift/JournalPlatformWire.swift"),
+         str(ROOT / "swift/JournalTimelineFilterPreferences.swift"), str(ROOT / "swift/JournalRuntime.swift"),
          str(ROOT / "apple-tests/platform-services/JournalRuntimeFailureTests.swift"),
          str(work / "bridge.o"), "-o", str(executable)])
     failures = []
