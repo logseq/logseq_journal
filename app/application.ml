@@ -402,6 +402,59 @@ module Task_catalog = struct
   ;;
 end
 
+module Timeline_filter_preferences = struct
+  let startup_prefix = "JTF1"
+
+  let unwrap_startup payload =
+    if not (String.starts_with ~prefix:startup_prefix payload) then [], payload else
+    match String.index_from_opt payload (String.length startup_prefix) '\n' with
+    | None -> [], payload
+    | Some separator ->
+      let offset = String.length startup_prefix in
+      let snapshot = String.sub payload offset (separator - offset) in
+      let config = String.sub payload (separator + 1) (String.length payload - separator - 1) in
+      let entries =
+        try match Yojson.Safe.from_string snapshot with `Assoc entries -> entries | _ -> []
+        with Yojson.Json_error _ -> [] in
+      entries, config
+  ;;
+
+  let decode text =
+    let open Timeline_filter in
+    let open Yojson.Safe.Util in
+    let ids = function
+      | `List values -> List.map (fun value ->
+          match Uuid.of_string (to_string value) with
+          | Ok id -> id | Error _ -> raise Exit) values
+      | _ -> raise Exit in
+    try
+      let value = Yojson.Safe.from_string text in
+      if member "version" value <> `Int 1 then raise Exit;
+      let time = match member "time" value with
+        | `String "any" -> any_time
+        | `String "past-7-days" -> preset Past_7_days
+        | `String "past-2-weeks" -> preset Past_2_weeks
+        | `List [`Int count; `String unit_] ->
+          let unit_ = match unit_ with "days" -> Days | "weeks" -> Weeks | _ -> raise Exit in
+          (match custom ~count ~unit_ with Ok time -> time | Error _ -> raise Exit)
+        | _ -> raise Exit in
+      Some (criteria ~tags:(ids (member "tags" value)) ~statuses:(ids (member "statuses" value)) ~time)
+    with Yojson.Json_error _ | Type_error _ | Exit -> None
+  ;;
+
+  let encode value =
+    let open Timeline_filter in
+    let ids values = `List (List.map (fun id -> `String (Uuid.to_string id)) values) in
+    let time = match time value with
+      | `Any_time -> `String "any"
+      | `Preset Past_7_days -> `String "past-7-days"
+      | `Preset Past_2_weeks -> `String "past-2-weeks"
+      | `Custom (count, unit_) -> `List [`Int count; `String (match unit_ with Days -> "days" | Weeks -> "weeks")] in
+    Yojson.Safe.to_string (`Assoc ["version", `Int 1; "tags", ids (tags value);
+      "statuses", ids (statuses value); "time", time])
+  ;;
+end
+
 type cleanup = Discard_staged_file of Journal_asset_import.staged
 type cleanup_plan = cleanup Rrbvec.t
 
@@ -416,6 +469,7 @@ type state =
   ; routes : Journal_routes.t
   ; filter_tag_text : string
   ; filters : Timeline_filter.t
+  ; filters_restored : bool
   ; timeline : Journal_timeline_state.t
   ; timeline_structure_revision : int
   ; next_request_generation : int64
@@ -566,6 +620,7 @@ let initial_state =
   ; routes = Journal_routes.create ()
   ; filter_tag_text = ""
   ; filters = Timeline_filter.initial
+  ; filters_restored = false
   ; timeline = Journal_timeline_state.empty ~today:0
   ; timeline_structure_revision = 0
   ; next_request_generation = 1L
@@ -790,6 +845,7 @@ let clear_graph_surface ~discard ?(discard_capture = true) state =
   ; routes = Journal_routes.create ()
   ; filter_tag_text = ""
   ; filters = Timeline_filter.initial
+  ; filters_restored = false
   ; timeline = Journal_timeline_state.empty ~today:0
   ; feed_loaded = false
   ; task_catalog = Task_catalog.empty
@@ -1987,6 +2043,8 @@ module Root_navigation = struct
     ; task_status_page = 0
     ; reference_sources = Reference_sources.empty
     ; graph_state = { state.graph_state with generation }
+    ; filters = Timeline_filter.initial
+    ; filters_restored = false
     ; graph_ready = false
     ; feed_loaded = false
     ; capture_error = None
@@ -3521,11 +3579,33 @@ let start
       ~on_view_region
       ~on_platform_request
       ~calendar_sampler
+      ~filter_preferences
       ~client
       ~platform_code
       ~host_code
   : app_context
   =
+  let filter_preferences = ref filter_preferences in
+  let graph_filter_key id =
+    String.lowercase_ascii (Logseq_db_types.Graph_types.Uuid.to_string id) in
+  let save_filters id criteria =
+    let key = graph_filter_key id in
+    let text = if criteria = Timeline_filter.all then "" else Timeline_filter_preferences.encode criteria in
+    filter_preferences := List.remove_assoc key !filter_preferences;
+    if text <> "" then filter_preferences := (key, `String text) :: !filter_preferences;
+    Journal_bridge.platform_request ("journal.timeline-filter.commit\n" ^ key ^ "\n" ^ text) in
+  let saved_filters id calendar =
+    let criteria = match List.assoc_opt (graph_filter_key id) !filter_preferences with
+      | Some (`String text) -> Timeline_filter_preferences.decode text
+      | _ -> None in
+    let criteria = Option.value criteria ~default:Timeline_filter.all in
+    try ignore (Timeline_filter.resolve_days criteria ~today:(Journal_calendar.local_day calendar)); criteria
+    with Invalid_argument _ -> Timeline_filter.all in
+  let restore_filters state =
+    match state.filters_restored, state.graph_state.graph_id, state.calendar with
+    | false, Some id, Some calendar ->
+      { state with filters_restored = true; filters = Timeline_filter.restore (saved_filters id calendar) }
+    | _ -> state in
   let pump = Journal_pump.create () in
   Journal_pump.set_wakeup pump Journal_bridge.wakeup;
   let running = ref true in
@@ -5237,7 +5317,12 @@ let start
           let feed_output =
             match current.calendar with
             | None -> Journal_graph_runtime.{ requests = []; responses = [] }
-            | Some _ ->
+            | Some calendar ->
+              let criteria = Option.fold ~none:Timeline_filter.all
+                  ~some:(fun id -> saved_filters id calendar) graph_state.graph_id in
+              let days = Timeline_filter.resolve_days criteria ~today:(Journal_calendar.local_day calendar) in
+              Journal_graph_runtime.set_timeline_filter (!graph_runtime_cell)
+                ~tags:(Timeline_filter.tags criteria) ~statuses:(Timeline_filter.statuses criteria) ~days;
               submit
                 (Journal_graph_request.Load_feed
                    { cursor = None; root_limit = feed_root_limit
@@ -7140,21 +7225,22 @@ let start
       update (fun state ->
         if state.modal = Filters_sheet then { state with modal = No_modal; filters = Timeline_filter.cancel state.filters } else state)
     | Apply_filters ->
-      update (fun state ->
-        if state.modal <> Filters_sheet then state else
-        match Timeline_filter.apply state.filters with
-        | Error _ -> state
-        | Ok filters when Option.exists (fun calendar ->
+      set_state_and_effect (fun state ->
+        if state.modal <> Filters_sheet then state, Effect.ignore else
+        match Timeline_filter.apply state.filters, state.graph_state.graph_id with
+        | Ok filters, Some graph_id when state.filters_restored
+            && Option.exists (fun calendar ->
             try ignore (Timeline_filter.resolve_days (Timeline_filter.applied filters)
                           ~today:(Journal_calendar.local_day calendar)); true
             with Invalid_argument _ -> false) state.calendar ->
           let changed = Timeline_filter.applied filters <> Timeline_filter.applied state.filters in
-          if not changed then { state with modal = No_modal; filters } else
+          let next = if not changed then { state with modal = No_modal; filters } else
             { state with modal = No_modal; filters; feed_loaded = false; feed_refresh = None
             ; timeline = Journal_timeline_state.empty ~today:(Option.fold ~none:0 ~some:Journal_calendar.local_day state.calendar)
             ; timeline_structure_revision = state.timeline_structure_revision + 1
-            ; presented_feed_context = None }
-        | Ok _ -> state)
+            ; presented_feed_context = None } in
+          next, Effect.of_thunk (fun () -> save_filters graph_id (Timeline_filter.applied filters))
+        | _ -> state, Effect.ignore)
     | Open_diagnostics ->
       set_state_and_effect (fun state ->
         let admission_refresh, directive =
@@ -7658,6 +7744,7 @@ let start
     Option.iter activate_runtime (timeline_scope model);
     let before = model in
     let model,eff=transition model in
+    let model = restore_filters model in
     match !before_transition_effect before model with
     | Error cause ->
       let message = "Nothing was submitted. " ^ cause in
@@ -8897,6 +8984,7 @@ let create
   let init platform_code host_code payload =
     latest_patch := "";
     Printexc.record_backtrace true;
+    let filter_preferences, payload = Timeline_filter_preferences.unwrap_startup payload in
     (match decode_config (Bytes.of_string payload) with
      | Error source -> raise (Journal_bridge.initialization_failure Decode_startup source)
      | Ok config ->
@@ -8913,6 +9001,7 @@ let create
                   ~on_view_region
                   ~on_platform_request
                   ~calendar_sampler:(calendar_sampler ())
+                  ~filter_preferences
                   ~client
                   ~platform_code
                   ~host_code);

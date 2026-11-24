@@ -119,7 +119,10 @@ private final class JournalPlatformRequestIngress: @unchecked Sendable {
 private let platformRequestIngress = JournalPlatformRequestIngress()
 private let platformRequest: PlatformRequestCallback = { data, length in
   guard let data, length > 0 else { return }
-  platformRequestIngress.submit(Data(bytes: data, count: Int(length)))
+  let request = Data(bytes: data, count: Int(length))
+  if !JournalTimelineFilterPreferences(defaults: .standard).handleCommit(request) {
+    platformRequestIngress.submit(request)
+  }
 }
 
 /// Owns the lui backend, the OCaml runtime, and the platform bridge for one
@@ -241,7 +244,8 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     #else
     let operatingSystem: Int32 = 2
     #endif
-    let accepted = startupPayload.withUnsafeBytes { bytes in
+    let payload = JournalTimelineFilterPreferences(defaults: .standard).wrapStartup(startupPayload)
+    let accepted = payload.withUnsafeBytes { bytes in
       luiOCamlStart(
         receivePatch,
         operatingSystem,
