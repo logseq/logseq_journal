@@ -444,6 +444,7 @@ let reset t =
   Favorites.reset t.favorites;
   Hashtbl.clear t.changed_point_epochs;
   Confirmation.reset t.confirmations;
+  Feed.set_filter t.feed ~tags:[] ~statuses:[];
   Feed.reset t.feed
 ;;
 
@@ -706,6 +707,8 @@ let page_of_graph_page (page : Graph.page) =
   in
   Projection.page_of_summary summary
 ;;
+
+let set_timeline_filter t ~tags ~statuses = Feed.set_filter t.feed ~tags ~statuses
 
 let feed_ports t =
   Feed.

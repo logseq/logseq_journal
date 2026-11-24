@@ -9276,10 +9276,31 @@ let test_root_quota_generated_traces () =
     [ 1; 2; 3 ]
 ;;
 
+let test_timeline_root_filter () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime
+      ~validate_session:Worker_producer.validate_session () in
+  set_calendar runtime;
+  let fixture = root_fixture 0 65 0 in
+  let tag = (List.nth fixture.roots 61).block.uuid in
+  let status = (List.nth fixture.roots 62).block.uuid in
+  let roots = List.mapi (fun index (value : Worker_pure_data.block_record) ->
+    match index with
+    | 61 -> { value with block = { value.block with tags = [tag] } }
+    | 62 -> { value with task_status = Some status }
+    | _ -> value) fixture.roots in
+  Runtime.set_timeline_filter runtime ~tags:[tag] ~statuses:[status];
+  let feed, _ = drive_roots runtime [{fixture with roots}] (initial_roots runtime 989L) in
+  let actual = List.concat_map (fun (day : Journal_graph_projection.day_feed) ->
+    List.map (fun (entry : Journal_graph_projection.timeline_entry) -> Journal_model.id entry.block) day.entries) feed.days in
+  Alcotest.(check (list string)) "only matching roots across sparse packets"
+    (List.map Graph.Uuid.to_string [tag;status]) actual
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "status recovery"
+    [ ("timeline filters", [Alcotest.test_case "sparse tag or status matches" `Quick test_timeline_root_filter])
+    ; ( "status recovery"
       , [ Alcotest.test_case
             "catalog and delta cross fences"
             `Quick

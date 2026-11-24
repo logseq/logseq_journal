@@ -125,7 +125,9 @@ type ports =
   ; report : string -> (string * Yojson.Safe.t) list -> unit
   }
 type t =
-  { mutable initial_feed_spec : (int * int) option
+  { mutable tags : Graph.Uuid.t list
+  ; mutable statuses : Graph.Uuid.t list
+  ; mutable initial_feed_spec : (int * int) option
   ; mutable feed_session : int64
   ; mutable session : Worker.session option
   ; mutable owner : int64
@@ -145,7 +147,7 @@ let feed_failure request_generation message = responses [Failed { scope = Feed r
 let day_failure ~day request_generation message = responses [Failed { scope = Day {day;request_generation}; stale_cursor = false; message; cause=None }]
 let reject message = responses [Failed { scope = Reconciliation; stale_cursor = false; message; cause=None }]
 let create () =
-  { initial_feed_spec = None
+  { tags = []; statuses = []; initial_feed_spec = None
   ; feed_session = 0L
   ; session = None
   ; owner = 0L
@@ -170,6 +172,13 @@ let reset t =
   t.initial_feed_spec <- None;
   t.feed_session <- Int64.succ t.feed_session
 ;;
+let set_filter t ~tags ~statuses =
+  if t.tags <> tags || t.statuses <> statuses then (
+    reset t;
+    t.tags <- tags;
+    t.statuses <- statuses)
+;;
+
 let timeline_uuid value =
   match Graph.Uuid.of_string value with
   | Ok uuid -> `String (Graph.Uuid.to_string uuid)
@@ -846,8 +855,14 @@ let receive_root_tree t ~ports batch (packet : Worker_pure_data.tree_member Pagi
   then root_failure batch "The root cursor did not advance."
   else (
     Hashtbl.replace batch.root_proofs (Roots_scope batch.root_page.id) (Paging.Receipt packet.receipt);
-    let members = Rrbvec.map (fun (m : Worker_pure_data.tree_member) ->
-      Projection.{block=m.value.block;revision=m.revision;depth=0}) items in
+    let matches (m : Worker_pure_data.tree_member) =
+      (t.tags = [] && t.statuses = [])
+      || List.exists (fun tag -> List.exists (Graph.Uuid.equal tag) t.tags) m.value.block.tags
+      || Option.exists (fun status -> List.exists (Graph.Uuid.equal status) t.statuses) m.value.task_status
+    in
+    let members = Rrbvec.filter_map (fun (m : Worker_pure_data.tree_member) ->
+      if matches m then Some Projection.{block=m.value.block;revision=m.revision;depth=0}
+      else None) items in
     match (ports.context ()).time_context with
     | Error message -> root_failure batch message
     | Ok time_context ->
