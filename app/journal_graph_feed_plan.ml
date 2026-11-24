@@ -3,7 +3,7 @@ module Projection = Journal_graph_projection
 module Worker = Journal_worker_coordination.Worker_api
 module Paging = Journal_timeline_cursor.Timeline_cursor
 
-type scope = Dates_scope of Worker.journal_day * Worker.journal_day | Roots_scope of string | Preview_scope of string * string
+type scope = Coverage_scope | Dates_scope of Worker.journal_day * Worker.journal_day | Roots_scope of string | Preview_scope of string * string
 type proofs = (scope, Paging.packed_receipt) Hashtbl.t
 
 type day_feed =
@@ -91,7 +91,7 @@ type journal_request =
   ; after : Worker_pure_data.journal_item Paging.cursor option
   }
 
-type validation_action = Assemble of root_batch | Publish_feed of feed_scan | Window of {request_generation:int64; refresh:bool}
+type validation_action = Assemble of root_batch | Publish_feed of feed_scan | Window of {request_generation:int64; refresh:bool; filtered:bool}
 type validation = { action : validation_action; proofs : (scope * Paging.packed_receipt) Rrbvec.t
   ; session : int64; epoch : int64 }
 
@@ -104,6 +104,7 @@ type operation =
 
 type failure_scope = Feed of int64 | Day of { day : int; request_generation : int64 } | Reconciliation
 type publication =
+  | Refresh_started of int64
   | Loaded of { request_generation : int64; feed : Projection.feed; complete : bool }
   | Reconciled of { page : Projection.page; value : Projection.timeline_entry_page }
   | Failed of { scope : failure_scope; stale_cursor : bool; message : string; cause : Worker.error option }
@@ -176,12 +177,16 @@ let reset t =
   t.feed_session <- Int64.succ t.feed_session
 ;;
 let set_filter t ~tags ~statuses ~days =
+  let tags = List.sort_uniq Graph.Uuid.compare tags in
+  let statuses = List.sort_uniq Graph.Uuid.compare statuses in
   if t.tags <> tags || t.statuses <> statuses || t.days <> days then (
     reset t;
     t.tags <- tags;
     t.statuses <- statuses;
     t.days <- days)
 ;;
+
+let filtered t = t.tags <> [] || t.statuses <> [] || Option.is_some t.days
 
 let timeline_uuid value =
   match Graph.Uuid.of_string value with
@@ -235,8 +240,11 @@ let make_root_batch t ~ports owner ~page_uuid (page : Projection.page) cursor li
     | Changed_roots refresh when refresh.refresh_prefix = None ->
       min limit (max 1 (refresh.refresh_prefix_limit - Rrbvec.length refresh.refresh_entries))
     | _ -> limit in
-  Hashtbl.replace t.root_page_limits page.id (max limit (Option.value ~default:1 (Hashtbl.find_opt t.root_page_limits page.id)));
-  ports.retain_root_interest page ~minimum_limit:limit;
+  (match owner with
+   | Feed_roots scan when filtered t && scan.root_start_day = None -> ()
+   | _ ->
+     Hashtbl.replace t.root_page_limits page.id (max limit (Option.value ~default:1 (Hashtbl.find_opt t.root_page_limits page.id)));
+     ports.retain_root_interest page ~minimum_limit:limit);
   let epoch = match Hashtbl.find_opt t.root_page_epochs page.id with
     | Some epoch -> epoch
     | None -> let epoch = ports.now () in
@@ -293,7 +301,7 @@ let continue_root_batch t ~ports owner page cursor limit =
   | Error message -> (match owner with Feed_roots scan -> scan_failure scan message | Changed_roots _ -> reject message)
 ;;
 
-let scope_page = function Roots_scope id | Preview_scope (id, _) -> Some id | Dates_scope _ -> None
+let scope_page = function Roots_scope id | Preview_scope (id, _) -> Some id | Dates_scope _ | Coverage_scope -> None
 let drop_page t id =
   Hashtbl.remove t.retained_prefixes id;
   Hashtbl.filter_map_inplace (fun scope proof ->
@@ -315,7 +323,7 @@ let retire t ~ports ~pages ~entries ~pending =
   if Hashtbl.length removed_pages > 0 || Hashtbl.length changed_entries > 0 then (
     let filter_proofs proofs = Hashtbl.filter_map_inplace (fun scope proof ->
       let removed = match scope with
-        | Dates_scope _ -> false
+        | Dates_scope _ | Coverage_scope -> false
         | Roots_scope page -> Hashtbl.mem removed_pages page
         | Preview_scope (page,root) -> Hashtbl.mem removed_pages page
             || Hashtbl.find_opt changed_entries (page,root) = Some None in
@@ -489,6 +497,9 @@ let has_retained t = Hashtbl.length t.retained > 0
 let validation_failure action message = match action with
   | Assemble batch -> root_failure batch message
   | Publish_feed scan -> scan_failure scan message
+  | Window {request_generation;refresh;filtered=true} ->
+    responses ((if refresh then [] else [Refresh_started request_generation]) @
+      [Failed {scope=Feed request_generation;stale_cursor=false;message;cause=None}])
   | Window _ -> reject message
 
 let check t ~ports action =
@@ -509,7 +520,7 @@ let check t ~ports action =
 let validate_retained t ~ports ~request_generation ~refresh =
   if not (has_retained t) then empty else (
     t.window_epoch <- Int64.succ t.window_epoch;
-    check t ~ports (Window {request_generation;refresh}))
+    check t ~ports (Window {request_generation;refresh;filtered=filtered t}))
 ;;
 
 let rec next_feed_batch ?(verified=false) t ~ports scan =
@@ -774,7 +785,7 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
     (* A replacement catalog traversal owns its own date scopes. Root and
        preview receipts still belong to every retained page. *)
     Hashtbl.filter_map_inplace (fun scope proof -> match scope with
-      | Dates_scope _ -> None | _ -> Some proof) t.retained;
+      | Dates_scope _ | Coverage_scope -> None | _ -> Some proof) t.retained;
     if cursor = None && after = None
     then t.initial_feed_spec <- Some (root_limit, day_limit);
     let scan =
@@ -783,7 +794,7 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
       ; root_through_day = through_day
       ; root_proofs = Hashtbl.create 16
       ; root_retries = 0
-      ; root_reuse = reuse
+      ; root_reuse = reuse && not (filtered t)
       ; root_generation = request_generation
       ; root_continued = Option.exists (fun (_, cursor) -> Option.is_some cursor) after
       ; root_start_day = start_day
@@ -885,7 +896,25 @@ let receive_root_tree t ~ports batch (packet : Worker_pure_data.tree_member Pagi
         let ids = List.map (fun (e : Projection.timeline_entry) -> Journal_model.id e.block) projected.entries in
         let todo = Rrbvec.filter (fun (m : Projection.tree_member) ->
           List.mem (Graph.Uuid.to_string m.block.uuid) ids) members in
-        next_root_preview t ~ports
+        match batch.root_owner with
+        | Feed_roots scan when filtered t && Rrbvec.is_empty todo
+            && scan.root_start_day = None
+            && not (Rrbvec.exists (fun (day : day_feed) -> day.page.id = batch.root_page.id) scan.root_days) ->
+          (match next_cursor with
+           | Some cursor -> continue_root_batch t ~ports batch.root_owner batch.root_page (Some cursor) batch.root_limit
+           | None ->
+             if not (retained_page t batch.root_page.id) then
+               Hashtbl.remove t.root_page_epochs batch.root_page.id;
+             if Some batch.root_page.day <> scan.root_skipped_day then
+               scan.root_date_boundary <- Some batch.root_page.day;
+             next_feed_batch t ~ports scan)
+        | _ ->
+          if filtered t && not (Rrbvec.is_empty todo) then (
+            let id = batch.root_page.id in
+            Hashtbl.replace t.root_page_limits id (max batch.root_limit
+              (Option.value ~default:1 (Hashtbl.find_opt t.root_page_limits id)));
+            ports.retain_root_interest batch.root_page ~minimum_limit:batch.root_limit);
+          next_root_preview t ~ports
           {batch with root_members=members;root_todo=todo;root_next=next_cursor})
 ;;
 
@@ -1002,7 +1031,7 @@ let restart_dates t ~ports scan =
     scan.root_retries <- scan.root_retries + 1;
     Hashtbl.clear scan.root_proofs;
     Hashtbl.clear scan.root_consumed_by_page;
-    Hashtbl.filter_map_inplace (fun scope proof -> match scope with Dates_scope _ -> None | _ -> Some proof) t.retained;
+    Hashtbl.filter_map_inplace (fun scope proof -> match scope with Dates_scope _ | Coverage_scope -> None | _ -> Some proof) t.retained;
     scan.root_days <- Rrbvec.empty;
     scan.root_queued <- Rrbvec.empty;
     scan.root_remaining <- scan.root_requested_root_limit;
@@ -1014,6 +1043,17 @@ let restart_dates t ~ports scan =
     Hashtbl.clear scan.root_journal_boundary_pages;
     scan.root_journals_done <- false;
     read_root_dates ~ports scan)
+;;
+
+let with_coverage t ~ports scan receipt accept =
+  if not (filtered t) then accept () else
+  match Paging.coverage receipt with
+  | None -> scan_failure scan "Filtered Timeline read returned no coverage witness."
+  | Some proof ->
+    match Hashtbl.find_opt scan.root_proofs Coverage_scope with
+    | None -> Hashtbl.replace scan.root_proofs Coverage_scope proof; accept ()
+    | Some old ->
+      if Paging.equal_coverage proof old then accept () else restart_dates t ~ports scan
 ;;
 
 let operation_failure operation message = match operation with
@@ -1061,7 +1101,7 @@ let receive_check t ~ports validation (checked : Paging.check) =
         merge_proofs (owner_proofs batch.root_owner) batch.root_proofs;
         complete_verified_batch t ~ports batch
       | Publish_feed scan -> responses [root_feed_response ~ports scan true]
-      | Window {request_generation;refresh} ->
+      | Window {request_generation;refresh;_} ->
         if refresh then Option.fold ~none:empty ~some:(fun (root_limit,day_limit) ->
           start_feed_scan t ~ports ~cursor:None ~root_limit ~day_limit ~request_generation ~reuse:true ()) t.initial_feed_spec
         else empty)
@@ -1073,7 +1113,7 @@ let receive_check t ~ports validation (checked : Paging.check) =
       | Some (_,error) ->
         paging_failure (validation_failure validation.action) error
       | None ->
-        let dates_changed = Rrbvec.exists (fun (scope,_) -> match scope with Dates_scope _ -> true | _ -> false) invalid in
+        let dates_changed = Rrbvec.exists (fun (scope,_) -> match scope with Dates_scope _ | Coverage_scope -> true | _ -> false) invalid in
         let pages = Hashtbl.create 8 in
         Rrbvec.iter (fun (scope,_) ->
           Hashtbl.remove t.retained scope;
@@ -1084,7 +1124,8 @@ let receive_check t ~ports validation (checked : Paging.check) =
           | Assemble {root_owner=Feed_roots scan;_} ->
             Rrbvec.exists (fun (day:day_feed) -> Hashtbl.mem pages day.page.id) scan.root_days
           | _ -> false in
-        let roots = Hashtbl.to_seq_keys pages |> Seq.filter_map (fun id ->
+        let coverage_changed = Rrbvec.exists (fun (scope,_) -> scope = Coverage_scope) invalid in
+        let roots = if coverage_changed then Rrbvec.empty else Hashtbl.to_seq_keys pages |> Seq.filter_map (fun id ->
           if current_page = Some id then None else
           let day = Hashtbl.find_opt t.retained_prefixes id in
           drop_page t id;
@@ -1103,8 +1144,13 @@ let receive_check t ~ports validation (checked : Paging.check) =
            else if Hashtbl.mem pages batch.root_page.id then restart_batch t ~ports batch
            else check t ~ports (Assemble batch)
          | Publish_feed scan -> restart_dates t ~ports scan
-         | Window {request_generation;refresh} ->
-           if dates_changed || refresh then
+         | Window {request_generation;refresh;_} ->
+           if coverage_changed then
+             Option.fold ~none:empty ~some:(fun (root_limit,day_limit) ->
+               let output = start_feed_scan t ~ports ~cursor:None ~root_limit ~day_limit ~request_generation () in
+               if refresh then output else
+                 {output with publications=Rrbvec.push_front output.publications (Refresh_started request_generation)}) t.initial_feed_spec
+           else if dates_changed || refresh then
              Option.fold ~none:empty ~some:(fun (root_limit,day_limit) ->
                start_feed_scan t ~ports ~cursor:None ~root_limit ~day_limit ~request_generation ~reuse:true ()) t.initial_feed_spec
            else empty in
@@ -1142,8 +1188,8 @@ let superseded t ~ports = function
   | Check {action=Assemble batch;_} -> superseded_root_batch t ~ports batch
   | Check {action=Publish_feed scan;_} when root_owner_current t (Feed_roots scan) ->
     check t ~ports (Publish_feed scan)
-  | Check {action=Window {request_generation;refresh};_} when has_retained t ->
-    check t ~ports (Window {request_generation;refresh})
+  | Check {action=(Window _ as action);_} when has_retained t ->
+    check t ~ports action
   | Check _ | Root_dates _ | Root_today _ -> empty
   | Root_tree batch -> superseded_root_batch t ~ports batch
   | Root_preview preview -> superseded_root_batch t ~ports preview.preview_batch
@@ -1167,7 +1213,8 @@ let receive : type a. ?session:Worker.session -> t -> ports:ports
   Some (match operation,query,value with
       | Check validation, Worker.Timeline_check _, checked -> receive_check t ~ports validation checked
       | Root_dates (scan, params), Worker.Timeline_read {query=Paging.Dates _;_}, Ok packet ->
-        Hashtbl.replace scan.root_proofs
+        with_coverage t ~ports scan packet.receipt (fun () ->
+        if not (filtered t) then Hashtbl.replace scan.root_proofs
           (Dates_scope (params.from_day, params.through_day))
           (Paging.Receipt packet.receipt);
         let items = packet.items in
@@ -1237,9 +1284,10 @@ let receive : type a. ?session:Worker.session -> t -> ports:ports
                              scan.root_skipped_day)
                         pages -> read_priority_today ~ports scan
             | None -> next_feed_batch t ~ports scan)
-          else next_feed_batch t ~ports scan)
+          else next_feed_batch t ~ports scan))
       | Root_today (scan, params), Worker.Timeline_read {query=Paging.Dates _;_}, Ok packet ->
-        Hashtbl.replace scan.root_proofs
+        with_coverage t ~ports scan packet.receipt (fun () ->
+        if not (filtered t) then Hashtbl.replace scan.root_proofs
           (Dates_scope (params.from_day, params.through_day))
           (Paging.Receipt packet.receipt);
         let items = packet.items in
@@ -1250,10 +1298,14 @@ let receive : type a. ?session:Worker.session -> t -> ports:ports
             items
         in
         scan.root_queued <- Rrbvec.append today scan.root_queued;
-        next_feed_batch t ~ports scan
+        next_feed_batch t ~ports scan)
      | Root_tree batch, Worker.Timeline_read {query=Paging.Roots _;_}, Ok packet ->
-       ports.observe_packet (Roots (Rrbvec.to_seq packet.items));
-       receive_root_tree t ~ports batch packet
+       let accept () =
+         ports.observe_packet (Roots (Rrbvec.to_seq packet.items));
+         receive_root_tree t ~ports batch packet in
+       (match batch.root_owner with
+        | Feed_roots scan -> with_coverage t ~ports scan packet.receipt accept
+        | Changed_roots _ -> accept ())
      | Root_preview preview, Worker.Timeline_read {query=Paging.Preview_children _;_}, Ok packet ->
        ports.observe_packet (Preview (Rrbvec.to_seq packet.items));
        receive_root_preview t ~ports preview packet

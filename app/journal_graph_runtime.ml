@@ -768,6 +768,8 @@ let feed_output ?source (value : Feed.output) =
       Rrbvec.to_list
         (Rrbvec.map
            (function
+             | Feed.Refresh_started request_generation ->
+               response (Feed_refresh_started {request_generation})
              | Feed.Loaded { request_generation; feed; complete } ->
                response (Feed_loaded { request_generation; feed; complete })
              | Reconciled { page; value } ->

@@ -45,6 +45,7 @@ type _ kind =
   | Members : Worker.children kind
   | Tree : Worker_pure_data.tree_member Worker.slice kind
   | Favorites : Worker.favorites kind
+  | Tags : Worker.Graph.tag_summary Worker.slice kind
   | Statuses : Worker.task_status_catalog kind
   | Definitions : Worker.Graph.task_status_definition option list kind
   | Asset_lookup : Worker.asset_lookup_result kind
@@ -67,6 +68,7 @@ let kind : type a. a Worker.query -> a kind = function
   | Child_members _ -> Members
   | Tree _ -> Tree
   | Favorites _ -> Favorites
+  | Tag_search _ -> Tags
   | Task_statuses _ -> Statuses
   | Task_status_definitions _ -> Definitions
   | Asset_descriptors _ -> Asset_lookup
@@ -106,6 +108,7 @@ let rec same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option 
   | Members, Members -> Some Refl
   | Tree, Tree -> Some Refl
   | Favorites, Favorites -> Some Refl
+  | Tags, Tags -> Some Refl
   | Statuses, Statuses -> Some Refl
   | Definitions, Definitions -> Some Refl
   | Asset_lookup, Asset_lookup -> Some Refl
@@ -915,6 +918,7 @@ let validate_continuation_session : type a. Worker.session -> a Worker.query -> 
     | Worker.Child_members {after;_} -> Option.map Worker.continuation_budget after
     | Worker.Tree {after;_} -> Option.map Worker.continuation_budget after
     | Worker.Favorites after -> Option.map Worker.continuation_budget after
+    | Worker.Tag_search {after;_} -> Option.map Worker.continuation_budget after
     | Worker.Task_statuses after -> Option.map Worker.continuation_budget after
     | Worker.Assets {after;_} -> Option.map Worker.continuation_budget after
     | Worker.Timeline_read _ | Worker.Timeline_check _

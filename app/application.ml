@@ -458,6 +458,19 @@ end
 type cleanup = Discard_staged_file of Journal_asset_import.staged
 type cleanup_plan = cleanup Rrbvec.t
 
+type filter_tag_page =
+  | Tag_loading
+  | Tag_failed of string
+  | Tag_results of Logseq_db_types.Graph_types.tag_summary Journal_worker_coordination.Worker_api.slice
+
+type filter_tag_picker =
+  { sheet_epoch : int
+  ; search_epoch : int
+  ; prefix : string
+  ; labels : (Timeline_filter.tag_id * string) list
+  ; page : filter_tag_page
+  }
+
 type state =
   { resident_states : state Graph_drafts.t
   ; graph_preview : string option
@@ -467,7 +480,7 @@ type state =
   ; favorites_media_roots : string Rrbvec.t
   ; favorites_requests : Journal_graph_request.favorites_request list
   ; routes : Journal_routes.t
-  ; filter_tag_text : string
+  ; filter_tag_picker : filter_tag_picker
   ; filters : Timeline_filter.t
   ; filters_restored : bool
   ; timeline : Journal_timeline_state.t
@@ -618,7 +631,7 @@ let initial_state =
   ; favorites_media_roots = Rrbvec.empty
   ; favorites_requests = []
   ; routes = Journal_routes.create ()
-  ; filter_tag_text = ""
+  ; filter_tag_picker = { sheet_epoch = 0; search_epoch = 0; prefix = ""; labels = []; page = Tag_loading }
   ; filters = Timeline_filter.initial
   ; filters_restored = false
   ; timeline = Journal_timeline_state.empty ~today:0
@@ -843,7 +856,7 @@ let clear_graph_surface ~discard ?(discard_capture = true) state =
   ; favorites_media_roots = Rrbvec.empty
   ; favorites_requests = []
   ; routes = Journal_routes.create ()
-  ; filter_tag_text = ""
+  ; filter_tag_picker = { sheet_epoch = 0; search_epoch = 0; prefix = ""; labels = []; page = Tag_loading }
   ; filters = Timeline_filter.initial
   ; filters_restored = false
   ; timeline = Journal_timeline_state.empty ~today:0
@@ -2373,7 +2386,9 @@ type command =
   | Open_filters
   | Edit_filters of Timeline_filter.edit
   | Edit_filter_tag_text of string
-  | Add_filter_tag of Timeline_filter.tag_id
+  | Pick_filter_tag of Logseq_db_types.Graph_types.tag_summary
+  | More_filter_tags
+  | Retry_filter_tags
   | Close_filters
   | Apply_filters
   | Open_diagnostics
@@ -2834,17 +2849,24 @@ let filters_page state dispatch filter_draft =
     | Any_time | Preset _ -> []
   in
   let selected_tags = draft_tags filter_draft in
+  let picker = state.filter_tag_picker in
   let tag_input = V.of_lui (Lui_elements.input ~key:"journal-filter-tag-input"
-    ~accessibility_identifier:"journal-filter-tag-input" ~label:"Tag UUID" ~text:state.filter_tag_text
+    ~accessibility_identifier:"journal-filter-tag-input" ~label:"Search tags" ~text:picker.prefix
     ~on_input:(Lui_elements.on_input (fun command -> dispatch.send command; true)
       (fun text -> Edit_filter_tag_text text)) []) in
-  let tag_add = match Uuid.of_string (String.trim state.filter_tag_text) with
-    | Ok id when not (List.mem id selected_tags) -> [ button "add-tag" "Add tag" (Add_filter_tag id) ]
-    | _ -> [] in
-  let tag_options = List.map (fun id ->
-    let label = Uuid.to_string id in
-    choice ("tag-" ^ label) ("Remove " ^ label) true (Toggle_tag id)) selected_tags in
-  let fields = [ V.text "Tags"; tag_input ] @ tag_add @ tag_options
+  let selected = List.map (fun id ->
+    let title = List.assoc_opt id picker.labels |> Option.value ~default:("Unavailable tag · " ^ Uuid.to_string id) in
+    choice ("selected-tag-" ^ Uuid.to_string id) ("Remove " ^ title) true (Toggle_tag id)) selected_tags in
+  let results = match picker.page with
+    | Tag_loading -> [ V.text "Searching tags…" ]
+    | Tag_failed message -> [ V.text message; button "retry-tags" "Retry tag search" Retry_filter_tags ]
+    | Tag_results { items; next } ->
+      let rows = List.filter_map (fun (tag : Logseq_db_types.Graph_types.tag_summary) ->
+        if List.mem tag.uuid selected_tags then None
+        else Some (button ("pick-tag-" ^ Uuid.to_string tag.uuid) tag.title (Pick_filter_tag tag))) items in
+      (if items = [] then [ V.text "No matching tags" ] else rows)
+      @ (if Option.is_some next then [ button "more-tags" "Next tags" More_filter_tags ] else []) in
+  let fields = [ V.text "Tags"; tag_input ] @ selected @ results
     @ [ V.text "Task statuses" ] @ options @ [ V.text "Time range" ] @ times @ custom in
   V.column ~spacing:12.
     [ V.of_lui (Lui_elements.scroll [ Ui.mount (V.column ~spacing:8. fields) ])
@@ -6524,6 +6546,61 @@ let start
   let prev_sync_error_key =
     graph_ref (fun () -> Option.map (fun notice -> notice.sequence) initial_state.sync_error)
   in
+  let read_filter_picker : type value. owner:Graph_service.timeline_scope option -> maximum_items:int ->
+      value Wc.query -> ((value, string) result -> unit) -> unit =
+    fun ~owner ~maximum_items query finish ->
+      let failed error = finish (Error (Coordination_host.reply_error_message
+        ~fallback:"Could not load tags." error)) in
+      match owner, ensure_coordination () with
+      | Some owner, Ok host ->
+        (match Coordination_host.plan_query_when_available host ~owner ~maximum_items
+          ~maximum_bytes:Worker_pure_data.maximum_response_bytes query with
+         | Error _ -> finish (Error "Could not load tags.")
+         | Ok ticket -> Coordination_host.watch_read host ticket ~f:(fun origin reply ->
+           run_owned (Some owner) (fun () -> Effect.of_thunk (fun () ->
+             match origin, reply with
+             | Some (session, _), Wc.Answered (Ok value)
+               when Coordination_host.validate_session ~owner host session = Ok () -> finish (Ok value)
+             | _, Wc.Answered (Ok _) -> finish (Error "The graph changed. Retry tag search.")
+             | _ -> failed reply))))
+      | _ -> finish (Error "The graph is not ready.")
+  in
+  let search_filter_tags ~owner picker ~after ~debounce =
+    let current state = state.modal = Filters_sheet
+      && state.filter_tag_picker.sheet_epoch = picker.sheet_epoch
+      && state.filter_tag_picker.search_epoch = picker.search_epoch in
+    let run () = run_owned owner (fun () -> Effect.of_thunk (fun () ->
+      if current !state_ref then
+        read_filter_picker ~owner ~maximum_items:24 (Wc.Tag_search { prefix = picker.prefix; after })
+          (fun result -> Effect.run (set_state (fun state ->
+            if not (current state) then state else
+            let page = match result with Ok page -> Tag_results page | Error message -> Tag_failed message in
+            { state with filter_tag_picker = { state.filter_tag_picker with page } }))))) in
+    Effect.of_thunk (fun () -> if debounce then schedule_after 0.15 run else run ())
+  in
+  let resolve_filter_tag_labels ~owner ~sheet_epoch tags =
+    let rec resolve = function
+      | [] -> ()
+      | uuid :: rest ->
+        let state = !state_ref in
+        if state.modal = Filters_sheet && state.filter_tag_picker.sheet_epoch = sheet_epoch then
+          read_filter_picker ~owner ~maximum_items:1 (Wc.Page { uuid; revision = None }) (fun result ->
+            (match result with
+             | Ok (Worker_pure_data.V2_present_page { page; _ }) when not page.recycled ->
+               Effect.run (set_state (fun state ->
+                 let picker = state.filter_tag_picker in
+                 if state.modal <> Filters_sheet || picker.sheet_epoch <> sheet_epoch then state else
+                 let labels = (uuid, page.title) :: List.remove_assoc uuid picker.labels in
+                 { state with filter_tag_picker = { picker with labels } }))
+             | Ok _ -> Effect.run (set_state (fun state ->
+                 let picker = state.filter_tag_picker in
+                 if state.modal <> Filters_sheet || picker.sheet_epoch <> sheet_epoch then state else
+                 { state with filter_tag_picker = { picker with labels = List.remove_assoc uuid picker.labels } }))
+             | Error _ -> ());
+            resolve rest)
+    in
+    Effect.of_thunk (fun () -> resolve tags)
+  in
   let handle_dispatch payload =
     let snapshot = !state_ref in
     let update f = set_state f in
@@ -7205,21 +7282,44 @@ let start
         | Status_sheet _ -> { state with modal = No_modal }
         | _ -> state)
     | Open_filters ->
-      update (fun state ->
-        if state.modal = No_modal && state.graph_ready && Journal_routes.destination state.routes = Journals
-        then { state with modal = Filters_sheet; filter_tag_text = "";
-          filters = Timeline_filter.open_sheet (Timeline_filter.cancel state.filters) }
-        else state)
+      let owner = current_owner () in
+      set_state_and_effect (fun state ->
+        if state.modal <> No_modal || not state.graph_ready || Journal_routes.destination state.routes <> Journals
+        then state, Effect.ignore else
+        let filters = Timeline_filter.open_sheet (Timeline_filter.cancel state.filters) in
+        let sheet_epoch = state.filter_tag_picker.sheet_epoch + 1 in
+        let selected = Timeline_filter.tags (Timeline_filter.applied filters) in
+        let labels = List.filter (fun (id, _) -> List.mem id selected) state.filter_tag_picker.labels in
+        let picker = { sheet_epoch; search_epoch = 0; prefix = ""; labels; page = Tag_loading } in
+        { state with modal = Filters_sheet; filter_tag_picker = picker; filters },
+        Effect.many [ search_filter_tags ~owner picker ~after:None ~debounce:false
+                    ; resolve_filter_tag_labels ~owner ~sheet_epoch selected ])
     | Edit_filters edit ->
       update (fun state ->
         if state.modal = Filters_sheet then { state with filters = Timeline_filter.edit state.filters edit } else state)
-    | Edit_filter_tag_text text ->
-      update (fun state -> if state.modal = Filters_sheet then { state with filter_tag_text = text } else state)
-    | Add_filter_tag id ->
+    | (Edit_filter_tag_text _ | More_filter_tags | Retry_filter_tags) as action ->
+      let owner = current_owner () in
+      set_state_and_effect (fun state ->
+        let picker = state.filter_tag_picker in
+        let request = match action, picker.page with
+          | Edit_filter_tag_text prefix, _ when prefix <> picker.prefix -> Some (prefix, None, true)
+          | More_filter_tags, Tag_results { next = Some after; _ } -> Some (picker.prefix, Some after, false)
+          | Retry_filter_tags, Tag_failed _ -> Some (picker.prefix, None, false)
+          | _ -> None in
+        match state.modal, request with
+        | Filters_sheet, Some (prefix, after, debounce) ->
+          let picker = { picker with prefix; search_epoch = picker.search_epoch + 1; page = Tag_loading } in
+          { state with filter_tag_picker = picker }, search_filter_tags ~owner picker ~after ~debounce
+        | _ -> state, Effect.ignore)
+    | Pick_filter_tag tag ->
       update (fun state ->
-        match state.modal, Timeline_filter.sheet state.filters with
-        | Filters_sheet, Some draft when not (List.mem id (Timeline_filter.draft_tags draft)) ->
-          { state with filter_tag_text = ""; filters = Timeline_filter.edit state.filters (Toggle_tag id) }
+        match state.modal, Timeline_filter.sheet state.filters, state.filter_tag_picker.page with
+        | Filters_sheet, Some draft, Tag_results { items; _ }
+          when List.mem tag items && not (List.mem tag.uuid (Timeline_filter.draft_tags draft)) ->
+          let picker = state.filter_tag_picker in
+          let labels = (tag.uuid, tag.title) :: List.remove_assoc tag.uuid picker.labels in
+          { state with filter_tag_picker = { picker with labels };
+            filters = Timeline_filter.edit state.filters (Toggle_tag tag.uuid) }
         | _ -> state)
     | Close_filters ->
       update (fun state ->

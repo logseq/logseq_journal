@@ -224,6 +224,10 @@ module Timeline : sig
   type 'a packet = private { items : 'a Rrbvec.t; receipt : 'a receipt; next : 'a remaining }
   type packed_receipt = Receipt : 'a receipt -> packed_receipt
   type check = private { results : (unit, error) result Rrbvec.t }
+  val coverage : 'a receipt -> packed_receipt option
+  (** Extract a membership-only proof obtained in the packet snapshot. *)
+
+  val equal_coverage : packed_receipt -> packed_receipt -> bool
   val maximum_receipts : int
 
   (** {1 Minimal usage example}
@@ -310,6 +314,12 @@ type _ query =
       }
       -> Worker_pure_data.tree_member slice query
   | Favorites : Worker_pure_data.favorite_item continuation option -> favorites query
+  | Tag_search :
+      { prefix : string; after : Graph.tag_summary continuation option }
+      -> Graph.tag_summary slice query
+  (** Graph-wide class search. Empty prefix browses all classes. Supply at most
+      1024 prefix bytes and 200 items; reuse the same normalized prefix and
+      budget with [next]. Restart at [None] after a stale continuation. *)
   | Task_statuses :
       Graph.task_status_definition continuation option
       -> task_status_catalog query
@@ -351,6 +361,8 @@ module For_worker : sig
   val timeline_packet : receipt:'a Timeline.receipt -> items:'a Rrbvec.t -> next:string option -> 'a Timeline.packet
   val timeline_cursor_position : 'a Timeline.cursor -> string
   val timeline_cursor_receipt : 'a Timeline.cursor -> 'a Timeline.receipt
+  val with_timeline_coverage : 'a Timeline.receipt -> string -> 'a Timeline.receipt
+  val timeline_receipt_is_coverage : 'a Timeline.receipt -> bool
   val timeline_receipt_owner : 'a Timeline.receipt -> session
   val timeline_receipt_query : 'a Timeline.receipt -> 'a Timeline.query
   val timeline_receipt_version : 'a Timeline.receipt -> string

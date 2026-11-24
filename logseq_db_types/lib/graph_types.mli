@@ -192,6 +192,7 @@ type tag_summary =
   ; title : string
   ; ident : qualified_ident option
   }
+[@@deriving yojson]
 
 type property_definition =
   { uuid : property_uuid

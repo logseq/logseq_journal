@@ -12,6 +12,7 @@ module Worker = Journal_worker_coordination.Worker_api
 type operation
 type failure_scope = Feed of int64 | Day of { day : int; request_generation : int64 } | Reconciliation
 type publication =
+  | Refresh_started of int64
   | Loaded of { request_generation : int64; feed : Projection.feed; complete : bool }
   | Reconciled of { page : Projection.page; value : Projection.timeline_entry_page }
   | Failed of { scope : failure_scope; stale_cursor : bool; message : string; cause : Worker.error option }
