@@ -68,7 +68,7 @@ val load_day : t -> ports:ports -> page:Projection.page -> after:Projection.bloc
 val refresh_initial : t -> ports:ports -> request_generation:int64 -> output option
 val reconcile_page : t -> ports:ports -> page:Projection.page -> limit:int -> Graph.Uuid.t option
 
-val set_filter : t -> tags:Graph.Uuid.t list -> statuses:Graph.Uuid.t list -> unit
+val set_filter : t -> tags:Graph.Uuid.t list -> statuses:Graph.Uuid.t list -> days:(int * int) option -> unit
 (** Replace the root restriction and revoke the retained window when it changes. *)
 
 val validate_retained : t -> ports:ports -> request_generation:int64 -> refresh:bool -> output

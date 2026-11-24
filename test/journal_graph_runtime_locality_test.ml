@@ -9288,8 +9288,12 @@ let test_timeline_root_filter () =
     | 61 -> { value with block = { value.block with tags = [tag] } }
     | 62 -> { value with task_status = Some status }
     | _ -> value) fixture.roots in
-  Runtime.set_timeline_filter runtime ~tags:[tag] ~statuses:[status];
-  let feed, _ = drive_roots runtime [{fixture with roots}] (initial_roots runtime 989L) in
+  Runtime.set_timeline_filter runtime ~tags:[tag] ~statuses:[status]
+    ~days:(Some (20260930, 20260930));
+  let older = root_fixture 1 1 0 in
+  let older = {older with roots = List.map (fun (value : Worker_pure_data.block_record) ->
+    {value with task_status = Some status}) older.roots} in
+  let feed, _ = drive_roots runtime [{fixture with roots}; older] (initial_roots runtime 989L) in
   let actual = List.concat_map (fun (day : Journal_graph_projection.day_feed) ->
     List.map (fun (entry : Journal_graph_projection.timeline_entry) -> Journal_model.id entry.block) day.entries) feed.days in
   Alcotest.(check (list string)) "only matching roots across sparse packets"

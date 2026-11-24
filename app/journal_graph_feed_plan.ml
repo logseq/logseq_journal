@@ -15,6 +15,8 @@ type day_feed =
 
 type feed_scan =
   { root_session : int64
+  ; root_from_day : int
+  ; root_through_day : int
   ; root_proofs : proofs
   ; mutable root_retries : int
   ; root_reuse : bool
@@ -127,6 +129,7 @@ type ports =
 type t =
   { mutable tags : Graph.Uuid.t list
   ; mutable statuses : Graph.Uuid.t list
+  ; mutable days : (int * int) option
   ; mutable initial_feed_spec : (int * int) option
   ; mutable feed_session : int64
   ; mutable session : Worker.session option
@@ -147,7 +150,7 @@ let feed_failure request_generation message = responses [Failed { scope = Feed r
 let day_failure ~day request_generation message = responses [Failed { scope = Day {day;request_generation}; stale_cursor = false; message; cause=None }]
 let reject message = responses [Failed { scope = Reconciliation; stale_cursor = false; message; cause=None }]
 let create () =
-  { tags = []; statuses = []; initial_feed_spec = None
+  { tags = []; statuses = []; days = None; initial_feed_spec = None
   ; feed_session = 0L
   ; session = None
   ; owner = 0L
@@ -172,11 +175,12 @@ let reset t =
   t.initial_feed_spec <- None;
   t.feed_session <- Int64.succ t.feed_session
 ;;
-let set_filter t ~tags ~statuses =
-  if t.tags <> tags || t.statuses <> statuses then (
+let set_filter t ~tags ~statuses ~days =
+  if t.tags <> tags || t.statuses <> statuses || t.days <> days then (
     reset t;
     t.tags <- tags;
-    t.statuses <- statuses)
+    t.statuses <- statuses;
+    t.days <- days)
 ;;
 
 let timeline_uuid value =
@@ -387,7 +391,7 @@ let read_changed_roots t ~ports page limit =
 ;;
 
 let read_root_dates ~ports scan =
-  match Worker.journal_day 10101,
+  match Worker.journal_day scan.root_from_day,
         Worker.journal_day (min 99991231 scan.root_journal_through) with
   | Error error, _ | _, Error error -> scan_failure scan (Paging.error_message (Paging.Read_failed error))
   | Ok from_day, Ok through_day ->
@@ -527,7 +531,7 @@ let rec next_feed_batch ?(verified=false) t ~ports scan =
        | _ -> continue_root_batch t ~ports (Feed_roots scan) page None
            (min scan.root_page_size scan.root_remaining))
     | None when scan.root_journals_done -> if verified then responses [root_feed_response ~ports scan true] else check t ~ports (Publish_feed scan)
-    | None when scan.root_journal_through < 10101 ->
+    | None when scan.root_journal_through < scan.root_from_day ->
       scan.root_journals_done <- true;
       if not (has_retained t) then responses [root_feed_response ~ports scan true] else check t ~ports (Publish_feed scan)
     | None -> read_root_dates ~ports scan)
@@ -742,7 +746,11 @@ let next_root_preview t ~ports batch =
 let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation ?(reuse=false) ?after () =
   let before_day = Option.bind cursor (fun c -> c.Projection.before_day) in
   let start_day = Option.map (fun ((page : Projection.page), _) -> page.day) after in
-  if root_limit <= 0 || day_limit <= 0
+  let from_day, through_day = Option.value t.days ~default:(10101, 99991231) in
+  if from_day > through_day || Result.is_error (Worker.journal_day from_day)
+     || Result.is_error (Worker.journal_day through_day)
+  then feed_failure request_generation "The Timeline date range is invalid."
+  else if root_limit <= 0 || day_limit <= 0
   then (
     match start_day with
     | None ->
@@ -771,6 +779,8 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
     then t.initial_feed_spec <- Some (root_limit, day_limit);
     let scan =
       { root_session = t.feed_session
+      ; root_from_day = from_day
+      ; root_through_day = through_day
       ; root_proofs = Hashtbl.create 16
       ; root_retries = 0
       ; root_reuse = reuse
@@ -784,7 +794,9 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
       ; root_skipped_day =
           (match cursor, after with
            | Some c, _ -> c.Projection.skipped_day
-           | None, None -> (ports.context ()).today
+           | None, None ->
+             Option.bind (ports.context ()).today (fun day ->
+               if day >= from_day && day <= through_day then Some day else None)
            | None, Some _ -> None)
       ; root_date_boundary = before_day
       ; root_priority_pending = cursor = None && after = None
@@ -797,7 +809,7 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
       ; root_queued = Rrbvec.empty
       ; root_journal_cursor = None
       ; root_journal_through =
-          Option.fold ~none:99_999_999 ~some:previous_journal_day before_day
+          min through_day (Option.fold ~none:through_day ~some:previous_journal_day before_day)
       ; root_journal_boundary = None
       ; root_journal_boundary_pages = Hashtbl.create 8
       ; root_date_retries = 0
@@ -997,7 +1009,7 @@ let restart_dates t ~ports scan =
     scan.root_date_boundary <- scan.root_before_day;
     scan.root_priority_pending <- scan.root_source_cursor = None && scan.root_start_day = None;
     scan.root_journal_cursor <- None;
-    scan.root_journal_through <- Option.fold ~none:99991231 ~some:previous_journal_day scan.root_before_day;
+    scan.root_journal_through <- min scan.root_through_day (Option.fold ~none:scan.root_through_day ~some:previous_journal_day scan.root_before_day);
     scan.root_journal_boundary <- None;
     Hashtbl.clear scan.root_journal_boundary_pages;
     scan.root_journals_done <- false;
@@ -1297,6 +1309,7 @@ let refresh_initial t ~ports ~request_generation =
   Option.map (fun (root_limit,day_limit) -> start_feed_scan t ~ports ~cursor:None ~root_limit ~day_limit ~request_generation ~reuse:true ())
     t.initial_feed_spec
 let reconcile_page t ~ports ~page ~limit =
-  match Graph.Uuid.of_string page.Projection.id with
+  if Option.exists (fun (first, last) -> page.Projection.day < first || page.day > last) t.days
+  then None else match Graph.Uuid.of_string page.Projection.id with
   | Error _ -> None
   | Ok _ -> read_changed_roots t ~ports page limit |> Result.to_option

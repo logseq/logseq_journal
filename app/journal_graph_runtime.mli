@@ -167,7 +167,7 @@ val reset : t -> unit
     Deliver the returned output: surviving reads may need a replacement check.
     Removed reads release their business payloads and retire change consumers. *)
 val retire_timeline : t -> before:Journal_timeline_state.t -> after:Journal_timeline_state.t -> output
-val set_timeline_filter : t -> tags:Logseq_db_types.Graph_types.Uuid.t list -> statuses:Logseq_db_types.Graph_types.Uuid.t list -> unit
+val set_timeline_filter : t -> tags:Logseq_db_types.Graph_types.Uuid.t list -> statuses:Logseq_db_types.Graph_types.Uuid.t list -> days:(int * int) option -> unit
 val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_types.Graph_types.Uuid.t
 val submit : ?capture_chain:Journal_graph_mutation_confirmation.Pure_insertion.t ->
