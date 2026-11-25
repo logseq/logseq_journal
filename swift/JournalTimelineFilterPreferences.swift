@@ -12,11 +12,61 @@ struct JournalSavedFilterName: Identifiable {
   private nonisolated static let recordLimit = 64 * 1024
   private static let graphLimit = 64
 
+  private struct LocalDay {
+    let year: Int
+    let month: Int
+    let dayOfYear: Int
+
+    static func sample() -> Self? {
+      var now = time(nil)
+      var local = tm()
+      guard localtime_r(&now, &local) != nil else { return nil }
+      let year = Int(local.tm_year) + 1900
+      guard year >= 1 else { return nil }
+      return Self(year: year, month: Int(local.tm_mon) + 1, dayOfYear: Int(local.tm_yday) + 1)
+    }
+
+    var daysSinceYearOne: Int {
+      let precedingYears = year - 1
+      return 365 * precedingYears + precedingYears / 4 - precedingYears / 100
+        + precedingYears / 400 + dayOfYear - 1
+    }
+  }
+
+  private enum Lookback {
+    case days(Int), threeMonths
+
+    func fits(_ today: LocalDay) -> Bool {
+      switch self {
+      case .days(let count): return count - 1 <= today.daysSinceYearOne
+      case .threeMonths: return today.year > 1 || today.month >= 4
+      }
+    }
+  }
+
   private struct Record: Decodable {
+    private static let stringOrFloat = try! NSRegularExpression(
+      pattern: #""(?:[^"\\]++|\\.)*+"|(?<=[\[,: \t\r\n])-?(?:0|[1-9][0-9]*)(?:\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+)(?=[\],} \t\r\n])"#)
+
+    private static func decodingData(_ text: String) -> Data {
+      let source = text as NSString
+      let range = NSRange(location: 0, length: source.length)
+      var start = 0
+      var result = ""
+      for match in stringOrFloat.matches(in: text, range: range) {
+        guard source.character(at: match.range.location) != 34 else { continue }
+        result += source.substring(with: NSRange(location: start, length: match.range.location - start))
+        result += "false"
+        start = NSMaxRange(match.range)
+      }
+      result += source.substring(from: start)
+      return Data(result.utf8)
+    }
     struct Definition: Decodable {
       let name: String
       let tags: [UUID]
       let statuses: [UUID]
+      let lookback: Lookback
 
       private enum CodingKeys: String, CodingKey { case name, tags, statuses, time }
 
@@ -25,8 +75,13 @@ struct JournalSavedFilterName: Identifiable {
         name = try fields.decode(String.self, forKey: .name)
         tags = try fields.decode([UUID].self, forKey: .tags)
         statuses = try fields.decode([UUID].self, forKey: .statuses)
-        if let preset = try? fields.decode(String.self, forKey: .time),
-           ["any", "14-days", "3-months"].contains(preset) { return }
+        if let preset = try? fields.decode(String.self, forKey: .time) {
+          switch preset {
+          case "14-days": lookback = .days(14); return
+          case "any", "3-months": lookback = .threeMonths; return
+          default: break
+          }
+        }
         var time = try fields.nestedUnkeyedContainer(forKey: .time)
         let count = try time.decode(Int.self)
         let unit = try time.decode(String.self)
@@ -35,6 +90,7 @@ struct JournalSavedFilterName: Identifiable {
               (unit == "days" && count <= ocamlMaxInt || unit == "weeks" && count <= ocamlMaxInt / 7) else {
           throw DecodingError.dataCorruptedError(forKey: .time, in: fields, debugDescription: "Invalid relative time")
         }
+        lookback = .days(unit == "weeks" ? 7 * count : count)
       }
 
       var trimmedName: Data {
@@ -46,18 +102,40 @@ struct JournalSavedFilterName: Identifiable {
     let definitions: [Definition]
     let selected: String?
 
-    static func decode(_ text: String) -> Self? {
+    private enum CodingKeys: String, CodingKey { case version, definitions, selected }
+
+    init(from decoder: Decoder) throws {
+      let fields = try decoder.container(keyedBy: CodingKeys.self)
+      version = try fields.decode(Int.self, forKey: .version)
+      if version == 1 {
+        definitions = []
+        selected = nil
+      } else {
+        definitions = try fields.decode([Definition].self, forKey: .definitions)
+        selected = try fields.decodeIfPresent(String.self, forKey: .selected)
+      }
+    }
+
+    static func decode(_ text: String, today: LocalDay?) -> Self? {
       guard text.utf8.prefix(JournalTimelineFilterPreferences.recordLimit + 1).count
               <= JournalTimelineFilterPreferences.recordLimit,
-            let record = try? JSONDecoder().decode(Self.self, from: Data(text.utf8)),
-            record.version == 2, record.definitions.count <= 5 else { return nil }
-      var names: Set<Data> = []
+            let record = try? JSONDecoder().decode(Self.self, from: decodingData(text)),
+            record.version == 1 || record.version == 2, record.definitions.count <= 5 else { return nil }
+      var lookbacks: [Data: Lookback] = [:]
       for definition in record.definitions {
         let name = definition.trimmedName
-        guard (1...128).contains(name.count), names.insert(name).inserted,
+        guard (1...128).contains(name.count), lookbacks[name] == nil,
               definition.tags.count <= 100, definition.statuses.count <= 100 else { return nil }
+        lookbacks[name] = definition.lookback
       }
-      if let selected = record.selected, !names.contains(Data(selected.utf8)) { return nil }
+      let applied: Lookback
+      if let selected = record.selected {
+        guard let lookback = lookbacks[Data(selected.utf8)] else { return nil }
+        applied = lookback
+      } else {
+        applied = .threeMonths
+      }
+      guard today.map(applied.fits) ?? true else { return nil }
       return record
     }
   }
@@ -70,20 +148,12 @@ struct JournalSavedFilterName: Identifiable {
   }
 
   private struct StoredRecord {
-    private struct Version: Decodable { let version: Int }
-
     let text: String
     let hasDefinitions: Bool
 
-    init?(_ value: Any) {
-      guard let text = value as? String, text.utf8.prefix(recordLimit + 1).count <= recordLimit else { return nil }
-      if let record = Record.decode(text) {
-        hasDefinitions = !record.definitions.isEmpty
-      } else if (try? JSONDecoder().decode(Version.self, from: Data(text.utf8)))?.version == 1 {
-        hasDefinitions = false
-      } else {
-        return nil
-      }
+    init?(_ value: Any, today: LocalDay?) {
+      guard let text = value as? String, let record = Record.decode(text, today: today) else { return nil }
+      hasDefinitions = !record.definitions.isEmpty
       self.text = text
     }
   }
@@ -94,10 +164,11 @@ struct JournalSavedFilterName: Identifiable {
   }
 
   var snapshot: [String: String] {
+    let today = LocalDay.sample()
     var records: [String: Entry] = [:]
     for key in defaults.dictionaryRepresentation().keys {
       guard let graph = Self.graphID(forKey: key), let value = defaults.object(forKey: key) else { continue }
-      guard let record = StoredRecord(value) else {
+      guard let record = StoredRecord(value, today: today) else {
         defaults.removeObject(forKey: key)
         continue
       }
@@ -144,9 +215,10 @@ struct JournalSavedFilterName: Identifiable {
       return false
     }
     let replacement = mutation.suffix(from: expectedEnd + 1)
+    let today = LocalDay.sample()
     guard replacement.count <= Self.recordLimit,
           let text = String(data: replacement, encoding: .utf8),
-          let record = Record.decode(text) else { return false }
+          let record = Record.decode(text, today: today), record.version == 2 else { return false }
     let graph = id.uuidString.lowercased()
     let stored = defaults.dictionaryRepresentation()
     let keys = stored.keys.filter { Self.graphID(forKey: $0) == graph }
@@ -154,7 +226,7 @@ struct JournalSavedFilterName: Identifiable {
     let key = keys.first ?? Self.keyPrefix + graph
     let hasDefinitions: Bool
     if let value = stored[key] {
-      guard let expected, let current = StoredRecord(value), current.text.utf8.elementsEqual(expected.utf8)
+      guard let expected, let current = StoredRecord(value, today: today), current.text.utf8.elementsEqual(expected.utf8)
       else { return false }
       hasDefinitions = current.hasDefinitions
     } else {
@@ -169,7 +241,7 @@ struct JournalSavedFilterName: Identifiable {
       var occupied: Set<String> = []
       for (storedKey, value) in stored {
         guard let storedGraph = Self.graphID(forKey: storedKey), !occupied.contains(storedGraph),
-              StoredRecord(value)?.hasDefinitions == true else { continue }
+              StoredRecord(value, today: today)?.hasDefinitions == true else { continue }
         occupied.insert(storedGraph)
         if occupied.count == Self.graphLimit { return false }
       }

@@ -57,8 +57,18 @@ let () =
     [20240531, 20240229; 20230531, 20230228; 20250115, 20241015; 20241231, 20240930];
   assert (Preferences.decode {|{"version":1,"tags":[],"statuses":[],"time":"past-7-days"}|}
           = Ok Filter.empty_preferences);
+  let persisted = {|{"version":2,"definitions":[{"name":"First week","tags":[],"statuses":[],"time":[1,"weeks"]}],"selected":"First week"}|} in
+  let applied = Filter.applied (Filter.restore (Result.get_ok (Preferences.decode persisted))) in
+  assert (Journal_filter_date.resolve_days applied ~today:10107 = Some (10101, 10107));
+  (match Journal_filter_date.resolve_days applied ~today:10106 with
+   | exception Invalid_argument _ -> ()
+   | _ -> assert false);
   List.iter (fun value -> assert (Result.is_error (Preferences.decode value)))
     [ "broken"; String.make (64 * 1024 + 1) ' '
+    ; {|{"version":2.0,"definitions":[],"selected":null}|}
+    ; {|{"version":1e0}|}
+    ; {|{"version":2,"definitions":[{"name":"Float","tags":[],"statuses":[],"time":[7.0,"days"]}],"selected":null}|}
+    ; {|{"version":2,"definitions":[{"name":"Float","tags":[],"statuses":[],"time":[7e0,"weeks"]}],"selected":"Float"}|}
     ; {|{"version":2,"definitions":[],"selected":"unknown"}|}
     ; {|{"version":2,"definitions":[{"name":"X","tags":["not-a-uuid"],"statuses":[],"time":"any"}],"selected":null}|}
     ; {|{"version":2,"definitions":[{"name":"X","tags":[],"statuses":[],"time":[0,"weeks"]}],"selected":null}|} ]

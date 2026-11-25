@@ -99,6 +99,33 @@ import Foundation
     precondition(commit(graph(3), preset, expecting: startupAfterCleanup[graph(3)]))
     precondition(commit(graph(3), #"{"version":2,"definitions":[]}"#, expecting: preset))
     precondition(commit(graph(5), #"{"version":2,"definitions":[]}"#, expecting: startupAfterCleanup[graph(5)]))
+    let invalidRecords = [
+      #"{"version":2.0,"definitions":[],"selected":null}"#,
+      #"{"version":1e0}"#,
+      #"{"version":2,"definitions":[{"name":"Float","tags":[],"statuses":[],"time":[7.0,"days"]}],"selected":null}"#,
+      #"{"version":2,"definitions":[{"name":"Float","tags":[],"statuses":[],"time":[7e0,"weeks"]}],"selected":"Float"}"#,
+      #"{"version":2,"definitions":[{"name":"Too far","tags":[],"statuses":[],"time":[1000000,"weeks"]}],"selected":"Too far"}"#,
+    ]
+    let validRecords = [
+      #"{"version":1,"ignored":2.0}"#,
+      #"{"version":2,"definitions":[{"name":"7.0 days","tags":[],"statuses":[],"time":[7,"days"],"ignored":2.0}],"selected":"7.0 days"}"#,
+      #"{"version":2,"definitions":[{"name":"Too far","tags":[],"statuses":[],"time":[1000000,"weeks"]}],"selected":null}"#,
+    ]
+    for (index, text) in (invalidRecords + validRecords).enumerated() {
+      defaults.set(text, forKey: keyPrefix + graph(index + 100))
+    }
+    let cleaned = trySnapshot(reopened.wrapStartup(Data([0, 255])))
+    for (index, text) in invalidRecords.enumerated() {
+      let id = graph(index + 100)
+      precondition(cleaned[id] == nil && defaults.object(forKey: keyPrefix + id) == nil,
+                   "Invalid persisted record survived startup: \(text)")
+      precondition(!commit(id, text), "Commit accepted an invalid replacement: \(text)")
+    }
+    for (index, text) in validRecords.enumerated() {
+      let id = graph(index + 100 + invalidRecords.count)
+      precondition(cleaned[id] == text && defaults.string(forKey: keyPrefix + id) == text)
+      defaults.removeObject(forKey: keyPrefix + id)
+    }
     var expected = [graphB: custom]
     for index in 10...72 {
       precondition(commit(graph(index), preset))
