@@ -514,7 +514,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
         Divider().padding(.vertical, 4)
         heading("RELATIVE TIME")
         FilterChipRows { ForEach(choices.times) { chip($0) } }
-        if let custom = properties.custom { customControls(custom) }
+        if let custom = properties.custom {
+          customControls(custom).fixedSize(horizontal: false, vertical: true)
+            .id("filter-custom-controls")
+        }
       }
       .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -538,13 +541,18 @@ struct JournalSheetDismissButton: SwiftUI.View {
           }
         }
         ViewThatFits(in: .vertical) {
-          if !showsTags && properties.custom == nil {
+          if !showsTags {
             fields.fixedSize(horizontal: false, vertical: true)
           }
-          ScrollView { fields }
-            .scrollBounceBehavior(.basedOnSize)
-            .scrollDismissesKeyboard(.interactively)
-            .frame(maxHeight: 330)
+          ScrollViewReader { scroll in
+            ScrollView { fields }
+              .scrollBounceBehavior(.basedOnSize)
+              .scrollDismissesKeyboard(.interactively)
+              .frame(maxHeight: 330)
+              .onChange(of: properties.custom != nil, initial: true) { _, isCustom in
+                if isCustom { scroll.scrollTo("filter-custom-controls", anchor: .bottom) }
+              }
+          }
         }
         VStack(spacing: 8) {
           if let datePreview {
@@ -589,15 +597,22 @@ struct JournalSheetDismissButton: SwiftUI.View {
       .padding(.top, 9)
       .padding(.bottom, 15)
       .frame(maxWidth: 540)
+      #if os(iOS)
+      .frame(maxWidth: .infinity)
+      .background(alignment: .bottom) {
+        UnevenRoundedRectangle(topLeadingRadius: 24, topTrailingRadius: 24)
+          .fill(surface)
+          .ignoresSafeArea(.container, edges: .bottom)
+      }
+      #else
       .background(surface, in: .rect(cornerRadius: 24))
       .overlay { RoundedRectangle(cornerRadius: 24).strokeBorder(Color.primary.opacity(0.12)) }
+      #endif
       .accessibilityElement(children: .contain)
       .accessibilityAddTraits(.isModal)
       .accessibilityIdentifier("journal-filter-panel")
       .accessibilityAction(.escape) { send("cancel") }
-      #if os(iOS)
-      .padding(.bottom, editing == nil ? 55 : 0)
-      #else
+      #if !os(iOS)
       .padding(.bottom, 64)
       #endif
     }
@@ -1371,7 +1386,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
                 FilterPanel(properties: properties, choices: choices, send: { action in
                   JournalExtensions.emit(context: context, payload: Data(action.utf8))
                 }, accessibilityFocus: $filterFocus)
+                #if !os(iOS)
                 .padding(.horizontal, 4)
+                #endif
                 .padding(.top, 8)
               }
             }

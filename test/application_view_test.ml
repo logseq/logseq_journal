@@ -6014,7 +6014,7 @@ let test_root_capture_placement () =
               ~key:(Journal_view.Key.string "capture-placement") ~platform
               ~context:(if favorites then Journal_header.Context.favorites else Journal_header.Context.journals)
               ~sync_phase:None ~sync_error:None ~on_error_info:None ~on_account_action:None
-              ~local_deletion_available:false ~on_journals:noop ~on_favorites:noop
+              ~local_deletion_available:false ~filter_control:None ~on_journals:noop ~on_favorites:noop
               ~on_capture:noop ~capture_enabled ~capture_expanded:None
               ~body:(Journal_view.View.text "Root body"))) in
         Fun.protect ~finally:(fun () -> ignore (Lui_app.dispose app)) (fun () ->
@@ -6201,6 +6201,7 @@ let test_reactive_header_current_controls () =
               ~on_error_info:(Some (handler (fun () -> incr error_count)))
               ~on_account_action:(Some (fun _ -> ()))
               ~local_deletion_available:false
+              ~filter_control:None
               ~on_journals:noop
               ~on_favorites:noop
               ~on_capture:(handler (fun () -> incr capture_count))

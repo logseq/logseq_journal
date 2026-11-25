@@ -30,6 +30,7 @@ val view
   -> on_error_info:Journal_view.Event.Handler.t option
   -> on_account_action:(account_action -> unit) option
   -> local_deletion_available:bool
+  -> filter_control:Journal_view.View.t option
   -> on_journals:Journal_view.Event.Handler.t
   -> on_favorites:Journal_view.Event.Handler.t
   -> on_capture:Journal_view.Event.Handler.t
@@ -48,6 +49,7 @@ val reactive_view
   -> on_error_info:Journal_view.Event.Handler.t option
   -> on_account_action:(account_action -> unit) option
   -> local_deletion_available:bool
+  -> filter_control:Journal_view.View.t option
   -> on_journals:Journal_view.Event.Handler.t
   -> on_favorites:Journal_view.Event.Handler.t
   -> on_capture:Journal_view.Event.Handler.t

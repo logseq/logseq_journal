@@ -208,6 +208,7 @@ let view_impl
       ~on_error_info
       ~on_account_action
       ~local_deletion_available
+      ~filter_control
       ~on_journals
       ~on_favorites
       ~on_capture
@@ -354,10 +355,14 @@ let view_impl
       ~equal:(fun left right ->
         left.error_available = right.error_available
         && left.local_deletion_available = right.local_deletion_available)
-      (fun presentation -> V.column (Option.to_list (cluster_for presentation)))
+      (fun presentation ->
+        let account_controls = Option.to_list (cluster_for presentation) in
+        match filter_control with
+        | None -> V.column account_controls
+        | Some filter -> V.row ~spacing:8. (filter :: account_controls))
   in
   let controls presentation =
-    Option.is_some on_account_action
+    Option.is_some filter_control || Option.is_some on_account_action
     || (presentation.error_available && Option.is_some on_error_info)
   in
   let capture =
@@ -498,6 +503,7 @@ let view
       ~on_error_info
       ~on_account_action
       ~local_deletion_available
+      ~filter_control
       ~on_journals
       ~on_favorites
       ~on_capture
@@ -515,6 +521,7 @@ let view
     ~on_error_info
     ~on_account_action
     ~local_deletion_available
+    ~filter_control
     ~on_journals
     ~on_favorites
     ~on_capture
@@ -533,6 +540,7 @@ let reactive_view
       ~on_error_info
       ~on_account_action
       ~local_deletion_available
+      ~filter_control
       ~on_journals
       ~on_favorites
       ~on_capture
@@ -550,6 +558,7 @@ let reactive_view
     ~on_error_info
     ~on_account_action
     ~local_deletion_available
+    ~filter_control
     ~on_journals
     ~on_favorites
     ~on_capture

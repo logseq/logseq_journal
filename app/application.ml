@@ -179,7 +179,7 @@ module Timeline_filter = struct
   type tag_id = Uuid.t
   type status_id = Uuid.t
   type unit_ = Days | Weeks
-  type preset = Past_7_days | Past_2_weeks
+  type preset = Past_14_days | Past_3_months
   type relative_time = [ `Any_time | `Preset of preset | `Custom of int * unit_ ]
   type time_error = Invalid_count
 
@@ -260,14 +260,17 @@ module Timeline_filter = struct
   ;;
 
   let resolve_days criteria ~today =
-    let count = match time_choice (time criteria) with
-      | `Any_time -> None
-      | `Preset Past_7_days -> Some 7
-      | `Preset Past_2_weeks -> Some 14
-      | `Custom (count, Days) -> Some count
-      | `Custom (count, Weeks) -> Some (7 * count)
+    let calendar_months () =
+      let month_index = (today / 10000) * 12 + today / 100 mod 100 - 1 - 3 in
+      if month_index < 12 then invalid_arg "Filter range starts before year 1";
+      let year = month_index / 12 and month = month_index mod 12 + 1 in
+      let last_day = match month with
+        | 2 -> if year mod 4 = 0 && (year mod 100 <> 0 || year mod 400 = 0) then 29 else 28
+        | 4 | 6 | 9 | 11 -> 30
+        | _ -> 31 in
+      Some (year * 10000 + month * 100 + min (today mod 100) last_day, today)
     in
-    Option.map (fun count ->
+    let days count =
       let civil day =
         let year = day / 10000 and month = day / 100 mod 100 in
         let year = if month <= 2 then year - 1 else year in
@@ -280,7 +283,14 @@ module Timeline_filter = struct
       let earliest = civil today - (count - 1) in
       if earliest < civil 10101 then invalid_arg "Filter range starts before year 1";
       let start = Unix.gmtime (float_of_int earliest *. 86400.) in
-      ((start.tm_year + 1900) * 10000 + (start.tm_mon + 1) * 100 + start.tm_mday), today) count
+      Some ((start.tm_year + 1900) * 10000 + (start.tm_mon + 1) * 100 + start.tm_mday, today)
+    in
+    match time_choice (time criteria) with
+    | `Any_time -> None
+    | `Preset Past_3_months -> calendar_months ()
+    | `Preset Past_14_days -> days 14
+    | `Custom (count, Days) -> days count
+    | `Custom (count, Weeks) -> days (7 * count)
   ;;
 
   let edit state change =
@@ -432,8 +442,10 @@ module Timeline_filter_preferences = struct
       if member "version" value <> `Int 1 then raise Exit;
       let time = match member "time" value with
         | `String "any" -> any_time
-        | `String "past-7-days" -> preset Past_7_days
-        | `String "past-2-weeks" -> preset Past_2_weeks
+        | `String "past-7-days" ->
+          (match custom ~count:7 ~unit_:Days with Ok time -> time | Error _ -> raise Exit)
+        | `String "past-2-weeks" -> preset Past_14_days
+        | `String "past-3-months" -> preset Past_3_months
         | `List [`Int count; `String unit_] ->
           let unit_ = match unit_ with "days" -> Days | "weeks" -> Weeks | _ -> raise Exit in
           (match custom ~count ~unit_ with Ok time -> time | Error _ -> raise Exit)
@@ -447,8 +459,8 @@ module Timeline_filter_preferences = struct
     let ids values = `List (List.map (fun id -> `String (Uuid.to_string id)) values) in
     let time = match time value with
       | `Any_time -> `String "any"
-      | `Preset Past_7_days -> `String "past-7-days"
-      | `Preset Past_2_weeks -> `String "past-2-weeks"
+      | `Preset Past_14_days -> `String "past-2-weeks"
+      | `Preset Past_3_months -> `String "past-3-months"
       | `Custom (count, unit_) -> `List [`Int count; `String (match unit_ with Days -> "days" | Weeks -> "weeks")] in
     Yojson.Safe.to_string (`Assoc ["version", `Int 1; "tags", ids (tags value);
       "statuses", ids (statuses value); "time", time])
@@ -2821,8 +2833,8 @@ let filters_page state dispatch filter_draft =
   let time = draft_time filter_draft in
   let custom_time = match time with
     | Custom _ -> time
-    | Preset Past_2_weeks -> Custom { count_text = "2"; unit_ = Weeks }
-    | Any_time | Preset Past_7_days -> Custom { count_text = "7"; unit_ = Days }
+    | Preset Past_14_days -> Custom { count_text = "14"; unit_ = Days }
+    | Any_time | Preset Past_3_months -> Custom { count_text = "7"; unit_ = Days }
   in
   let range = match apply state.filters, state.calendar with
     | Ok filters, Some calendar ->
@@ -2842,8 +2854,8 @@ let filters_page state dispatch filter_draft =
     choice ("status-" ^ Uuid.to_string id) title (List.mem id selected_statuses) (Toggle_status id)) statuses in
   let times = List.map (fun (id, label, control, selected) -> choice id label selected (Set_time control))
     [ "any", "Any time", Any_time, time = Any_time
-    ; "week", "7 days", Preset Past_7_days, time = Preset Past_7_days
-    ; "fortnight", "2 weeks", Preset Past_2_weeks, time = Preset Past_2_weeks
+    ; "fortnight", "14 days", Preset Past_14_days, time = Preset Past_14_days
+    ; "quarter", "3 months", Preset Past_3_months, time = Preset Past_3_months
     ; "custom", "Custom", custom_time, (match time with Custom _ -> true | _ -> false) ] in
   let custom = match time with
     | Custom { count_text; unit_ } ->
@@ -2993,16 +3005,16 @@ let timeline_page
         ~on_retry:on_favorites_retry
         ~on_open_favorite
         ~on_copy:on_copy_favorite)
-    else
-      timeline ()
-      |> V.Body.toolbar
-           ~items:[ V.Toolbar.item ~key:(Ui.Key.string "journal-filters") ~placement:Primary_action
-             (let payload = Yojson.Safe.to_string (`Assoc
-                [ "mode", `String "filter-trigger"; "level", `Int filter_count
-                ; "enabled", `Bool interaction_enabled ]) in
-              V.of_lui (Journal_lui_native.mount ~key:"journal-filters" ~payload ~children:[]
-                ~on_event:(fun _ -> on_account_action.send Open_filters)
-                Journal_lui_native.chrome_identifier)) ]
+    else timeline ()
+  in
+  let filter_control =
+    if favorites_selected then None else
+    let payload = Yojson.Safe.to_string (`Assoc
+      [ "mode", `String "filter-trigger"; "level", `Int filter_count
+      ; "enabled", `Bool interaction_enabled ]) in
+    Some (V.of_lui (Journal_lui_native.mount ~key:"journal-filters" ~payload ~children:[]
+      ~on_event:(fun _ -> on_account_action.send Open_filters)
+      Journal_lui_native.chrome_identifier))
   in
   let destination_action index =
     Ui.Event.Handler.create (fun _ ->
@@ -3040,6 +3052,7 @@ let timeline_page
                 | Sign_out -> Sign_out))
        else None)
     ~local_deletion_available:cache_reset_available
+    ~filter_control
     ~on_journals:(destination_action 0L)
     ~on_favorites:(destination_action 1L)
     ~on_capture:(bind_action on_capture_event Open_capture)

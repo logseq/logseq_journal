@@ -11,8 +11,8 @@ type unit_ =
   | Weeks
 
 type preset =
-  | Past_7_days
-  | Past_2_weeks
+  | Past_14_days
+  | Past_3_months
 
 type relative_time
 type time_error = Invalid_count
@@ -24,7 +24,7 @@ val preset : preset -> relative_time
     than wrapping or silently changing the number or unit. *)
 val custom : count:int -> unit_:unit_ -> (relative_time, time_error) result
 
-(** Preserve the user's choice: custom 2 weeks and the 2-week preset match the
+(** Preserve the user's choice: custom 2 weeks and the 14-day preset match the
     same date range but reopen in different controls. *)
 val time_choice
   :  relative_time
@@ -82,8 +82,10 @@ type time_control =
 
 val draft_time : sheet -> time_control
 
-(** Show Any time, 7 days, 2 weeks, and Custom. Only Custom exposes the numeric
-    input and Days/Weeks selector. Raw text can be partial or invalid; show the
+(** Show Any time, 14 days, 3 months, and Custom. The 3-month preset starts on
+    the same day of the month three Gregorian calendar months before today,
+    clamped to that month's last day if necessary. Both endpoints are inclusive.
+    Only Custom exposes the numeric input and Days/Weeks selector. Raw text can be partial or invalid; show the
     error near the field and do not apply a previous valid value in its place.
     The returned value is a relative setting, not an absolute date range. *)
 val validate_draft_time : sheet -> (relative_time, time_error) result
