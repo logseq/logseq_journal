@@ -1,37 +1,28 @@
-open Filter_modules
-module Filter = Timeline_filter
+module Filter = Journal_timeline_filter.Timeline_filter
 module Preferences = Timeline_filter_preferences
 
 let () =
   let tag = Result.get_ok (Filter.Uuid.of_string "00000000-0000-4000-8000-000000000001") in
   let status = Result.get_ok (Filter.Uuid.of_string "00000000-0000-4000-8000-000000000002") in
-  let decode_time time =
-    Preferences.decode (Printf.sprintf {|{"version":1,"tags":[],"statuses":[],"time":"%s"}|} time)
-    |> Option.get
-  in
-  let months = decode_time "past-3-months" in
-  List.iter (fun (today, first) ->
-    assert (Filter.resolve_days months ~today = Some (first, today)))
-    [ 20240531, 20240229; 20230531, 20230228; 20250115, 20241015; 20241231, 20240930 ];
-  List.iter (fun (key, first) ->
-    let today = 20250107 in
-    assert (Filter.resolve_days (decode_time key) ~today = Some (first, today)))
-    [ "past-7-days", 20250101; "past-2-weeks", 20241225 ];
+  let criteria time = Filter.criteria ~tags:[tag] ~statuses:[status] ~time in
   let custom = Result.get_ok (Filter.custom ~count:14 ~unit_:Days) in
   let preset = Filter.preset Filter.Past_14_days in
-  let criteria time = Filter.criteria ~tags:[tag] ~statuses:[status] ~time in
-  List.iter (fun time ->
-    let value = criteria time in
-    let restored = Preferences.decode (Preferences.encode value) |> Option.get |> Filter.restore in
-    assert (Filter.applied restored = value);
-    assert (Filter.sheet restored = None)) [custom; preset; Filter.time months; Filter.any_time];
-  assert (Preferences.encode (criteria custom) <> Preferences.encode (criteria preset));
-  List.iter (fun value -> assert (Preferences.decode value = None))
-    [ "broken"; {|{"version":2,"tags":[],"statuses":[],"time":"any"}|}
-    ; {|{"version":1,"tags":["bad"],"statuses":[],"time":"any"}|}
-    ; {|{"version":1,"tags":[],"statuses":[],"time":[0,"weeks"]}|} ];
-  assert (Preferences.unwrap_startup "LDB1\000\255" = ([], "LDB1\000\255"));
-  assert (Preferences.unwrap_startup "JTF1{\"graph\":\"criteria\"}\nLDB1\000\255"
-          = (["graph", `String "criteria"], "LDB1\000\255"));
-  assert (Preferences.unwrap_startup "JTF1invalid-json\nLDB1" = ([], "LDB1"))
+  let months = Filter.preset Filter.Past_3_months in
+  let definitions = List.map (fun (name, time) -> name, criteria time)
+      ["Custom", custom; "Fortnight", preset; "Quarter", months; "All time", Filter.any_time] in
+  let record = Result.get_ok (Filter.preferences ~definitions ~selected_name:(Some "Quarter")) in
+  let restored = Result.get_ok (Preferences.decode (Preferences.encode record)) in
+  assert (Filter.definitions restored = definitions);
+  assert (Filter.selected_name restored = Some "Quarter");
+  assert (Filter.applied (Filter.restore restored) = criteria months);
+  List.iter (fun (today, first) ->
+    assert (Journal_filter_date.resolve_days (criteria months) ~today = Some (first, today)))
+    [20240531, 20240229; 20230531, 20230228; 20250115, 20241015; 20241231, 20240930];
+  assert (Preferences.decode {|{"version":1,"tags":[],"statuses":[],"time":"past-7-days"}|}
+          = Ok Filter.empty_preferences);
+  List.iter (fun value -> assert (Result.is_error (Preferences.decode value)))
+    [ "broken"; String.make (512 * 1024 + 1) ' '
+    ; {|{"version":2,"definitions":[],"selected":"unknown"}|}
+    ; {|{"version":2,"definitions":[{"name":"X","tags":["not-a-uuid"],"statuses":[],"time":"any"}],"selected":null}|}
+    ; {|{"version":2,"definitions":[{"name":"X","tags":[],"statuses":[],"time":[0,"weeks"]}],"selected":null}|} ]
 ;;

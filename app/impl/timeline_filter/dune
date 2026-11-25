@@ -1,0 +1,5 @@
+(library
+ (name journal_timeline_filter_impl)
+ (implements journal_timeline_filter)
+ (modules timeline_filter)
+ (libraries logseq_db_types))

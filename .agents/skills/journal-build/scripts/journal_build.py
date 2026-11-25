@@ -1261,7 +1261,8 @@ void journal_ocaml_platform_event(const char *d, int32_t l) { (void)d; (void)l; 
 void journal_ocaml_platform_response(const char *d, int32_t l) { (void)d; (void)l; }
 void journal_ocaml_platform_failure(const char *d, int32_t l) { (void)d; (void)l; }
 void journal_ocaml_set_wakeup_callback(wakeup_cb cb) { (void)cb; }
-void journal_ocaml_set_platform_request_callback(platform_request_cb cb) { (void)cb; }"""
+void journal_ocaml_set_platform_request_callback(platform_request_cb cb) { (void)cb; }
+void journal_ocaml_set_filter_commit_callback(int32_t (*cb)(const char *, int32_t)) { (void)cb; }"""
 
 
 if __name__ == "__main__":

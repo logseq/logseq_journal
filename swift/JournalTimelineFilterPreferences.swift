@@ -27,13 +27,11 @@ struct JournalTimelineFilterPreferences {
     let body = request.dropFirst(Self.commitPrefix.count)
     guard let separator = body.firstIndex(of: 10),
           let id = UUID(uuidString: String(decoding: body.prefix(upTo: separator), as: UTF8.self)),
-          let criteria = String(data: body.suffix(from: separator + 1), encoding: .utf8) else { return true }
+          body.count - body.distance(from: body.startIndex, to: separator) - 1 <= 512 * 1024,
+          let record = String(data: body.suffix(from: separator + 1), encoding: .utf8),
+          !record.isEmpty else { return false }
     let key = Self.keyPrefix + id.uuidString.lowercased()
-    if criteria.isEmpty {
-      defaults.removeObject(forKey: key)
-    } else {
-      defaults.set(criteria, forKey: key)
-    }
-    return true
+    defaults.set(record, forKey: key)
+    return defaults.string(forKey: key) == record
   }
 }

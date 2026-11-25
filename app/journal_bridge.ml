@@ -11,6 +11,8 @@ type hooks =
   }
 
 external wakeup : unit -> unit = "journal_ml_wakeup"
+external commit_timeline_filter : string -> bool = "journal_ml_commit_timeline_filter"
+
 external platform_request : string -> unit = "journal_ml_platform_request"
 
 let current : hooks option ref = ref None

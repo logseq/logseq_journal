@@ -296,6 +296,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let ownerID: String?
     let visible: Bool?
     let sheetEpoch: Int?
+    let filterOwner: Int?
+    let filterNames: [String]?
+    let filterActiveName: String?
+    let filterError: String?
     let choices: FilterChoices?
     let custom: FilterCustom?
     let dateRange: [Int]?
@@ -328,15 +332,16 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
   private struct FilterTriggerButton: SwiftUI.View {
     let count: Int
-    let action: () -> Void
+    let names: [String]
+    let activeName: String?
+    let action: (String) -> Void
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     private var active: Bool { count > 0 }
 
-    var body: some SwiftUI.View {
-      Button(action: action) {
-        Image(systemName: "line.3.horizontal.decrease")
+    private var icon: some SwiftUI.View {
+      Image(systemName: "line.3.horizontal.decrease")
           .font(.system(size: 17, weight: .semibold))
           .foregroundStyle(active ? filterBlue(scheme) : Color.primary)
           .frame(width: 44, height: 44)
@@ -350,8 +355,30 @@ struct JournalSheetDismissButton: SwiftUI.View {
             }
           }
           .contentShape(Circle())
+    }
+
+    var body: some SwiftUI.View {
+      Group {
+        if names.isEmpty {
+          Button { action("open") } label: { icon }.buttonStyle(.plain)
+        } else {
+          Menu {
+            ForEach(names.indices, id: \.self) { index in
+              let name = names[index]
+              Button { action("select:" + name) } label: {
+                if activeName?.utf8.elementsEqual(name.utf8) == true { Label(name, systemImage: "checkmark") }
+                else { Text(name) }
+              }
+            }
+            Divider()
+            Button("Clear filter") { action("clear") }
+            Button("Configure filters") { action("open") }
+          } label: { icon }
+          .menuOrder(.fixed)
+          .menuStyle(.borderlessButton)
+          .menuIndicator(.hidden)
+        }
       }
-      .buttonStyle(.plain)
       #if os(iOS)
       .background {
         if reduceTransparency { Circle().fill(Color(uiColor: .secondarySystemBackground)) }
@@ -412,6 +439,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let accessibilityFocus: AccessibilityFocusState<JournalFilterAccessibilityTarget?>.Binding
     #endif
     @State private var showsTags = false
+    @State private var naming = false
+    @State private var filterName = ""
     @FocusState private var editing: Field?
     @Environment(\.colorScheme) private var scheme
     @Environment(\.dynamicTypeSize) private var typeSize
@@ -567,6 +596,18 @@ struct JournalSheetDismissButton: SwiftUI.View {
       .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    private func footerButton(_ title: String, primary: Bool, action: @escaping () -> Void) -> some SwiftUI.View {
+      Button(action: action) {
+        Text(title).font(.headline)
+          .foregroundStyle(primary ? Color.white : filterBlue(scheme))
+          .frame(maxWidth: .infinity, minHeight: 46)
+          .background(primary ? Color(red: 0.12, green: 0.31, blue: 0.63) : Color.primary.opacity(0.08), in: .capsule)
+          .contentShape(.capsule)
+      }
+      .buttonStyle(.plain)
+      .accessibilityIdentifier(primary ? "journal-filter-apply" : "journal-filter-save")
+    }
+
     private var scrollableFields: some SwiftUI.View {
       ScrollViewReader { scroll in
         ScrollView { fields }
@@ -632,19 +673,41 @@ struct JournalSheetDismissButton: SwiftUI.View {
             Text("Enter a positive whole number within the supported range.")
               .font(.footnote).foregroundStyle(.secondary)
           }
-          let apply = Button { send("apply") } label: {
-            Text("Apply filters").font(.headline)
-              .foregroundStyle(.white)
-              .multilineTextAlignment(.center)
-              .fixedSize(horizontal: false, vertical: true)
-              .padding(.horizontal, 10)
-              .frame(maxWidth: .infinity, minHeight: 46)
-              .background(Color(red: 0.12, green: 0.31, blue: 0.63), in: .capsule)
+          if !naming, let error = properties.filterError {
+            Text(error).font(.footnote).foregroundStyle(.red)
           }
-          .buttonStyle(.plain)
+          let apply = HStack(spacing: 12) {
+            footerButton("Save", primary: false) {
+              editing = nil
+              filterName = ""
+              send("name")
+              naming = true
+            }
+            footerButton("Apply", primary: true) { send("apply") }
+          }
           .disabled(properties.enabled != true)
           .opacity(properties.enabled == true ? 1 : 0.45)
-          .accessibilityIdentifier("journal-filter-apply")
+          .sheet(isPresented: $naming) {
+            NavigationStack {
+              Form {
+                TextField("Name", text: $filterName)
+                  .accessibilityIdentifier("journal-filter-name")
+                if let error = properties.filterError {
+                  Text(error).foregroundStyle(.red)
+                }
+              }
+              .navigationTitle("Save filter")
+              .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                  Button("Cancel") { naming = false; send("name") }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                  Button("Save") { send("save:" + filterName) }
+                }
+              }
+            }
+            .presentationDetents([.medium])
+          }
           #if os(iOS)
           if editing == .count {
             HStack(spacing: 12) {
@@ -1439,7 +1502,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
       guard isPresented, active?.epoch == epoch, cancelledEpoch != epoch,
         let requested, requested.epoch == epoch else { return }
       if action == "apply", requested.properties.enabled != true { return }
-      if JournalExtensions.emit(context: context, id: (action == "cancel" || action == "apply") ? epoch : 1,
+      if JournalExtensions.emit(context: context, id: epoch,
                                 payload: Data(action.utf8)), action == "cancel" {
         cancelledEpoch = epoch
         isPresented = false
@@ -1531,7 +1594,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
                   .onTapGesture { JournalExtensions.emit(context: context, id: epoch, payload: Data("cancel".utf8)) }
                   .accessibilityHidden(true)
                 FilterPanel(properties: properties, choices: choices, send: { action in
-                  JournalExtensions.emit(context: context, id: (action == "cancel" || action == "apply") ? epoch : 1,
+                  JournalExtensions.emit(context: context, id: epoch,
                                          payload: Data(action.utf8))
                 }, accessibilityFocus: $filterFocus)
                 .padding(.horizontal, 4)
@@ -1551,8 +1614,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
       case .filterTrigger:
         if let properties {
           let count = properties.level ?? 0
-          let trigger = FilterTriggerButton(count: count) {
-            JournalExtensions.emit(context: context, payload: Data("open".utf8))
+          let trigger = FilterTriggerButton(count: count, names: properties.filterNames ?? [],
+            activeName: properties.filterActiveName) { action in
+            guard let owner = properties.filterOwner else { return }
+            JournalExtensions.emit(context: context, id: owner, payload: Data(action.utf8))
           }
           .disabled(properties.enabled != true)
           #if os(iOS)

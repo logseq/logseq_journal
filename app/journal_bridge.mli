@@ -48,6 +48,8 @@ val picked : int -> string -> string
     the app thread. *)
 external wakeup : unit -> unit = "journal_ml_wakeup"
 
+external commit_timeline_filter : string -> bool = "journal_ml_commit_timeline_filter"
+
 (* Forwards one LJP2 request envelope to the host platform bridge (the host
     answers asynchronously through [platform_response]). *)
 external platform_request : string -> unit = "journal_ml_platform_request"

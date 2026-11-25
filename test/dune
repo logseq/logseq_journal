@@ -1,3 +1,13 @@
+(test
+ (name timeline_filter_preferences_codec_test)
+ (modules timeline_filter_preferences_codec_test)
+ (libraries journal_app_business journal_timeline_filter_impl journal_worker_coordination_impl))
+
+(test
+ (name timeline_filter_contract_test)
+ (modules timeline_filter_contract_test)
+ (libraries journal_timeline_filter_impl))
+
 (library
  (name coordination_test_fixture)
  (modules coordination_test_fixture)
