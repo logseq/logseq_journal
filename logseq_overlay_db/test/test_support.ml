@@ -88,31 +88,43 @@ let copy_storage_fixture database_path =
       "logseq_db_worker/test/fixtures/storage/logseq-65.33-create-page.json"
   in
   let fixture = Yojson.Safe.from_file fixture_path in
-  let db = Sqlite3.db_open database_path in
-  Sqlite3.Rc.check (Sqlite3.exec db (fixture |> member "tableSql" |> to_string));
-  let statement =
-    Sqlite3.prepare db "INSERT INTO kvs(addr, content, addresses) VALUES(?, ?, ?)"
+  let with_cleanup ~finally run =
+    match run () with
+    | () -> finally ()
+    | exception exn ->
+      let backtrace = Printexc.get_raw_backtrace () in
+      (try finally () with _ -> ());
+      Printexc.raise_with_backtrace exn backtrace
   in
-  fixture
-  |> member "rows"
-  |> to_list
-  |> List.iter (fun row ->
-    Sqlite3.Rc.check (Sqlite3.reset statement);
-    Sqlite3.Rc.check
-      (Sqlite3.bind_int64 statement 1 (row |> member "addr" |> to_int |> Int64.of_int));
-    Sqlite3.Rc.check
-      (Sqlite3.bind_text statement 2 (row |> member "content" |> to_string));
-    Sqlite3.Rc.check
-      (Sqlite3.bind
-         statement
-         3
-         (match row |> member "addresses" with
-          | `Null -> Sqlite3.Data.NULL
-          | `String value -> TEXT value
-          | _ -> Alcotest.fail "storage fixture has malformed addresses"));
-    Sqlite3.Rc.check (Sqlite3.step statement));
-  ignore (Sqlite3.finalize statement);
-  require (Sqlite3.db_close db) "unable to close storage fixture"
+  let db = Sqlite3.db_open database_path in
+  with_cleanup ~finally:(fun () ->
+    require (Sqlite3.db_close db) "unable to close storage fixture") (fun () ->
+    Sqlite3.Rc.check (Sqlite3.exec db "BEGIN");
+    Sqlite3.Rc.check (Sqlite3.exec db (fixture |> member "tableSql" |> to_string));
+    let statement =
+      Sqlite3.prepare db "INSERT INTO kvs(addr, content, addresses) VALUES(?, ?, ?)"
+    in
+    with_cleanup ~finally:(fun () -> Sqlite3.Rc.check (Sqlite3.finalize statement))
+      (fun () ->
+        fixture
+        |> member "rows"
+        |> to_list
+        |> List.iter (fun row ->
+          Sqlite3.Rc.check (Sqlite3.reset statement);
+          Sqlite3.Rc.check
+            (Sqlite3.bind_int64 statement 1 (row |> member "addr" |> to_int |> Int64.of_int));
+          Sqlite3.Rc.check
+            (Sqlite3.bind_text statement 2 (row |> member "content" |> to_string));
+          Sqlite3.Rc.check
+            (Sqlite3.bind
+               statement
+               3
+               (match row |> member "addresses" with
+                | `Null -> Sqlite3.Data.NULL
+                | `String value -> TEXT value
+                | _ -> Alcotest.fail "storage fixture has malformed addresses"));
+          Sqlite3.Rc.check (Sqlite3.step statement)));
+    Sqlite3.Rc.check (Sqlite3.exec db "COMMIT"))
 ;;
 
 let install_remote_identity ~graph_id database_path =
