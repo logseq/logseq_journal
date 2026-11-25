@@ -4,6 +4,7 @@ import SwiftUI
 import UIKit
 #endif
 
+#if !os(iOS)
 private enum JournalFilterAccessibilityTarget: Hashable {
   case trigger, heading
 }
@@ -11,6 +12,8 @@ private enum JournalFilterAccessibilityTarget: Hashable {
 private extension EnvironmentValues {
   @Entry var journalFilterAccessibilityFocus: AccessibilityFocusState<JournalFilterAccessibilityTarget?>.Binding? = nil
 }
+
+#endif
 
 /// One initial native layout handoff for this GraphPages lifetime, not per graph.
 /// Later routes may have no Timeline list; downloads never participate.
@@ -292,6 +295,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let loadingPageIDs: [String]?
     let ownerID: String?
     let visible: Bool?
+    let sheetEpoch: Int?
     let choices: FilterChoices?
     let custom: FilterCustom?
     let dateRange: [Int]?
@@ -365,7 +369,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let properties: Properties
     let choices: FilterChoices
     let send: (String) -> Void
+    #if !os(iOS)
     let accessibilityFocus: AccessibilityFocusState<JournalFilterAccessibilityTarget?>.Binding
+    #endif
     @State private var showsTags = false
     @FocusState private var editing: Field?
     @Environment(\.colorScheme) private var scheme
@@ -522,13 +528,45 @@ struct JournalSheetDismissButton: SwiftUI.View {
       .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    private var scrollableFields: some SwiftUI.View {
+      ScrollViewReader { scroll in
+        ScrollView { fields }
+          .scrollBounceBehavior(.basedOnSize)
+          .scrollDismissesKeyboard(.interactively)
+          .onChange(of: properties.custom != nil, initial: true) { _, isCustom in
+            if isCustom { scroll.scrollTo("filter-custom-controls", anchor: .bottom) }
+          }
+      }
+    }
+
     var body: some SwiftUI.View {
       VStack(spacing: 8) {
+        #if !os(iOS)
         Capsule().fill(.secondary.opacity(0.32)).frame(width: 34, height: 4)
           .accessibilityHidden(true)
-        let title = Text("Filters").font(.headline)
-          .accessibilityAddTraits(.isHeader)
-          .accessibilityFocused(accessibilityFocus, equals: .heading)
+        #endif
+        let heading = Text("Filters").font(.headline).accessibilityAddTraits(.isHeader)
+        #if os(iOS)
+        let title = heading
+        #else
+        let title = heading.accessibilityFocused(accessibilityFocus, equals: .heading)
+        #endif
+        #if os(iOS)
+        ViewThatFits(in: .horizontal) {
+          HStack {
+            action("cancel", "Cancel")
+            Spacer()
+            title
+            Spacer()
+            action("reset", "Reset")
+          }
+          VStack(spacing: 0) {
+            title
+            HStack { action("cancel", "Cancel"); Spacer(); action("reset", "Reset") }
+          }
+        }
+        scrollableFields
+        #else
         if typeSize.isAccessibilitySize {
           VStack(spacing: 0) {
             title
@@ -544,16 +582,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
           if !showsTags {
             fields.fixedSize(horizontal: false, vertical: true)
           }
-          ScrollViewReader { scroll in
-            ScrollView { fields }
-              .scrollBounceBehavior(.basedOnSize)
-              .scrollDismissesKeyboard(.interactively)
-              .frame(maxHeight: 330)
-              .onChange(of: properties.custom != nil, initial: true) { _, isCustom in
-                if isCustom { scroll.scrollTo("filter-custom-controls", anchor: .bottom) }
-              }
-          }
+          scrollableFields.frame(maxHeight: 330)
         }
+        #endif
         VStack(spacing: 8) {
           if let datePreview {
             Text(datePreview).font(.footnote).foregroundStyle(.secondary)
@@ -599,17 +630,14 @@ struct JournalSheetDismissButton: SwiftUI.View {
       .frame(maxWidth: 540)
       #if os(iOS)
       .frame(maxWidth: .infinity)
-      .background(alignment: .bottom) {
-        UnevenRoundedRectangle(topLeadingRadius: 24, topTrailingRadius: 24)
-          .fill(surface)
-          .ignoresSafeArea(.container, edges: .bottom)
-      }
       #else
       .background(surface, in: .rect(cornerRadius: 24))
       .overlay { RoundedRectangle(cornerRadius: 24).strokeBorder(Color.primary.opacity(0.12)) }
       #endif
       .accessibilityElement(children: .contain)
+      #if !os(iOS)
       .accessibilityAddTraits(.isModal)
+      #endif
       .accessibilityIdentifier("journal-filter-panel")
       .accessibilityAction(.escape) { send("cancel") }
       #if !os(iOS)
@@ -1333,12 +1361,48 @@ struct JournalSheetDismissButton: SwiftUI.View {
   }
   #endif
 
+  #if os(iOS)
+  private struct FilterSheetPresenter: SwiftUI.View {
+    let context: LUIAppleExtensionViewContext
+    let properties: Properties
+    let choices: FilterChoices
+    let epoch: Int
+    @State private var cancelSent = false
+
+    private func send(_ action: String) {
+      guard !cancelSent else { return }
+      if action == "apply", properties.enabled != true { return }
+      if action == "cancel" { cancelSent = true }
+      if !JournalExtensions.emit(context: context, id: action == "cancel" ? epoch : 1,
+                                 payload: Data(action.utf8)), action == "cancel" {
+        cancelSent = false
+      }
+    }
+
+    var body: some SwiftUI.View {
+      Color.clear.frame(width: 0, height: 0)
+        .sheet(isPresented: Binding(
+          get: { !cancelSent },
+          set: { if !$0 { send("cancel") } }
+        )) {
+          FilterPanel(properties: properties, choices: choices, send: send)
+            .padding(.top, 16)
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationBackgroundInteraction(.disabled)
+        }
+    }
+  }
+  #endif
+
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
     @Environment(\.journalStartupContainerFrame) private var startupContainerFrame
+    #if !os(iOS)
     @Environment(\.journalFilterAccessibilityFocus) private var filterAccessibilityFocus
     @AccessibilityFocusState private var filterFocus: JournalFilterAccessibilityTarget?
     @State private var presentedFilter = false
+    #endif
 
     private var properties: Properties? {
       JournalExtensions.decode(Properties.self, context: context)
@@ -1372,23 +1436,30 @@ struct JournalSheetDismissButton: SwiftUI.View {
       case .timelineHost:
         if context.childIDs.count==1 {child(0)}
       case .filterOverlay:
+        #if os(iOS)
+        child(0).background {
+          if let properties, let choices = properties.choices, let epoch = properties.sheetEpoch {
+            FilterSheetPresenter(context: context, properties: properties, choices: choices, epoch: epoch)
+              .id(epoch)
+          }
+        }
+        #else
         let isPresented = properties?.choices != nil
         child(0)
           .environment(\.journalFilterAccessibilityFocus, $filterFocus)
           .accessibilityHidden(isPresented)
           .allowsHitTesting(!isPresented)
           .overlay(alignment: .bottom) {
-            if let properties, let choices = properties.choices {
+            if let properties, let choices = properties.choices, let epoch = properties.sheetEpoch {
               ZStack(alignment: .bottom) {
                 Color.clear.contentShape(Rectangle())
-                  .onTapGesture { JournalExtensions.emit(context: context, payload: Data("cancel".utf8)) }
+                  .onTapGesture { JournalExtensions.emit(context: context, id: epoch, payload: Data("cancel".utf8)) }
                   .accessibilityHidden(true)
                 FilterPanel(properties: properties, choices: choices, send: { action in
-                  JournalExtensions.emit(context: context, payload: Data(action.utf8))
+                  JournalExtensions.emit(context: context, id: action == "cancel" ? epoch : 1,
+                                         payload: Data(action.utf8))
                 }, accessibilityFocus: $filterFocus)
-                #if !os(iOS)
                 .padding(.horizontal, 4)
-                #endif
                 .padding(.top, 8)
               }
             }
@@ -1401,6 +1472,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
             presentedFilter = isPresented
             filterFocus = isPresented ? .heading : .trigger
           }
+        #endif
       case .filterTrigger:
         if let properties {
           let count = properties.level ?? 0
@@ -1410,11 +1482,15 @@ struct JournalSheetDismissButton: SwiftUI.View {
           }
           .disabled(properties.enabled != true)
           .accessibilityIdentifier("journal-filters")
+          #if os(iOS)
+          trigger
+          #else
           if let filterAccessibilityFocus {
             trigger.accessibilityFocused(filterAccessibilityFocus, equals: .trigger)
           } else {
             trigger
           }
+          #endif
         }
       case .page:
         if let properties, context.childIDs.count == 3,

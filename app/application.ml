@@ -2409,7 +2409,7 @@ type command =
   | Pick_filter_tag of Logseq_db_types.Graph_types.tag_summary
   | More_filter_tags
   | Retry_filter_tags
-  | Close_filters
+  | Close_filters of int
   | Apply_filters
   | Open_diagnostics
   | Close_diagnostics
@@ -2888,6 +2888,7 @@ let filters_page state dispatch filter_draft =
   let enabled = state.filters_restored && Option.is_some range in
   let payload = Yojson.Safe.to_string (`Assoc
     [ "mode", `String "filter-overlay"; "enabled", `Bool enabled
+    ; "sheetEpoch", `Int picker.sheet_epoch
     ; "choices", `Assoc [ "tags", `List selected; "statuses", `List options
                         ; "times", `List times; "results", `List results ]
     ; "custom", custom; "dateRange", date_range; "text", `String picker.prefix
@@ -2895,7 +2896,7 @@ let filters_page state dispatch filter_draft =
   let on_event event =
     let raw = event.Journal_lui_native.payload in
     match raw with
-    | "cancel" -> dispatch.send Close_filters
+    | "cancel" -> dispatch.send (Close_filters event.event_id)
     | "reset" -> dispatch.send (Edit_filters Reset)
     | "apply" when enabled -> dispatch.send Apply_filters
     | _ when String.starts_with ~prefix:"search:" raw ->
@@ -3695,6 +3696,7 @@ let start
       drain_pending_actions ()
   in
   let state_ref = ref initial_state in
+  let filter_sheet_epoch = ref 0 in
   let processing_owner : Graph_service.timeline_scope option ref = ref None in
   let visible_owner : Graph_service.timeline_scope option ref = ref None in
   let preview_owner = ref None in
@@ -7325,7 +7327,8 @@ let start
         if state.modal <> No_modal || not state.graph_ready || Journal_routes.destination state.routes <> Journals
         then state, Effect.ignore else
         let filters = Timeline_filter.open_sheet (Timeline_filter.cancel state.filters) in
-        let sheet_epoch = state.filter_tag_picker.sheet_epoch + 1 in
+        incr filter_sheet_epoch;
+        let sheet_epoch = !filter_sheet_epoch in
         let selected = Timeline_filter.tags (Timeline_filter.applied filters) in
         let labels = List.filter (fun (id, _) -> List.mem id selected) state.filter_tag_picker.labels in
         let picker = { sheet_epoch; search_epoch = 0; prefix = ""; labels; page = Tag_loading } in
@@ -7359,9 +7362,11 @@ let start
           { state with filter_tag_picker = { picker with labels };
             filters = Timeline_filter.edit state.filters (Toggle_tag tag.uuid) }
         | _ -> state)
-    | Close_filters ->
+    | Close_filters sheet_epoch ->
       update (fun state ->
-        if state.modal = Filters_sheet then { state with modal = No_modal; filters = Timeline_filter.cancel state.filters } else state)
+        if state.modal = Filters_sheet && state.filter_tag_picker.sheet_epoch = sheet_epoch
+        then { state with modal = No_modal; filters = Timeline_filter.cancel state.filters }
+        else state)
     | Apply_filters ->
       set_state_and_effect (fun state ->
         if state.modal <> Filters_sheet then state, Effect.ignore else
