@@ -316,7 +316,8 @@ let protected f =
 let response_deadline (request : Http.request) =
   let asset_bytes =
     match request.expected_content_type, request.operation with
-    | Asset_binary, Get -> request.maximum_response_bytes
+    | Asset_download { estimated_wire_bytes }, Get ->
+      Option.value estimated_wire_bytes ~default:0
     | Asset_binary, Put bytes -> String.length bytes
     | _ -> 0
   in
@@ -327,8 +328,9 @@ let response_deadline (request : Http.request) =
 
 let perform ~sw ~authenticator ~network ~clock request =
   Tls_client_eio.initialize_rng ();
-  let response_budget = ref (response_deadline request) in
-  protected (fun () ->
+  let deadline = response_deadline request in
+  let response_budget = ref deadline in
+  let perform () =
     Result.bind
       (follow_redirects
          (request_once ~sw ~authenticator ~network ~clock ~response_budget)
@@ -339,7 +341,12 @@ let perform ~sw ~authenticator ~network ~clock request =
            Result.map
              (fun () -> response)
              (Http.validate_response_content_type request response.headers)
-         else Ok response))
+         else Ok response)
+  in
+  protected (fun () ->
+    match request.expected_content_type with
+    | Asset_download _ -> Eio.Time.with_timeout_exn clock deadline perform
+    | _ -> perform ())
 ;;
 
 let remove_partial path =

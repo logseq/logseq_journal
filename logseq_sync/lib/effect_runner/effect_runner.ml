@@ -1540,6 +1540,7 @@ let fetch_asset_admitted
       ~cache
       ~encryption
       ~maximum_plaintext_bytes
+      ~estimated_wire_bytes
       ~current
       ~(scope : Core.graph_scope)
       ~asset
@@ -1577,7 +1578,7 @@ let fetch_asset_admitted
             ; uri
             ; headers = [ "authorization", "Bearer " ^ token ]
             ; maximum_response_bytes
-            ; expected_content_type = Asset_binary
+            ; expected_content_type = Asset_download { estimated_wire_bytes }
             }
           in
           match t.dependencies.transport.perform_http ~sw:t.sw request with
@@ -1595,6 +1596,7 @@ let fetch_asset_admitted
           | Ok response -> Ok response)
       |> Result.map_error (fun cause ->
         let reason = match !last_failure with
+          | Core.Asset_size_rejected -> "sizeRejected"
           | Core.Asset_network -> "networkFailed"
           | Asset_revoked_access -> "revokedAccess"
           | _ -> "authenticationFailed" in
@@ -1654,25 +1656,37 @@ let fetch_asset
       ~current
       ~scope
       ~asset
-      ~version
+      ~(version : Logseq_db_types.Asset_descriptor.version)
   =
+  let encrypted = match encryption with Plaintext -> false | Encrypted _ -> true in
+  let wire_bytes maximum_plaintext_bytes = asset_wire_bytes ~maximum_plaintext_bytes encrypted in
+  let estimated_wire_bytes =
+    match version.download_size_hint with
+    | Some size when size >= 0L ->
+      Some (wire_bytes (Int64.to_int (min size (Int64.of_int maximum_plaintext_bytes))))
+    | _ -> None
+  in
   let fetch maximum_plaintext_bytes =
     if t.closed || not (current ()) then Error Core.Asset_cancelled
-    else fetch_asset_admitted t ~cache ~encryption ~maximum_plaintext_bytes ~current
-      ~scope ~asset ~version
+    else fetch_asset_admitted t ~cache ~encryption ~maximum_plaintext_bytes ~estimated_wire_bytes
+      ~current ~scope ~asset ~version
   in
-  let encrypted = match encryption with Plaintext -> false | Encrypted _ -> true in
-  let reserve maximum_plaintext_bytes =
-    let bytes = asset_wire_bytes ~maximum_plaintext_bytes encrypted + maximum_plaintext_bytes in
+  (* A small hint buys a concurrent, bounded buffer, not an exact-size check.
+     If that buffer is exceeded, fail without refetching. Without a hint, use
+     the single large permit for the full bound but keep the ordinary deadline.
+     Callers with a lower hard limit can reserve that amount directly. *)
+  let small_bound = 8 * 1024 * 1024 in
+  let small_limit =
+    match estimated_wire_bytes with
+    | Some bytes when bytes <= small_bound -> Some (min small_bound maximum_plaintext_bytes)
+    | None when maximum_plaintext_bytes <= 24 * 1024 * 1024 -> Some maximum_plaintext_bytes
+    | _ -> None
+  in
+  match small_limit with
+  | Some limit ->
     with_asset_slot t.asset_download_slots (fun () ->
-      with_byte_reservation t bytes (fun () -> fetch maximum_plaintext_bytes))
-  in
-  if maximum_plaintext_bytes <= 24 * 1024 * 1024 then reserve maximum_plaintext_bytes
-  else
-    match reserve (8 * 1024 * 1024) with
-    | Error Core.Asset_size_rejected ->
-      with_asset_slot t.asset_large_slot (fun () -> fetch maximum_plaintext_bytes)
-    | result -> result
+      with_byte_reservation t (wire_bytes limit + limit) (fun () -> fetch limit))
+  | None -> with_asset_slot t.asset_large_slot (fun () -> fetch maximum_plaintext_bytes)
 ;;
 
 let close_asset_scope_checked ?except_id t scope =

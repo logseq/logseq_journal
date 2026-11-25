@@ -282,6 +282,7 @@ let pump t =
              then
                Option.map
                  (fun version ->
+                    let version = Asset.with_download_size_hint version entry.descriptor.size in
                     let t, ticket = fresh_fetch t uuid version in
                     t, Fetching ticket, Fetch ticket)
                  (remote_version entry.descriptor)

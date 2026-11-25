@@ -2456,7 +2456,7 @@ let scenarios =
   @ [ Alcotest.test_case "asset upload resource admission" `Quick asset_upload_admission ]
 ;;
 
-let asset_download_budget maximum_plaintext_bytes expected_entered () =
+let asset_download_budget ?size maximum_plaintext_bytes expected_entered () =
   let module Asset = Logseq_db_types.Asset_descriptor in
   with_support (fun support ->
     Eio_main.run (fun environment ->
@@ -2474,6 +2474,7 @@ let asset_download_budget maximum_plaintext_bytes expected_entered () =
         in
         let version =
           Asset.version ~checksum:(String.make 64 '0') ~file_type:"bin" |> Result.get_ok
+          |> fun version -> Asset.with_download_size_hint version size
         in
         let cores =
           List.init 5 (fun index ->
@@ -2512,7 +2513,7 @@ let asset_download_budget maximum_plaintext_bytes expected_entered () =
         Runner.shutdown t)))
 ;;
 
-let asset_download_admission = asset_download_budget (200 * 1024 * 1024) 3
+let asset_download_admission = asset_download_budget ~size:1024L (200 * 1024 * 1024) 3
 
 let scenarios =
   scenarios
@@ -2520,10 +2521,12 @@ let scenarios =
         "asset download resource admission"
         `Quick
         asset_download_admission
+    ; Alcotest.test_case "known 24 MiB downloads share the large lane" `Quick
+        (asset_download_budget ~size:25165824L (200 * 1024 * 1024) 1)
     ]
 ;;
 
-let asset_download_falls_back () =
+let asset_download_without_size () =
   let bytes = String.make ((8 * 1024 * 1024) + 1) 'x' in
   let version = Logseq_db_types.Asset_descriptor.version
     ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum bytes) ~file_type:"bin"
@@ -2531,7 +2534,7 @@ let asset_download_falls_back () =
   let wire = response
     ~headers:(Printf.sprintf "Content-Length: %d\r\n" (String.length bytes)) bytes in
   let report =
-    with_peer [ case wire; case wire ] (fun ~environment ~sw ~support ~origin ->
+    with_peer [ case wire ] (fun ~environment ~sw ~support ~origin ->
       let posted = ref [] in
       let t = runner ~environment ~sw ~support ~posted ~invalidations:(ref 0) () in
       let selected, scope = bootstrap ~mirror_absent:false origin in
@@ -2546,11 +2549,11 @@ let asset_download_falls_back () =
       Runner.shutdown t)
   in
   check_retired report;
-  Alcotest.(check int) "one bounded fallback request" 2 Yojson.Basic.Util.(report |> to_list |> List.length)
+  Alcotest.(check int) "one GET for an unknown size above the small bound" 1 Yojson.Basic.Util.(report |> to_list |> List.length)
 ;;
 
 let scenarios =
-  scenarios @ [ Alcotest.test_case "asset download bounded fallback" `Quick asset_download_falls_back ]
+  scenarios @ [ Alcotest.test_case "unknown-size asset above small bound downloads once" `Quick asset_download_without_size ]
 ;;
 
 let shared_asset_byte_budget = asset_download_budget 16777216 2
@@ -3373,7 +3376,8 @@ let delayed_case ?(tls_delay = 0.) ?(response_delay = 0.) wire =
   | _ -> assert false
 ;;
 
-let test_slow_asset_download () =
+let test_slow_asset_download ~size () =
+  let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
   let bytes = "slow asset" in
   let version = Logseq_db_types.Asset_descriptor.version
     ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum bytes) ~file_type:"bin"
@@ -3389,14 +3393,30 @@ let test_slow_asset_download () =
          let runner = runner ~clock ~environment ~sw ~support ~posted
            ~invalidations:(ref 0) () in
          let selected, scope = bootstrap ~mirror_absent:false origin in
+         let descriptor = Logseq_db_types.Asset_descriptor.create ~uuid:scope.graph_id
+           ~source:(Managed (Some version)) ~current_checksum:None ~size ~dimensions:None
+           |> Result.get_ok in
+         let scheduler = Transfer.create
+           (Transfer.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:0 |> Result.get_ok)
+           ~scope ~online:true ~unlocked:true in
+         let scheduler, work = Transfer.step scheduler
+           (Replace { consumer = "slow-download"; priority = Foreground; assets = [descriptor] }) in
+         let lookup = List.find_map (function Transfer.Check_cache ticket -> Some ticket | _ -> None) work
+           |> Option.get in
+         let _, work = Transfer.step scheduler (Cache_checked (lookup, Ok None)) in
+         let fetch = List.find_map (function Transfer.Fetch ticket -> Some ticket | _ -> None) work
+           |> Option.get in
          let result = asset_run runner ~clock:wall ~posted selected.next scope "slow-download"
-           (Core.Fetch_asset { asset = scope.graph_id; version;
-              maximum_plaintext_bytes = 24 * 1024 * 1024 }) in
-         Alcotest.(check bool) "asset survives the control deadline" true
-           (match result with Ok (Core.Asset_downloaded _) -> true | _ -> false);
+           (Core.Fetch_asset { asset = fetch.asset; version = fetch.version;
+              maximum_plaintext_bytes = 200 * 1024 * 1024 }) in
+         Alcotest.(check bool) "declared size determines whether the first GET survives 30s" true
+           (match size, result with
+            | Some _, Ok (Core.Asset_downloaded _) | None, Error Core.Asset_network -> true
+            | _ -> false);
          Runner.shutdown runner)
   in
-  check_retired report
+  check_retired report;
+  Alcotest.(check int) "exactly one GET" 1 Yojson.Basic.Util.(report |> to_list |> List.length)
 ;;
 
 let test_tls_slow_legal_handshake () =
@@ -3568,7 +3588,10 @@ let scenarios =
         "redirect response deadline remains shared"
         `Quick
         test_redirect_response_budget_is_shared
-    ; Alcotest.test_case "slow asset download" `Quick test_slow_asset_download
+    ; Alcotest.test_case "known 24 MiB gets a longer first GET" `Quick
+        (test_slow_asset_download ~size:(Some 25165824L))
+    ; Alcotest.test_case "unknown size keeps one ordinary GET" `Quick
+        (test_slow_asset_download ~size:None)
     ]
 ;;
 

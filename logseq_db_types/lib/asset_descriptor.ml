@@ -1,6 +1,7 @@
 type version =
   { checksum : string
   ; file_type : string
+  ; download_size_hint : int64 option [@default None]
   }
 [@@deriving yojson]
 
@@ -26,7 +27,7 @@ let version ~checksum ~file_type =
               | _ -> false)
             file_type)
   then Error "Invalid asset file type"
-  else Ok { checksum; file_type }
+  else Ok { checksum; file_type; download_size_hint = None }
 ;;
 
 let version_of_yojson json =
@@ -66,7 +67,11 @@ let create ~uuid ~source ~current_checksum ~size ~dimensions =
   else Ok { uuid; source; current_checksum; size; dimensions }
 ;;
 
-let equal_version a b = a = b
+let with_download_size_hint version download_size_hint =
+  { version with download_size_hint }
+;;
+
+let equal_version a b = a.checksum = b.checksum && a.file_type = b.file_type
 
 let of_yojson json =
   Result.bind (Json_codec.decode of_yojson json) (fun value ->

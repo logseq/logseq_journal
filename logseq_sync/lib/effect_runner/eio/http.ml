@@ -7,6 +7,7 @@ type expected_content_type =
   | Structured_response
   | Snapshot_artifact
   | Asset_binary
+  | Asset_download of { estimated_wire_bytes : int option }
 
 type request =
   { operation : operation
@@ -154,14 +155,14 @@ let validate_response_content_type request headers =
     ( request.expected_content_type
     , Option.map media_type (response_header "content-type" headers) )
   with
-  | (Snapshot_artifact | Asset_binary), None -> Ok ()
+  | (Snapshot_artifact | Asset_binary | Asset_download _), None -> Ok ()
   | Structured_response, None -> Error "sync HTTP response is missing Content-Type"
   | expected_content_type, Some value ->
     let accepted =
       match expected_content_type with
       | Structured_response -> structured_media_type value
       | Snapshot_artifact -> artifact_media_type value
-      | Asset_binary -> true
+      | Asset_binary | Asset_download _ -> true
     in
     if accepted
     then Ok ()
