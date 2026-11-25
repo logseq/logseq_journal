@@ -7244,7 +7244,7 @@ let start
            | exception Invalid_argument reason -> report reason
            | _ ->
              if not (Option.fold ~none:true ~some:(save_filters graph_id) replacement)
-             then report "Could not save Timeline filter preferences."
+             then report "Could not save Timeline filter preferences. Saved filters are limited to 64 graphs."
              else
                let next = { state with modal = No_modal; filters; filter_error = None } in
                if applied filters = applied state.filters then next else

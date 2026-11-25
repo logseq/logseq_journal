@@ -32,16 +32,37 @@ import Foundation
     let bounded = reopened.wrapStartup(Data([0, 255]))
     precondition(bounded.count < 1024)
     precondition(trySnapshot(bounded)[graphB] == custom)
-    precondition(trySnapshot(bounded)[graphA] == "")
-    for index in 3...65 {
-      let graph = String(format: "10000000-0000-4000-8000-%012d", index)
-      precondition(commit(graph, preset))
+    func graph(_ index: Int) -> String {
+      String(format: "10000000-0000-4000-8000-%012d", index)
     }
-    let capped = trySnapshot(reopened.wrapStartup(Data([0, 255])))
-    precondition(capped.count == 65 && capped["overflow"] == "")
-    precondition(capped[graphB] == custom)
-    precondition(capped["10000000-0000-4000-8000-000000000064"] == preset)
-    precondition(capped["10000000-0000-4000-8000-000000000065"] == nil)
+    for (index, legacy) in [#"{"version":1}"#, #"{"version":3,"definitions":[]}"#,
+                            #"{"version":2,"definitions":[],"selected":null}"#,
+                            #"{"version":2,"definitions":[{"name":"Broken"}],"selected":null}"#,
+                            preset.replacingOccurrences(of: "\"selected\":\"Work\"", with: "\"selected\":\"Missing\""),
+                            "not json"].enumerated() {
+      defaults.set(legacy, forKey: "journal.timeline-filter.graph.\(graph(index + 3))")
+    }
+    var expected = [graphB: custom]
+    for index in 10...72 {
+      precondition(commit(graph(index), preset))
+      expected[graph(index)] = preset
+    }
+    precondition(!commit(graph(0), preset), "A write must not displace an existing graph")
+    precondition(!commit(graph(73), preset), "A write must not succeed and disappear on restart")
+    precondition(trySnapshot(reopened.wrapStartup(Data([0, 255]))) == expected)
+    precondition(commit(graph(72), noSelection))
+    expected[graph(72)] = noSelection
+    precondition(trySnapshot(reopened.wrapStartup(Data([0, 255]))) == expected)
+    let empty = #"{"version":2,"definitions":[],"selected":null}"#
+    precondition(commit(graphB, empty))
+    expected.removeValue(forKey: graphB)
+    precondition(commit(graph(73), preset))
+    expected[graph(73)] = preset
+    precondition(trySnapshot(reopened.wrapStartup(Data([0, 255]))) == expected)
+    defaults.set(preset, forKey: "journal.timeline-filter.graph.\(graph(74))")
+    expected["overflow"] = ""
+    precondition(trySnapshot(reopened.wrapStartup(Data([0, 255]))) == expected)
+    precondition(defaults.string(forKey: "journal.timeline-filter.graph.\(graph(74))") == preset)
   }
 
   static func trySnapshot(_ data: Data) -> [String: String] {
