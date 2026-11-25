@@ -335,10 +335,10 @@ type key_entry =
 (* Transfer lanes bound request counts; this shared semaphore bounds the
    in-flight byte footprint of those lanes. Each admitted download or upload
    reserves its worst-case wire plus plaintext footprint before buffers are
-   held, in 64 KiB units, so total asset memory stays bounded independently
-   of the lane permits. *)
+   held, in 64 KiB units. A larger transfer takes the entire budget so it
+   cannot overlap another transfer. *)
 let asset_byte_unit = 65536
-let asset_byte_budget_units = 8192
+let asset_byte_budget_units = 1024
 
 (* The private effect cannot be reconstructed by callers. Its identity must
    stay replay-protected for as long as a caller can retain and resubmit it,
@@ -1515,10 +1515,8 @@ let asset_wire_bytes ~maximum_plaintext_bytes encrypted =
 ;;
 
 let with_byte_reservation t bytes work =
-  let units = (max bytes 0 + asset_byte_unit - 1) / asset_byte_unit in
-  if units > asset_byte_budget_units
-  then Error Core.Asset_size_rejected
-  else (
+  let units = min asset_byte_budget_units ((max bytes 0 + asset_byte_unit - 1) / asset_byte_unit) in
+  (
     let acquired = ref 0 in
     Fun.protect
       ~finally:(fun () ->
