@@ -135,7 +135,7 @@ type task_catalog_cache =
   ; catalog_items : Graph.task_status_definition array
   }
 
-type timeline_scope = Journal_index | Page_roots of Graph.page_uuid | Parent_children of Graph.block_uuid
+type timeline_scope = Journal_index | Journal_root_membership | Page_roots of Graph.page_uuid | Parent_children of Graph.block_uuid
 type timeline_scope_version = string
 type journal_position = string
 type member_position = string
@@ -153,6 +153,7 @@ let member_position_of_string value =
 
 let timeline_scope_key = function
   | Journal_index -> "journal"
+  | Journal_root_membership -> "journal-root-membership"
   | Page_roots uuid -> "roots:" ^ Graph.Uuid.to_string uuid
   | Parent_children uuid -> "children:" ^ Graph.Uuid.to_string uuid
 
@@ -170,6 +171,7 @@ let timeline_bucket key = Hashtbl.hash key mod 64
 type t =
   { lock : Eio.Mutex.t
   ; task_catalog_cache : task_catalog_cache option Atomic.t
+  ; tag_catalog_cache : (string * Logseq_db_types.Tag_catalog.t) option Atomic.t
   ; notification_lock : Eio.Mutex.t
   ; sw : Eio.Switch.t
   ; dispatch_stream : dispatch_item Eio.Stream.t
@@ -3659,6 +3661,77 @@ let get_task_status_definitions snapshot uuids =
     else Ok (List.map (task_status_at snapshot) uuids))
 ;;
 
+let get_timeline_filter_tags snapshot ~prefix ~limit ~cursor =
+  with_snapshot_read snapshot (fun snapshot ->
+    let module Catalog = Logseq_db_types.Tag_catalog in
+    let exception Read_error of Types.read_error in
+    let invalid message = raise (Read_error (Types.Invalid_read_request message)) in
+    let exceeded () = raise (Read_error Types.Read_limit_exceeded) in
+    try
+      if not (valid_page_limit limit) then invalid "limit must be between 1 and 200";
+      if String.length prefix > 1024 then invalid "tag prefix exceeds 1024 bytes";
+      let prefix = Catalog.normalize prefix in
+      let version = state_digest (snapshot.owner.graph_uuid, snapshot.version) in
+      let prefix_key = state_digest prefix in
+      let offset = match cursor with
+        | None -> None
+        | Some cursor ->
+          (match String.split_on_char ':' (Graph.Cursor.to_string cursor) with
+           | [ "timeline-tags"; "v1"; previous; key; offset ] when key = prefix_key ->
+             if previous <> version then raise (Read_error Types.Stale_read_cursor);
+             (match int_of_string_opt offset with
+              | Some offset -> Some offset
+              | None -> invalid "invalid tag cursor offset")
+           | _ -> invalid "invalid tag cursor") in
+      let catalog =
+        match Atomic.get snapshot.owner.tag_catalog_cache with
+        | Some (key, catalog) when key = version -> catalog
+        | _ ->
+          let database = Option.get snapshot.authoritative_database in
+          let context = lazy (read_context snapshot) in
+          let candidates =
+            match entity_of_ident database "logseq.class/Tag" with
+            | None -> Seq.empty
+            | Some class_entity ->
+              Datascript.datoms database Datascript.Avet ~a:"block/tags"
+                ~v:(Datascript.Ref class_entity) () in
+          let examined = ref 0 in
+          let text_bytes = ref 0 in
+          let candidates = Seq.filter_map (fun (datom : Datascript.datom) ->
+            incr examined;
+            if !examined > 10_000 then exceeded ();
+            Option.bind (uuid_of_entity database datom.e) (fun uuid ->
+              match read_page (Lazy.force context) uuid with
+              | Some { page = { kind = (Graph.Class_page | Graph.Built_in_page); title; recycled = false; _ } } ->
+                let ident = Option.bind (one database datom.e "db/ident") ident_of_value in
+                let bytes = String.length title + Option.fold ~none:0 ~some:String.length ident in
+                if bytes > 65_536 || bytes > (8 * 1024 * 1024) - !text_bytes then exceeded ();
+                text_bytes := !text_bytes + bytes;
+                Some Graph.{ uuid; title; ident }
+              | _ -> None)) candidates in
+          (match Catalog.create ~maximum_candidates:10_000 candidates with
+           | Error _ -> exceeded ()
+           | Ok catalog ->
+             Atomic.set snapshot.owner.tag_catalog_cache (Some (version, catalog));
+             catalog) in
+      let after = Option.map (fun offset -> match Catalog.resume catalog ~prefix offset with
+        | Ok after -> after
+        | Error _ -> invalid "tag cursor outside matching range") offset in
+      let budget = max 1 (snapshot.owner.dependencies.limits.response_budget_bytes - 8192) in
+      let rec read limit =
+        match Catalog.search catalog ~prefix ~limit ~after with
+        | Error _ -> invalid "invalid tag search"
+        | Ok (items, next) ->
+          let bytes = List.fold_left (fun bytes (tag : Graph.tag_summary) ->
+            bytes + String.length (Yojson.Safe.to_string (Graph.tag_summary_to_yojson tag)) + 1) 0 items in
+          if bytes > budget then (if limit = 1 then exceeded () else read (limit / 2))
+          else Ok (items, Option.map (fun next ->
+            token Graph.Cursor.of_string
+              (Printf.sprintf "timeline-tags:v1:%s:%s:%d" version prefix_key (Catalog.cursor_offset next))) next) in
+      read limit
+    with Read_error error -> Error error)
+;;
+
 let get_task_statuses snapshot ~limit ~cursor =
   with_snapshot_read snapshot (fun snapshot ->
     let exception Read_error of Types.read_error in
@@ -4748,11 +4821,22 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
               let revoked = Hashtbl.mem revoked_identities key in
               if revoked || block_dto old_context old_block <> block_dto new_context new_block then
                 List.iter mark_parent (List.filter_map Fun.id [parent_of old_block;parent_of new_block]);
+              let candidate context = function
+                | Some (record : Types.block_record) when Graph.Uuid.equal record.block.parent record.block.page ->
+                  (match journal_dto context (read_page context record.block.page) with
+                   | Some _ -> Some (record.block.page, record.block.order, record.block.tags, record.task_status)
+                   | None -> None)
+                | _ -> None in
+              let old_candidate = candidate old_context old_block
+              and new_candidate = candidate new_context new_block in
+              if old_candidate <> new_candidate
+                 || (revoked && (Option.is_some old_candidate || Option.is_some new_candidate))
+              then mark Journal_root_membership;
               let old_journal = journal_dto old_context old_page
               and new_journal = journal_dto new_context new_page in
               if old_journal <> new_journal
                  || (revoked && (Option.is_some old_journal || Option.is_some new_journal))
-              then mark Journal_index);
+              then (mark Journal_index; mark Journal_root_membership));
             let rendered_title = function None -> None | Some (page : Types.page_record) -> Some page.page.title in
             let title_changed = rendered_title old_page <> rendered_title new_page in
             let deleted db = Option.bind (entity_of_uuid db uuid) (fun entity -> one db entity "logseq.property/deleted-at") in
@@ -6360,6 +6444,7 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                    let database =
                      { lock = Eio.Mutex.create ()
                         ; task_catalog_cache = Atomic.make None
+                        ; tag_catalog_cache = Atomic.make None
                         ; notification_lock = Eio.Mutex.create ()
                      ; sw
                      ; dispatch_stream =

@@ -194,6 +194,7 @@ let test_ios_capsules_mount_outside_toolbars () =
                    then Some (fun _ -> presses := "Account menu" :: !presses)
                    else None)
                 ~local_deletion_available:false
+                ~filter_control:None
                 ~on_journals:(handler "Journals")
                 ~on_favorites:(handler "Favorites")
                 ~on_capture:(handler "Capture")

@@ -19,6 +19,7 @@ let fixture_scope : type a. a Read.Timeline.query -> string = function
 ;;
 
 let fixture_versions = Hashtbl.create 32
+let fixture_coverage () = string_of_int (Option.value ~default:0 (Hashtbl.find_opt fixture_versions "coverage"))
 let fixture_version query =
   string_of_int (Option.value ~default:0 (Hashtbl.find_opt fixture_versions (fixture_scope query)))
 ;;
@@ -27,6 +28,7 @@ let fixture_packet budget query ~items ~next =
   let module F = Read.For_worker in
   let receipt = F.timeline_receipt ~owner:(F.read_budget_owner budget) ~query
       ~version:(fixture_version query) in
+  let receipt = F.with_timeline_coverage receipt (fixture_coverage ()) in
   F.timeline_packet ~receipt ~items:(Rrbvec.of_list items)
     ~next:(Option.map Graph.Cursor.to_string next)
 ;;
@@ -80,7 +82,8 @@ let check_sample = query_sample (fun (Read.Read_query (budget, query)) ->
   | Read.Timeline_check receipts ->
     let checks = Rrbvec.map (fun (Read.Timeline.Receipt receipt) ->
       if Read.For_worker.timeline_receipt_version receipt =
-          fixture_version (Read.For_worker.timeline_receipt_query receipt)
+          (if Read.For_worker.timeline_receipt_is_coverage receipt then fixture_coverage ()
+           else fixture_version (Read.For_worker.timeline_receipt_query receipt))
       then Ok () else Error (Read.Timeline.Invalidated Scope_changed)) receipts in
     Read.For_worker.answer budget query (Ok (Read.For_worker.timeline_check checks))
   | _ -> failwith "Expected same-snapshot Timeline receipt checks")
@@ -3938,6 +3941,52 @@ let pending_feed_check runtime ~empty =
         (children_sample ~parent:block_uuid ~scope_revision:"preview" ~items:[] ~next:None) in
   Alcotest.(check int) "nothing publishes before verification" 0 (List.length output.responses);
   only "combined verification" output.requests
+;;
+
+let test_filtered_empty_skips_point_proofs publish_first =
+  let runtime = Runtime.create () in
+  Runtime.set_timeline_filter runtime ~tags:[block_uuid] ~statuses:[] ~days:None;
+  let request = pending_feed_check runtime ~empty:true in
+  (match Runtime.worker_read runtime request with
+   | Some (Runtime.Read {query=W.Timeline_check receipts;_}) ->
+     Alcotest.(check int) "empty scan needs one coverage proof" 1 (Rrbvec.length receipts)
+   | _ -> Alcotest.fail "filtered exhaustion bypassed validation");
+  let request = if not publish_first then request else (
+    let initial = Worker_producer.deliver runtime request check_sample in
+    (match (only "initial empty publication" initial.responses).payload with
+     | Feed_loaded {feed={days=[];_};complete=true;_} -> ()
+     | _ -> Alcotest.fail "initial scan did not exhaust empty");
+    let output = Runtime.reconcile_signal runtime ~request_generation:12L
+        (Worker_pure_data.Resync_required {generation="generation-1";reason="gap"}) in
+    Alcotest.(check bool) "withdraw empty during revalidation" true
+      (List.exists (fun (response : Runtime.response) -> match response.payload with
+        | Feed_refresh_started _ -> true | _ -> false) output.responses);
+    only "retained witness check" (List.filter (fun request ->
+      match Runtime.worker_read runtime request with
+      | Some (Runtime.Read {query=W.Timeline_check _;_}) -> true | _ -> false) output.requests)) in
+  let previous = Hashtbl.find_opt fixture_versions "coverage" in
+  Fun.protect ~finally:(fun () -> match previous with
+    | Some version -> Hashtbl.replace fixture_versions "coverage" version
+    | None -> Hashtbl.remove fixture_versions "coverage") (fun () ->
+    Hashtbl.replace fixture_versions "coverage" (1 + Option.value ~default:0 previous);
+    let stale = Worker_producer.deliver runtime request check_sample in
+    Alcotest.(check int) "stale empty never publishes" 0 (List.length stale.responses);
+    let dates = only "restart from dates" stale.requests in
+    let roots = Worker_producer.deliver runtime dates
+        (journal_sample ~items:[Worker_pure_data.{page;journal_day=20260901;revision="page"}] ~next:None)
+      |> fun output -> only "revisit skipped day" output.requests in
+    let matching = {record with block={record.block with tags=[block_uuid]}} in
+    let preview = Worker_producer.deliver runtime roots
+        (tree_sample ~items:[Worker_pure_data.{value=matching;revision="root";depth=0;parent=page_uuid}] ~next:None)
+      |> fun output -> only "preview new match" output.requests in
+    let check = Worker_producer.deliver runtime preview
+        (children_sample ~parent:block_uuid ~scope_revision:"preview" ~items:[] ~next:None)
+      |> fun output -> only "verify new match" output.requests in
+    let final = Worker_producer.deliver runtime check check_sample in
+    match (only "publish new match" final.responses).payload with
+    | Feed_loaded {feed={days=[{entries=[entry];_}];_};complete=true;_} ->
+      Alcotest.(check string) "matching root" (Graph.Uuid.to_string block_uuid) (Journal_model.id entry.block)
+    | _ -> Alcotest.fail "the skipped day did not become visible")
 ;;
 
 let test_empty_end_receipts_survive_resync () =
@@ -9276,10 +9325,37 @@ let test_root_quota_generated_traces () =
     [ 1; 2; 3 ]
 ;;
 
+let test_timeline_root_filter () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime
+      ~validate_session:Worker_producer.validate_session () in
+  set_calendar runtime;
+  let fixture = root_fixture 0 65 0 in
+  let tag = (List.nth fixture.roots 61).block.uuid in
+  let status = (List.nth fixture.roots 62).block.uuid in
+  let roots = List.mapi (fun index (value : Worker_pure_data.block_record) ->
+    match index with
+    | 61 -> { value with block = { value.block with tags = [tag] } }
+    | 62 -> { value with task_status = Some status }
+    | _ -> value) fixture.roots in
+  Runtime.set_timeline_filter runtime ~tags:[tag] ~statuses:[status]
+    ~days:(Some (20260930, 20260930));
+  let older = root_fixture 1 1 0 in
+  let older = {older with roots = List.map (fun (value : Worker_pure_data.block_record) ->
+    {value with task_status = Some status}) older.roots} in
+  let feed, _ = drive_roots runtime [{fixture with roots}; older] (initial_roots runtime 989L) in
+  let actual = List.concat_map (fun (day : Journal_graph_projection.day_feed) ->
+    List.map (fun (entry : Journal_graph_projection.timeline_entry) -> Journal_model.id entry.block) day.entries) feed.days in
+  Alcotest.(check (list string)) "only matching roots across sparse packets"
+    (List.map Graph.Uuid.to_string [tag;status]) actual
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "status recovery"
+    [ ("timeline filters", [Alcotest.test_case "sparse tag or status matches" `Quick test_timeline_root_filter;
+      Alcotest.test_case "skipped day matches before empty publication" `Quick (fun () -> test_filtered_empty_skips_point_proofs false);
+      Alcotest.test_case "skipped day matches after empty publication" `Quick (fun () -> test_filtered_empty_skips_point_proofs true)])
+    ; ( "status recovery"
       , [ Alcotest.test_case
             "catalog and delta cross fences"
             `Quick

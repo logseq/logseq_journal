@@ -279,6 +279,21 @@ val get_outline_blocks
   -> Graph.block_uuid list
   -> (Types.block_lookup list, Types.read_error) result
 
+(** Search graph-wide active class pages by trimmed, ASCII-case-insensitive
+    title prefix (at most 1024 bytes), ordered by normalized title then UUID.
+    Empty input browses all classes. The limit is 1..200; encoded bytes may
+    reduce a page. A bounded index examines at most 10,000 class memberships
+    before failing explicitly rather than returning an incomplete catalog. The
+    index also caps title plus ident at 64 KiB per candidate and 8 MiB total.
+    Cursors bind to the graph, captured projection and normalized prefix.
+    Restart without a cursor after [Types.Stale_read_cursor]. *)
+val get_timeline_filter_tags
+  :  snapshot
+  -> prefix:string
+  -> limit:int
+  -> cursor:Graph.Cursor.t option
+  -> (Graph.tag_summary list * Graph.Cursor.t option, Types.read_error) result
+
 (** Reads active status choices owned by the status property in database order.
     Limit is 1..200. Cursors bind to one captured projection. Empty placeholders
     and recycled choices are excluded. No per-block reads or graph writes occur. *)
@@ -365,6 +380,7 @@ val get_structure
     Release every borrowed snapshot to release its history roots. *)
 type timeline_scope =
   | Journal_index
+  | Journal_root_membership (** Date membership and visible journal root candidacy. *)
   | Page_roots of Graph.page_uuid
   | Parent_children of Graph.block_uuid
 

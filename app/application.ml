@@ -173,8 +173,155 @@ type feed_refresh =
   ; graph_generation : Graph_service.graph_id option
   }
 
+module Timeline_filter = struct
+  module Uuid = Logseq_db_types.Graph_types.Uuid
+
+  type tag_id = Uuid.t
+  type status_id = Uuid.t
+  type unit_ = Days | Weeks
+  type preset = Past_14_days | Past_3_months
+  type relative_time = [ `Any_time | `Preset of preset | `Custom of int * unit_ ]
+  type time_error = Invalid_count
+
+  let any_time = `Any_time
+  let preset value = `Preset value
+
+  let custom ~count ~unit_ =
+    let multiplier = match unit_ with Days -> 1 | Weeks -> 7 in
+    if count <= 0 || count > max_int / multiplier
+    then Error Invalid_count
+    else Ok (`Custom (count, unit_))
+  ;;
+
+  let time_choice time = time
+
+  type criteria = { tags : tag_id list; statuses : status_id list; time : relative_time }
+
+  let criteria ~tags ~statuses ~time =
+    { tags = List.sort_uniq Uuid.compare tags; statuses = List.sort_uniq Uuid.compare statuses; time }
+  ;;
+
+  let all = criteria ~tags:[] ~statuses:[] ~time:any_time
+  let tags criteria = criteria.tags
+  let statuses criteria = criteria.statuses
+  let time criteria = criteria.time
+
+  let active_count criteria =
+    Bool.to_int (criteria.tags <> [])
+    + Bool.to_int (criteria.statuses <> [])
+    + Bool.to_int (criteria.time <> any_time)
+  ;;
+
+  type time_control = Any_time | Preset of preset | Custom of { count_text : string; unit_ : unit_ }
+  type sheet = { draft_tags : tag_id list; draft_statuses : status_id list; draft_time : time_control }
+  type t = { applied : criteria; sheet : sheet option }
+
+  let restore applied = { applied; sheet = None }
+  let initial = restore all
+  let applied state = state.applied
+  let sheet state = state.sheet
+  let draft_tags sheet = sheet.draft_tags
+  let draft_statuses sheet = sheet.draft_statuses
+  let draft_time sheet = sheet.draft_time
+
+  let validate_draft_time sheet =
+    match sheet.draft_time with
+    | Any_time -> Ok any_time
+    | Preset value -> Ok (preset value)
+    | Custom { count_text; unit_ } ->
+      if not (String.for_all (function '0' .. '9' -> true | _ -> false) count_text)
+      then Error Invalid_count
+      else (
+        match int_of_string_opt count_text with
+        | None -> Error Invalid_count
+        | Some count -> custom ~count ~unit_)
+  ;;
+
+  let draft criteria =
+    let draft_time =
+      match time_choice criteria.time with
+      | `Any_time -> Any_time
+      | `Preset value -> Preset value
+      | `Custom (count, unit_) -> Custom { count_text = string_of_int count; unit_ }
+    in
+    { draft_tags = criteria.tags; draft_statuses = criteria.statuses; draft_time }
+  ;;
+
+  let open_sheet state =
+    match state.sheet with Some _ -> state | None -> { state with sheet = Some (draft state.applied) }
+  ;;
+
+  type edit = Toggle_tag of tag_id | Toggle_status of status_id | Set_time of time_control | Reset
+
+  let toggle id ids =
+    if List.exists (Uuid.equal id) ids
+    then List.filter (fun candidate -> not (Uuid.equal id candidate)) ids
+    else id :: ids
+  ;;
+
+  let resolve_days criteria ~today =
+    let calendar_months () =
+      let month_index = (today / 10000) * 12 + today / 100 mod 100 - 1 - 3 in
+      if month_index < 12 then invalid_arg "Filter range starts before year 1";
+      let year = month_index / 12 and month = month_index mod 12 + 1 in
+      let last_day = match month with
+        | 2 -> if year mod 4 = 0 && (year mod 100 <> 0 || year mod 400 = 0) then 29 else 28
+        | 4 | 6 | 9 | 11 -> 30
+        | _ -> 31 in
+      Some (year * 10000 + month * 100 + min (today mod 100) last_day, today)
+    in
+    let days count =
+      let civil day =
+        let year = day / 10000 and month = day / 100 mod 100 in
+        let year = if month <= 2 then year - 1 else year in
+        let era = year / 400 in
+        let year_of_era = year mod 400 in
+        let month = if month <= 2 then month + 9 else month - 3 in
+        era * 146097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100
+        + (153 * month + 2) / 5 + day mod 100 - 1 - 719468
+      in
+      let earliest = civil today - (count - 1) in
+      if earliest < civil 10101 then invalid_arg "Filter range starts before year 1";
+      let start = Unix.gmtime (float_of_int earliest *. 86400.) in
+      Some ((start.tm_year + 1900) * 10000 + (start.tm_mon + 1) * 100 + start.tm_mday, today)
+    in
+    match time_choice (time criteria) with
+    | `Any_time -> None
+    | `Preset Past_3_months -> calendar_months ()
+    | `Preset Past_14_days -> days 14
+    | `Custom (count, Days) -> days count
+    | `Custom (count, Weeks) -> days (7 * count)
+  ;;
+
+  let edit state change =
+    match state.sheet with
+    | None -> state
+    | Some sheet ->
+      let sheet =
+        match change with
+        | Toggle_tag id -> { sheet with draft_tags = toggle id sheet.draft_tags }
+        | Toggle_status id -> { sheet with draft_statuses = toggle id sheet.draft_statuses }
+        | Set_time draft_time -> { sheet with draft_time }
+        | Reset -> draft all
+      in
+      { state with sheet = Some sheet }
+  ;;
+
+  let cancel state = { state with sheet = None }
+
+  let apply state =
+    match state.sheet with
+    | None -> Ok state
+    | Some sheet ->
+      Result.map
+        (fun time -> restore (criteria ~tags:sheet.draft_tags ~statuses:sheet.draft_statuses ~time))
+        (validate_draft_time sheet)
+  ;;
+end
+
 type modal =
   | No_modal
+  | Filters_sheet
   | Capture_sheet
   | Append_sheet
   | Status_sheet of string
@@ -265,8 +412,76 @@ module Task_catalog = struct
   ;;
 end
 
+module Timeline_filter_preferences = struct
+  let startup_prefix = "JTF1"
+
+  let unwrap_startup payload =
+    if not (String.starts_with ~prefix:startup_prefix payload) then [], payload else
+    match String.index_from_opt payload (String.length startup_prefix) '\n' with
+    | None -> [], payload
+    | Some separator ->
+      let offset = String.length startup_prefix in
+      let snapshot = String.sub payload offset (separator - offset) in
+      let config = String.sub payload (separator + 1) (String.length payload - separator - 1) in
+      let entries =
+        try match Yojson.Safe.from_string snapshot with `Assoc entries -> entries | _ -> []
+        with Yojson.Json_error _ -> [] in
+      entries, config
+  ;;
+
+  let decode text =
+    let open Timeline_filter in
+    let open Yojson.Safe.Util in
+    let ids = function
+      | `List values -> List.map (fun value ->
+          match Uuid.of_string (to_string value) with
+          | Ok id -> id | Error _ -> raise Exit) values
+      | _ -> raise Exit in
+    try
+      let value = Yojson.Safe.from_string text in
+      if member "version" value <> `Int 1 then raise Exit;
+      let time = match member "time" value with
+        | `String "any" -> any_time
+        | `String "past-7-days" ->
+          (match custom ~count:7 ~unit_:Days with Ok time -> time | Error _ -> raise Exit)
+        | `String "past-2-weeks" -> preset Past_14_days
+        | `String "past-3-months" -> preset Past_3_months
+        | `List [`Int count; `String unit_] ->
+          let unit_ = match unit_ with "days" -> Days | "weeks" -> Weeks | _ -> raise Exit in
+          (match custom ~count ~unit_ with Ok time -> time | Error _ -> raise Exit)
+        | _ -> raise Exit in
+      Some (criteria ~tags:(ids (member "tags" value)) ~statuses:(ids (member "statuses" value)) ~time)
+    with Yojson.Json_error _ | Type_error _ | Exit -> None
+  ;;
+
+  let encode value =
+    let open Timeline_filter in
+    let ids values = `List (List.map (fun id -> `String (Uuid.to_string id)) values) in
+    let time = match time value with
+      | `Any_time -> `String "any"
+      | `Preset Past_14_days -> `String "past-2-weeks"
+      | `Preset Past_3_months -> `String "past-3-months"
+      | `Custom (count, unit_) -> `List [`Int count; `String (match unit_ with Days -> "days" | Weeks -> "weeks")] in
+    Yojson.Safe.to_string (`Assoc ["version", `Int 1; "tags", ids (tags value);
+      "statuses", ids (statuses value); "time", time])
+  ;;
+end
+
 type cleanup = Discard_staged_file of Journal_asset_import.staged
 type cleanup_plan = cleanup Rrbvec.t
+
+type filter_tag_page =
+  | Tag_loading
+  | Tag_failed of string
+  | Tag_results of Logseq_db_types.Graph_types.tag_summary Journal_worker_coordination.Worker_api.slice
+
+type filter_tag_picker =
+  { sheet_epoch : int
+  ; search_epoch : int
+  ; prefix : string
+  ; labels : (Timeline_filter.tag_id * string) list
+  ; page : filter_tag_page
+  }
 
 type state =
   { resident_states : state Graph_drafts.t
@@ -277,6 +492,9 @@ type state =
   ; favorites_media_roots : string Rrbvec.t
   ; favorites_requests : Journal_graph_request.favorites_request list
   ; routes : Journal_routes.t
+  ; filter_tag_picker : filter_tag_picker
+  ; filters : Timeline_filter.t
+  ; filters_restored : bool
   ; timeline : Journal_timeline_state.t
   ; timeline_structure_revision : int
   ; next_request_generation : int64
@@ -392,7 +610,14 @@ let cleanup_batches batches =
   |> Rrbvec.of_seq
 ;;
 
+let cancel_filters state =
+  if state.modal = Filters_sheet
+  then { state with modal = No_modal; filters = Timeline_filter.cancel state.filters }
+  else state
+;;
+
 let select_destination state destination =
+  let state = cancel_filters state in
   if Journal_routes.destination state.routes = destination
   then (
     if destination = Journal_routes.Journals
@@ -425,6 +650,9 @@ let initial_state =
   ; favorites_media_roots = Rrbvec.empty
   ; favorites_requests = []
   ; routes = Journal_routes.create ()
+  ; filter_tag_picker = { sheet_epoch = 0; search_epoch = 0; prefix = ""; labels = []; page = Tag_loading }
+  ; filters = Timeline_filter.initial
+  ; filters_restored = false
   ; timeline = Journal_timeline_state.empty ~today:0
   ; timeline_structure_revision = 0
   ; next_request_generation = 1L
@@ -647,6 +875,9 @@ let clear_graph_surface ~discard ?(discard_capture = true) state =
   ; favorites_media_roots = Rrbvec.empty
   ; favorites_requests = []
   ; routes = Journal_routes.create ()
+  ; filter_tag_picker = { sheet_epoch = 0; search_epoch = 0; prefix = ""; labels = []; page = Tag_loading }
+  ; filters = Timeline_filter.initial
+  ; filters_restored = false
   ; timeline = Journal_timeline_state.empty ~today:0
   ; feed_loaded = false
   ; task_catalog = Task_catalog.empty
@@ -834,10 +1065,11 @@ let apply_manager_state ~discard state (manager_state : Graph_service.state) =
   in
   let modal =
     match state.modal, snapshot.selected_graph with
-    | (Status_sheet _ | Capture_sheet | Append_sheet), _ when graph_context_changed ->
+    | (Filters_sheet | Status_sheet _ | Capture_sheet | Append_sheet), _ when graph_context_changed ->
       No_modal
     | Cache_reset_confirmation _, _ when not owner_changed -> state.modal
     | ( ( No_modal
+        | Filters_sheet
         | Capture_sheet
         | Append_sheet
         | Status_sheet _
@@ -1843,6 +2075,8 @@ module Root_navigation = struct
     ; task_status_page = 0
     ; reference_sources = Reference_sources.empty
     ; graph_state = { state.graph_state with generation }
+    ; filters = Timeline_filter.initial
+    ; filters_restored = false
     ; graph_ready = false
     ; feed_loaded = false
     ; capture_error = None
@@ -1879,6 +2113,7 @@ module Root_navigation = struct
       match event with
       | Select destination -> select_destination state destination
       | Capture_opened ->
+        let state = cancel_filters state in
         let state =
           match state.direct_capture with
           | Some _ -> state
@@ -2168,6 +2403,14 @@ type command =
   | Capture_task_off
   | Open_append
   | Close_status
+  | Open_filters
+  | Edit_filters of Timeline_filter.edit
+  | Edit_filter_tag_text of string
+  | Pick_filter_tag of Logseq_db_types.Graph_types.tag_summary
+  | More_filter_tags
+  | Retry_filter_tags
+  | Close_filters of int
+  | Apply_filters of int
   | Open_diagnostics
   | Close_diagnostics
   | Open_error_info
@@ -2579,6 +2822,96 @@ let composer_page ~on_close =
   composer_view ~render:Journal_composer_view.page ~on_close:(Some on_close)
 ;;
 
+let filters_page state dispatch filter_draft =
+  let open Timeline_filter in
+  let actions = ref [] in
+  let button ?(selected = false) id label action : Yojson.Safe.t =
+    actions := (id, action) :: !actions;
+    `Assoc [ "id", `String id; "label", `String label; "selected", `Bool selected ]
+  in
+  let choice id label selected action = button ~selected id label (Edit_filters action) in
+  let time = draft_time filter_draft in
+  let custom_time = match time with
+    | Custom _ -> time
+    | Preset Past_14_days -> Custom { count_text = "14"; unit_ = Days }
+    | Any_time | Preset Past_3_months -> Custom { count_text = "7"; unit_ = Days }
+  in
+  let range = match apply state.filters, state.calendar with
+    | Ok filters, Some calendar ->
+      (try Some (resolve_days (applied filters) ~today:(Journal_calendar.local_day calendar))
+       with Invalid_argument _ -> None)
+    | _ -> None
+  in
+  let statuses =
+    Rrbvec.to_seq state.task_catalog.items
+    |> Seq.map (fun (status : Logseq_db_types.Graph_types.task_status_definition) -> status.uuid, status.title)
+    |> List.of_seq
+  in
+  let selected_statuses = draft_statuses filter_draft in
+  let statuses = statuses @ List.filter_map (fun id ->
+    if List.mem_assoc id statuses then None else Some (id, "Unavailable status · " ^ Uuid.to_string id)) selected_statuses in
+  let options = List.map (fun (id, title) ->
+    choice ("status-" ^ Uuid.to_string id) title (List.mem id selected_statuses) (Toggle_status id)) statuses in
+  let times = List.map (fun (id, label, control, selected) -> choice id label selected (Set_time control))
+    [ "any", "Any time", Any_time, time = Any_time
+    ; "fortnight", "14 days", Preset Past_14_days, time = Preset Past_14_days
+    ; "quarter", "3 months", Preset Past_3_months, time = Preset Past_3_months
+    ; "custom", "Custom", custom_time, (match time with Custom _ -> true | _ -> false) ] in
+  let custom = match time with
+    | Custom { count_text; unit_ } ->
+      let units = List.map (fun (id, label, unit_choice) ->
+        choice id label (unit_choice = unit_) (Set_time (Custom { count_text; unit_ = unit_choice })))
+        [ "days", "days", Days; "weeks", "weeks", Weeks ] in
+      `Assoc [ "count", `String count_text; "units", `List units ]
+    | Any_time | Preset _ -> `Null
+  in
+  let selected_tags = draft_tags filter_draft in
+  let picker = state.filter_tag_picker in
+  let selected = List.map (fun id ->
+    let title = List.assoc_opt id picker.labels
+      |> Option.value ~default:("Unavailable tag · " ^ Uuid.to_string id) in
+    choice ("selected-tag-" ^ Uuid.to_string id) ("#" ^ title) true (Toggle_tag id)) selected_tags in
+  let results, tag_message = match picker.page with
+    | Tag_loading -> [], Some "Searching tags…"
+    | Tag_failed message -> [ button "retry-tags" "Retry tag search" Retry_filter_tags ], Some message
+    | Tag_results { items; next } ->
+      let rows = List.filter_map (fun (tag : Logseq_db_types.Graph_types.tag_summary) ->
+        if List.mem tag.uuid selected_tags then None
+        else Some (button ("pick-tag-" ^ Uuid.to_string tag.uuid) tag.title (Pick_filter_tag tag))) items in
+      rows @ (if Option.is_some next then [ button "more-tags" "Next tags" More_filter_tags ] else []),
+      (if rows = [] && Option.is_none next then Some "No matching tags" else None)
+  in
+  let date_range = match range with
+    | Some (Some (first, last)) -> `List [ `Int first; `Int last ]
+    | Some None | None -> `Null
+  in
+  let enabled = state.filters_restored && Option.is_some range in
+  let payload = Yojson.Safe.to_string (`Assoc
+    [ "mode", `String "filter-overlay"; "enabled", `Bool enabled
+    ; "sheetEpoch", `Int picker.sheet_epoch
+    ; "choices", `Assoc [ "tags", `List selected; "statuses", `List options
+                        ; "times", `List times; "results", `List results ]
+    ; "custom", custom; "dateRange", date_range; "text", `String picker.prefix
+    ; "message", Option.fold ~none:`Null ~some:(fun text -> `String text) tag_message ]) in
+  let on_event event =
+    let raw = event.Journal_lui_native.payload in
+    match raw with
+    | "cancel" -> dispatch.send (Close_filters event.event_id)
+    | "reset" -> dispatch.send (Edit_filters Reset)
+    | "apply" when enabled -> dispatch.send (Apply_filters event.event_id)
+    | _ when String.starts_with ~prefix:"search:" raw ->
+      dispatch.send (Edit_filter_tag_text (String.sub raw 7 (String.length raw - 7)))
+    | _ when String.starts_with ~prefix:"count:" raw ->
+      (match time with
+       | Custom { unit_; _ } ->
+         let count_text = String.sub raw 6 (String.length raw - 6) in
+         dispatch.send (Edit_filters (Set_time (Custom { count_text; unit_ })))
+       | Any_time | Preset _ -> ())
+    | _ -> Option.iter dispatch.send (List.assoc_opt raw !actions)
+  in
+  payload, on_event
+;;
+
 let timeline_page
       ~status_name
       ~header_signal
@@ -2619,6 +2952,7 @@ let timeline_page
       ~error_info_available
       ~on_error_info
       ~account_menu_available
+      ~filter_count
       ~cache_reset_available
       ~on_account_action
   =
@@ -2674,6 +3008,15 @@ let timeline_page
         ~on_copy:on_copy_favorite)
     else timeline ()
   in
+  let filter_control =
+    if favorites_selected then None else
+    let payload = Yojson.Safe.to_string (`Assoc
+      [ "mode", `String "filter-trigger"; "level", `Int filter_count
+      ; "enabled", `Bool interaction_enabled ]) in
+    Some (V.of_lui (Journal_lui_native.mount ~key:"journal-filters" ~payload ~children:[]
+      ~on_event:(fun _ -> on_account_action.send Open_filters)
+      Journal_lui_native.chrome_identifier))
+  in
   let destination_action index =
     Ui.Event.Handler.create (fun _ ->
       Ui.Event.Handler.Private.invoke on_select_destination (Ui.Event.Payload.Int64 index))
@@ -2710,6 +3053,7 @@ let timeline_page
                 | Sign_out -> Sign_out))
        else None)
     ~local_deletion_available:cache_reset_available
+    ~filter_control
     ~on_journals:(destination_action 0L)
     ~on_favorites:(destination_action 1L)
     ~on_capture:(bind_action on_capture_event Open_capture)
@@ -3296,11 +3640,33 @@ let start
       ~on_view_region
       ~on_platform_request
       ~calendar_sampler
+      ~filter_preferences
       ~client
       ~platform_code
       ~host_code
   : app_context
   =
+  let filter_preferences = ref filter_preferences in
+  let graph_filter_key id =
+    String.lowercase_ascii (Logseq_db_types.Graph_types.Uuid.to_string id) in
+  let save_filters id criteria =
+    let key = graph_filter_key id in
+    let text = if criteria = Timeline_filter.all then "" else Timeline_filter_preferences.encode criteria in
+    filter_preferences := List.remove_assoc key !filter_preferences;
+    if text <> "" then filter_preferences := (key, `String text) :: !filter_preferences;
+    Journal_bridge.platform_request ("journal.timeline-filter.commit\n" ^ key ^ "\n" ^ text) in
+  let saved_filters id calendar =
+    let criteria = match List.assoc_opt (graph_filter_key id) !filter_preferences with
+      | Some (`String text) -> Timeline_filter_preferences.decode text
+      | _ -> None in
+    let criteria = Option.value criteria ~default:Timeline_filter.all in
+    try ignore (Timeline_filter.resolve_days criteria ~today:(Journal_calendar.local_day calendar)); criteria
+    with Invalid_argument _ -> Timeline_filter.all in
+  let restore_filters state =
+    match state.filters_restored, state.graph_state.graph_id, state.calendar with
+    | false, Some id, Some calendar ->
+      { state with filters_restored = true; filters = Timeline_filter.restore (saved_filters id calendar) }
+    | _ -> state in
   let pump = Journal_pump.create () in
   Journal_pump.set_wakeup pump Journal_bridge.wakeup;
   let running = ref true in
@@ -3330,6 +3696,7 @@ let start
       drain_pending_actions ()
   in
   let state_ref = ref initial_state in
+  let filter_sheet_epoch = ref 0 in
   let processing_owner : Graph_service.timeline_scope option ref = ref None in
   let visible_owner : Graph_service.timeline_scope option ref = ref None in
   let preview_owner = ref None in
@@ -5012,7 +5379,12 @@ let start
           let feed_output =
             match current.calendar with
             | None -> Journal_graph_runtime.{ requests = []; responses = [] }
-            | Some _ ->
+            | Some calendar ->
+              let criteria = Option.fold ~none:Timeline_filter.all
+                  ~some:(fun id -> saved_filters id calendar) graph_state.graph_id in
+              let days = Timeline_filter.resolve_days criteria ~today:(Journal_calendar.local_day calendar) in
+              Journal_graph_runtime.set_timeline_filter (!graph_runtime_cell)
+                ~tags:(Timeline_filter.tags criteria) ~statuses:(Timeline_filter.statuses criteria) ~days;
               submit
                 (Journal_graph_request.Load_feed
                    { cursor = None; root_limit = feed_root_limit
@@ -5911,6 +6283,10 @@ let start
     | None -> Effect.ignore
     | Some context ->
       let generation = snapshot.next_request_generation in
+      let criteria = Timeline_filter.applied snapshot.filters in
+      let days = Timeline_filter.resolve_days criteria ~today:context.local_day in
+      Journal_graph_runtime.set_timeline_filter (!graph_runtime_cell)
+        ~tags:(Timeline_filter.tags criteria) ~statuses:(Timeline_filter.statuses criteria) ~days;
       let output =
         submit
           (Journal_graph_request.Load_feed
@@ -6209,6 +6585,61 @@ let start
   in
   let prev_sync_error_key =
     graph_ref (fun () -> Option.map (fun notice -> notice.sequence) initial_state.sync_error)
+  in
+  let read_filter_picker : type value. owner:Graph_service.timeline_scope option -> maximum_items:int ->
+      value Wc.query -> ((value, string) result -> unit) -> unit =
+    fun ~owner ~maximum_items query finish ->
+      let failed error = finish (Error (Coordination_host.reply_error_message
+        ~fallback:"Could not load tags." error)) in
+      match owner, ensure_coordination () with
+      | Some owner, Ok host ->
+        (match Coordination_host.plan_query_when_available host ~owner ~maximum_items
+          ~maximum_bytes:Worker_pure_data.maximum_response_bytes query with
+         | Error _ -> finish (Error "Could not load tags.")
+         | Ok ticket -> Coordination_host.watch_read host ticket ~f:(fun origin reply ->
+           run_owned (Some owner) (fun () -> Effect.of_thunk (fun () ->
+             match origin, reply with
+             | Some (session, _), Wc.Answered (Ok value)
+               when Coordination_host.validate_session ~owner host session = Ok () -> finish (Ok value)
+             | _, Wc.Answered (Ok _) -> finish (Error "The graph changed. Retry tag search.")
+             | _ -> failed reply))))
+      | _ -> finish (Error "The graph is not ready.")
+  in
+  let search_filter_tags ~owner picker ~after ~debounce =
+    let current state = state.modal = Filters_sheet
+      && state.filter_tag_picker.sheet_epoch = picker.sheet_epoch
+      && state.filter_tag_picker.search_epoch = picker.search_epoch in
+    let run () = run_owned owner (fun () -> Effect.of_thunk (fun () ->
+      if current !state_ref then
+        read_filter_picker ~owner ~maximum_items:24 (Wc.Tag_search { prefix = picker.prefix; after })
+          (fun result -> Effect.run (set_state (fun state ->
+            if not (current state) then state else
+            let page = match result with Ok page -> Tag_results page | Error message -> Tag_failed message in
+            { state with filter_tag_picker = { state.filter_tag_picker with page } }))))) in
+    Effect.of_thunk (fun () -> if debounce then schedule_after 0.15 run else run ())
+  in
+  let resolve_filter_tag_labels ~owner ~sheet_epoch tags =
+    let rec resolve = function
+      | [] -> ()
+      | uuid :: rest ->
+        let state = !state_ref in
+        if state.modal = Filters_sheet && state.filter_tag_picker.sheet_epoch = sheet_epoch then
+          read_filter_picker ~owner ~maximum_items:1 (Wc.Page { uuid; revision = None }) (fun result ->
+            (match result with
+             | Ok (Worker_pure_data.V2_present_page { page; _ }) when not page.recycled ->
+               Effect.run (set_state (fun state ->
+                 let picker = state.filter_tag_picker in
+                 if state.modal <> Filters_sheet || picker.sheet_epoch <> sheet_epoch then state else
+                 let labels = (uuid, page.title) :: List.remove_assoc uuid picker.labels in
+                 { state with filter_tag_picker = { picker with labels } }))
+             | Ok _ -> Effect.run (set_state (fun state ->
+                 let picker = state.filter_tag_picker in
+                 if state.modal <> Filters_sheet || picker.sheet_epoch <> sheet_epoch then state else
+                 { state with filter_tag_picker = { picker with labels = List.remove_assoc uuid picker.labels } }))
+             | Error _ -> ());
+            resolve rest)
+    in
+    Effect.of_thunk (fun () -> resolve tags)
   in
   let handle_dispatch payload =
     let snapshot = !state_ref in
@@ -6583,6 +7014,7 @@ let start
           }
         | No_modal -> state
         | Capture_sheet -> step_root state Capture_closed
+        | Filters_sheet -> { state with modal = No_modal; filters = Timeline_filter.cancel state.filters }
         | Append_sheet | Status_sheet _ | Error_info | Cache_reset_confirmation _ ->
           { state with modal = No_modal })
     | Media_range (owner, first, last)
@@ -6889,6 +7321,70 @@ let start
         | Status_sheet "append-draft" -> { state with modal = Append_sheet }
         | Status_sheet _ -> { state with modal = No_modal }
         | _ -> state)
+    | Open_filters ->
+      let owner = current_owner () in
+      set_state_and_effect (fun state ->
+        if state.modal <> No_modal || not state.graph_ready || Journal_routes.destination state.routes <> Journals
+        then state, Effect.ignore else
+        let filters = Timeline_filter.open_sheet (Timeline_filter.cancel state.filters) in
+        incr filter_sheet_epoch;
+        let sheet_epoch = !filter_sheet_epoch in
+        let selected = Timeline_filter.tags (Timeline_filter.applied filters) in
+        let labels = List.filter (fun (id, _) -> List.mem id selected) state.filter_tag_picker.labels in
+        let picker = { sheet_epoch; search_epoch = 0; prefix = ""; labels; page = Tag_loading } in
+        { state with modal = Filters_sheet; filter_tag_picker = picker; filters },
+        Effect.many [ search_filter_tags ~owner picker ~after:None ~debounce:false
+                    ; resolve_filter_tag_labels ~owner ~sheet_epoch selected ])
+    | Edit_filters edit ->
+      update (fun state ->
+        if state.modal = Filters_sheet then { state with filters = Timeline_filter.edit state.filters edit } else state)
+    | (Edit_filter_tag_text _ | More_filter_tags | Retry_filter_tags) as action ->
+      let owner = current_owner () in
+      set_state_and_effect (fun state ->
+        let picker = state.filter_tag_picker in
+        let request = match action, picker.page with
+          | Edit_filter_tag_text prefix, _ when prefix <> picker.prefix -> Some (prefix, None, true)
+          | More_filter_tags, Tag_results { next = Some after; _ } -> Some (picker.prefix, Some after, false)
+          | Retry_filter_tags, Tag_failed _ -> Some (picker.prefix, None, false)
+          | _ -> None in
+        match state.modal, request with
+        | Filters_sheet, Some (prefix, after, debounce) ->
+          let picker = { picker with prefix; search_epoch = picker.search_epoch + 1; page = Tag_loading } in
+          { state with filter_tag_picker = picker }, search_filter_tags ~owner picker ~after ~debounce
+        | _ -> state, Effect.ignore)
+    | Pick_filter_tag tag ->
+      update (fun state ->
+        match state.modal, Timeline_filter.sheet state.filters, state.filter_tag_picker.page with
+        | Filters_sheet, Some draft, Tag_results { items; _ }
+          when List.mem tag items && not (List.mem tag.uuid (Timeline_filter.draft_tags draft)) ->
+          let picker = state.filter_tag_picker in
+          let labels = (tag.uuid, tag.title) :: List.remove_assoc tag.uuid picker.labels in
+          { state with filter_tag_picker = { picker with labels };
+            filters = Timeline_filter.edit state.filters (Toggle_tag tag.uuid) }
+        | _ -> state)
+    | Close_filters sheet_epoch ->
+      update (fun state ->
+        if state.modal = Filters_sheet && state.filter_tag_picker.sheet_epoch = sheet_epoch
+        then { state with modal = No_modal; filters = Timeline_filter.cancel state.filters }
+        else state)
+    | Apply_filters sheet_epoch ->
+      set_state_and_effect (fun state ->
+        if state.modal <> Filters_sheet || state.filter_tag_picker.sheet_epoch <> sheet_epoch
+        then state, Effect.ignore else
+        match Timeline_filter.apply state.filters, state.graph_state.graph_id with
+        | Ok filters, Some graph_id when state.filters_restored
+            && Option.exists (fun calendar ->
+            try ignore (Timeline_filter.resolve_days (Timeline_filter.applied filters)
+                          ~today:(Journal_calendar.local_day calendar)); true
+            with Invalid_argument _ -> false) state.calendar ->
+          let changed = Timeline_filter.applied filters <> Timeline_filter.applied state.filters in
+          let next = if not changed then { state with modal = No_modal; filters } else
+            { state with modal = No_modal; filters; feed_loaded = false; feed_refresh = None
+            ; timeline = Journal_timeline_state.empty ~today:(Option.fold ~none:0 ~some:Journal_calendar.local_day state.calendar)
+            ; timeline_structure_revision = state.timeline_structure_revision + 1
+            ; presented_feed_context = None } in
+          next, Effect.of_thunk (fun () -> save_filters graph_id (Timeline_filter.applied filters))
+        | _ -> state, Effect.ignore)
     | Open_diagnostics ->
       set_state_and_effect (fun state ->
         let admission_refresh, directive =
@@ -7187,6 +7683,7 @@ let start
               }
               request)
        | No_modal, _, _, _, _
+       | Filters_sheet, _, _, _, _
        | Capture_sheet, _, _, _, _
        | Append_sheet, _, _, _, _
        | Diagnostics, _, _, _, _
@@ -7391,6 +7888,7 @@ let start
     Option.iter activate_runtime (timeline_scope model);
     let before = model in
     let model,eff=transition model in
+    let model = restore_filters model in
     match !before_transition_effect before model with
     | Error cause ->
       let message = "Nothing was submitted. " ^ cause in
@@ -7670,6 +8168,7 @@ let start
       && same_actions left right
       && left.reference_sources == right.reference_sources
       && left.task_catalog.definitions == right.task_catalog.definitions
+      && Timeline_filter.applied left.filters = Timeline_filter.applied right.filters
       && left.feed_loaded = right.feed_loaded
       && left.graph_error == right.graph_error
       && (Option.is_none left.graph_error
@@ -7976,6 +8475,7 @@ let start
               (error_info_available state)
             ~on_error_info:(bind_action dispatch Open_error_info)
             ~account_menu_available:true
+            ~filter_count:(Timeline_filter.active_count (Timeline_filter.applied state.filters))
             ~on_account_action:dispatch
             ~cache_reset_available:(local_deletion_available state)
     in
@@ -8143,6 +8643,7 @@ let start
       in
       match state.modal with
       | No_modal -> None
+      | Filters_sheet -> None
       | Capture_sheet ->
         if state.environment.platform = "ios"
         then None
@@ -8194,6 +8695,7 @@ let start
     in
     let modal_title = function
       | No_modal -> ""
+      | Filters_sheet -> "Filters"
       | Capture_sheet -> "Capture"
       | Append_sheet -> "Append"
       | Status_sheet _ -> "Set status"
@@ -8268,6 +8770,20 @@ let start
         ; settings
         ]
     in
+    let body = V.of_lui (fun context parent ->
+      let presentation = Signal.map (fun current ->
+        match current.modal, Timeline_filter.sheet current.filters with
+        | Filters_sheet, Some draft -> filters_page current dispatch draft
+        | _ -> {|{"mode":"filter-overlay"}|}, Fun.const ()) model_signal in
+      let payload = Signal.map fst presentation in
+      Signal.on_dispose context.Lui_ui.ui_scope (fun () ->
+        Signal.dispose_signal payload;
+        Signal.dispose_signal presentation);
+      Journal_lui_native.mount ~key:"journal-filter-overlay"
+        ~payload:(Signal.sample payload) ~payload_signal:payload
+        ~children:[ Journal_view.mount body ]
+        ~on_event:(fun event -> snd (Signal.sample presentation) event)
+        Journal_lui_native.chrome_identifier context parent) in
     V.Body.theme ~data:(application_theme ()) (V.Body.static body)
   in
   let show_graphs state =
@@ -8626,6 +9142,7 @@ let create
   let init platform_code host_code payload =
     latest_patch := "";
     Printexc.record_backtrace true;
+    let filter_preferences, payload = Timeline_filter_preferences.unwrap_startup payload in
     (match decode_config (Bytes.of_string payload) with
      | Error source -> raise (Journal_bridge.initialization_failure Decode_startup source)
      | Ok config ->
@@ -8642,6 +9159,7 @@ let create
                   ~on_view_region
                   ~on_platform_request
                   ~calendar_sampler:(calendar_sampler ())
+                  ~filter_preferences
                   ~client
                   ~platform_code
                   ~host_code);
@@ -8895,6 +9413,7 @@ module For_testing = struct
       ~error_info_available:true
       ~on_error_info:handler
       ~account_menu_available:true
+      ~filter_count:0
       ~on_account_action:(ignore_dispatch handler)
       ~cache_reset_available:false
     |> fun page ->

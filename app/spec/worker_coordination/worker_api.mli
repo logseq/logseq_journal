@@ -290,6 +290,12 @@ type 'a query = 'a Worker_effect_authority.query =
       }
       -> Worker_pure_data.tree_member slice query
   | Favorites : Worker_pure_data.favorite_item continuation option -> favorites query
+  | Tag_search :
+      { prefix : string; after : Graph.tag_summary continuation option }
+      -> Graph.tag_summary slice query
+  (** Graph-wide class search. Empty prefix browses all classes. Supply at most
+      1024 prefix bytes and 200 items; reuse the same normalized prefix and
+      budget with [next]. Restart at [None] after a stale continuation. *)
   | Task_statuses :
       Graph.task_status_definition continuation option
       -> task_status_catalog query

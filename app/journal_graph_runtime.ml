@@ -444,6 +444,7 @@ let reset t =
   Favorites.reset t.favorites;
   Hashtbl.clear t.changed_point_epochs;
   Confirmation.reset t.confirmations;
+  Feed.set_filter t.feed ~tags:[] ~statuses:[] ~days:None;
   Feed.reset t.feed
 ;;
 
@@ -707,6 +708,8 @@ let page_of_graph_page (page : Graph.page) =
   Projection.page_of_summary summary
 ;;
 
+let set_timeline_filter t ~tags ~statuses ~days = Feed.set_filter t.feed ~tags ~statuses ~days
+
 let feed_ports t =
   Feed.
     { now = (fun () -> t.next_request)
@@ -765,6 +768,8 @@ let feed_output ?source (value : Feed.output) =
       Rrbvec.to_list
         (Rrbvec.map
            (function
+             | Feed.Refresh_started request_generation ->
+               response (Feed_refresh_started {request_generation})
              | Feed.Loaded { request_generation; feed; complete } ->
                response (Feed_loaded { request_generation; feed; complete })
              | Reconciled { page; value } ->

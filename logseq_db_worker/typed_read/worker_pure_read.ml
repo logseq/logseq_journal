@@ -158,12 +158,17 @@ module Timeline = struct
     | Read_failed of worker_error
     | Limit_exceeded of string
     | Invalid_source_reply of string
-  type 'a receipt = { owner : session; query : 'a query; version : string }
+  type 'a receipt = { owner : session; query : 'a query; version : string; coverage : string option; coverage_only : bool }
   type 'a cursor = { receipt : 'a receipt; position : string }
   type 'a remaining = End | More of 'a cursor
   type 'a packet = { items : 'a Rrbvec.t; receipt : 'a receipt; next : 'a remaining }
   type packed_receipt = Receipt : 'a receipt -> packed_receipt
   type check = { results : (unit, error) result Rrbvec.t }
+  let coverage (receipt : 'a receipt) =
+    Option.map (fun version -> Receipt {receipt with version;coverage=None;coverage_only=true}) receipt.coverage
+  let equal_coverage (Receipt left) (Receipt right) =
+    left.coverage_only && right.coverage_only && left.version = right.version
+    && left.owner = right.owner
   let maximum_receipts = 4096
   let dates ~from_day ~through_day = Dates { from_day; through_day }
   let roots ~page = Roots page
@@ -223,6 +228,9 @@ module Timeline = struct
       `Int owner.account;`Intlit(Int64.to_string owner.lifecycle);`Int owner.generation]
   let receipt_json receipt = `Assoc ["owner",owner_json receipt.owner;
     "query",query_json receipt.query;"version",`String receipt.version]
+    |> (function `Assoc fields when receipt.coverage_only -> `Assoc (("coverageOnly",`Bool true)::fields)
+      | `Assoc fields when Option.is_some receipt.coverage -> `Assoc (("coverage",`String (Option.get receipt.coverage))::fields)
+      | value -> value)
   let cursor_json (cursor:'a cursor) = `Assoc ["receipt",receipt_json cursor.receipt;"position",`String cursor.position]
   let packet_json : type a. a query -> a packet -> Yojson.Safe.t = fun query packet ->
     let encode : a -> Yojson.Safe.t = match query with
@@ -284,6 +292,9 @@ type _ query =
       }
       -> Worker_pure_data.tree_member slice query
   | Favorites : Worker_pure_data.favorite_item continuation option -> favorites query
+  | Tag_search :
+      { prefix : string; after : Graph.tag_summary continuation option }
+      -> Graph.tag_summary slice query
   | Task_statuses :
       Graph.task_status_definition continuation option
       -> task_status_catalog query
@@ -324,6 +335,7 @@ let query_result_equality : type a b. a query -> b query -> (a, b) equality opti
   | Child_members _, Child_members _ -> Some Refl
   | Tree _, Tree _ -> Some Refl
   | Favorites _, Favorites _ -> Some Refl
+  | Tag_search _, Tag_search _ -> Some Refl
   | Task_statuses _, Task_statuses _ -> Some Refl
   | Task_status_definitions _, Task_status_definitions _ -> Some Refl
   | Asset_descriptors _, Asset_descriptors _ -> Some Refl
@@ -419,7 +431,9 @@ let change_ack_through (a : change_ack) = a.through
 
 module For_worker = struct
   let timeline_check results : Timeline.check = {results}
-  let timeline_receipt ~owner ~query ~version : 'a Timeline.receipt = {owner;query;version}
+  let timeline_receipt ~owner ~query ~version : 'a Timeline.receipt = {owner;query;version;coverage=None;coverage_only=false}
+  let with_timeline_coverage (receipt : 'a Timeline.receipt) coverage = {receipt with coverage=Some coverage}
+  let timeline_receipt_is_coverage (receipt : 'a Timeline.receipt) = receipt.coverage_only
   let timeline_packet ~receipt ~items ~next : 'a Timeline.packet =
     {items;receipt;next=(match next with None->Timeline.End|Some position->More {receipt;position})}
   let timeline_cursor_position (cursor:'a Timeline.cursor) = cursor.position
@@ -473,7 +487,7 @@ end
 let smaller_page_size : type a. a query -> int -> int option = fun query count ->
   match query with
   |Journals _|Block_summary _|Children _|Child_members _|Tree _|Favorites _
-  |Task_statuses _|Assets _|Changes _->if count>1 then Some(max 1(count/2))else None
+  |Tag_search _|Task_statuses _|Assets _|Changes _->if count>1 then Some(max 1(count/2))else None
   |Timeline_read _|Timeline_check _|Graph_info|Admission|Journal _|Page _|Outline_block _|Task_status_definitions _|Asset_descriptors _->None
 ;;
 
@@ -501,6 +515,7 @@ let query_json : type a. read_budget -> a query -> Graph.Cursor.t option -> Yojs
     |Child_members{parent;revision=version;_}->"Child_members",page["parent",Uuid.to_yojson parent;"revision",revision version]
     |Tree{page=root;maximum_depth;revision=version;_}->"Tree",page["page",Uuid.to_yojson root;"maximum_depth",integer maximum_depth;"revision",revision version]
     |Favorites _->"Favorites",page[]
+    |Tag_search{prefix;_}->"Tag_search",page["prefix",text (Logseq_db_types.Tag_catalog.normalize prefix)]
     |Task_statuses _->"Task_statuses",page[]
     |Task_status_definitions statuses->"Task_status_definitions",["statuses",ids statuses]
     |Asset_descriptors assets->"Asset_descriptors",["assets",ids assets]
@@ -527,6 +542,7 @@ let query_cursor : type a. session -> read_budget -> a query -> (Graph.Cursor.t 
   |Child_members{after;_}->check after
   |Tree{after;_}->check after
   |Favorites after->check after
+  |Tag_search{after;_}->check after
   |Task_statuses after->check after
   |Assets{after;_}->check after
   |_->Ok None
@@ -543,6 +559,7 @@ let checked_query : type a. session -> read_budget -> a query -> (Graph.Cursor.t
   if not(equal_session session budget.owner) then Error Revoked_session
   else if count>budget.maximum_items then Error(Invalid_input "Lookup exceeds item budget") else
   let valid=match query with
+    |Tag_search{prefix;_}->String.length prefix <= 1024 && budget.maximum_items <= 200
     |Assets{roots;_}->List.compare_length_with roots Data.maximum_filter_values<=0
     |Tree{maximum_depth;_}->maximum_depth>=0 && maximum_depth<=Data.maximum_tree_depth
     |_->true in
@@ -600,6 +617,7 @@ let value_json : type a. a query -> a -> Yojson.Safe.t = fun query value->
   |Favorites _->`Assoc[
     "favorites_page",json_optional Uuid.to_yojson value.favorites_page;"generation",`String value.generation;
     "projection_revision",`String value.projection_revision;"items",json_list Data.favorite_item_to_yojson value.items;"next",continuation_json value.next]
+  |Tag_search _->slice_json Graph.tag_summary_to_yojson value
   |Task_statuses _->`Assoc[
     "property_uuid",json_optional Uuid.to_yojson value.property_uuid;"default_status",json_optional Uuid.to_yojson value.default_status;
     "items",json_list Graph.task_status_definition_to_yojson value.items;"next",continuation_json value.next]
@@ -628,6 +646,7 @@ let validate_value : type a. session -> read_budget -> a query -> a -> (unit,err
     |Child_members _->List.length value.items
     |Tree _->List.length value.items
     |Favorites _->List.length value.items
+    |Tag_search _->List.length value.items
     |Task_statuses _->List.length value.items
     |Task_status_definitions _->List.length value
     |Asset_descriptors _->List.length value.items
@@ -638,7 +657,11 @@ let validate_value : type a. session -> read_budget -> a query -> a -> (unit,err
   let page_matches uuid = function Data.V2_present_page{page;_}->Uuid.equal uuid page.uuid|V2_missing_page{uuid=actual;_}->Uuid.equal uuid actual in
   let matches=match query with
     |Timeline_read{query;_}->(match value with Error _->true|Ok packet->
-      equal_session session packet.receipt.owner && Timeline.equal_query query packet.receipt.query)
+      not packet.receipt.coverage_only
+      && equal_session session packet.receipt.owner && Timeline.equal_query query packet.receipt.query
+      && (match packet.next with
+        | Timeline.End -> true
+        | Timeline.More cursor -> cursor.receipt = packet.receipt))
     |Timeline_check receipts->Rrbvec.length receipts=Rrbvec.length value.Timeline.results
     |Graph_info->Uuid.equal session.graph value.graph_uuid
     |Page{uuid;_}->page_matches uuid value

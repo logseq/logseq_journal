@@ -637,6 +637,7 @@ let run_favorites_native_visibility
       ?(check_pending_changes = false)
       ?(check_import_recovery = false)
       ?malformed_native_event
+      ?(check_filter_dismissal = false)
       ?(check_ios_capture = false)
       ?(check_capture_imports = false)
       ?capture_case
@@ -2130,6 +2131,36 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          has_root "Favorites"
          && Option.is_some (find "text" "Timeline fixture 2"));
+       if check_filter_dismissal then (
+         let open Yojson.Safe.Util in
+         let chrome mode predicate =
+           Hashtbl.fold (fun id values found ->
+             match List.assoc_opt "_extension" values, List.assoc_opt "payload" values with
+             | Some (`String "journal-chrome"), Some (`String text) ->
+               let json = Yojson.Safe.from_string text in
+               if member "mode" json = `String mode && predicate json then Some (id, json) else found
+             | _ -> found) props None in
+         let sheet () = chrome "filter-overlay" (fun json -> member "choices" json <> `Null) in
+         let send (node, _) id payload =
+           hooks.extension_event node "event"
+             (Yojson.Safe.to_string (`Assoc ["id", `Int id; "payload", `String payload])) |> consume in
+         let open_sheet () =
+           send (Option.get (chrome "filter-trigger" (fun json -> member "enabled" json = `Bool true))) 1 "open";
+           wait "filter sheet opens" (fun () -> Option.is_some (sheet ()));
+           let presentation = Option.get (sheet ()) in
+           presentation, to_int (member "sheetEpoch" (snd presentation)) in
+         let first, first_epoch = open_sheet () in
+         send first first_epoch "cancel";
+         wait "current Cancel closes the sheet" (fun () -> Option.is_none (sheet ()));
+         let second, second_epoch = open_sheet () in
+         send second first_epoch "cancel";
+         Alcotest.(check bool) "late dismissal leaves the replacement open" true (Option.is_some (sheet ()));
+         wait "replacement Apply is enabled" (fun () ->
+           Option.exists (fun (_, json) -> member "enabled" json = `Bool true) (sheet ()));
+         send second first_epoch "apply";
+         Alcotest.(check bool) "stale Apply leaves the replacement open" true (Option.is_some (sheet ()));
+         send second second_epoch "apply";
+         wait "current Apply closes the replacement" (fun () -> Option.is_none (sheet ())));
        if check_asset_scan_owner || (Option.is_some asset_change && asset_change<>Some `Unconfigured) then (
          let settings=Option.get(find "_extension" "journal-asset-settings") in
          hooks.extension_event settings "event"
@@ -6014,7 +6045,7 @@ let test_root_capture_placement () =
               ~key:(Journal_view.Key.string "capture-placement") ~platform
               ~context:(if favorites then Journal_header.Context.favorites else Journal_header.Context.journals)
               ~sync_phase:None ~sync_error:None ~on_error_info:None ~on_account_action:None
-              ~local_deletion_available:false ~on_journals:noop ~on_favorites:noop
+              ~local_deletion_available:false ~filter_control:None ~on_journals:noop ~on_favorites:noop
               ~on_capture:noop ~capture_enabled ~capture_expanded:None
               ~body:(Journal_view.View.text "Root body"))) in
         Fun.protect ~finally:(fun () -> ignore (Lui_app.dispose app)) (fun () ->
@@ -6201,6 +6232,7 @@ let test_reactive_header_current_controls () =
               ~on_error_info:(Some (handler (fun () -> incr error_count)))
               ~on_account_action:(Some (fun _ -> ()))
               ~local_deletion_available:false
+              ~filter_control:None
               ~on_journals:noop
               ~on_favorites:noop
               ~on_capture:(handler (fun () -> incr capture_count))
@@ -8560,6 +8592,9 @@ let () =
     "application view"
     [ ( "Worker admission owner", [
       Alcotest.test_case "exclusive channel response routing" `Quick test_worker_response_routing])
+    ; ( "Timeline filter dismissal", [
+      Alcotest.test_case "late dismissal cannot close replacement" `Quick
+        (fun () -> run_favorites_native_visibility ~check_filter_dismissal:true ()) ])
     ; ( "diagnostic identity", [ Alcotest.test_case "actual worker identity" `Quick test_diagnostic_identity_comes_from_worker ])
     ; ( "diagnostic failure", [
       Alcotest.test_case "integrity attention survives read success and bounded history" `Quick test_integrity_attention_survives_unrelated_read_success;

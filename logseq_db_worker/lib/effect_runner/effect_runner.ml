@@ -1563,6 +1563,14 @@ let read_typed
                 Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision})items),
                 Option.map Database.member_position_to_string next) in
           let receipt=F.timeline_receipt ~owner ~query:timeline_query ~version in
+          let receipt = match timeline_query with
+            | Preview_children _ -> Ok receipt
+            | Dates _ | Roots _ ->
+              Database.timeline_scope_version snapshot Journal_root_membership
+              |> Result.map_error source_error
+              |> Result.map (fun coverage -> F.with_timeline_coverage receipt
+                (Database.timeline_scope_version_to_string coverage)) in
+          Result.bind receipt (fun receipt ->
           let rec bounded limit = Result.bind(read timeline_query limit)(fun(items,next)->
             if Rrbvec.length items>limit then Error(Timeline.Invalid_source_reply "Timeline source exceeded its item bound") else
             let packet=F.timeline_packet ~receipt ~items ~next in
@@ -1570,14 +1578,15 @@ let read_typed
             then Ok packet
             else if limit>1 then bounded(max 1(limit/2))
             else Error(Timeline.Limit_exceeded "Timeline packet exceeds its final encoded byte bound")) in
-          bounded limit)) in
+          bounded limit))) in
       Ok value)
     |Read.Timeline_check receipts->with_snapshot(fun snapshot _ _ ->
       let module Timeline=Read.Timeline in
       let check (Timeline.Receipt receipt) =
         if not(Read.equal_session owner(F.timeline_receipt_owner receipt))
         then Error(Timeline.Invalidated Owner_changed) else
-        let scope=match F.timeline_receipt_query receipt with
+        let scope=if F.timeline_receipt_is_coverage receipt then Database.Journal_root_membership
+          else match F.timeline_receipt_query receipt with
           |Timeline.Dates _->Database.Journal_index
           |Roots page->Page_roots page|Preview_children parent->Parent_children parent in
         match Database.timeline_scope_version snapshot scope with
@@ -1674,6 +1683,10 @@ let read_typed
             membership_revision=Overlay.Block_state_revision.to_string item.membership_revision;target})result.items in
         F.favorites ~favorites_page:result.favorites_page ~items ~next:(next result.next_cursor)
           ~generation:(Overlay.Generation.to_string result.version.generation) ~projection_revision:(Overlay.Projection_revision.to_string result.version.projection_revision)))
+    |Tag_search{prefix;_}->with_snapshot(fun snapshot _ limit->
+      Database.get_timeline_filter_tags snapshot ~prefix ~limit ~cursor
+      |> Result.map_error typed_read_error
+      |> Result.map(fun (items, next_cursor)->F.slice ~items ~next:(next next_cursor)))
     |Task_statuses _->with_snapshot(fun snapshot _ limit->
       Database.get_task_statuses snapshot ~limit ~cursor |>Result.map_error typed_read_error |>Result.map(fun (result:Overlay.task_status_catalog_result)->
         F.task_status_catalog ~property_uuid:result.property_uuid ~default_status:result.default_status ~items:result.items ~next:(next result.next_cursor)))

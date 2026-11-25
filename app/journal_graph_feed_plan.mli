@@ -12,6 +12,7 @@ module Worker = Journal_worker_coordination.Worker_api
 type operation
 type failure_scope = Feed of int64 | Day of { day : int; request_generation : int64 } | Reconciliation
 type publication =
+  | Refresh_started of int64
   | Loaded of { request_generation : int64; feed : Projection.feed; complete : bool }
   | Reconciled of { page : Projection.page; value : Projection.timeline_entry_page }
   | Failed of { scope : failure_scope; stale_cursor : bool; message : string; cause : Worker.error option }
@@ -67,6 +68,9 @@ val load_feed : t -> ports:ports -> cursor:Projection.feed_cursor option -> root
 val load_day : t -> ports:ports -> page:Projection.page -> after:Projection.block_cursor option -> limit:int -> request_generation:int64 -> output
 val refresh_initial : t -> ports:ports -> request_generation:int64 -> output option
 val reconcile_page : t -> ports:ports -> page:Projection.page -> limit:int -> Graph.Uuid.t option
+
+val set_filter : t -> tags:Graph.Uuid.t list -> statuses:Graph.Uuid.t list -> days:(int * int) option -> unit
+(** Replace the root restriction and revoke the retained window when it changes. *)
 
 val validate_retained : t -> ports:ports -> request_generation:int64 -> refresh:bool -> output
 

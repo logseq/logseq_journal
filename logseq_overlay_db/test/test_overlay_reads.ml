@@ -1832,4 +1832,88 @@ let cases =
   ]
 ;;
 
-let () = Alcotest.run "logseq_overlay_db reads" [ "public reads", cases ]
+module Tag_catalog = Logseq_db_types.Tag_catalog
+
+let tag_catalog_paging () =
+  let tag uuid title : Graph.tag_summary = { uuid; title; ident = None } in
+  let first = tag T.page_uuid " Alpha" in
+  let second = tag T.missing_page_uuid "alpha" in
+  let other = tag T.block_uuid "Zulu" in
+  let build () =
+    Tag_catalog.create ~maximum_candidates:3 (List.to_seq [ other; second; first ])
+    |> T.require_ok ~behavior:"build bounded tag catalogue"
+  in
+  let catalog = build () in
+  let page catalog prefix after = Tag_catalog.search catalog ~prefix ~limit:1 ~after in
+  let ordered = List.sort (fun (a : Graph.tag_summary) (b : Graph.tag_summary) ->
+    Graph.Uuid.compare a.uuid b.uuid) [ first; second ] in
+  let rows, after = page catalog " AL " None |> T.require_ok ~behavior:"first prefix page" in
+  T.require (rows = [ List.hd ordered ]) "equal normalized labels were not UUID ordered";
+  T.require (Option.is_some after) "first page lost its continuation";
+  T.require
+    (page catalog "al" after = Ok ([ List.nth ordered 1 ], None))
+    "normalized prefix did not resume to the final match";
+  T.require (page catalog "z" after = Error Tag_catalog.Invalid_cursor) "different prefix reused cursor";
+  T.require (page (build ()) "al" after = Error Tag_catalog.Invalid_cursor) "different index reused cursor";
+  T.require (page catalog "zz" None = Ok ([], None)) "nonmatching prefix returned a row";
+  T.require
+    (Tag_catalog.search catalog ~prefix:"" ~limit:201 ~after:None = Error Tag_catalog.Invalid_limit)
+    "oversized page was accepted"
+;;
+
+let tag_catalog_candidate_budget () =
+  let tag : Graph.tag_summary = { uuid = T.page_uuid; title = "Alpha"; ident = None } in
+  let rec candidates count () =
+    if count > 3 then Alcotest.fail "catalogue read beyond its overflow sentinel";
+    Seq.Cons (tag, candidates (count + 1))
+  in
+  T.require
+    (Tag_catalog.create ~maximum_candidates:2 (candidates 1) = Error Tag_catalog.Candidate_limit_exceeded)
+    "catalogue silently truncated overflowing candidates"
+;;
+
+let graph_tag_search database =
+  let module J = Transit_core.Json in
+  let behavior = "graph-wide tag search" in
+  let id n = T.uuid (Printf.sprintf "77000000-0000-4000-8000-%012d" n) in
+  let add n = T.status_add (J.Int (31000 + n)) in
+  let page n title =
+    [ add n "block/uuid" (J.Uuid (Graph.Uuid.to_string (id n)))
+    ; add n "block/name" (J.String (Printf.sprintf "fixture-%d" n))
+    ; add n "block/title" (J.String title) ] in
+  let class_tag n = add n "block/tags" (J.Array [J.Keyword "db/ident"; J.Keyword "logseq.class/Tag"]) in
+  T.apply_test_transaction database ~cursor:1
+    (page 1 "Alpha" @ page 2 "alpha" @ page 3 "Alphabet ordinary page"
+     @ [class_tag 1; class_tag 2]);
+  let with_snapshot f =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () -> f snapshot) in
+  let read snapshot prefix cursor = Database.get_timeline_filter_tags snapshot ~prefix ~limit:1 ~cursor in
+  let next = with_snapshot (fun snapshot ->
+    let first, next = read snapshot " AL " None |> T.require_ok ~behavior in
+    let second, done_ = read snapshot "al" next |> T.require_ok ~behavior in
+    let ids rows = List.map (fun (row : Graph.tag_summary) -> row.uuid) rows in
+    T.require (ids first = [id 1] && ids second = [id 2] && done_ = None)
+      "unused classes should page in UUID order and exclude ordinary pages";
+    T.require (Option.is_some next && Result.is_error (read snapshot "other" next))
+      "tag cursor escaped its prefix";
+    next) in
+  T.apply_test_transaction database ~cursor:2
+    [T.status_add (T.status_lookup (id 2)) "block/title" (J.String "Zulu")];
+  with_snapshot (fun snapshot ->
+    match read snapshot "al" next with
+    | Error Stale_read_cursor -> ()
+    | _ -> Alcotest.fail "a renamed tag did not invalidate continuation")
+;;
+
+let () =
+  Alcotest.run "logseq_overlay_db reads"
+    [ "public reads", cases
+    ; "graph tag search", [ Alcotest.test_case "graph-wide stable paging" `Quick
+        (fun () -> T.with_database ~behavior:"graph-wide tag search" graph_tag_search) ]
+    ; "tag catalogue",
+      [ Alcotest.test_case "prefix paging and cursor isolation" `Quick tag_catalog_paging
+      ; Alcotest.test_case "bounded catalogue construction" `Quick tag_catalog_candidate_budget
+      ]
+    ]
+;;
