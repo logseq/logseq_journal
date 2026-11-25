@@ -775,7 +775,7 @@ module Asset_cache = struct
       if
         budget_bytes < 0L
         || maximum_file_bytes < 0
-        || maximum_file_bytes > 100 * 1024 * 1024
+        || maximum_file_bytes > 200 * 1024 * 1024
       then Error (Invalid "Invalid cache size limits")
       else (
         let directory =

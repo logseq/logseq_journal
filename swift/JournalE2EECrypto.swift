@@ -1217,9 +1217,9 @@ public func logseqJournalCryptoBinary(
     outputLength?.pointee = -1
     guard let key, let input, let outputLength,
       keyLength == 32, inputLength >= 0,
-      (sealing == 1 && ivLength == 0 && inputLength <= 8 * 1024 * 1024)
+      (sealing == 1 && ivLength == 0 && inputLength <= 200 * 1024 * 1024)
         || (sealing == 0 && ivLength == 12 && inputLength >= 16
-          && inputLength <= 8 * 1024 * 1024 + 16)
+          && inputLength <= 200 * 1024 * 1024 + 16)
     else { return nil }
     outputLength.pointee = -4
     do {

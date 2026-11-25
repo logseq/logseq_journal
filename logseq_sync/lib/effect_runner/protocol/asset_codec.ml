@@ -8,7 +8,7 @@ type crypto =
 
 let checksum bytes = Digestif.SHA256.(to_hex (digest_string bytes))
 let ( let* ) = Result.bind
-let limit maximum = maximum >= 0 && maximum <= 100 * 1024 * 1024
+let limit maximum = maximum >= 0 && maximum <= 200 * 1024 * 1024
 
 let encode ~maximum_plaintext_bytes ~crypto ~key bytes =
   if

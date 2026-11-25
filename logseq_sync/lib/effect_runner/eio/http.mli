@@ -1,11 +1,13 @@
 type operation =
   | Get
   | Put of string
+  | Post of string
 
 type expected_content_type =
   | Structured_response
   | Snapshot_artifact
   | Asset_binary
+  | Asset_download of { estimated_wire_bytes : int option }
 
 type request =
   { operation : operation

@@ -27,9 +27,8 @@ let scope : C.graph_scope =
   }
 ;;
 
-let intent =
-  get
-    (I.prepare
+let prepare size =
+  I.prepare
        ~replace_reference:None
        ~operation_id:(uuid 2)
        ~origin:"https://sync.example"
@@ -38,11 +37,40 @@ let intent =
        ~asset:(uuid 3)
        ~version:(get (A.version ~checksum:(String.make 64 'a') ~file_type:"png"))
        ~title:"Fixture image"
-       ~size:4L
+       ~size
        ~staged_file:"staged-file"
        ~target:(uuid 4)
        ~local_mutation:(uuid 5)
-       ~metadata_mutation:(uuid 6))
+       ~metadata_mutation:(uuid 6)
+;;
+
+let intent = get (prepare 4L)
+
+let durable_size_boundary () =
+  let maximum = 209715200L in
+  let prepared =
+    match prepare maximum with
+    | Ok prepared -> prepared
+    | Error message -> Alcotest.fail message
+  in
+  let uploading = get (I.advance (get (I.advance prepared Local_committed)) Uploading) in
+  let encoded = I.Pure_codec.encode uploading in
+  Alcotest.(check bool) "exact ceiling survives recovery" true
+    (I.Pure_codec.decode encoded = Ok uploading);
+  Alcotest.(check bool) "prepare rejects ceiling plus one" true
+    (Result.is_error (prepare (Int64.succ maximum)));
+  let oversized =
+    let rec replace index =
+      if index + 9 > String.length encoded then Alcotest.fail "missing size"
+      else if String.sub encoded index 9 = "209715200" then
+        String.sub encoded 0 index ^ "209715201" ^
+        String.sub encoded (index + 9) (String.length encoded - index - 9)
+      else replace (index + 1)
+    in
+    replace 0
+  in
+  Alcotest.(check bool) "recovery rejects ceiling plus one" true
+    (Result.is_error (I.Pure_codec.decode oversized))
 ;;
 
 let one = function
@@ -331,7 +359,9 @@ let pause_during_checkpoint () =
 let () =
   Alcotest.run
     "asset upload"
-    [ ( "public worker reducer"
+    [ ( "durable intent"
+      , [ Alcotest.test_case "200 MiB checkpoint boundary" `Quick durable_size_boundary ] )
+    ; ( "public worker reducer"
       , List.map
           (fun (n, f) -> Alcotest.test_case n `Quick f)
           [ "presentation status", presentation_status

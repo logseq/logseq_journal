@@ -180,7 +180,7 @@ let existing_directory path =
 
 let local_store
       ?(asset_cache_budget_bytes = 268435456L)
-      ?(asset_maximum_file_bytes = 8 * 1024 * 1024)
+      ?(asset_maximum_file_bytes = 200 * 1024 * 1024)
       ?(asset_pending_budget_bytes = 268435456L)
       ~application_support_directory
       ()
@@ -189,7 +189,7 @@ let local_store
     asset_cache_budget_bytes <= 0L
     || asset_cache_budget_bytes > 268435456L
     || asset_maximum_file_bytes <= 0
-    || asset_maximum_file_bytes > 8 * 1024 * 1024
+    || asset_maximum_file_bytes > 200 * 1024 * 1024
     || asset_pending_budget_bytes <= 0L
     || asset_pending_budget_bytes > 268435456L
   then Error (Invalid_dependency "Asset storage limits exceed the supported bounds")
@@ -335,8 +335,8 @@ type key_entry =
 (* Transfer lanes bound request counts; this shared semaphore bounds the
    in-flight byte footprint of those lanes. Each admitted download or upload
    reserves its worst-case wire plus plaintext footprint before buffers are
-   held, in 64 KiB units, so total asset memory stays bounded independently
-   of the lane permits. *)
+   held, in 64 KiB units. A larger transfer takes the entire budget so it
+   cannot overlap another transfer. *)
 let asset_byte_unit = 65536
 let asset_byte_budget_units = 1024
 
@@ -375,6 +375,7 @@ type t =
   ; mutable retired_websockets : Core.connection_scope list
   ; asset_download_slots : Eio.Semaphore.t
   ; asset_upload_slots : Eio.Semaphore.t
+  ; asset_large_slot : Eio.Semaphore.t
   ; asset_codec_slot : Eio.Semaphore.t
   ; asset_byte_budget : Eio.Semaphore.t
   ; asset_byte_reservation_lock : Eio.Semaphore.t
@@ -404,6 +405,7 @@ let create ?(on_asset_diagnostic=(fun ~scope:_ ~operation:_ ~request_operation:_
     ; retired_websockets = []
     ; asset_download_slots = Eio.Semaphore.make 3
     ; asset_upload_slots = Eio.Semaphore.make 1
+    ; asset_large_slot = Eio.Semaphore.make 1
     ; asset_codec_slot = Eio.Semaphore.make 1
     ; asset_byte_budget = Eio.Semaphore.make asset_byte_budget_units
     ; asset_byte_reservation_lock = Eio.Semaphore.make 1
@@ -1480,6 +1482,7 @@ let asset_decode_failure error =
   report_asset_failure ~reason:reason_name source;
   match error with
   | Asset_codec.Checksum_mismatch -> Core.Asset_checksum_mismatch
+  | Wire_too_large | Plaintext_too_large -> Core.Asset_size_rejected
   | _ -> Core.Asset_invalid_content Failure_diagnostic.(
     of_source ~operation:"assetDownload" ~reason:reason_name source |> encode)
 ;;
@@ -1515,10 +1518,8 @@ let asset_wire_bytes ~maximum_plaintext_bytes encrypted =
 ;;
 
 let with_byte_reservation t bytes work =
-  let units = (max bytes 0 + asset_byte_unit - 1) / asset_byte_unit in
-  if units > asset_byte_budget_units
-  then Error Core.Asset_size_rejected
-  else (
+  let units = min asset_byte_budget_units ((max bytes 0 + asset_byte_unit - 1) / asset_byte_unit) in
+  (
     let acquired = ref 0 in
     Fun.protect
       ~finally:(fun () ->
@@ -1539,13 +1540,14 @@ let fetch_asset_admitted
       ~cache
       ~encryption
       ~maximum_plaintext_bytes
+      ~estimated_wire_bytes
       ~current
       ~(scope : Core.graph_scope)
       ~asset
       ~(version : Logseq_db_types.Asset_descriptor.version)
   =
   let ( let* ) = Result.bind in
-  if maximum_plaintext_bytes < 0 || maximum_plaintext_bytes > 100 * 1024 * 1024
+  if maximum_plaintext_bytes < 0 || maximum_plaintext_bytes > 200 * 1024 * 1024
   then Error (Core.Asset_invalid_content "Invalid asset size limit")
   else
     let* graph_key = asset_graph_key t scope encryption in
@@ -1576,12 +1578,14 @@ let fetch_asset_admitted
             ; uri
             ; headers = [ "authorization", "Bearer " ^ token ]
             ; maximum_response_bytes
-            ; expected_content_type = Asset_binary
+            ; expected_content_type = Asset_download { estimated_wire_bytes }
             }
           in
           match t.dependencies.transport.perform_http ~sw:t.sw request with
           | Error message ->
-            last_failure := Core.Asset_network;
+            last_failure :=
+              (if message = "HTTP body exceeds its configured bound"
+               then Core.Asset_size_rejected else Core.Asset_network);
             Error (Request_failed message)
           | Ok response when response.status = 401 ->
             last_failure := Core.Asset_authentication;
@@ -1592,6 +1596,7 @@ let fetch_asset_admitted
           | Ok response -> Ok response)
       |> Result.map_error (fun cause ->
         let reason = match !last_failure with
+          | Core.Asset_size_rejected -> "sizeRejected"
           | Core.Asset_network -> "networkFailed"
           | Asset_revoked_access -> "revokedAccess"
           | _ -> "authenticationFailed" in
@@ -1651,30 +1656,37 @@ let fetch_asset
       ~current
       ~scope
       ~asset
-      ~version
+      ~(version : Logseq_db_types.Asset_descriptor.version)
   =
-  with_asset_slot t.asset_download_slots (fun () ->
-    if t.closed || not (current ())
-    then Error Core.Asset_cancelled
-    else (
-      let encrypted =
-        match encryption with
-        | Plaintext -> false
-        | Encrypted _ -> true
-      in
-      let reservation =
-        asset_wire_bytes ~maximum_plaintext_bytes encrypted + maximum_plaintext_bytes
-      in
-      with_byte_reservation t reservation (fun () ->
-        fetch_asset_admitted
-          t
-          ~cache
-          ~encryption
-          ~maximum_plaintext_bytes
-          ~current
-          ~scope
-          ~asset
-          ~version)))
+  let encrypted = match encryption with Plaintext -> false | Encrypted _ -> true in
+  let wire_bytes maximum_plaintext_bytes = asset_wire_bytes ~maximum_plaintext_bytes encrypted in
+  let estimated_wire_bytes =
+    match version.download_size_hint with
+    | Some size when size >= 0L ->
+      Some (wire_bytes (Int64.to_int (min size (Int64.of_int maximum_plaintext_bytes))))
+    | _ -> None
+  in
+  let fetch maximum_plaintext_bytes =
+    if t.closed || not (current ()) then Error Core.Asset_cancelled
+    else fetch_asset_admitted t ~cache ~encryption ~maximum_plaintext_bytes ~estimated_wire_bytes
+      ~current ~scope ~asset ~version
+  in
+  (* A small hint buys a concurrent, bounded buffer, not an exact-size check.
+     If that buffer is exceeded, fail without refetching. Without a hint, use
+     the single large permit for the full bound but keep the ordinary deadline.
+     Callers with a lower hard limit can reserve that amount directly. *)
+  let small_bound = 8 * 1024 * 1024 in
+  let small_limit =
+    match estimated_wire_bytes with
+    | Some bytes when bytes <= small_bound -> Some (min small_bound maximum_plaintext_bytes)
+    | None when maximum_plaintext_bytes <= 24 * 1024 * 1024 -> Some maximum_plaintext_bytes
+    | _ -> None
+  in
+  match small_limit with
+  | Some limit ->
+    with_asset_slot t.asset_download_slots (fun () ->
+      with_byte_reservation t (wire_bytes limit + limit) (fun () -> fetch limit))
+  | None -> with_asset_slot t.asset_large_slot (fun () -> fetch maximum_plaintext_bytes)
 ;;
 
 let close_asset_scope_checked ?except_id t scope =
@@ -1810,6 +1822,7 @@ let read_upload_source ~maximum_plaintext_bytes source_file =
          else (
            let bytes = really_input_string input stat.st_size in
            match input_char input with
+           | _ when stat.st_size = maximum_plaintext_bytes -> Error Core.Asset_size_rejected
            | _ -> Error (Core.Asset_invalid_content "Asset upload source grew during reading")
            | exception End_of_file -> Ok bytes))
   with
@@ -1824,10 +1837,9 @@ let read_upload_source ~maximum_plaintext_bytes source_file =
         (Printexc.to_string error) |> encode))
 ;;
 
-let put_asset_admitted
+let prepare_asset_upload
       t
       ~(context : Core.asset_context)
-      ~asset
       ~version
       ~source_file
       ~maximum_plaintext_bytes
@@ -1837,7 +1849,7 @@ let put_asset_admitted
   let valid () = (not t.closed) && current () in
   if not (valid ())
   then Error Core.Asset_cancelled
-  else if maximum_plaintext_bytes < 0 || maximum_plaintext_bytes > 100 * 1024 * 1024
+  else if maximum_plaintext_bytes < 0 || maximum_plaintext_bytes > 200 * 1024 * 1024
   then Error Core.Asset_size_rejected
   else (
     let encryption = if context.encrypted then Encrypted context.key else Plaintext in
@@ -1845,8 +1857,7 @@ let put_asset_admitted
       asset_graph_key t context.scope encryption
       |> Result.map_error (fun _ -> Core.Asset_locked)
     in
-    let* body =
-      with_asset_slot t.asset_codec_slot (fun () ->
+    with_asset_slot t.asset_codec_slot (fun () ->
         if not (valid ())
         then Error Core.Asset_cancelled
         else
@@ -1864,12 +1875,22 @@ let put_asset_admitted
               }
             in
             Asset_codec.encode ~maximum_plaintext_bytes ~crypto ~key:graph_key plaintext
+            |> Result.map (fun body -> String.length plaintext, body)
             |> Result.map_error (fun source ->
               Core.Asset_invalid_content Failure_diagnostic.(
                 of_source ~operation:"assetUpload" ~reason:(
                   if source = "Asset exceeds plaintext size limit" then "sizeRejected" else "cryptoInvalid")
-                  source |> encode))))
-    in
+                  source |> encode)))))
+;;
+
+let send_asset_upload
+      t ~(context : Core.asset_context) ~asset
+      ~(version : Logseq_db_types.Asset_descriptor.version) ~size ~body ~current
+  =
+  let ( let* ) = Result.bind in
+  let valid () = (not t.closed) && current () in
+  if not (valid ()) then Error Core.Asset_cancelled
+  else (
     let base_url = context.scope.account.managed_sync_origin in
     let* () =
       Http.validate_base_url base_url
@@ -1907,9 +1928,52 @@ let put_asset_admitted
               ; expected_content_type = Asset_binary
               }
             in
-            match t.dependencies.transport.perform_http ~sw:t.sw request with
+            let perform request = t.dependencies.transport.perform_http ~sw:t.sw request in
+            let control action =
+              let payload = Yojson.Safe.to_string (`Assoc
+                [ "action", `String action; "size", `Int size
+                ; "checksum", `String version.checksum ]) in
+              perform { request with operation = Post payload
+                ; headers = [ "authorization", "Bearer " ^ token
+                            ; "content-type", "application/json" ] }
+            in
+            let transfer () =
+              if String.length body <= 100 * 1024 * 1024 then perform request
+              else
+                let* plan = control "prepare" in
+                if plan.status < 200 || plan.status >= 300 then Ok plan
+                else if not (valid ()) then Error "Asset upload expired"
+                else
+                  let open Yojson.Safe.Util in
+                  try
+                    let json = Yojson.Safe.from_string plan.body in
+                    match json |> member "mode" |> to_string with
+                    | "present" -> control "complete"
+                    | "proxy" -> perform request
+                    | "direct" ->
+                      let uri = Uri.of_string (json |> member "url" |> to_string) in
+                      let allowed = [ "content-type"; "x-amz-meta-checksum"
+                        ; "x-amz-meta-size"; "x-amz-meta-type"; "if-match"; "if-none-match" ] in
+                      let headers = json |> member "headers" |> to_assoc
+                        |> List.map (fun (name, value) -> String.lowercase_ascii name, to_string value) in
+                      if Uri.scheme uri <> Some "https" || Uri.host uri = None
+                         || Uri.userinfo uri <> None || Uri.fragment uri <> None
+                         || not (List.for_all (fun (name, value) ->
+                           List.mem name allowed && not (String.exists (fun ch -> ch < ' ' || ch = '\127') value)) headers)
+                         || List.length headers <> List.length (List.sort_uniq String.compare (List.map fst headers))
+                      then Error "Invalid signed asset upload plan"
+                      else (
+                        match perform { request with uri; headers } with
+                        | Ok uploaded when uploaded.status = 412 || (uploaded.status >= 200 && uploaded.status < 300) ->
+                          if valid () then control "complete" else Error "Asset upload expired"
+                        | _ -> Error "Signed asset upload failed")
+                    | _ -> Error "Invalid asset upload plan"
+                  with Yojson.Json_error _ | Type_error _ | Invalid_argument _ ->
+                    Error "Invalid asset upload plan"
+            in
+            match transfer () with
             | Error message ->
-              failure := Core.Asset_network;
+              failure := (if valid () then Core.Asset_network else Core.Asset_cancelled);
               Error (Request_failed message)
             | Ok response when response.status = 401 ->
               failure := Core.Asset_authentication;
@@ -1954,22 +2018,34 @@ let put_asset
       ~maximum_plaintext_bytes
       ~current
   =
-  with_asset_slot t.asset_upload_slots (fun () ->
-    let reservation =
-      asset_wire_bytes
-        ~maximum_plaintext_bytes
-        (context.encrypted && Option.is_some context.key)
-      + maximum_plaintext_bytes
+  let prepare maximum_plaintext_bytes =
+    prepare_asset_upload t ~context ~version ~source_file ~maximum_plaintext_bytes ~current
+  in
+  let send (size, body) = send_asset_upload t ~context ~asset ~version ~size ~body ~current in
+  let large () =
+    with_asset_slot t.asset_large_slot (fun () ->
+      Result.bind (prepare maximum_plaintext_bytes) send)
+  in
+  if maximum_plaintext_bytes < 0 || maximum_plaintext_bytes > 200 * 1024 * 1024
+  then Error Core.Asset_size_rejected
+  else
+    let size =
+      try (Unix.stat source_file).st_size with Unix.Unix_error _ -> 8 * 1024 * 1024
     in
-    with_byte_reservation t reservation (fun () ->
-      put_asset_admitted
-        t
-        ~context
-        ~asset
-        ~version
-        ~source_file
-        ~maximum_plaintext_bytes
-        ~current))
+    let bound = min size maximum_plaintext_bytes in
+    if bound > 24 * 1024 * 1024 then large ()
+    else
+      let reservation = asset_wire_bytes ~maximum_plaintext_bytes:bound context.encrypted + bound in
+      match
+        with_asset_slot t.asset_upload_slots (fun () ->
+          with_byte_reservation t reservation (fun () ->
+            match prepare bound with
+            | Error Core.Asset_size_rejected when bound < maximum_plaintext_bytes -> None
+            | Error error -> Some (Error error)
+            | Ok prepared -> Some (send prepared)))
+      with
+      | None -> large ()
+      | Some result -> result
 ;;
 
 let staged_asset_path t ~scope ~file =

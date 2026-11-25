@@ -49,7 +49,7 @@ let prepare
     || (not (String.is_valid_utf_8 title))
     || String.contains title '\000'
     || size < 0L
-    || size > 104857600L
+    || size > 209715200L
     || staged_file = ""
     || staged_file <> Filename.basename staged_file
     || staged_file = "."

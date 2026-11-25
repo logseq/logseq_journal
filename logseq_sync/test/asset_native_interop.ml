@@ -47,7 +47,7 @@ let () =
   let key = read (path "key.bin") in
   reject
     "plaintext above the native attachment limit"
-    (crypto.encrypt ~key ~plaintext:(String.make ((8 * 1024 * 1024) + 1) 'x'));
+    (crypto.encrypt ~key ~plaintext:(String.make ((200 * 1024 * 1024) + 1) 'x'));
   reject "invalid key length" (crypto.encrypt ~key:"short" ~plaintext:"");
   reject
     "invalid nonce length"

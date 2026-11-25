@@ -50,7 +50,7 @@ CAMLprim value logseq_journal_crypto_binary_call(
     value encrypt, value key, value iv, value input) {
   CAMLparam4(encrypt, key, iv, input);
   CAMLlocal2(result, payload);
-  const size_t limit = 8 * 1024 * 1024;
+  const size_t limit = 200 * 1024 * 1024;
   const int sealing = Bool_val(encrypt);
   const size_t key_length = caml_string_length(key);
   const size_t iv_length = caml_string_length(iv);

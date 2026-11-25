@@ -135,7 +135,7 @@ let validate = function
     else validate_append_tree ~page root
   | Types.Insert_blocks { tree; asset; _ } ->
     (match asset with
-     | Some asset when tree.children <> [] || asset.size < 0L || asset.size > 104857600L
+     | Some asset when tree.children <> [] || asset.size < 0L || asset.size > 209715200L
        -> Error "Asset insertion requires one block and a bounded size"
      | None | Some _ -> Outliner.Validation.validate_tree tree)
   | Set_asset_reference _

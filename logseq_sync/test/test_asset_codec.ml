@@ -314,6 +314,16 @@ let transit_failures_never_become_raw () =
     (get (decode envelope))
 ;;
 
+let plaintext_size_boundary () =
+  let limit = 200 * 1024 * 1024 in
+  let bytes = String.make limit 'a' in
+  let encoded = get (C.encode ~maximum_plaintext_bytes:limit ~crypto ~key:None bytes) in
+  Alcotest.(check int) "exact limit accepted" limit (String.length encoded);
+  match C.encode ~maximum_plaintext_bytes:limit ~crypto ~key:None (bytes ^ "a") with
+  | Error "Asset exceeds plaintext size limit" -> ()
+  | _ -> Alcotest.fail "one byte over must be rejected"
+;;
+
 let () =
   Alcotest.run
     "asset codec"
@@ -332,6 +342,7 @@ let () =
             transit_failures_never_become_raw
         ; Alcotest.test_case "raw binary envelope" `Quick raw_bytes
         ; Alcotest.test_case "plaintext" `Quick plaintext
+        ; Alcotest.test_case "200 MiB boundary" `Slow plaintext_size_boundary
         ; Alcotest.test_case "invalid and oversized" `Quick validation
         ; Alcotest.test_case "bounded envelope shape" `Quick bounded_envelope_shape
         ] )

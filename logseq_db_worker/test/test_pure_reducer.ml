@@ -373,7 +373,7 @@ let test_current_deletion_preserves_work_until_retirement () =
 module Asset = Logseq_db_types.Asset_descriptor
 module Transfer = Logseq_sync_pure_reducer.Asset_transfer
 
-let asset_demand (scope : Sync.graph_scope) =
+let asset_demand ?size (scope : Sync.graph_scope) =
   let version =
     Asset.version ~checksum:(String.make 64 'a') ~file_type:"png" |> Result.get_ok
   in
@@ -382,7 +382,7 @@ let asset_demand (scope : Sync.graph_scope) =
       ~uuid:scope.Sync.graph_id
       ~source:(Managed (Some version))
       ~current_checksum:None
-      ~size:None
+      ~size
       ~dimensions:None
     |> Result.get_ok
   in
@@ -475,7 +475,8 @@ let asset_instructions effects =
 
 let test_asset_manual_retry_policy () =
   let state, scope = worker_open_graph () in
-  let demanded = Core.step state (asset_demand scope) in
+  let size = 25165824L in
+  let demanded = Core.step state (asset_demand ~size scope) in
   let local = lookup demanded.effects in
   let missing =
     Core.step
@@ -490,6 +491,8 @@ let test_asset_manual_retry_policy () =
       (asset_instructions missing.effects)
     |> Option.get
   in
+  Alcotest.(check (option int64)) "worker schedules with the descriptor size"
+    (Some size) download.version.download_size_hint;
   let failed =
     Core.step
       missing.next

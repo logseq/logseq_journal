@@ -157,6 +157,7 @@ let with_attempt ~sw ~authenticator ~network ~clock ~response_budget request ~co
                        match request.Http.operation with
                        | Get -> `GET
                        | Put _ -> `PUT
+                       | Post _ -> `POST
                      in
                      let response_handler response body =
                        guard (fun () ->
@@ -182,7 +183,7 @@ let with_attempt ~sw ~authenticator ~network ~clock ~response_budget request ~co
                      let request_headers =
                        match request.Http.operation with
                        | Get -> request.headers
-                       | Put bytes ->
+                       | Put bytes | Post bytes ->
                          ("content-length", string_of_int (String.length bytes))
                          :: request.headers
                      in
@@ -208,7 +209,7 @@ let with_attempt ~sw ~authenticator ~network ~clock ~response_budget request ~co
                      in
                      (match request.Http.operation with
                       | Get -> ()
-                      | Put bytes -> Httpun.Body.Writer.write_string writer bytes);
+                      | Put bytes | Post bytes -> Httpun.Body.Writer.write_string writer bytes);
                      Httpun.Body.Writer.close writer;
                      Eio.Promise.await completed;
                      Eio.Fiber.check ();
@@ -294,7 +295,7 @@ let follow_redirects attempt request =
       then
         if
           match request.Http.operation with
-          | Put _ -> true
+          | Put _ | Post _ -> true
           | Get -> false
         then Error "Asset uploads cannot redirect"
         else if remaining = 0
@@ -312,10 +313,24 @@ let protected f =
   | exception_ -> Error (exception_message exception_)
 ;;
 
+let response_deadline (request : Http.request) =
+  let asset_bytes =
+    match request.expected_content_type, request.operation with
+    | Asset_download { estimated_wire_bytes }, Get ->
+      Option.value estimated_wire_bytes ~default:0
+    | Asset_binary, Put bytes -> String.length bytes
+    | _ -> 0
+  in
+  if asset_bytes <= 8 * 1024 * 1024
+  then 30.
+  else 30. +. (Float.of_int (min asset_bytes (280 * 1024 * 1024)) /. 262144.)
+;;
+
 let perform ~sw ~authenticator ~network ~clock request =
   Tls_client_eio.initialize_rng ();
-  let response_budget = ref 30. in
-  protected (fun () ->
+  let deadline = response_deadline request in
+  let response_budget = ref deadline in
+  let perform () =
     Result.bind
       (follow_redirects
          (request_once ~sw ~authenticator ~network ~clock ~response_budget)
@@ -326,7 +341,12 @@ let perform ~sw ~authenticator ~network ~clock request =
            Result.map
              (fun () -> response)
              (Http.validate_response_content_type request response.headers)
-         else Ok response))
+         else Ok response)
+  in
+  protected (fun () ->
+    match request.expected_content_type with
+    | Asset_download _ -> Eio.Time.with_timeout_exn clock deadline perform
+    | _ -> perform ())
 ;;
 
 let remove_partial path =
