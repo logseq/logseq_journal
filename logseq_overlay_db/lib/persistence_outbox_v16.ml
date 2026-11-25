@@ -268,7 +268,7 @@ let mutation_of_wire = function
           | None -> Ok None
           | Some text -> Result.map Option.some (Graph.Uuid.of_string text)
         in
-        if asset.size >= 0L && asset.size <= 104857600L
+        if asset.size >= 0L && asset.size <= 209715200L
         then Ok (Some Types.{ replace_reference; version; size = asset.size })
         else Error "Invalid persisted asset size"
     in
