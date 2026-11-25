@@ -3343,6 +3343,32 @@ let delayed_case ?(tls_delay = 0.) ?(response_delay = 0.) wire =
   | _ -> assert false
 ;;
 
+let test_slow_asset_download () =
+  let bytes = "slow asset" in
+  let version = Logseq_db_types.Asset_descriptor.version
+    ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum bytes) ~file_type:"bin"
+    |> Result.get_ok in
+  let report =
+    with_peer
+      [ delayed_case ~response_delay:1.8
+          (response ~headers:"Content-Length: 10\r\n" bytes) ]
+      (fun ~environment ~sw ~support ~origin ->
+         let wall = Eio.Stdenv.clock environment in
+         let clock = scaled_clock wall 20. in
+         let posted = ref [] in
+         let runner = runner ~clock ~environment ~sw ~support ~posted
+           ~invalidations:(ref 0) () in
+         let selected, scope = bootstrap ~mirror_absent:false origin in
+         let result = asset_run runner ~clock:wall ~posted selected.next scope "slow-download"
+           (Core.Fetch_asset { asset = scope.graph_id; version;
+              maximum_plaintext_bytes = 24 * 1024 * 1024 }) in
+         Alcotest.(check bool) "asset survives the control deadline" true
+           (match result with Ok (Core.Asset_downloaded _) -> true | _ -> false);
+         Runner.shutdown runner)
+  in
+  check_retired report
+;;
+
 let test_tls_slow_legal_handshake () =
   let report =
     with_peer
@@ -3512,6 +3538,7 @@ let scenarios =
         "redirect response deadline remains shared"
         `Quick
         test_redirect_response_budget_is_shared
+    ; Alcotest.test_case "slow asset download" `Quick test_slow_asset_download
     ]
 ;;
 

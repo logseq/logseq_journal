@@ -313,9 +313,21 @@ let protected f =
   | exception_ -> Error (exception_message exception_)
 ;;
 
+let response_deadline (request : Http.request) =
+  let asset_bytes =
+    match request.expected_content_type, request.operation with
+    | Asset_binary, Get -> request.maximum_response_bytes
+    | Asset_binary, Put bytes -> String.length bytes
+    | _ -> 0
+  in
+  if asset_bytes <= 8 * 1024 * 1024
+  then 30.
+  else 30. +. (Float.of_int (min asset_bytes (280 * 1024 * 1024)) /. 262144.)
+;;
+
 let perform ~sw ~authenticator ~network ~clock request =
   Tls_client_eio.initialize_rng ();
-  let response_budget = ref 30. in
+  let response_budget = ref (response_deadline request) in
   protected (fun () ->
     Result.bind
       (follow_redirects
