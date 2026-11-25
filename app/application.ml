@@ -2698,6 +2698,9 @@ let filters_page state dispatch filter_draft =
   let payload = Yojson.Safe.to_string (`Assoc
     [ "mode", `String "filter-overlay"; "enabled", `Bool enabled
     ; "sheetEpoch", `Int picker.sheet_epoch
+    ; "filterNames", `List (match Timeline_filter.entry state.filters with
+        | Configure_directly -> []
+        | Native_menu { names; _ } -> List.map (fun name -> `String name) names)
     ; "choices", `Assoc [ "tags", `List selected; "statuses", `List options
                         ; "times", `List times; "results", `List results ]
     ; "filterError", Option.fold ~none:`Null ~some:(fun text -> `String text) state.filter_error
@@ -2712,6 +2715,8 @@ let filters_page state dispatch filter_draft =
     | "apply" when enabled -> dispatch.send (Submit_filters (event.event_id, Apply))
     | _ when enabled && String.starts_with ~prefix:"save:" raw ->
       dispatch.send (Submit_filters (event.event_id, Save_as (String.sub raw 5 (String.length raw - 5))))
+    | _ when String.starts_with ~prefix:"delete:" raw ->
+      dispatch.send (Submit_filters (event.event_id, Delete (String.sub raw 7 (String.length raw - 7))))
     | _ when String.starts_with ~prefix:"search:" raw ->
       dispatch.send (Edit_filter_tag_text (String.sub raw 7 (String.length raw - 7)))
     | _ when String.starts_with ~prefix:"count:" raw ->
@@ -7229,7 +7234,7 @@ let start
       update (fun state ->
         let open Timeline_filter in
         let valid_owner = match command with
-          | Apply | Save_as _ -> state.modal = Filters_sheet && state.filter_tag_picker.sheet_epoch = epoch
+          | Apply | Save_as _ | Delete _ -> state.modal = Filters_sheet && state.filter_tag_picker.sheet_epoch = epoch
           | Select _ | Clear -> state.modal = No_modal && state.graph_state.generation = epoch
               && Journal_routes.destination state.routes = Journals in
         if not valid_owner || not state.graph_ready || not state.filters_restored then state else
@@ -7246,7 +7251,8 @@ let start
              if not (Option.fold ~none:true ~some:(save_filters graph_id) replacement)
              then report "Could not save Timeline filter preferences. Saved filters are limited to 64 graphs."
              else
-               let next = { state with modal = No_modal; filters; filter_error = None } in
+               let modal = match command with Delete _ -> Filters_sheet | _ -> No_modal in
+               let next = { state with modal; filters; filter_error = None } in
                if applied filters = applied state.filters then next else
                { next with feed_loaded = false; feed_refresh = None
                ; timeline = Journal_timeline_state.empty ~today

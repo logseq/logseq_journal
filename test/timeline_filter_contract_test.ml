@@ -50,6 +50,33 @@ let () =
   let draft = Filter.open_sheet (Filter.restore full) in
   assert (Filter.submit draft (Save_as "sixth") = Error (Invalid_preferences Too_many_filters));
   assert ((get (Filter.submit draft Apply)).replacement = None);
+  let delete state name = get (Filter.submit state (Delete name)) in
+  let active = Filter.open_sheet saved.next in
+  assert (Filter.submit saved.next (Delete "Custom") = Error No_open_sheet);
+  assert (Filter.submit active (Delete " Custom ") = Error Unknown_name);
+  let deleted = delete active "Custom" in
+  let persisted = Option.get deleted.replacement in
+  assert (List.map fst (Filter.definitions persisted) = ["Work"]);
+  assert (Filter.selected_name persisted = None);
+  assert (Filter.applied (Filter.restore persisted) = Filter.all);
+  assert (Filter.applied deleted.next = Filter.all);
+  assert (Filter.applied (submit deleted.next Apply) = Filter.all);
+  let edited = Filter.edit active (Set_time (Custom { count_text = "0"; unit_ = Weeks })) in
+  assert (Filter.sheet (delete edited "Custom").next = Filter.sheet edited);
+  let inactive = delete active "Work" in
+  assert (Filter.sheet inactive.next = Filter.sheet active);
+  assert (Filter.applied inactive.next = Filter.applied active);
+  let persisted = Option.get inactive.replacement in
+  assert (Filter.selected_name persisted = Some "Custom");
+  assert (Filter.applied (Filter.restore persisted) = Filter.applied active);
+  let anonymous = Filter.open_sheet (submit active Apply) in
+  let deleted = delete anonymous "Work" in
+  assert (Filter.applied deleted.next = Filter.applied anonymous);
+  assert (Filter.sheet deleted.next = Filter.sheet anonymous);
+  assert (Filter.selected_name (Option.get deleted.replacement) = None);
+  let freed = delete draft "2" in
+  let refilled = get (Filter.submit freed.next (Save_as "sixth")) in
+  assert (List.map fst (Filter.definitions (Option.get refilled.replacement)) = ["0"; "1"; "3"; "4"; "sixth"]);
   List.iter (fun (toggle, selected) ->
     let ids = List.init 101 (fun index ->
       get (Filter.Uuid.of_string (Printf.sprintf "00000000-0000-4000-8000-%012d" index))) in

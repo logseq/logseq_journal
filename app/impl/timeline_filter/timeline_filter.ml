@@ -138,7 +138,7 @@ let edit state change =
 
 let cancel state = { state with sheet = None }
 
-type command = Apply | Save_as of string | Select of string | Clear
+type command = Apply | Save_as of string | Select of string | Clear | Delete of string
 type error = Invalid_time of time_error | Invalid_preferences of preference_error | No_open_sheet | Unknown_name
 type transition = { next : t; replacement : preferences option }
 
@@ -154,6 +154,19 @@ let submit state command =
     (match List.assoc_opt name previous.definitions with
      | None -> Error Unknown_name
      | Some applied -> finish applied state.sheet { previous with selected_name = Some name })
+  | Delete name ->
+    (match state.sheet with
+     | None -> Error No_open_sheet
+     | Some sheet ->
+       if not (List.mem_assoc name previous.definitions) then Error Unknown_name else
+       let definitions = List.remove_assoc name previous.definitions in
+       if previous.selected_name = Some name then
+         let unchanged =
+           List.sort Uuid.compare sheet.draft_tags = state.applied.tags
+           && List.sort Uuid.compare sheet.draft_statuses = state.applied.statuses
+           && sheet.draft_time = (draft state.applied).draft_time in
+         finish all (Some (if unchanged then draft all else sheet)) { definitions; selected_name = None }
+       else finish state.applied state.sheet { previous with definitions })
   | Apply | Save_as _ ->
     match state.sheet with
     | None -> Error No_open_sheet
@@ -171,5 +184,5 @@ let submit state command =
           (match preferences ~definitions:(previous.definitions @ [name, applied]) ~selected_name with
            | Ok preferences -> finish applied None preferences
            | Error error -> Error (Invalid_preferences error))
-        | Clear | Select _ -> assert false
+        | Clear | Select _ | Delete _ -> assert false
 ;;

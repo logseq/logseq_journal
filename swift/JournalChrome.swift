@@ -439,6 +439,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let accessibilityFocus: AccessibilityFocusState<JournalFilterAccessibilityTarget?>.Binding
     #endif
     @State private var showsTags = false
+    @State private var managesSavedFilters = false
+    @State private var confirmingDeletion = false
+    @State private var deletionName: String?
     @State private var naming = false
     @State private var filterName = ""
     @FocusState private var editing: Field?
@@ -566,8 +569,43 @@ struct JournalSheetDismissButton: SwiftUI.View {
       return formatter.string(from: dates[0], to: dates[1]) + " · Includes today"
     }
 
+    private func savedFilterManagement(_ names: [String]) -> some SwiftUI.View {
+      DisclosureGroup("Manage saved filters", isExpanded: $managesSavedFilters) {
+        ForEach(names, id: \.self) { name in
+          HStack {
+            Text(verbatim: name)
+            Spacer()
+            Button(role: .destructive) {
+              editing = nil
+              deletionName = name
+              confirmingDeletion = true
+            } label: {
+              Image(systemName: "trash")
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.red)
+            .accessibilityLabel("Delete \(name)")
+          }
+        }
+      }
+      .font(.subheadline)
+      .tint(filterBlue(scheme))
+      .alert("Delete saved filter?", isPresented: $confirmingDeletion, presenting: deletionName) { name in
+        Button("Cancel", role: .cancel) {}
+        Button("Delete", role: .destructive) { send("delete:" + name) }
+      } message: { name in
+        Text("Delete ‘\(name)’ from saved filters?")
+      }
+    }
+
     private var fields: some SwiftUI.View {
       VStack(alignment: .leading, spacing: 6) {
+        if let names = properties.filterNames, !names.isEmpty {
+          savedFilterManagement(names)
+          Divider().padding(.vertical, 4)
+        }
         heading("TAG · MATCH ANY")
         FilterChipRows {
           ForEach(choices.tags) { chip($0) }

@@ -192,13 +192,14 @@ val cancel : t -> t
     draft unchanged. The host owns the naming prompt and its input. Do not use
     an existing name as an implicit overwrite. *)
 
-(** {1 Apply, save, select, and clear} *)
+(** {1 Apply, save, select, clear, and delete} *)
 
 type command =
   | Apply
   | Save_as of string
   | Select of string
   | Clear
+  | Delete of string
 
 type error =
   | Invalid_time of time_error
@@ -221,7 +222,13 @@ type transition = private
     capacity; it does not add a definition.
     Select activates an existing name and persists the selection. Clear
     applies [all] and clears the selected name without deleting definitions.
-    Select and Clear do not modify a draft. Validation errors preserve the
+    Select and Clear do not modify a draft. Delete requires an open sheet and
+    an exact existing name. Offer it only in the configuration sheet, with
+    confirmation naming the definition. Canceling confirmation has no effect.
+    Delete removes only that definition and keeps the sheet open. Deleting the
+    selected definition clears the selection and applies [all]; rebase an
+    unchanged draft to [all] but keep edits. Other deletions leave applied
+    criteria, selection and draft unchanged. Validation errors preserve the
     draft, active criteria and preferences. Keep naming open with feedback
     for a rejected name; surface draft errors in the sheet.
 
