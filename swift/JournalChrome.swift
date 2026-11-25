@@ -304,7 +304,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
   private struct FilterChip: SwiftUI.View {
     let label: String
     let selected: Bool
-    var highlighted = false
     let action: () -> Void
     @Environment(\.colorScheme) private var scheme
 
@@ -315,15 +314,55 @@ struct JournalSheetDismissButton: SwiftUI.View {
           if selected { Image(systemName: "checkmark").font(.caption.weight(.semibold)) }
         }
         .font(.subheadline.weight(.semibold))
-        .foregroundStyle(selected || highlighted ? filterBlue(scheme) : Color.primary)
+        .foregroundStyle(selected ? filterBlue(scheme) : Color.primary)
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
-        .background(selected || highlighted ? filterBlue(scheme).opacity(0.12) : Color.primary.opacity(0.06), in: .capsule)
+        .background(selected ? filterBlue(scheme).opacity(0.12) : Color.primary.opacity(0.06), in: .capsule)
         .frame(minHeight: 44)
         .contentShape(Rectangle())
       }
       .buttonStyle(.plain)
       .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+  }
+
+  private struct FilterTriggerButton: SwiftUI.View {
+    let count: Int
+    let action: () -> Void
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    private var active: Bool { count > 0 }
+
+    var body: some SwiftUI.View {
+      Button(action: action) {
+        Image(systemName: "line.3.horizontal.decrease")
+          .font(.system(size: 17, weight: .semibold))
+          .foregroundStyle(active ? filterBlue(scheme) : Color.primary)
+          .frame(width: 44, height: 44)
+          .background(active ? filterBlue(scheme).opacity(0.14) : .clear, in: Circle())
+          .overlay(alignment: .topTrailing) {
+            if active {
+              Circle().fill(filterBlue(scheme))
+                .frame(width: 6, height: 6)
+                .padding(8)
+                .accessibilityHidden(true)
+            }
+          }
+          .contentShape(Circle())
+      }
+      .buttonStyle(.plain)
+      #if os(iOS)
+      .background {
+        if reduceTransparency { Circle().fill(Color(uiColor: .secondarySystemBackground)) }
+      }
+      .glassEffect(reduceTransparency ? .identity : .regular.interactive(), in: Circle())
+      #else
+      .background(Color.primary.opacity(0.06), in: Circle())
+      #endif
+      .accessibilityLabel("Filters")
+      .accessibilityValue(count == 0 ? "No active filters" : count == 1 ? "1 active filter" : "\(count) active filters")
+      .accessibilityIdentifier("journal-filters")
     }
   }
 
@@ -1512,12 +1551,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
       case .filterTrigger:
         if let properties {
           let count = properties.level ?? 0
-          let trigger = FilterChip(label: count > 0 ? "Filters · \(count)" : "Filters",
-                     selected: false, highlighted: count > 0) {
+          let trigger = FilterTriggerButton(count: count) {
             JournalExtensions.emit(context: context, payload: Data("open".utf8))
           }
           .disabled(properties.enabled != true)
-          .accessibilityIdentifier("journal-filters")
           #if os(iOS)
           trigger
           #else
