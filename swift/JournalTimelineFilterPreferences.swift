@@ -64,21 +64,25 @@ struct JournalTimelineFilterPreferences {
     return UUID(uuidString: String(graph))?.uuidString.lowercased()
   }
 
+  private static func storedRecord(for graph: String, keys: [String], in stored: [String: Any]) -> String? {
+    let canonicalKey = keyPrefix + graph
+    for key in [canonicalKey] + keys.filter({ $0 != canonicalKey }).sorted() {
+      if let value = stored[key] as? String,
+         let record = Record.decode(value), !record.definitions.isEmpty { return value }
+    }
+    return nil
+  }
+
   private static func admittedRecords(in stored: [String: Any]) -> (records: [String: String], overflow: Bool) {
     let keysByGraph = Dictionary(grouping: stored.keys.compactMap { key in
       graphID(forKey: key).map { (graph: $0, key: key) }
     }, by: \.graph)
     var records: [String: String] = [:]
     for graph in keysByGraph.keys.sorted() {
-      let canonicalKey = keyPrefix + graph
-      let keys = [canonicalKey] + keysByGraph[graph, default: []].map(\.key).filter { $0 != canonicalKey }.sorted()
-      for key in keys {
-        guard let value = stored[key] as? String,
-              let record = Record.decode(value), !record.definitions.isEmpty else { continue }
-        guard records.count < graphLimit else { return (records, true) }
-        records[graph] = value
-        break
-      }
+      guard let value = storedRecord(for: graph, keys: keysByGraph[graph, default: []].map(\.key), in: stored)
+      else { continue }
+      guard records.count < graphLimit else { return (records, true) }
+      records[graph] = value
     }
     return (records, false)
   }
@@ -99,15 +103,28 @@ struct JournalTimelineFilterPreferences {
     guard request.starts(with: Self.commitPrefix) else { return false }
     let body = request.dropFirst(Self.commitPrefix.count)
     guard let separator = body.firstIndex(of: 10),
-          let id = UUID(uuidString: String(decoding: body.prefix(upTo: separator), as: UTF8.self)),
-          body.count - body.distance(from: body.startIndex, to: separator) - 1 <= Self.recordLimit,
-          let text = String(data: body.suffix(from: separator + 1), encoding: .utf8),
+          let id = UUID(uuidString: String(decoding: body.prefix(upTo: separator), as: UTF8.self)) else { return false }
+    let mutation = body.suffix(from: separator + 1)
+    guard let expectedEnd = mutation.firstIndex(of: 10),
+          mutation.distance(from: mutation.startIndex, to: expectedEnd) <= 6 * Self.recordLimit + 2 else { return false }
+    let expected: String?
+    do {
+      expected = try JSONDecoder().decode(String?.self, from: mutation.prefix(upTo: expectedEnd))
+    } catch {
+      return false
+    }
+    let replacement = mutation.suffix(from: expectedEnd + 1)
+    guard replacement.count <= Self.recordLimit,
+          let text = String(data: replacement, encoding: .utf8),
           let record = Record.decode(text) else { return false }
     let graph = id.uuidString.lowercased()
     let key = Self.keyPrefix + graph
     let stored = defaults.dictionaryRepresentation()
+    let keys = stored.keys.filter { Self.graphID(forKey: $0) == graph }
+    let current = Self.storedRecord(for: graph, keys: keys, in: stored)
+    guard current.map({ Data($0.utf8) }) == expected.map({ Data($0.utf8) }) else { return false }
     if record.definitions.isEmpty {
-      for key in stored.keys where Self.graphID(forKey: key) == graph {
+      for key in keys {
         defaults.removeObject(forKey: key)
       }
       return true

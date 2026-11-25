@@ -3484,12 +3484,10 @@ let start
     String.lowercase_ascii (Logseq_db_types.Graph_types.Uuid.to_string id) in
   let save_filters id preferences =
     let key = graph_filter_key id in
-    let text = Timeline_filter_preferences.encode preferences in
-    if Journal_bridge.commit_timeline_filter ("journal.timeline-filter.commit\n" ^ key ^ "\n" ^ text)
-    then (
-      filter_preferences := (key, `String text) :: List.remove_assoc key !filter_preferences;
-      true)
-    else false in
+    match Timeline_filter_preferences.commit ~persist:Journal_bridge.commit_timeline_filter
+        !filter_preferences ~key preferences with
+    | Some retained -> filter_preferences := retained; true
+    | None -> false in
   let saved_filters id calendar =
     let open Timeline_filter in
     let invalid reason =
@@ -7249,7 +7247,7 @@ let start
            | exception Invalid_argument reason -> report reason
            | _ ->
              if not (Option.fold ~none:true ~some:(save_filters graph_id) replacement)
-             then report "Could not save Timeline filter preferences. Saved filters are limited to 64 graphs."
+             then report "Could not update saved Timeline filters. Restart the app to reload saved filters. If you have filters saved for 64 graphs, remove filters from another graph before adding more."
              else
                let modal = match command with Delete _ -> Filters_sheet | _ -> No_modal in
                let next = { state with modal; filters; filter_error = None } in

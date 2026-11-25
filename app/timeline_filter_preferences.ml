@@ -81,3 +81,14 @@ let encode record =
   let selected = Option.fold ~none:`Null ~some:(fun name -> `String name) (selected_name record) in
   Yojson.Safe.to_string (`Assoc ["version", `Int 2; "definitions", `List (List.map definition (definitions record)); "selected", selected])
 ;;
+
+let commit ~persist entries ~key record =
+  let text = encode record in
+  let expected = match List.assoc_opt key entries with Some (`String _ as value) -> value | _ -> `Null in
+  let request = "journal.timeline-filter.commit\n" ^ key ^ "\n"
+                ^ Yojson.Safe.to_string expected ^ "\n" ^ text in
+  if persist request then (
+    let rest = List.remove_assoc key entries in
+    Some (if definitions record = [] then rest else (key, `String text) :: rest))
+  else None
+;;
