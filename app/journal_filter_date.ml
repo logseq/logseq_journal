@@ -27,7 +27,6 @@ let resolve_days criteria ~today =
     Some ((start.tm_year + 1900) * 10000 + (start.tm_mon + 1) * 100 + start.tm_mday, today)
   in
   match time_choice (time criteria) with
-  | `Any_time -> None
   | `Preset Past_3_months -> calendar_months ()
   | `Preset Past_14_days -> days 14
   | `Custom (count, Days) -> days count

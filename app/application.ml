@@ -2642,7 +2642,7 @@ let filters_page state dispatch filter_draft =
   let custom_time = match time with
     | Custom _ -> time
     | Preset Past_14_days -> Custom { count_text = "14"; unit_ = Days }
-    | Any_time | Preset Past_3_months -> Custom { count_text = "7"; unit_ = Days }
+    | Preset Past_3_months -> Custom { count_text = "7"; unit_ = Days }
   in
   let range = match validate_draft_time filter_draft, state.calendar with
     | Ok time, Some calendar ->
@@ -2662,8 +2662,7 @@ let filters_page state dispatch filter_draft =
   let options = List.map (fun (id, title) ->
     choice ("status-" ^ Uuid.to_string id) title (List.mem id selected_statuses) (Toggle_status id)) statuses in
   let times = List.map (fun (id, label, control, selected) -> choice id label selected (Set_time control))
-    [ "any", "Any time", Any_time, time = Any_time
-    ; "fortnight", "14 days", Preset Past_14_days, time = Preset Past_14_days
+    [ "fortnight", "14 days", Preset Past_14_days, time = Preset Past_14_days
     ; "quarter", "3 months", Preset Past_3_months, time = Preset Past_3_months
     ; "custom", "Custom", custom_time, (match time with Custom _ -> true | _ -> false) ] in
   let custom = match time with
@@ -2672,7 +2671,7 @@ let filters_page state dispatch filter_draft =
         choice id label (unit_choice = unit_) (Set_time (Custom { count_text; unit_ = unit_choice })))
         [ "days", "days", Days; "weeks", "weeks", Weeks ] in
       `Assoc [ "count", `String count_text; "units", `List units ]
-    | Any_time | Preset _ -> `Null
+    | Preset _ -> `Null
   in
   let selected_tags = draft_tags filter_draft in
   let picker = state.filter_tag_picker in
@@ -2724,7 +2723,7 @@ let filters_page state dispatch filter_draft =
        | Custom { unit_; _ } ->
          let count_text = String.sub raw 6 (String.length raw - 6) in
          dispatch.send (Edit_filters (Set_time (Custom { count_text; unit_ })))
-       | Any_time | Preset _ -> ())
+       | Preset _ -> ())
     | _ -> Option.iter dispatch.send (List.assoc_opt raw !actions)
   in
   payload, on_event

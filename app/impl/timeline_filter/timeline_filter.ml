@@ -4,11 +4,11 @@ type tag_id = Uuid.t
 type status_id = Uuid.t
 type unit_ = Days | Weeks
 type preset = Past_14_days | Past_3_months
-type relative_time = [ `Any_time | `Preset of preset | `Custom of int * unit_ ]
+type relative_time = [ `Preset of preset | `Custom of int * unit_ ]
 type time_error = Invalid_count
 
-let any_time = `Any_time
 let preset value = `Preset value
+let default_time = preset Past_3_months
 
 let custom ~count ~unit_ =
   let multiplier = match unit_ with Days -> 1 | Weeks -> 7 in
@@ -25,7 +25,7 @@ let criteria ~tags ~statuses ~time =
   { tags = List.sort_uniq Uuid.compare tags; statuses = List.sort_uniq Uuid.compare statuses; time }
 ;;
 
-let all = criteria ~tags:[] ~statuses:[] ~time:any_time
+let all = criteria ~tags:[] ~statuses:[] ~time:default_time
 let tags criteria = criteria.tags
 let statuses criteria = criteria.statuses
 let time criteria = criteria.time
@@ -33,10 +33,10 @@ let time criteria = criteria.time
 let active_count criteria =
   Bool.to_int (criteria.tags <> [])
   + Bool.to_int (criteria.statuses <> [])
-  + Bool.to_int (criteria.time <> any_time)
+  + Bool.to_int (criteria.time <> default_time)
 ;;
 
-type time_control = Any_time | Preset of preset | Custom of { count_text : string; unit_ : unit_ }
+type time_control = Preset of preset | Custom of { count_text : string; unit_ : unit_ }
 type sheet = { draft_tags : tag_id list; draft_statuses : status_id list; draft_time : time_control }
 
 type preferences = { definitions : (string * criteria) list; selected_name : string option }
@@ -89,7 +89,6 @@ let draft_time sheet = sheet.draft_time
 
 let validate_draft_time sheet =
   match sheet.draft_time with
-  | Any_time -> Ok any_time
   | Preset value -> Ok (preset value)
   | Custom { count_text; unit_ } ->
     if not (String.for_all (function '0' .. '9' -> true | _ -> false) count_text)
@@ -103,7 +102,6 @@ let validate_draft_time sheet =
 let draft criteria =
   let draft_time =
     match time_choice criteria.time with
-    | `Any_time -> Any_time
     | `Preset value -> Preset value
     | `Custom (count, unit_) -> Custom { count_text = string_of_int count; unit_ }
   in

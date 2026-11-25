@@ -47,7 +47,6 @@ type preset =
 type relative_time
 type time_error = Invalid_count
 
-val any_time : relative_time
 val preset : preset -> relative_time
 
 (** The custom count is a positive integer. Reject arithmetic overflow rather
@@ -58,11 +57,11 @@ val custom : count:int -> unit_:unit_ -> (relative_time, time_error) result
     same date range but reopen in different controls. *)
 val time_choice
   :  relative_time
-  -> [ `Any_time | `Preset of preset | `Custom of int * unit_ ]
+  -> [ `Preset of preset | `Custom of int * unit_ ]
 
 type criteria
 
-(** No tag or status selected, with [any_time]. The default Timeline settings. *)
+(** The default Timeline criteria: no tags or statuses, and [Past_3_months]. *)
 val all : criteria
 
 (** Construct settings from validated values, e.g. after decoding local
@@ -77,7 +76,7 @@ val tags : criteria -> tag_id list
 val statuses : criteria -> status_id list
 val time : criteria -> relative_time
 
-(** Count active groups (0..3), not selections or named definitions. *)
+(** Count groups that differ from the default (0..3), not selections or named definitions. *)
 val active_count : criteria -> int
 
 (** {1 Graph preferences and restoration} *)
@@ -150,7 +149,6 @@ val draft_tags : sheet -> tag_id list
 val draft_statuses : sheet -> status_id list
 
 type time_control =
-  | Any_time
   | Preset of preset
   | Custom of
       { count_text : string
@@ -159,7 +157,7 @@ type time_control =
 
 val draft_time : sheet -> time_control
 
-(** Show Any time, 14 days, 3 months, and Custom. The 3-month preset starts on
+(** Show 14 days, 3 months, and Custom. The 3-month preset starts on
     the same day of the month three Gregorian calendar months before today,
     clamped to that month's last day if necessary. Both endpoints are inclusive.
     Only Custom exposes the numeric input and Days/Weeks selector. Raw text can be partial or invalid; show the

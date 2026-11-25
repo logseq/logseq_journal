@@ -9,7 +9,23 @@ let () =
   let preset = Filter.preset Filter.Past_14_days in
   let months = Filter.preset Filter.Past_3_months in
   let definitions = List.map (fun (name, time) -> name, criteria time)
-      ["Custom", custom; "Fortnight", preset; "Quarter", months; "All time", Filter.any_time] in
+      ["Custom", custom; "Fortnight", preset; "Quarter", months] in
+  let legacy = {|{ "version":2,"definitions":[{"name":"Old","tags":["00000000-0000-4000-8000-000000000001"],"statuses":["00000000-0000-4000-8000-000000000002"],"time":"any"}],"selected":"Old" }|} in
+  let migrated = Result.get_ok (Preferences.decode legacy) in
+  assert (Filter.selected_name migrated = Some "Old");
+  assert (Filter.definitions migrated = ["Old", criteria months]);
+  let legacy_key = "legacy-graph" in
+  let persist request =
+    match String.split_on_char '\n' request with
+    | [_; key; expected; replacement] ->
+      assert (key = legacy_key);
+      let escaped = String.concat "\\\"" (String.split_on_char '"' legacy) in
+      assert (expected = "\"" ^ escaped ^ "\"");
+      assert (Result.get_ok (Preferences.decode replacement) = migrated);
+      true
+    | _ -> assert false
+  in
+  assert (Option.is_some (Preferences.commit ~persist [legacy_key, `String legacy] ~key:legacy_key migrated));
   let record = Result.get_ok (Filter.preferences ~definitions ~selected_name:(Some "Quarter")) in
   let restored = Result.get_ok (Preferences.decode (Preferences.encode record)) in
   assert (Filter.definitions restored = definitions);

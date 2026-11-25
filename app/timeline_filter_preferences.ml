@@ -38,7 +38,7 @@ let decode text =
       (bounded 100 value) in
   let criteria_of_json value =
     let time = match member "time" value with
-      | `String "any" -> any_time
+      | `String "any" -> time all
       | `String "14-days" -> preset Past_14_days
       | `String "3-months" -> preset Past_3_months
       | `List [`Int count; `String unit_name] ->
@@ -72,7 +72,6 @@ let encode record =
   let ids values = `List (List.map (fun id -> `String (Uuid.to_string id)) values) in
   let definition (name, value) =
     let time = match time_choice (time value) with
-      | `Any_time -> `String "any"
       | `Preset Past_14_days -> `String "14-days"
       | `Preset Past_3_months -> `String "3-months"
       | `Custom (count, unit_) -> `List [`Int count; `String (match unit_ with Days -> "days" | Weeks -> "weeks")] in

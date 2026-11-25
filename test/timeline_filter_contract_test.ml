@@ -11,15 +11,24 @@ let draft state = Option.get (Filter.sheet state)
 
 let () =
   let tag = uuid "1" and status = uuid "2" in
-  let saved = Filter.criteria ~tags:[ tag; tag ] ~statuses:[ status ] ~time:Filter.any_time in
+  let saved = Filter.criteria ~tags:[ tag; tag ] ~statuses:[ status ] ~time:(Filter.preset Past_3_months) in
   assert (Filter.tags saved = [ tag ]);
   assert (Filter.active_count saved = 2);
   let prefs = get (Filter.preferences ~definitions:["Work", saved] ~selected_name:(Some "Work")) in
   let restored = Filter.restore prefs in
   let submit state command = (get (Filter.submit state command)).next in
+  let assert_default state =
+    let criteria = Filter.applied state in
+    assert (Filter.time_choice (Filter.time criteria) = `Preset Past_3_months);
+    assert (Filter.active_count criteria = 0)
+  in
+  assert_default (Filter.restore Filter.empty_preferences);
+  assert_default (submit restored Clear);
   assert (Filter.sheet restored = None);
   let reset = Filter.edit (Filter.open_sheet restored) Reset in
   assert (Filter.draft_tags (draft reset) = []);
+  assert (Filter.draft_time (draft reset) = Preset Past_3_months);
+  assert_default (submit reset Apply);
   assert (Filter.active_count (Filter.applied reset) = 2);
   assert (Filter.applied (Filter.cancel reset) = saved);
   assert (Filter.applied (submit reset Apply) = Filter.all);
