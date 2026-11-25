@@ -1,10 +1,15 @@
 import Foundation
 
-struct JournalTimelineFilterPreferences {
+struct JournalSavedFilterName: Identifiable {
+  let name: String
+  var id: Data { Data(name.utf8) }
+}
+
+@MainActor struct JournalTimelineFilterPreferences {
   let defaults: UserDefaults
   private static let keyPrefix = "journal.timeline-filter.graph."
   private static let commitPrefix = Data("journal.timeline-filter.commit\n".utf8)
-  private static let recordLimit = 64 * 1024
+  private nonisolated static let recordLimit = 64 * 1024
   private static let graphLimit = 64
 
   private struct Record: Decodable {
@@ -64,33 +69,58 @@ struct JournalTimelineFilterPreferences {
     return UUID(uuidString: String(graph))?.uuidString.lowercased()
   }
 
-  private static func storedRecord(for graph: String, keys: [String], in stored: [String: Any]) -> String? {
-    let canonicalKey = keyPrefix + graph
-    for key in [canonicalKey] + keys.filter({ $0 != canonicalKey }).sorted() {
-      if let value = stored[key] as? String,
-         let record = Record.decode(value), !record.definitions.isEmpty { return value }
+  private struct StoredRecord {
+    private struct Version: Decodable { let version: Int }
+
+    let text: String
+    let hasDefinitions: Bool
+
+    init?(_ value: Any) {
+      guard let text = value as? String, text.utf8.prefix(recordLimit + 1).count <= recordLimit else { return nil }
+      if let record = Record.decode(text) {
+        hasDefinitions = !record.definitions.isEmpty
+      } else if (try? JSONDecoder().decode(Version.self, from: Data(text.utf8)))?.version == 1 {
+        hasDefinitions = false
+      } else {
+        return nil
+      }
+      self.text = text
     }
-    return nil
   }
 
-  private static func admittedRecords(in stored: [String: Any]) -> (records: [String: String], overflow: Bool) {
-    let keysByGraph = Dictionary(grouping: stored.keys.compactMap { key in
-      graphID(forKey: key).map { (graph: $0, key: key) }
-    }, by: \.graph)
-    var records: [String: String] = [:]
-    for graph in keysByGraph.keys.sorted() {
-      guard let value = storedRecord(for: graph, keys: keysByGraph[graph, default: []].map(\.key), in: stored)
-      else { continue }
-      guard records.count < graphLimit else { return (records, true) }
-      records[graph] = value
-    }
-    return (records, false)
+  private struct Entry {
+    let key: String
+    let record: StoredRecord
   }
 
   var snapshot: [String: String] {
-    var (records, overflow) = Self.admittedRecords(in: defaults.dictionaryRepresentation())
-    if overflow { records["overflow"] = "" }
-    return records
+    var records: [String: Entry] = [:]
+    for key in defaults.dictionaryRepresentation().keys {
+      guard let graph = Self.graphID(forKey: key), let value = defaults.object(forKey: key) else { continue }
+      guard let record = StoredRecord(value) else {
+        defaults.removeObject(forKey: key)
+        continue
+      }
+      if let existing = records[graph] {
+        if existing.record.hasDefinitions != record.hasDefinitions {
+          guard record.hasDefinitions else { continue }
+        } else {
+          guard key == Self.keyPrefix + graph ||
+                  (existing.key != Self.keyPrefix + graph && key < existing.key) else { continue }
+        }
+      }
+      records[graph] = Entry(key: key, record: record)
+    }
+    let graphs = records.keys.sorted {
+      let left = records[$0]!.record.hasDefinitions
+      let right = records[$1]!.record.hasDefinitions
+      return left == right ? $0 < $1 : left
+    }
+    var snapshot = Dictionary(uniqueKeysWithValues: graphs.prefix(Self.graphLimit).map {
+      ($0, records[$0]!.record.text)
+    })
+    if graphs.count > Self.graphLimit { snapshot["overflow"] = "" }
+    return snapshot
   }
 
   func wrapStartup(_ payload: Data) -> Data {
@@ -118,20 +148,33 @@ struct JournalTimelineFilterPreferences {
           let text = String(data: replacement, encoding: .utf8),
           let record = Record.decode(text) else { return false }
     let graph = id.uuidString.lowercased()
-    let key = Self.keyPrefix + graph
     let stored = defaults.dictionaryRepresentation()
     let keys = stored.keys.filter { Self.graphID(forKey: $0) == graph }
-    let current = Self.storedRecord(for: graph, keys: keys, in: stored)
-    guard current.map({ Data($0.utf8) }) == expected.map({ Data($0.utf8) }) else { return false }
+    guard keys.count <= 1 else { return false }
+    let key = keys.first ?? Self.keyPrefix + graph
+    let hasDefinitions: Bool
+    if let value = stored[key] {
+      guard let expected, let current = StoredRecord(value), current.text.utf8.elementsEqual(expected.utf8)
+      else { return false }
+      hasDefinitions = current.hasDefinitions
+    } else {
+      guard expected == nil else { return false }
+      hasDefinitions = false
+    }
     if record.definitions.isEmpty {
-      for key in keys {
-        defaults.removeObject(forKey: key)
-      }
+      if !keys.isEmpty { defaults.removeObject(forKey: key) }
       return true
     }
-    let (admitted, _) = Self.admittedRecords(in: stored)
-    guard admitted[graph] != nil || admitted.count < Self.graphLimit else { return false }
+    if !hasDefinitions {
+      var occupied: Set<String> = []
+      for (storedKey, value) in stored {
+        guard let storedGraph = Self.graphID(forKey: storedKey), !occupied.contains(storedGraph),
+              StoredRecord(value)?.hasDefinitions == true else { continue }
+        occupied.insert(storedGraph)
+        if occupied.count == Self.graphLimit { return false }
+      }
+    }
     defaults.set(text, forKey: key)
-    return defaults.string(forKey: key) == text
+    return true
   }
 }

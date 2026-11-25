@@ -30,9 +30,31 @@ import Foundation
     precondition(trySnapshot(reopened.wrapStartup(Data([0, 255]))) == [graphA: noSelection, graphB: custom])
     defaults.set(String(repeating: "\\", count: 512 * 1024 + 1),
                  forKey: "journal.timeline-filter.graph.\(graphA)")
+    let keyPrefix = "journal.timeline-filter.graph."
+    let keyA = keyPrefix + graphA
+    defaults.set("unrelated", forKey: "journal.other-preference")
+    precondition(!commit(graphA, preset), "An invalid record inserted after startup is not absence")
+    precondition(!commit(graphA, #"{"version":2,"definitions":[]}"#))
     let bounded = reopened.wrapStartup(Data([0, 255]))
     precondition(bounded.count < 1024)
-    precondition(trySnapshot(bounded)[graphB] == custom)
+    precondition(trySnapshot(bounded) == [graphB: custom])
+    precondition(defaults.object(forKey: keyA) == nil, "Startup must delete the oversized record")
+    precondition(defaults.string(forKey: "journal.other-preference") == "unrelated")
+    precondition(!commit(graphA, custom, expecting: noSelection), "Old snapshot must not resurrect a deleted record")
+    precondition(reopened.snapshot == [graphB: custom])
+    let equivalentNames = #"{"version":2,"definitions":[{"name":"\u00e9","tags":[],"statuses":[],"time":"any"},{"name":"e\u0301","tags":[],"statuses":[],"time":"14-days"}],"selected":"e\u0301"}"#
+    let composed = JournalSavedFilterName(name: "\u{00e9}")
+    let decomposed = JournalSavedFilterName(name: "e\u{0301}")
+    precondition(composed.name == decomposed.name)
+    precondition(composed.id == Data([0xc3, 0xa9]))
+    precondition(decomposed.id == Data([0x65, 0xcc, 0x81]))
+    precondition(Set([composed.id, decomposed.id]).count == 2)
+    let remainingName = #"{"version":2,"definitions":[{"name":"e\u0301","tags":[],"statuses":[],"time":"14-days"}],"selected":"e\u0301"}"#
+    precondition(commit(graphA, equivalentNames))
+    precondition(reopened.snapshot[graphA] == equivalentNames)
+    precondition(commit(graphA, remainingName, expecting: equivalentNames))
+    precondition(reopened.snapshot[graphA] == remainingName)
+    precondition(commit(graphA, #"{"version":2,"definitions":[]}"#, expecting: remainingName))
     func graph(_ index: Int) -> String {
       String(format: "10000000-0000-4000-8000-%012d", index)
     }
@@ -43,6 +65,40 @@ import Foundation
                             "not json"].enumerated() {
       defaults.set(legacy, forKey: "journal.timeline-filter.graph.\(graph(index + 3))")
     }
+    let nonStringKey = keyPrefix + graph(9)
+    defaults.set(["version": 2], forKey: nonStringKey)
+    let legacyKey = keyPrefix + graph(3)
+    let emptyKey = keyPrefix + graph(5)
+    let startupAfterCleanup = reopened.snapshot
+    precondition(defaults.string(forKey: legacyKey) == #"{"version":1}"#)
+    precondition(defaults.string(forKey: emptyKey) == #"{"version":2,"definitions":[],"selected":null}"#)
+    for index in [4, 6, 7, 8, 9] {
+      precondition(defaults.object(forKey: keyPrefix + graph(index)) == nil, "Invalid record \(index) survived startup")
+    }
+    precondition(!commit(graph(4), custom, expecting: #"{"version":3,"definitions":[]}"#))
+    precondition(commit(graph(4), custom, expecting: startupAfterCleanup[graph(4)]))
+    precondition(commit(graph(4), #"{"version":2,"definitions":[]}"#, expecting: custom))
+    defaults.set(custom, forKey: keyA)
+    precondition(!commit(graphA, preset, expecting: startupAfterCleanup[graphA]))
+    precondition(defaults.string(forKey: keyA) == custom)
+    precondition(commit(graphA, #"{"version":2,"definitions":[]}"#, expecting: custom))
+    let aliasGraph = "a0000000-0000-4000-8000-000000000000"
+    let aliasKey = keyPrefix + aliasGraph.uppercased()
+    defaults.set(custom, forKey: aliasKey)
+    defaults.set("broken", forKey: keyPrefix + aliasGraph)
+    precondition(reopened.snapshot[aliasGraph] == custom)
+    precondition(defaults.object(forKey: keyPrefix + aliasGraph) == nil)
+    defaults.set(preset, forKey: keyPrefix + aliasGraph)
+    precondition(!commit(aliasGraph, #"{"version":2,"definitions":[]}"#, expecting: custom))
+    precondition(defaults.string(forKey: aliasKey) == custom)
+    precondition(defaults.string(forKey: keyPrefix + aliasGraph) == preset)
+    defaults.removeObject(forKey: keyPrefix + aliasGraph)
+    precondition(commit(aliasGraph, #"{"version":2,"definitions":[]}"#, expecting: custom))
+    precondition(reopened.snapshot[aliasGraph] == nil, "An alias must not reappear after deletion")
+    precondition(!commit(graph(3), preset), "An unobserved legacy value is not absence")
+    precondition(commit(graph(3), preset, expecting: startupAfterCleanup[graph(3)]))
+    precondition(commit(graph(3), #"{"version":2,"definitions":[]}"#, expecting: preset))
+    precondition(commit(graph(5), #"{"version":2,"definitions":[]}"#, expecting: startupAfterCleanup[graph(5)]))
     var expected = [graphB: custom]
     for index in 10...72 {
       precondition(commit(graph(index), preset))

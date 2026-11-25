@@ -46,6 +46,11 @@ let () =
   let entries, decoded_config = Preferences.unwrap_startup
       (frame (String.make (25 * 1024 * 1024) ' ')) in
   assert (decoded_config = config && List.mem_assoc "overflow" entries);
+  let never_persist _ = failwith "An unreadable startup store must not authorize writes" in
+  assert (Preferences.commit ~persist:never_persist entries ~key record = None);
+  let entries, decoded_config = Preferences.unwrap_startup (frame "[]") in
+  assert (decoded_config = config && List.mem_assoc "overflow" entries);
+  assert (Preferences.commit ~persist:never_persist entries ~key record = None);
   assert (Filter.applied (Filter.restore restored) = criteria months);
   List.iter (fun (today, first) ->
     assert (Journal_filter_date.resolve_days (criteria months) ~today = Some (first, today)))

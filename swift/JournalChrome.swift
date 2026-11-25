@@ -363,8 +363,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
           Button { action("open") } label: { icon }.buttonStyle(.plain)
         } else {
           Menu {
-            ForEach(names.indices, id: \.self) { index in
-              let name = names[index]
+            ForEach(names.map(JournalSavedFilterName.init)) { saved in
+              let name = saved.name
               Button { action("select:" + name) } label: {
                 if activeName?.utf8.elementsEqual(name.utf8) == true { Label(name, systemImage: "checkmark") }
                 else { Text(name) }
@@ -571,7 +571,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
     private func savedFilterManagement(_ names: [String]) -> some SwiftUI.View {
       DisclosureGroup("Manage saved filters", isExpanded: $managesSavedFilters) {
-        ForEach(names, id: \.self) { name in
+        ForEach(names.map(JournalSavedFilterName.init)) { saved in
+          let name = saved.name
           HStack {
             Text(verbatim: name)
             Spacer()

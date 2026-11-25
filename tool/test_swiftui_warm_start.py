@@ -99,7 +99,7 @@ generator.write_text(bootstrap+'\n#load '+json.dumps(str(fixture_source.with_suf
 
 sources = [root/'swift'/name for name in
            ['JournalE2EECrypto.swift', 'JournalPlatformWire.swift', 'JournalPlatformServices.swift',
-            'JournalStartupConfiguration.swift', 'JournalChrome.swift']]
+            'JournalStartupConfiguration.swift', 'JournalTimelineFilterPreferences.swift', 'JournalChrome.swift']]
 source = root/'apple-tests/warm-start/JournalWarmStartAcceptance.swift'
 for tracked in sources + [source]:
     record['inputs'][str(tracked.relative_to(root))] = hashlib.sha256(tracked.read_bytes()).hexdigest()

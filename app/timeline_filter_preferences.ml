@@ -4,12 +4,12 @@ let startup_prefix = "JTF1"
 let record_limit = 64 * 1024
 let graph_limit = 64
 let envelope_limit = graph_limit * ((6 * record_limit) + 64) + 64
-let unavailable = ["overflow", `String ""]
+let unavailable = ["overflow", `Bool true]
 
 let unwrap_startup payload =
   if not (String.starts_with ~prefix:startup_prefix payload) then [], payload else
   match String.index_from_opt payload (String.length startup_prefix) '\n' with
-  | None -> [], payload
+  | None -> unavailable, payload
   | Some separator ->
     let offset = String.length startup_prefix in
     let length = separator - offset in
@@ -82,6 +82,7 @@ let encode record =
 ;;
 
 let commit ~persist entries ~key record =
+  if entries = unavailable then None else
   let text = encode record in
   let expected = match List.assoc_opt key entries with Some (`String _ as value) -> value | _ -> `Null in
   let request = "journal.timeline-filter.commit\n" ^ key ^ "\n"
