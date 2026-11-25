@@ -57,6 +57,19 @@ let () =
     [20240531, 20240229; 20230531, 20230228; 20250115, 20241015; 20241231, 20240930];
   assert (Preferences.decode {|{"version":1,"tags":[],"statuses":[],"time":"past-7-days"}|}
           = Ok Filter.empty_preferences);
+  let root = Option.value (Sys.getenv_opt "DUNE_SOURCEROOT") ~default:"." in
+  let corpus = Filename.concat root "test/timeline_filter_json_cases.tsv" in
+  In_channel.with_open_bin corpus (fun channel ->
+    In_channel.fold_lines (fun () line ->
+      match String.split_on_char '\t' line with
+      | [expected; text] when expected = "ok" || expected = "bad" ->
+        if Result.is_ok (Preferences.decode text) <> (expected = "ok") then
+          failwith ("Unexpected OCaml codec verdict: " ^ text)
+      | _ -> failwith ("Malformed test fixture: " ^ line)) () channel);
+  let max_days = Result.get_ok (Filter.custom ~count:max_int ~unit_:Days) in
+  (match Journal_filter_date.resolve_days (criteria max_days) ~today:10101 with
+   | exception Invalid_argument message -> assert (message = "Filter range starts before year 1")
+   | _ -> assert false);
   let persisted = {|{"version":2,"definitions":[{"name":"First week","tags":[],"statuses":[],"time":[1,"weeks"]}],"selected":"First week"}|} in
   let applied = Filter.applied (Filter.restore (Result.get_ok (Preferences.decode persisted))) in
   assert (Journal_filter_date.resolve_days applied ~today:10107 = Some (10101, 10107));

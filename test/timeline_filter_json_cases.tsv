@@ -1,0 +1,17 @@
+ok	{"version":1,"ignored":{"array":[true,false,null,-0,2.5E+10,"escaped \" quote",{}]}}
+ok	{"version":2,"definitions":[{"name":"Float 7.0, \\ and \u0041","tags":[],"statuses":[],"time":[7,"days"]}],"selected":null}
+bad	﻿{"version":2,"definitions":[],"selected":null}
+bad	{"version":2,"definitions":[],"selected":null,}
+bad	{"version":2,"definitions":[{"name":"X","tags":[],"statuses":[],"time":[7,"days",]}],"selected":null}
+bad	{"version":2,"definitions":[],"ignored":{"nested":1,}}
+bad	{"version":2,"definitions":[],"ignored":[true,]}
+bad	{"version":2,"definitions":[],"ignored":[1 2]}
+bad	{"version":2,"definitions":[],"ignored":01}
+bad	{"version":2,"definitions":[],"ignored":1.}
+bad	{"version":2,"definitions":[],"ignored":1e+}
+bad	{"version":2,"definitions":[],"ignored":"\q"}
+bad	{"version":2,"definitions":[],"ignored":"\u12
+bad	{"version":2,"definitions":[],"ignored":"unterminated\
+bad	{"version":2,"definitions":[],"ignored":[true
+bad	{"version":2,"definitions":[],"ignored":fal
+bad	{"version":2,"definitions":[] } {}

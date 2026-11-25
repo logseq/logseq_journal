@@ -99,14 +99,20 @@ import Foundation
     precondition(commit(graph(3), preset, expecting: startupAfterCleanup[graph(3)]))
     precondition(commit(graph(3), #"{"version":2,"definitions":[]}"#, expecting: preset))
     precondition(commit(graph(5), #"{"version":2,"definitions":[]}"#, expecting: startupAfterCleanup[graph(5)]))
-    let invalidRecords = [
+    let corpus = try String(contentsOfFile: "test/timeline_filter_json_cases.tsv", encoding: .utf8)
+    let cases = corpus.split(separator: "\n").map { line in
+      let fields = line.split(separator: "\t", maxSplits: 1)
+      precondition(fields.count == 2 && (fields[0] == "ok" || fields[0] == "bad"))
+      return (accepted: fields[0] == "ok", text: String(fields[1]))
+    }
+    let invalidRecords = cases.filter { !$0.accepted }.map(\.text) + [
       #"{"version":2.0,"definitions":[],"selected":null}"#,
       #"{"version":1e0}"#,
       #"{"version":2,"definitions":[{"name":"Float","tags":[],"statuses":[],"time":[7.0,"days"]}],"selected":null}"#,
       #"{"version":2,"definitions":[{"name":"Float","tags":[],"statuses":[],"time":[7e0,"weeks"]}],"selected":"Float"}"#,
       #"{"version":2,"definitions":[{"name":"Too far","tags":[],"statuses":[],"time":[1000000,"weeks"]}],"selected":"Too far"}"#,
     ]
-    let validRecords = [
+    let validRecords = cases.filter(\.accepted).map(\.text) + [
       #"{"version":1,"ignored":2.0}"#,
       #"{"version":2,"definitions":[{"name":"7.0 days","tags":[],"statuses":[],"time":[7,"days"],"ignored":2.0}],"selected":"7.0 days"}"#,
       #"{"version":2,"definitions":[{"name":"Too far","tags":[],"statuses":[],"time":[1000000,"weeks"]}],"selected":null}"#,

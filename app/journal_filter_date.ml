@@ -21,8 +21,10 @@ let resolve_days criteria ~today =
       era * 146097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100
       + (153 * month + 2) / 5 + day mod 100 - 1 - 719468
     in
-    let earliest = civil today - (count - 1) in
-    if earliest < civil 10101 then invalid_arg "Filter range starts before year 1";
+    let last = civil today in
+    let offset = count - 1 in
+    if offset > last - civil 10101 then invalid_arg "Filter range starts before year 1";
+    let earliest = last - offset in
     let start = Unix.gmtime (float_of_int earliest *. 86400.) in
     Some ((start.tm_year + 1900) * 10000 + (start.tm_mon + 1) * 100 + start.tm_mday, today)
   in

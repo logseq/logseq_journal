@@ -45,22 +45,108 @@ struct JournalSavedFilterName: Identifiable {
   }
 
   private struct Record: Decodable {
-    private static let stringOrFloat = try! NSRegularExpression(
-      pattern: #""(?:[^"\\]++|\\.)*+"|(?<=[\[,: \t\r\n])-?(?:0|[1-9][0-9]*)(?:\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+)(?=[\],} \t\r\n])"#)
+    private static func decodingData(_ text: String) -> Data? {
+      let bytes = Array(text.utf8)
+      var index = 0
+      var copied = 0
+      var result = Data()
 
-    private static func decodingData(_ text: String) -> Data {
-      let source = text as NSString
-      let range = NSRange(location: 0, length: source.length)
-      var start = 0
-      var result = ""
-      for match in stringOrFloat.matches(in: text, range: range) {
-        guard source.character(at: match.range.location) != 34 else { continue }
-        result += source.substring(with: NSRange(location: start, length: match.range.location - start))
-        result += "false"
-        start = NSMaxRange(match.range)
+      func peek() -> UInt8? { index < bytes.count ? bytes[index] : nil }
+      func take(_ byte: UInt8) -> Bool {
+        guard peek() == byte else { return false }
+        index += 1
+        return true
       }
-      result += source.substring(from: start)
-      return Data(result.utf8)
+      func whitespace() {
+        while let byte = peek(), byte == 32 || byte == 9 || byte == 10 || byte == 13 { index += 1 }
+      }
+      func string() -> Bool {
+        guard take(34) else { return false }
+        while let byte = peek(), byte >= 32 {
+          index += 1
+          if byte == 34 { return true }
+          if byte == 92 {
+            guard let escape = peek() else { return false }
+            index += 1
+            switch escape {
+            case 34, 47, 92, 98, 102, 110, 114, 116: break
+            case 117:
+              for _ in 0..<4 {
+                guard let hex = peek(), (48...57).contains(hex) || (65...70).contains(hex)
+                        || (97...102).contains(hex) else { return false }
+                index += 1
+              }
+            default: return false
+            }
+          }
+        }
+        return false
+      }
+      func digits() -> Bool {
+        let start = index
+        while let byte = peek(), (48...57).contains(byte) { index += 1 }
+        return index > start
+      }
+      func number() -> Bool {
+        let start = index
+        _ = take(45)
+        guard take(48) || digits() else { return false }
+        var isFloat = false
+        if take(46) {
+          guard digits() else { return false }
+          isFloat = true
+        }
+        if take(101) || take(69) {
+          _ = take(43) || take(45)
+          guard digits() else { return false }
+          isFloat = true
+        }
+        if isFloat {
+          result.append(contentsOf: bytes[copied..<start])
+          result.append(contentsOf: "false".utf8)
+          copied = index
+        }
+        return true
+      }
+      func literal(_ token: String) -> Bool {
+        for byte in token.utf8 where !take(byte) { return false }
+        return true
+      }
+      func value(depth: Int) -> Bool {
+        whitespace()
+        switch peek() {
+        case 123, 91:
+          guard depth < 512 else { return false }
+          let object = take(123)
+          if !object { index += 1 }
+          let end: UInt8 = object ? 125 : 93
+          whitespace()
+          if take(end) { return true }
+          repeat {
+            whitespace()
+            if object {
+              guard string() else { return false }
+              whitespace()
+              guard take(58) else { return false }
+            }
+            guard value(depth: depth + 1) else { return false }
+            whitespace()
+          } while take(44)
+          return take(end)
+        case 34: return string()
+        case 116: return literal("true")
+        case 102: return literal("false")
+        case 110: return literal("null")
+        default: return number()
+        }
+      }
+
+      whitespace()
+      guard peek() == 123, value(depth: 0) else { return nil }
+      whitespace()
+      guard index == bytes.count else { return nil }
+      result.append(contentsOf: bytes[copied...])
+      return result
     }
     struct Definition: Decodable {
       let name: String
@@ -119,7 +205,8 @@ struct JournalSavedFilterName: Identifiable {
     static func decode(_ text: String, today: LocalDay?) -> Self? {
       guard text.utf8.prefix(JournalTimelineFilterPreferences.recordLimit + 1).count
               <= JournalTimelineFilterPreferences.recordLimit,
-            let record = try? JSONDecoder().decode(Self.self, from: decodingData(text)),
+            let data = decodingData(text),
+            let record = try? JSONDecoder().decode(Self.self, from: data),
             record.version == 1 || record.version == 2, record.definitions.count <= 5 else { return nil }
       var lookbacks: [Data: Lookback] = [:]
       for definition in record.definitions {
@@ -217,6 +304,7 @@ struct JournalSavedFilterName: Identifiable {
     let replacement = mutation.suffix(from: expectedEnd + 1)
     let today = LocalDay.sample()
     guard replacement.count <= Self.recordLimit,
+          !replacement.starts(with: [0xEF, 0xBB, 0xBF]),
           let text = String(data: replacement, encoding: .utf8),
           let record = Record.decode(text, today: today), record.version == 2 else { return false }
     let graph = id.uuidString.lowercased()
