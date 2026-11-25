@@ -873,7 +873,7 @@ let test_timeline_options_menu () =
   let view = Journal_header.view ~key:(Ui.Key.string "options") ~platform:"ios"
     ~context:Journal_header.Context.journals ~sync_phase:None ~sync_error:None
     ~on_error_info:None ~on_account_action:(Some (fun action -> actions := action :: !actions))
-    ~local_deletion_available:true ~on_journals:ignored ~on_favorites:ignored
+    ~local_deletion_available:true ~filter_control:None ~on_journals:ignored ~on_favorites:ignored
     ~on_capture:ignored ~capture_enabled:true ~capture_expanded:None
     ~body:(V.Body.static (V.text "content")) in
   with_mounted (V.Body.Private.to_widget view) (fun app ops ->
