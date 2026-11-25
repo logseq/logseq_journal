@@ -7,6 +7,7 @@ let fixture_timeline_packet budget query ~items ~next =
   let module F = Read.For_worker in
   let receipt = F.timeline_receipt ~owner:(F.read_budget_owner budget)
       ~query ~version:"fixture" in
+  let receipt = F.with_timeline_coverage receipt "fixture" in
   F.timeline_packet ~receipt ~items:(Rrbvec.of_list items) ~next
 ;;
 
