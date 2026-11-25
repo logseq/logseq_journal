@@ -2144,19 +2144,23 @@ let run_favorites_native_visibility
          let send (node, _) id payload =
            hooks.extension_event node "event"
              (Yojson.Safe.to_string (`Assoc ["id", `Int id; "payload", `String payload])) |> consume in
-         let open_sheet fallback_epoch =
+         let open_sheet () =
            send (Option.get (chrome "filter-trigger" (fun json -> member "enabled" json = `Bool true))) 1 "open";
            wait "filter sheet opens" (fun () -> Option.is_some (sheet ()));
            let presentation = Option.get (sheet ()) in
-           presentation, Option.value (to_int_option (member "sheetEpoch" (snd presentation))) ~default:fallback_epoch in
-         let first, first_epoch = open_sheet 1 in
+           presentation, to_int (member "sheetEpoch" (snd presentation)) in
+         let first, first_epoch = open_sheet () in
          send first first_epoch "cancel";
          wait "current Cancel closes the sheet" (fun () -> Option.is_none (sheet ()));
-         let second, second_epoch = open_sheet 2 in
+         let second, second_epoch = open_sheet () in
          send second first_epoch "cancel";
          Alcotest.(check bool) "late dismissal leaves the replacement open" true (Option.is_some (sheet ()));
-         send second second_epoch "cancel";
-         wait "replacement Cancel closes the sheet" (fun () -> Option.is_none (sheet ())));
+         wait "replacement Apply is enabled" (fun () ->
+           Option.exists (fun (_, json) -> member "enabled" json = `Bool true) (sheet ()));
+         send second first_epoch "apply";
+         Alcotest.(check bool) "stale Apply leaves the replacement open" true (Option.is_some (sheet ()));
+         send second second_epoch "apply";
+         wait "current Apply closes the replacement" (fun () -> Option.is_none (sheet ())));
        if check_asset_scan_owner || (Option.is_some asset_change && asset_change<>Some `Unconfigured) then (
          let settings=Option.get(find "_extension" "journal-asset-settings") in
          hooks.extension_event settings "event"

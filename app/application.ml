@@ -2410,7 +2410,7 @@ type command =
   | More_filter_tags
   | Retry_filter_tags
   | Close_filters of int
-  | Apply_filters
+  | Apply_filters of int
   | Open_diagnostics
   | Close_diagnostics
   | Open_error_info
@@ -2898,7 +2898,7 @@ let filters_page state dispatch filter_draft =
     match raw with
     | "cancel" -> dispatch.send (Close_filters event.event_id)
     | "reset" -> dispatch.send (Edit_filters Reset)
-    | "apply" when enabled -> dispatch.send Apply_filters
+    | "apply" when enabled -> dispatch.send (Apply_filters event.event_id)
     | _ when String.starts_with ~prefix:"search:" raw ->
       dispatch.send (Edit_filter_tag_text (String.sub raw 7 (String.length raw - 7)))
     | _ when String.starts_with ~prefix:"count:" raw ->
@@ -7367,9 +7367,10 @@ let start
         if state.modal = Filters_sheet && state.filter_tag_picker.sheet_epoch = sheet_epoch
         then { state with modal = No_modal; filters = Timeline_filter.cancel state.filters }
         else state)
-    | Apply_filters ->
+    | Apply_filters sheet_epoch ->
       set_state_and_effect (fun state ->
-        if state.modal <> Filters_sheet then state, Effect.ignore else
+        if state.modal <> Filters_sheet || state.filter_tag_picker.sheet_epoch <> sheet_epoch
+        then state, Effect.ignore else
         match Timeline_filter.apply state.filters, state.graph_state.graph_id with
         | Ok filters, Some graph_id when state.filters_restored
             && Option.exists (fun calendar ->

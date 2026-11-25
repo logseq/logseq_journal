@@ -1364,32 +1364,71 @@ struct JournalSheetDismissButton: SwiftUI.View {
   #if os(iOS)
   private struct FilterSheetPresenter: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
-    let properties: Properties
-    let choices: FilterChoices
-    let epoch: Int
-    @State private var cancelSent = false
+    let properties: Properties?
+    @State private var active: Presentation?
+    @State private var isPresented = false
+    @State private var cancelledEpoch: Int?
 
-    private func send(_ action: String) {
-      guard !cancelSent else { return }
-      if action == "apply", properties.enabled != true { return }
-      if action == "cancel" { cancelSent = true }
-      if !JournalExtensions.emit(context: context, id: action == "cancel" ? epoch : 1,
-                                 payload: Data(action.utf8)), action == "cancel" {
-        cancelSent = false
+    private struct PresentationChange: Equatable {
+      let requestedEpoch: Int?
+      let activeEpoch: Int?
+    }
+
+    private struct Presentation {
+      let properties: Properties
+      let choices: FilterChoices
+      let epoch: Int
+    }
+
+    private var requested: Presentation? {
+      guard let properties, let choices = properties.choices, let epoch = properties.sheetEpoch
+      else { return nil }
+      return Presentation(properties: properties, choices: choices, epoch: epoch)
+    }
+
+    private func reconcilePresentation() {
+      let requested = self.requested
+      if let active {
+        if requested?.epoch != active.epoch { isPresented = false }
+      } else if let requested, requested.epoch != cancelledEpoch {
+        active = requested
+        isPresented = true
+      }
+    }
+
+    private func send(_ action: String, epoch: Int) {
+      guard isPresented, active?.epoch == epoch, cancelledEpoch != epoch,
+        let requested, requested.epoch == epoch else { return }
+      if action == "apply", requested.properties.enabled != true { return }
+      if JournalExtensions.emit(context: context, id: (action == "cancel" || action == "apply") ? epoch : 1,
+                                payload: Data(action.utf8)), action == "cancel" {
+        cancelledEpoch = epoch
+        isPresented = false
       }
     }
 
     var body: some SwiftUI.View {
+      let epoch = active?.epoch
       Color.clear.frame(width: 0, height: 0)
+        .task(id: PresentationChange(requestedEpoch: requested?.epoch, activeEpoch: epoch)) {
+          guard !Task.isCancelled else { return }
+          reconcilePresentation()
+        }
         .sheet(isPresented: Binding(
-          get: { !cancelSent },
-          set: { if !$0 { send("cancel") } }
-        )) {
-          FilterPanel(properties: properties, choices: choices, send: send)
-            .padding(.top, 16)
-            .presentationDetents([.large])
-            .presentationDragIndicator(.visible)
-            .presentationBackgroundInteraction(.disabled)
+          get: { isPresented },
+          set: { if !$0, let epoch { send("cancel", epoch: epoch) } }
+        ), onDismiss: {
+          active = nil
+        }) {
+          if let active {
+            let presentation = requested?.epoch == active.epoch ? requested ?? active : active
+            FilterPanel(properties: presentation.properties, choices: presentation.choices,
+                        send: { send($0, epoch: presentation.epoch) })
+              .padding(.top, 16)
+              .presentationDetents([.large])
+              .presentationDragIndicator(.visible)
+              .presentationBackgroundInteraction(.disabled)
+          }
         }
     }
   }
@@ -1438,10 +1477,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
       case .filterOverlay:
         #if os(iOS)
         child(0).background {
-          if let properties, let choices = properties.choices, let epoch = properties.sheetEpoch {
-            FilterSheetPresenter(context: context, properties: properties, choices: choices, epoch: epoch)
-              .id(epoch)
-          }
+          FilterSheetPresenter(context: context, properties: properties)
         }
         #else
         let isPresented = properties?.choices != nil
@@ -1456,7 +1492,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
                   .onTapGesture { JournalExtensions.emit(context: context, id: epoch, payload: Data("cancel".utf8)) }
                   .accessibilityHidden(true)
                 FilterPanel(properties: properties, choices: choices, send: { action in
-                  JournalExtensions.emit(context: context, id: action == "cancel" ? epoch : 1,
+                  JournalExtensions.emit(context: context, id: (action == "cancel" || action == "apply") ? epoch : 1,
                                          payload: Data(action.utf8))
                 }, accessibilityFocus: $filterFocus)
                 .padding(.horizontal, 4)
