@@ -162,7 +162,9 @@ let submit state command =
       | Error error -> Error (Invalid_time error)
       | Ok time ->
         let applied = criteria ~tags:sheet.draft_tags ~statuses:sheet.draft_statuses ~time in
-        match command with
+        if List.length applied.tags > 100 || List.length applied.statuses > 100
+        then Error (Invalid_preferences Too_many_selections)
+        else match command with
         | Apply -> finish applied None { previous with selected_name = None }
         | Save_as name ->
           let selected_name = Some (String.trim name) in

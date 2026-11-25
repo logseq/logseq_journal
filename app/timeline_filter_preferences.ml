@@ -1,6 +1,10 @@
 open Journal_timeline_filter.Timeline_filter
 
 let startup_prefix = "JTF1"
+let record_limit = 64 * 1024
+let graph_limit = 64
+let envelope_limit = graph_limit * ((6 * record_limit) + 64) + 64
+let unavailable = ["overflow", `String ""]
 
 let unwrap_startup payload =
   if not (String.starts_with ~prefix:startup_prefix payload) then [], payload else
@@ -8,11 +12,15 @@ let unwrap_startup payload =
   | None -> [], payload
   | Some separator ->
     let offset = String.length startup_prefix in
-    let snapshot = String.sub payload offset (separator - offset) in
+    let length = separator - offset in
     let config = String.sub payload (separator + 1) (String.length payload - separator - 1) in
     let entries =
-      try match Yojson.Safe.from_string snapshot with `Assoc entries -> entries | _ -> []
-      with Yojson.Json_error _ -> [] in
+      if length > envelope_limit then unavailable else
+      let snapshot = String.sub payload offset length in
+      try match Yojson.Safe.from_string snapshot with
+      | `Assoc entries when List.length entries <= graph_limit + 1 -> entries
+      | _ -> unavailable
+      with Yojson.Json_error _ | Stack_overflow -> unavailable in
     entries, config
 ;;
 
@@ -41,7 +49,7 @@ let decode text =
     criteria ~tags:(ids (member "tags" value)) ~statuses:(ids (member "statuses" value)) ~time
   in
   try
-    if String.length text > 512 * 1024 then invalid "Filter record exceeds 512 KiB";
+    if String.length text > record_limit then invalid "Filter record exceeds 64 KiB";
     let value = Yojson.Safe.from_string text in
     match member "version" value with
     | `Int 1 -> Ok empty_preferences

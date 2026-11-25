@@ -17,6 +17,7 @@ int32_t lui_ocaml_start(void (*patch)(const char*),int32_t p,int32_t h,const cha
 int32_t lui_ocaml_stop(void){return 1;}
 void journal_ocaml_set_wakeup_callback(void(*f)(void)){}
 void journal_ocaml_set_platform_request_callback(void(*f)(const char*,int32_t)){request=f;}
+void journal_ocaml_set_filter_commit_callback(int32_t(*f)(const char*,int32_t)){}
 int32_t journal_ocaml_pump(void){return 1;}
 int32_t journal_ocaml_platform_event(const char*d,int32_t n){if(inside)reentrant++;return 1;}
 int32_t journal_ocaml_platform_response(const char*d,int32_t n){calls++;if(inside)reentrant++;return 1;}

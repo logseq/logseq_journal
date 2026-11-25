@@ -49,5 +49,14 @@ let () =
   let full = get (Filter.preferences ~definitions:(List.init 5 (fun index -> string_of_int index, Filter.all)) ~selected_name:None) in
   let draft = Filter.open_sheet (Filter.restore full) in
   assert (Filter.submit draft (Save_as "sixth") = Error (Invalid_preferences Too_many_filters));
-  assert ((get (Filter.submit draft Apply)).replacement = None)
+  assert ((get (Filter.submit draft Apply)).replacement = None);
+  List.iter (fun (toggle, selected) ->
+    let ids = List.init 101 (fun index ->
+      get (Filter.Uuid.of_string (Printf.sprintf "00000000-0000-4000-8000-%012d" index))) in
+    let over = List.fold_left (fun state id -> Filter.edit state (toggle id)) draft ids in
+    assert (Filter.submit over Apply = Error (Invalid_preferences Too_many_selections));
+    assert (Filter.submit over (Save_as "Another") = Error (Invalid_preferences Too_many_selections));
+    let reduced = Filter.edit over (toggle (List.hd ids)) in
+    assert (List.length (selected (Filter.applied (submit reduced Apply))) = 100))
+    [(fun id -> Filter.Toggle_tag id), Filter.tags; (fun id -> Filter.Toggle_status id), Filter.statuses]
 ;;

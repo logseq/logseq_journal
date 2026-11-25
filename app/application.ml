@@ -3500,10 +3500,26 @@ let start
          (try ignore (Journal_filter_date.resolve_days (applied filters) ~today:(Journal_calendar.local_day calendar)); filters
           with Invalid_argument reason -> invalid reason))
     | Some _ -> invalid "Expected a text record" in
-  let restore_filters state =
-    match state.filters_restored, state.graph_state.graph_id, state.calendar with
-    | false, Some id, Some calendar ->
-      { state with filters_restored = true; filters = saved_filters id calendar }
+  let restore_filters ~switched state =
+    match state.graph_state.graph_id, state.calendar with
+    | Some id, Some calendar when switched || not state.filters_restored ->
+      let filters = saved_filters id calendar in
+      let restored = { state with filters_restored = true; filters } in
+      let restored =
+        if not state.filters_restored || Timeline_filter.applied filters = Timeline_filter.applied state.filters
+        then restored
+        else
+          { restored with feed_loaded = false; feed_refresh = None
+          ; timeline = Journal_timeline_state.empty ~today:(Journal_calendar.local_day calendar)
+          ; timeline_structure_revision = state.timeline_structure_revision + 1
+          ; presented_feed_context = None } in
+      let warning = match List.assoc_opt (graph_filter_key id) !filter_preferences with
+        | Some (`String "") -> Some "The saved Timeline filters for this graph exceed the storage limit or are invalid."
+        | None when List.mem_assoc "overflow" !filter_preferences ->
+          Some "Some saved Timeline filters could not be loaded (64-graph storage limit or invalid startup data)."
+        | _ -> None in
+      Option.fold ~none:restored ~some:(fun message ->
+        show_sync_error restored (Non_worker_sync_failure message)) warning
     | _ -> state in
   let pump = Journal_pump.create () in
   Journal_pump.set_wakeup pump Journal_bridge.wakeup;
@@ -7750,7 +7766,10 @@ let start
     Option.iter activate_runtime (timeline_scope model);
     let before = model in
     let model,eff=transition model in
-    let model = restore_filters model in
+    let switched = visible &&
+      (before.graph_state.graph_id <> model.graph_state.graph_id
+       || before.graph_state.generation <> model.graph_state.generation) in
+    let model = restore_filters ~switched model in
     match !before_transition_effect before model with
     | Error cause ->
       let message = "Nothing was submitted. " ^ cause in

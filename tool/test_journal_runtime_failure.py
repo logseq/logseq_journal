@@ -44,6 +44,7 @@ int32_t lui_ocaml_stop(void) { stops++; return mode == 7 ? 0 : 1; }
 int32_t journal_ocaml_pump(void) { return mode == 3 ? 0 : 1; }
 void journal_ocaml_set_wakeup_callback(void (*f)(void)) {}
 void journal_ocaml_set_platform_request_callback(void (*f)(const char *,int32_t)) {}
+void journal_ocaml_set_filter_commit_callback(int32_t (*f)(const char *,int32_t)) {}
 int32_t journal_ocaml_platform_event(const char *d,int32_t n) { platform_calls++; return mode == 4 ? 0 : 1; }
 int32_t journal_ocaml_platform_response(const char *d,int32_t n) { platform_calls++; return mode == 5 ? 0 : 1; }
 int32_t journal_ocaml_platform_failure(const char *d,int32_t n) { platform_calls++; return mode == 6 ? 0 : 1; }
