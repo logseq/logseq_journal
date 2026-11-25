@@ -157,6 +157,7 @@ let with_attempt ~sw ~authenticator ~network ~clock ~response_budget request ~co
                        match request.Http.operation with
                        | Get -> `GET
                        | Put _ -> `PUT
+                       | Post _ -> `POST
                      in
                      let response_handler response body =
                        guard (fun () ->
@@ -182,7 +183,7 @@ let with_attempt ~sw ~authenticator ~network ~clock ~response_budget request ~co
                      let request_headers =
                        match request.Http.operation with
                        | Get -> request.headers
-                       | Put bytes ->
+                       | Put bytes | Post bytes ->
                          ("content-length", string_of_int (String.length bytes))
                          :: request.headers
                      in
@@ -208,7 +209,7 @@ let with_attempt ~sw ~authenticator ~network ~clock ~response_budget request ~co
                      in
                      (match request.Http.operation with
                       | Get -> ()
-                      | Put bytes -> Httpun.Body.Writer.write_string writer bytes);
+                      | Put bytes | Post bytes -> Httpun.Body.Writer.write_string writer bytes);
                      Httpun.Body.Writer.close writer;
                      Eio.Promise.await completed;
                      Eio.Fiber.check ();
@@ -294,7 +295,7 @@ let follow_redirects attempt request =
       then
         if
           match request.Http.operation with
-          | Put _ -> true
+          | Put _ | Post _ -> true
           | Get -> false
         then Error "Asset uploads cannot redirect"
         else if remaining = 0

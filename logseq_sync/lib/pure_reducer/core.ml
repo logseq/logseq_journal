@@ -3858,7 +3858,7 @@ let request_asset core (request : asset_request) =
     match request.action with
     | Fetch_asset { maximum_plaintext_bytes; _ }
     | Put_asset_file { maximum_plaintext_bytes; _ } ->
-      maximum_plaintext_bytes >= 0 && maximum_plaintext_bytes <= 100 * 1024 * 1024
+      maximum_plaintext_bytes >= 0 && maximum_plaintext_bytes <= 200 * 1024 * 1024
     | Asset_retry_after seconds -> Float.is_finite seconds && seconds >= 0.
     | Commit_graph_asset_deletion deletion | Cancel_graph_asset_deletion deletion ->
       asset_deletion_scope deletion = request.scope

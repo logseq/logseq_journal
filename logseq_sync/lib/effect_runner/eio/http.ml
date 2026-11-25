@@ -1,6 +1,7 @@
 type operation =
   | Get
   | Put of string
+  | Post of string
 
 type expected_content_type =
   | Structured_response

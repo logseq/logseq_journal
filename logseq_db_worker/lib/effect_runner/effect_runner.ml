@@ -3170,7 +3170,7 @@ let run_upload t (context : Sync.asset_context) instruction =
                 { asset = intent.asset
                 ; version = intent.version
                 ; file = intent.staged_file
-                ; maximum_plaintext_bytes = 8 * 1024 * 1024
+                ; maximum_plaintext_bytes = 200 * 1024 * 1024
                 })
          with
          | Ok Sync.Asset_unit -> Ok ()
@@ -3608,7 +3608,7 @@ let run_asset t (context : Sync.asset_context) instruction =
            (Sync.Fetch_asset
               { asset = ticket.asset
               ; version = ticket.version
-              ; maximum_plaintext_bytes = 8 * 1024 * 1024
+              ; maximum_plaintext_bytes = 200 * 1024 * 1024
               }))
       (fun result ->
          Transfer.Downloaded
