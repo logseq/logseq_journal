@@ -2512,7 +2512,7 @@ let asset_download_budget maximum_plaintext_bytes expected_entered () =
         Runner.shutdown t)))
 ;;
 
-let asset_download_admission = asset_download_budget 4 3
+let asset_download_admission = asset_download_budget (200 * 1024 * 1024) 3
 
 let scenarios =
   scenarios
@@ -2521,6 +2521,36 @@ let scenarios =
         `Quick
         asset_download_admission
     ]
+;;
+
+let asset_download_falls_back () =
+  let bytes = String.make ((8 * 1024 * 1024) + 1) 'x' in
+  let version = Logseq_db_types.Asset_descriptor.version
+    ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum bytes) ~file_type:"bin"
+    |> Result.get_ok in
+  let wire = response
+    ~headers:(Printf.sprintf "Content-Length: %d\r\n" (String.length bytes)) bytes in
+  let report =
+    with_peer [ case wire; case wire ] (fun ~environment ~sw ~support ~origin ->
+      let posted = ref [] in
+      let t = runner ~environment ~sw ~support ~posted ~invalidations:(ref 0) () in
+      let selected, scope = bootstrap ~mirror_absent:false origin in
+      let result =
+        asset_run t ~clock:(Eio.Stdenv.clock environment) ~posted selected.next scope
+          "download-over-small-bound"
+          (Core.Fetch_asset
+             { asset = scope.graph_id; version; maximum_plaintext_bytes = 200 * 1024 * 1024 })
+      in
+      Alcotest.(check bool) "a legal asset above the small bound still downloads" true
+        (match result with Ok (Core.Asset_downloaded _) -> true | _ -> false);
+      Runner.shutdown t)
+  in
+  check_retired report;
+  Alcotest.(check int) "one bounded fallback request" 2 Yojson.Basic.Util.(report |> to_list |> List.length)
+;;
+
+let scenarios =
+  scenarios @ [ Alcotest.test_case "asset download bounded fallback" `Quick asset_download_falls_back ]
 ;;
 
 let shared_asset_byte_budget = asset_download_budget 16777216 2
