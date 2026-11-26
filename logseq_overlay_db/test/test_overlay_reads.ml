@@ -1706,6 +1706,75 @@ let timeline_filter_parent_cap database =
       "wide preview position survived a change to the depth witness")
 ;;
 
+let timeline_filter_wide_continuations database =
+  let behavior = "wide root and child scans make bounded packet progress" in
+  let module J = Transit_core.Json in
+  let id = T.mutation_uuid in
+  let lookup n = T.status_lookup (id n) in
+  let create n fields =
+    List.map (fun (key, value) -> T.status_add (J.Int (31000 + n)) key value)
+      (("block/uuid", J.Uuid (Graph.Uuid.to_string (id n))) :: fields) in
+  let page n = create n ["block/title", J.String (string_of_int n);
+                         "block/name", J.String (string_of_int n)] in
+  let block n parent = create n
+    ["block/title", J.String (string_of_int n); "block/parent", lookup parent;
+     "block/page", lookup 1; "block/order", J.String (Printf.sprintf "%06d" n)] in
+  let tag n selected = T.status_add (lookup n) "block/tags" (lookup selected) in
+  let cursor = ref 0 in
+  let apply operations =
+    incr cursor;
+    T.apply_test_transaction database ~cursor:!cursor operations in
+  apply (page 1 @ page 2 @ page 3 @ page 4
+         @ [T.status_add (lookup 1) "block/journal-day" (J.Int 20261101)]);
+  let wide start parent =
+    for batch = 0 to 20 do
+      let offset = batch * 500 in
+      apply (List.concat_map (fun i -> block (start + offset + i) parent)
+               (List.init (min 500 (10_001 - offset)) Fun.id))
+    done in
+  wide 100 1;
+  wide 20_100 100;
+  apply [tag 30_099 2; tag 101 2; tag 101 3; tag 30_100 4; tag 10_100 4];
+  let with_snapshot f =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () -> f snapshot) in
+  let read snapshot selected after = Database.get_timeline_roots_through_grandchildren snapshot
+    ~page:(id 1) ~tags:(List.map id selected) ~statuses:[] ~limit:1 ~after in
+  let ids = List.map (fun (item : Types.tree_member) ->
+    T.require (item.depth = 0 && item.parent = id 1) "descendant was promoted";
+    item.block.block.uuid) in
+  let through_another_root snapshot selected expected =
+    let rec collect packets after hits =
+      T.require (packets < 48) "did not reach second root in the first %d packets" packets;
+      let items, next = read snapshot selected after |> T.require_ok ~behavior in
+      let hits = hits @ ids items in
+      if List.mem (id 101) hits then (
+        Printf.printf "second root, tag %d: %d packets\n%!" (List.hd selected) (packets + 1);
+        T.require (hits = expected) "wrong ordered roots before second root")
+      else (
+        T.require (Option.is_some next && next <> after) "continuation ended or stalled";
+        collect (packets + 1) next hits) in
+    collect 0 None [] in
+  with_snapshot (fun pinned ->
+    let first, position = read pinned [2] None |> T.require_ok ~behavior in
+    T.require (first = [] && Option.is_some position) "expected sparse first packet";
+    through_another_root pinned [2] [id 100; id 101];
+    through_another_root pinned [3] [id 101];
+    let rec collect_cap packets after =
+      T.require (packets < 90) "cap scan did not terminate";
+      let items, next = read pinned [4] after |> T.require_ok ~behavior in
+      T.require (items = []) "a raw candidate past the parent cap matched";
+      match next with None -> () | Some _ -> collect_cap (packets + 1) next in
+    collect_cap 0 None;
+    apply [tag 20_100 2];
+    with_snapshot (fun latest ->
+      T.require (read latest [2] position = Error Types.Stale_read_cursor) "old continuation stayed valid";
+      let items, _ = read latest [2] None |> T.require_ok ~behavior in
+      T.require (ids items = [id 100]) "fresh snapshot missed new early match");
+    let items, _ = read pinned [2] None |> T.require_ok ~behavior in
+    T.require (items = []) "pinned snapshot observed later write")
+;;
+
 let timeline_overlay_roots_follow_remote_page_metadata database =
   let behavior = "timeline overlay roots follow remote page metadata" in
   let module J = Transit_core.Json in
@@ -1892,6 +1961,7 @@ let cases =
   ; T.database_case "timeline overlay roots follow remote page metadata" timeline_overlay_roots_follow_remote_page_metadata
   ; T.database_case "timeline filter depth and moves" timeline_filter_depth
   ; T.database_case "timeline filter per-parent cap" timeline_filter_parent_cap
+  ; T.database_case "timeline wide continuation progress" timeline_filter_wide_continuations
   ; T.database_case "timeline remote scopes cover metadata moves and ABA" timeline_remote_scopes_cover_metadata_moves_and_aba
   ; T.database_case "timeline local scope versions bind payload and snapshots" timeline_scopes_follow_local_payload_and_snapshot
   ; T.database_case "timeline direct paging survives unrelated scopes" timeline_pages_continue_across_unrelated_scopes

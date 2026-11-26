@@ -4627,7 +4627,7 @@ let timeline_member_offset scope version = function
      | _ -> Error (Types.Invalid_read_request "timeline member position belongs to another query"))
 ;;
 
-let timeline_direct_candidates ~truncate snapshot parent =
+let timeline_direct_candidates ?(charge = fun _ -> ()) ~truncate snapshot parent =
         let database = Option.get snapshot.authoritative_database in
         let cache =
           { hydration = hydration_cache ~index_idents:false database
@@ -4665,6 +4665,7 @@ let timeline_direct_candidates ~truncate snapshot parent =
           Hashtbl.length identities <= maximum_cursor_offset
           with Exit -> false
         in
+        charge !examined;
         if not (complete || truncate) then None else
           Some (Hashtbl.to_seq_values identities |> Rrbvec.of_seq
             |> Rrbvec.sort Graph.Uuid.compare
@@ -4745,17 +4746,20 @@ let get_timeline_roots_through_grandchildren snapshot ~page ~tags ~statuses ~lim
            | _ -> invalid)
        | _ -> invalid) in
   let ordinary_steps = 16 and wide_steps = 256 in
-  let wide = ref false and materialized = ref 0 in
+  let wide = ref false and examined_total = ref 0 in
+  let candidate_budget = (3 * maximum_cursor_offset) + wide_steps in
+  let exception Candidate_budget_spent in
   let context = lazy (read_context snapshot) in
   let read cache parent offset =
     let candidates = match !cache with
       | Some (previous, result) when Graph.Uuid.equal previous parent -> result
       | _ ->
-        let result = timeline_direct_candidates ~truncate:true snapshot parent in
-        Option.iter (fun candidates ->
-          let count = Rrbvec.length candidates in
-          wide := !wide || count = maximum_cursor_offset;
-          materialized := !materialized + count) result;
+        if !examined_total + maximum_cursor_offset > candidate_budget then
+          raise_notrace Candidate_budget_spent;
+        let charge examined =
+          wide := !wide || examined = maximum_cursor_offset;
+          examined_total := !examined_total + examined in
+        let result = timeline_direct_candidates ~charge ~truncate:true snapshot parent in
         cache := Some (parent, result);
         result in
     match candidates with
@@ -4773,9 +4777,11 @@ let get_timeline_roots_through_grandchildren snapshot ~page ~tags ~statuses ~lim
     || match record.task_status with
        | Some (Status_uuid uuid) -> List.exists (Graph.Uuid.equal uuid) statuses
        | Some (Legacy_status_ident _) | None -> false in
+  let resume = ref ([], root, child, grandchild) in
   let rec scan fuel remaining items root child grandchild =
+    resume := (items, root, child, grandchild);
     if remaining = 0 || fuel = 0
-       || (fuel <= wide_steps - ordinary_steps && not !wide) || !materialized >= 2 * maximum_cursor_offset
+       || (fuel <= wide_steps - ordinary_steps && not !wide)
     then Ok (List.rev items, Some (position root child grandchild))
     else
       let* item, more_roots = read roots_cache page root in
@@ -4808,7 +4814,11 @@ let get_timeline_roots_through_grandchildren snapshot ~page ~tags ~statuses ~lim
           | Some item when Graph.Uuid.equal item.block.block.page page && matches item.block -> hit ()
           | _ when more -> scan (fuel - 1) remaining items root child (grandchild + 1)
           | _ -> advance_child () in
-  with_snapshot_read snapshot (fun _ -> scan wide_steps limit [] root child grandchild)
+  with_snapshot_read snapshot (fun _ ->
+    try scan wide_steps limit [] root child grandchild with
+    | Candidate_budget_spent ->
+      let items, root, child, grandchild = !resume in
+      Ok (List.rev items, Some (position root child grandchild)))
 ;;
 
 (* Writes own invalidation under the owner lock. Dependency cursors are lazy;
