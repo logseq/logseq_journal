@@ -8883,9 +8883,30 @@ let () =
               Fun.protect ~finally:(fun()->remove support) (fun()->
                 let before_capture_send () =
                   let owned=Filename.concat support "JournalDrafts-v1" in
-                  let account=Filename.concat owned (Array.get(Sys.readdir owned)0) in
-                  let manifest=Filename.concat account "state.json" in
-                  Unix.unlink manifest;Unix.mkdir manifest 0o700 in
+                  let deadline = Unix.gettimeofday () +. 5. in
+                  let rec await_picker_checkpoint () =
+                    let checkpoint =
+                      if not (Sys.file_exists owned) then None else
+                      match Sys.readdir owned with
+                      | [| account |] ->
+                        let manifest = Filename.concat (Filename.concat owned account) "state.json" in
+                        if not (Sys.file_exists manifest) then None else
+                        let open Yojson.Safe.Util in
+                        let drafts = Yojson.Safe.from_file manifest |> member "drafts" |> to_list in
+                        if List.exists (fun draft ->
+                          List.map (fun asset -> asset |> member "title" |> to_string)
+                            (draft |> member "assets" |> to_list)
+                          = ["First attachment"; "Second attachment"]) drafts
+                        then Some manifest else None
+                      | _ -> None in
+                    match checkpoint with
+                    | Some manifest -> manifest
+                    | None when Unix.gettimeofday () < deadline ->
+                      Unix.sleepf 0.001;
+                      await_picker_checkpoint ()
+                    | None -> Alcotest.fail "picker draft checkpoint was not published" in
+                  let manifest = await_picker_checkpoint () in
+                  Unix.unlink manifest; Unix.mkdir manifest 0o700 in
                 try run_favorites_native_visibility ~single_graph_shape:true
                   ~support_directory:support ~check_capture_imports:true
                   ~before_capture_send ~check_draft_write_failure:true ()
