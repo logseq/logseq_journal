@@ -1511,12 +1511,27 @@ let read_typed
     let block_lookup record = function
       |Overlay.Present_block{value;revision}->Worker_pure_data.V2_present_block{value=record value;revision=Overlay.Block_state_revision.to_string revision}
       |Missing_block{uuid;revision}->V2_missing_block{uuid;revision=Overlay.Block_state_revision.to_string revision} in
+    let timeline_coverage_scope query =
+      Option.map (function
+        | Read.Timeline.Root_membership -> Database.Journal_root_membership
+        | Root_and_descendant_membership -> Database.Journal_root_and_descendant_membership)
+        (Read.Timeline.coverage_scope query) in
+    let timeline_version : type item. _ -> item Read.Timeline.query -> _ = fun snapshot query ->
+      let scope = match query with
+        | Read.Timeline.Dates _ -> Database.Journal_index
+        | Roots page -> Page_roots page
+        | Roots_through_grandchildren {page;_} -> Page_roots page
+        | Preview_children {parent;_} -> Parent_children parent in
+      Result.bind (Database.timeline_scope_version snapshot scope) (fun version ->
+        let version = Database.timeline_scope_version_to_string version in
+        match query with
+        | Preview_children {overflow_fallback=true;_} ->
+          Database.timeline_scope_version snapshot Journal_root_and_descendant_membership
+          |> Result.map (fun depth -> version ^ "/" ^ Database.timeline_scope_version_to_string depth)
+        | _ -> Ok version) in
     match query with
     |Read.Timeline_read {query=timeline_query;after}->with_snapshot(fun snapshot record _ ->
       let module Timeline=Read.Timeline in
-      let scope : type item. item Timeline.query -> Database.timeline_scope = function
-        | Dates _->Journal_index | Roots page->Page_roots page
-        | Preview_children parent->Parent_children parent in
       let source_error error = match error with
         |Overlay.Read_limit_exceeded->Timeline.Limit_exceeded "Timeline source exceeded its structural bound"
         |_->Timeline.Read_failed(typed_read_error error) in
@@ -1529,17 +1544,16 @@ let read_typed
           Error(Timeline.Invalidated Owner_changed)
         |_->Ok() in
       let value=Result.bind checked(fun()->
-        Database.timeline_scope_version snapshot (scope timeline_query)
+        timeline_version snapshot timeline_query
         |>Result.map_error source_error
         |>fun version->Result.bind version(fun version->
-          let version=Database.timeline_scope_version_to_string version in
           if Option.exists(fun cursor->F.timeline_receipt_version(F.timeline_cursor_receipt cursor)<>version)after
           then Error(Timeline.Invalidated Scope_changed) else
           let position=Option.map F.timeline_cursor_position after in
           let decode_position decode=match position with None->Ok None|Some value->Result.map Option.some(decode value) in
           let read : type item. item Timeline.query -> int -> (item Rrbvec.t * string option,Timeline.error)result =
             fun query limit->match query with
-            |Dates {from_day;through_day}->
+            |Dates {from_day;through_day;_}->
               Result.bind(decode_position Database.journal_position_of_string)(fun after->
                 Database.get_timeline_journals snapshot ~from_day:(F.journal_day_value from_day)
                   ~through_day:(F.journal_day_value through_day) ~limit ~after)
@@ -1555,18 +1569,29 @@ let read_typed
               |>Result.map(fun(items,next)->Rrbvec.of_list(List.map(fun(item:Overlay.tree_member)->
                 Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision;
                   depth=item.depth;parent=item.parent})items),Option.map Database.member_position_to_string next)
-            |Preview_children parent->
+            |Roots_through_grandchildren {page;tags;statuses}->
               Result.bind(decode_position Database.member_position_of_string)(fun after->
-                Database.get_timeline_children snapshot ~parent ~limit ~after)
-              |>Result.map_error source_error
+                Database.get_timeline_roots_through_grandchildren snapshot ~page ~tags ~statuses ~limit ~after)
+              |>Result.map_error (function Overlay.Stale_read_cursor -> Timeline.Invalidated Scope_changed | error -> source_error error)
+              |>Result.map(fun(items,next)->Rrbvec.of_list(List.map(fun(item:Overlay.tree_member)->
+                Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision;
+                  depth=item.depth;parent=item.parent})items),Option.map Database.member_position_to_string next)
+            |Preview_children {parent;overflow_fallback}->
+              let read = if overflow_fallback then Database.get_timeline_filtered_preview_children
+                else Database.get_timeline_children in
+              Result.bind(decode_position Database.member_position_of_string)(fun after->
+                read snapshot ~parent ~limit ~after)
+              |>Result.map_error (function
+                | Overlay.Stale_read_cursor when overflow_fallback -> Timeline.Invalidated Scope_changed
+                | error -> source_error error)
               |>Result.map(fun(items,next)->Rrbvec.of_list(List.map(fun(item:Overlay.child_member)->
                 Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision})items),
                 Option.map Database.member_position_to_string next) in
           let receipt=F.timeline_receipt ~owner ~query:timeline_query ~version in
-          let receipt = match timeline_query with
-            | Preview_children _ -> Ok receipt
-            | Dates _ | Roots _ ->
-              Database.timeline_scope_version snapshot Journal_root_membership
+          let receipt = match timeline_coverage_scope timeline_query with
+            | None -> Ok receipt
+            | Some scope ->
+              Database.timeline_scope_version snapshot scope
               |> Result.map_error source_error
               |> Result.map (fun coverage -> F.with_timeline_coverage receipt
                 (Database.timeline_scope_version_to_string coverage)) in
@@ -1582,16 +1607,27 @@ let read_typed
       Ok value)
     |Read.Timeline_check receipts->with_snapshot(fun snapshot _ _ ->
       let module Timeline=Read.Timeline in
-      let check (Timeline.Receipt receipt) =
+      let rec check (Timeline.Receipt receipt) =
         if not(Read.equal_session owner(F.timeline_receipt_owner receipt))
         then Error(Timeline.Invalidated Owner_changed) else
-        let scope=if F.timeline_receipt_is_coverage receipt then Database.Journal_root_membership
-          else match F.timeline_receipt_query receipt with
-          |Timeline.Dates _->Database.Journal_index
-          |Roots page->Page_roots page|Preview_children parent->Parent_children parent in
-        match Database.timeline_scope_version snapshot scope with
-        |Error error->Error(Timeline.Read_failed(typed_read_error error))
-        |Ok version when Database.timeline_scope_version_to_string version=F.timeline_receipt_version receipt->Ok()
+        let query = F.timeline_receipt_query receipt in
+        let read_version result = Result.map_error (fun error -> Timeline.Read_failed(typed_read_error error)) result in
+        let version =
+          if F.timeline_receipt_is_coverage receipt then
+            match timeline_coverage_scope query with
+            | None -> Error (Timeline.Invalidated Scope_changed)
+            | Some scope -> Database.timeline_scope_version snapshot scope
+              |> Result.map Database.timeline_scope_version_to_string |> read_version
+          else timeline_version snapshot query |> read_version in
+        match version with
+        |Error error->Error error
+        |Ok version when version=F.timeline_receipt_version receipt->
+          (match F.timeline_receipt_query receipt with
+           | Roots_through_grandchildren _ when not (F.timeline_receipt_is_coverage receipt) ->
+             (match Timeline.coverage receipt with
+              | Some coverage -> check coverage
+              | None -> Error (Timeline.Invalidated Scope_changed))
+           | _ -> Ok ())
         |Ok _->Error(Timeline.Invalidated Scope_changed) in
       Ok(F.timeline_check(Rrbvec.map check receipts)))
     |Read.Changes{generation;after}->fit (fun limit->changes ~generation ~after ~limit)

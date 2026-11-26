@@ -380,7 +380,8 @@ val get_structure
     Release every borrowed snapshot to release its history roots. *)
 type timeline_scope =
   | Journal_index
-  | Journal_root_membership (** Date membership and visible journal root candidacy. *)
+  | Journal_root_membership (** Date membership and direct-root candidacy. *)
+  | Journal_root_and_descendant_membership (** Date membership and candidacy through grandchildren. *)
   | Page_roots of Graph.page_uuid
   | Parent_children of Graph.block_uuid
 
@@ -410,7 +411,29 @@ val get_timeline_journals
 val get_timeline_roots
   : snapshot -> page:Graph.page_uuid -> limit:int -> after:member_position option
   -> (Types.tree_member list * member_position option, Types.read_error) result
+
+(** Scan only roots, their children and their grandchildren. Match any selected
+    tag or task status and return the ordinary top-level member on the first hit.
+    Each parent (including the journal page) contributes at most 10,000 raw
+    entries: authoritative parent datoms in index order, then indexed overlay
+    footprints and shadow entries in stored order. Duplicates, tombstones and
+    entries that do not resolve to live direct members still consume slots.
+    The surviving prefix is sorted in ordinary member order; excluded members
+    and their descendants cannot match. Other parents continue independently.
+    A bounded scan may return an empty packet with a continuation. *)
+val get_timeline_roots_through_grandchildren
+  : snapshot -> page:Graph.page_uuid -> tags:Graph.Uuid.t list -> statuses:Graph.Uuid.t list
+  -> limit:int -> after:member_position option
+  -> (Types.tree_member list * member_position option, Types.read_error) result
+
 val get_timeline_children
+  : snapshot -> parent:Graph.block_uuid -> limit:int -> after:member_position option
+  -> (Types.child_member list * member_position option, Types.read_error) result
+
+(** Use ordinary direct preview paging, falling back to the bounded candidate
+    prefix if the ordinary read exceeds its structural limit. Preview members
+    do not need to match the filter. *)
+val get_timeline_filtered_preview_children
   : snapshot -> parent:Graph.block_uuid -> limit:int -> after:member_position option
   -> (Types.child_member list * member_position option, Types.read_error) result
 

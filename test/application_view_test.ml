@@ -1308,7 +1308,7 @@ let run_favorites_native_visibility
                   ; depth = 0
                   ; parent = page.uuid }))
                 ~next:(if offset + length < count then Some (string_of_int (offset + length)) else None)))
-            | Read.Timeline_read {query=(Read.Timeline.Preview_children parent as timeline);_} ->
+            | Read.Timeline_read {query=(Read.Timeline.Preview_children {parent;_} as timeline);_} ->
               let items, next = child_items parent in
               Ok (Ok (fixture_timeline_packet budget timeline ~items
                 ~next:(Option.map G.Cursor.to_string next)))

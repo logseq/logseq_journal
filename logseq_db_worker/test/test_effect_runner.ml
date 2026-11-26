@@ -1189,7 +1189,7 @@ let test_observation_release_waits_for_initial_snapshot () =
           "empty Timeline scopes retain an exhaustion receipt";
         let day=Read.journal_day 20260902 |> Result.get_ok in
         let dates=run (Read.Timeline_read {
-          query=Timeline.dates ~from_day:day ~through_day:day; after=None }) |> Result.get_ok in
+          query=Timeline.dates ~coverage_scope:Root_membership ~from_day:day ~through_day:day; after=None }) |> Result.get_ok in
         let receipts=Rrbvec.of_list [Timeline.Receipt packet.receipt;
           Timeline.Receipt empty.receipt; Timeline.Receipt dates.receipt] in
         let checked=(run(Read.Timeline_check receipts)).Timeline.results in
@@ -1210,6 +1210,85 @@ let test_observation_release_waits_for_initial_snapshot () =
         require (match Db.read_for_scope db ~scope (F.pack_query tiny (Read.Timeline_read{query=roots;after=None})) with
           | Read.Query_answer(_,Read.Timeline_read _,Ok(Error(Timeline.Limit_exceeded _)))->true
           | _->false) "Timeline singleton reports its final receipt and DTO byte bound";
+        let module Mutation = Logseq_db_worker_contract.Worker_pure_mutation in
+        let origin = scope.account.managed_sync_origin and user = scope.account.user_id in
+        let graph = scope.graph_id in
+        let commit intent = match Db.durable_mutation_for_scope db ~scope ~intent ~current:(fun () -> true) with
+          | Mutation.Committed _ -> ()
+          | _ -> Alcotest.fail "Timeline receipt fixture mutation did not commit" in
+        let journal = Fixture.mutation_uuid 29010 and child = Fixture.mutation_uuid 29012 in
+        let grandchild = Fixture.mutation_uuid 29015 in
+        let day = Read.journal_day 20261107 |> Result.get_ok in
+        let root : Worker_pure_data.append_node = {
+          block_id=Fixture.mutation_uuid 29011;title="Root";task_status=None;
+          children=Rrbvec.of_list Worker_pure_data.[
+            {block_id=child;title="Child";task_status=None;
+             children=Rrbvec.singleton {block_id=grandchild;title="Grandchild";task_status=None;children=Rrbvec.empty}};
+            {block_id=Fixture.mutation_uuid 29016;title="Sibling";task_status=None;children=Rrbvec.empty}] } in
+        commit (Mutation.Append_intent (Mutation.create_append ~origin ~user ~graph
+          ~mutation_id:(Fixture.mutation_uuid 29013) ~page:journal ~day ~root |> Result.get_ok));
+        let status = Fixture.builtin_todo_uuid in
+        let read_roots query = run (Read.Timeline_read {query;after=None}) |> Result.get_ok in
+        let filtered = Timeline.roots_through_grandchildren ~page:journal ~tags:[] ~statuses:[status] in
+        let ordinary = read_roots (Timeline.roots ~page:journal) in
+        let day_query = Timeline.dates ~coverage_scope:Root_membership ~from_day:day ~through_day:day in
+        let day_packet = read_roots day_query in
+        let depth_query = Timeline.dates ~coverage_scope:Root_and_descendant_membership ~from_day:day ~through_day:day in
+        let depth_packet = read_roots depth_query in
+        let absent_day = Read.journal_day 20261108 |> Result.get_ok in
+        let empty_dates scope = read_roots (Timeline.dates ~coverage_scope:scope
+          ~from_day:absent_day ~through_day:absent_day) in
+        let empty_day = empty_dates Root_membership
+        and empty_depth = empty_dates Root_and_descendant_membership in
+        let coverage packet = Option.get (Timeline.coverage packet.Timeline.receipt) in
+        require (Rrbvec.is_empty empty_day.items && empty_day.next = Timeline.End &&
+          Rrbvec.is_empty empty_depth.items && empty_depth.next = Timeline.End)
+          "both Dates modes can exhaust an empty range";
+        require (not (Timeline.equal_coverage (coverage day_packet) (coverage depth_packet)))
+          "root and descendant coverage compare unequal";
+        let preview_query = Timeline.preview_children ~parent:root.block_id in
+        let preview = read_roots preview_query in
+        let exhausted = read_roots filtered in
+        require (Rrbvec.is_empty exhausted.items && exhausted.next = Timeline.End) "filtered scope starts exhausted";
+        let before = Timeline.Receipt exhausted.receipt in
+        let check receipts = (run (Read.Timeline_check (Rrbvec.of_list receipts))).Timeline.results |> Rrbvec.to_list in
+        require (check [before] = [Ok ()]) "filtered receipt validates before descendant change";
+        let fallback_query = Timeline.filtered_preview_children ~parent:root.block_id in
+        let fallback = read_roots fallback_query in
+        let fallback_receipt = Timeline.Receipt fallback.receipt in
+        let cursor = match fallback.next with
+          | Timeline.More cursor -> cursor
+          | Timeline.End -> Alcotest.fail "fallback preview did not paginate" in
+        let resume () = run (Read.Timeline_read {query=fallback_query;after=Some cursor}) in
+        require (check [fallback_receipt] = [Ok ()]) "fallback receipt validates before descendant change";
+        let second = resume () |> Result.get_ok in
+        require (second.next = Timeline.End && Rrbvec.length second.items = 1)
+          "fallback resumes on the unchanged snapshot";
+        let revision = match run (Read.Outline_block {uuid=grandchild;revision=None}) with
+          | Worker_pure_data.V2_present_block {revision;_} -> revision
+          | _ -> Alcotest.fail "Timeline receipt fixture grandchild missing" in
+        let preconditions = Worker_pure_data.{blocks=[grandchild, revision];pages=[];scopes=[]} in
+        commit (Mutation.Mutation_intent (Mutation.create_mutation ~origin ~user ~graph
+          ~mutation_id:(Fixture.mutation_uuid 29014)
+          (Set_task_status {block=grandchild;status;preconditions}) |> Result.get_ok));
+        require (Rrbvec.length (read_roots filtered).items = 1) "descendant status makes the root match";
+        require (check [fallback_receipt] = [Error (Timeline.Invalidated Scope_changed)])
+          "fallback packet receipt rejects a changed depth witness";
+        require (resume () = Error (Timeline.Invalidated Scope_changed))
+          "fallback continuation rejects a changed depth witness";
+        require (check [Timeline.Receipt ordinary.receipt; before; Option.get (Timeline.coverage exhausted.receipt)] =
+          [Ok (); Error (Timeline.Invalidated Scope_changed); Error (Timeline.Invalidated Scope_changed)])
+          "empty End receipt independently rejects changed membership while the ordinary root stays valid";
+        require (check [coverage depth_packet; coverage empty_depth; coverage empty_day] =
+          [Error (Timeline.Invalidated Scope_changed); Error (Timeline.Invalidated Scope_changed); Ok ()])
+          "grandchild-only change invalidates depth-selected Dates coverage";
+        require (check [coverage day_packet; coverage ordinary; Timeline.Receipt preview.receipt] =
+          [Ok (); Ok (); Ok ()]) "grandchild-only change leaves day and regular root coverage and direct preview valid";
+        require (Timeline.equal_coverage (coverage day_packet) (coverage (read_roots day_query)))
+          "day coverage remains equal after a grandchild-only change";
+        require (Option.is_none (Timeline.coverage preview.receipt) &&
+          Rrbvec.to_list preview.items = Rrbvec.to_list (read_roots preview_query).items)
+          "direct preview still has the same items and no coverage receipt";
         (* Slot reconstruction is performed by the physical snapshot reader,
            not Core.step, so exercise it through the existing public Db fixture. *)
         let missing=Fixture.mutation_uuid 29001 in

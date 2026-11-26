@@ -262,14 +262,15 @@ let make_root_batch t ~ports owner ~page_uuid (page : Projection.page) cursor li
   }
 ;;
 
-let plan_root_batch ~ports batch =
+let plan_root_batch t ~ports batch =
   let limit = batch.root_limit in
   let request =
     ports.plan_read
       (Root_tree batch)
       ~maximum_items:limit
       (Worker.Timeline_read
-         { query = Paging.roots ~page:(batch.root_page_uuid)
+         { query = (if t.tags = [] && t.statuses = [] then Paging.roots ~page:batch.root_page_uuid
+                    else Paging.roots_through_grandchildren ~page:batch.root_page_uuid ~tags:t.tags ~statuses:t.statuses)
          ; after = batch.root_cursor })
   in
   (match batch.root_owner with
@@ -292,7 +293,7 @@ let plan_root_batch ~ports batch =
 let read_root_batch t ~ports owner (page:Projection.page) cursor limit =
   match Graph.Uuid.of_string page.id with
   | Error message -> Error message
-  | Ok page_uuid -> Ok (make_root_batch t ~ports owner ~page_uuid page cursor limit |> plan_root_batch ~ports)
+  | Ok page_uuid -> Ok (make_root_batch t ~ports owner ~page_uuid page cursor limit |> plan_root_batch t ~ports)
 ;;
 
 let continue_root_batch t ~ports owner page cursor limit =
@@ -398,7 +399,12 @@ let read_changed_roots t ~ports page limit =
     (min limit target)
 ;;
 
-let read_root_dates ~ports scan =
+let dates_coverage_scope t =
+  if t.tags = [] && t.statuses = [] then Paging.Root_membership
+  else Paging.Root_and_descendant_membership
+;;
+
+let read_root_dates t ~ports scan =
   match Worker.journal_day scan.root_from_day,
         Worker.journal_day (min 99991231 scan.root_journal_through) with
   | Error error, _ | _, Error error -> scan_failure scan (Paging.error_message (Paging.Read_failed error))
@@ -409,7 +415,7 @@ let read_root_dates ~ports scan =
       (Root_dates (scan, params))
       ~maximum_items:params.limit
       (Worker.Timeline_read
-         { query = Paging.dates ~from_day:params.from_day ~through_day:params.through_day
+         { query = Paging.dates ~coverage_scope:(dates_coverage_scope t) ~from_day:params.from_day ~through_day:params.through_day
          ; after = params.after })
   in
   ports.report
@@ -435,7 +441,7 @@ let root_date_continuation scan =
 ;;
 (* The first metadata packet usually covers Today. Probe its exact range only
    when every discovered date is future and the catalog has more packets. *)
-let read_priority_today ~ports scan =
+let read_priority_today t ~ports scan =
   match scan.root_skipped_day with
   | None -> scan_failure scan "The priority date is unavailable."
   | Some today -> match Worker.journal_day today with
@@ -447,7 +453,7 @@ let read_priority_today ~ports scan =
       (Root_today (scan, params))
       ~maximum_items:params.limit
       (Worker.Timeline_read
-         { query = Paging.dates ~from_day:params.from_day ~through_day:params.through_day
+         { query = Paging.dates ~coverage_scope:(dates_coverage_scope t) ~from_day:params.from_day ~through_day:params.through_day
          ; after = params.after })
   in
   ports.report
@@ -545,7 +551,7 @@ let rec next_feed_batch ?(verified=false) t ~ports scan =
     | None when scan.root_journal_through < scan.root_from_day ->
       scan.root_journals_done <- true;
       if not (has_retained t) then responses [root_feed_response ~ports scan true] else check t ~ports (Publish_feed scan)
-    | None -> read_root_dates ~ports scan)
+    | None -> read_root_dates t ~ports scan)
 ;;
 
 let complete_verified_batch t ~ports batch =
@@ -711,13 +717,16 @@ let complete_verified_batch t ~ports batch =
             else next)))
 ;;
 
-let read_root_preview ~ports preview =
+let read_root_preview t ~ports preview =
+  let parent = preview.preview_root.block.uuid in
+  let query = if t.tags = [] && t.statuses = [] then Paging.preview_children ~parent
+    else Paging.filtered_preview_children ~parent in
   let request =
     ports.plan_read
       (Root_preview preview)
       ~maximum_items:preview.preview_limit
       (Worker.Timeline_read
-         { query = Paging.preview_children ~parent:preview.preview_root.block.uuid
+         { query
          ; after = preview.preview_cursor })
   in
   (match preview.preview_batch.root_owner with
@@ -751,7 +760,7 @@ let next_root_preview t ~ports batch =
         ; preview_limit = 3
         }
       in
-      requests [ read_root_preview ~ports preview ])
+      requests [ read_root_preview t ~ports preview ])
 ;;
 
 let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation ?(reuse=false) ?after () =
@@ -784,8 +793,12 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
     t.window_epoch <- Int64.succ t.window_epoch;
     (* A replacement catalog traversal owns its own date scopes. Root and
        preview receipts still belong to every retained page. *)
+    let appended_coverage =
+      if Option.is_some cursor || Option.exists (fun (_, cursor) -> Option.is_some cursor) after
+      then Hashtbl.find_opt t.retained Coverage_scope else None in
     Hashtbl.filter_map_inplace (fun scope proof -> match scope with
-      | Dates_scope _ | Coverage_scope -> None | _ -> Some proof) t.retained;
+      | Coverage_scope -> appended_coverage
+      | Dates_scope _ -> None | _ -> Some proof) t.retained;
     if cursor = None && after = None
     then t.initial_feed_spec <- Some (root_limit, day_limit);
     let scan =
@@ -878,14 +891,8 @@ let receive_root_tree t ~ports batch (packet : Worker_pure_data.tree_member Pagi
   then root_failure batch "The root cursor did not advance."
   else (
     Hashtbl.replace batch.root_proofs (Roots_scope batch.root_page.id) (Paging.Receipt packet.receipt);
-    let matches (m : Worker_pure_data.tree_member) =
-      (t.tags = [] && t.statuses = [])
-      || List.exists (fun tag -> List.exists (Graph.Uuid.equal tag) t.tags) m.value.block.tags
-      || Option.exists (fun status -> List.exists (Graph.Uuid.equal status) t.statuses) m.value.task_status
-    in
-    let members = Rrbvec.filter_map (fun (m : Worker_pure_data.tree_member) ->
-      if matches m then Some Projection.{block=m.value.block;revision=m.revision;depth=0}
-      else None) items in
+    let members = Rrbvec.map (fun (m : Worker_pure_data.tree_member) ->
+      Projection.{block=m.value.block;revision=m.revision;depth=0}) items in
     match (ports.context ()).time_context with
     | Error message -> root_failure batch message
     | Ok time_context ->
@@ -977,7 +984,7 @@ let receive_root_preview t ~ports preview (packet : Worker_pure_data.child_membe
            then root_failure batch "The child cursor did not advance."
            else
              requests
-               [ read_root_preview ~ports
+               [ read_root_preview t ~ports
                    { preview with
                      preview_members = selected
                    ; preview_cursor = next_cursor
@@ -1042,7 +1049,7 @@ let restart_dates t ~ports scan =
     scan.root_journal_boundary <- None;
     Hashtbl.clear scan.root_journal_boundary_pages;
     scan.root_journals_done <- false;
-    read_root_dates ~ports scan)
+    read_root_dates t ~ports scan)
 ;;
 
 let with_coverage t ~ports scan receipt accept =
@@ -1050,10 +1057,19 @@ let with_coverage t ~ports scan receipt accept =
   match Paging.coverage receipt with
   | None -> scan_failure scan "Filtered Timeline read returned no coverage witness."
   | Some proof ->
-    match Hashtbl.find_opt scan.root_proofs Coverage_scope with
-    | None -> Hashtbl.replace scan.root_proofs Coverage_scope proof; accept ()
-    | Some old ->
-      if Paging.equal_coverage proof old then accept () else restart_dates t ~ports scan
+    let previous = match Hashtbl.find_opt scan.root_proofs Coverage_scope with
+      | Some _ as previous -> previous
+      | None -> Hashtbl.find_opt t.retained Coverage_scope in
+    match previous with
+    | Some old when not (Paging.equal_coverage proof old) ->
+      if scan.root_continued then stale_continuation scan
+      else if Option.is_some scan.root_source_cursor then
+        let output = start_feed_scan t ~ports ~cursor:None
+          ~root_limit:scan.root_requested_root_limit ~day_limit:scan.root_requested_day_limit
+          ~request_generation:scan.root_generation () in
+        {output with publications=Rrbvec.push_front output.publications (Refresh_started scan.root_generation)}
+      else restart_dates t ~ports scan
+    | _ -> Hashtbl.replace scan.root_proofs Coverage_scope proof; accept ()
 ;;
 
 let operation_failure operation message = match operation with
@@ -1199,7 +1215,7 @@ let receive : type a. ?session:Worker.session -> t -> ports:ports
   let handles = match operation, query with
     | Check _, Worker.Timeline_check _ -> true
     | (Root_dates _ | Root_today _), Worker.Timeline_read {query=Paging.Dates _;_} -> true
-    | Root_tree _, Worker.Timeline_read {query=Paging.Roots _;_} -> true
+    | Root_tree _, Worker.Timeline_read {query=(Paging.Roots _ | Paging.Roots_through_grandchildren _);_} -> true
     | Root_preview _, Worker.Timeline_read {query=Paging.Preview_children _;_} -> true
     | _ -> false in
   if not handles then None else if not (is_current t operation) then Some empty else
@@ -1282,7 +1298,7 @@ let receive : type a. ?session:Worker.session -> t -> ports:ports
                              ~none:false
                              ~some:(fun day -> p.day > day)
                              scan.root_skipped_day)
-                        pages -> read_priority_today ~ports scan
+                        pages -> read_priority_today t ~ports scan
             | None -> next_feed_batch t ~ports scan)
           else next_feed_batch t ~ports scan))
       | Root_today (scan, params), Worker.Timeline_read {query=Paging.Dates _;_}, Ok packet ->
@@ -1300,6 +1316,13 @@ let receive : type a. ?session:Worker.session -> t -> ports:ports
         scan.root_queued <- Rrbvec.append today scan.root_queued;
         next_feed_batch t ~ports scan)
      | Root_tree batch, Worker.Timeline_read {query=Paging.Roots _;_}, Ok packet ->
+       let accept () =
+         ports.observe_packet (Roots (Rrbvec.to_seq packet.items));
+         receive_root_tree t ~ports batch packet in
+       (match batch.root_owner with
+        | Feed_roots scan -> with_coverage t ~ports scan packet.receipt accept
+        | Changed_roots _ -> accept ())
+     | Root_tree batch, Worker.Timeline_read {query=Paging.Roots_through_grandchildren _;_}, Ok packet ->
        let accept () =
          ports.observe_packet (Roots (Rrbvec.to_seq packet.items));
          receive_root_tree t ~ports batch packet in
@@ -1327,20 +1350,20 @@ let failed t ~ports operation ~code =
          scan.root_date_retries <- scan.root_date_retries + 1;
          Option.iter (fun day -> scan.root_journal_through <- day) scan.root_journal_boundary;
          scan.root_journal_cursor <- None;
-         read_root_dates ~ports scan)
+         read_root_dates t ~ports scan)
      | Root_dates (scan, _), Logseq_db_worker.Error.Response_too_large when scan.root_list_size>1 ->
        scan.root_list_size <- max 1 (scan.root_list_size/2);
        (* Resize from the inclusive catalog boundary and deduplicate only
           identities already observed at that boundary. *)
        Option.iter (fun day -> scan.root_journal_through <- day) scan.root_journal_boundary;
        scan.root_journal_cursor <- None;
-       read_root_dates ~ports scan
+       read_root_dates t ~ports scan
      | Root_tree batch, Logseq_db_worker.Error.Response_too_large when batch.root_limit>1 ->
        let limit=max 1 (batch.root_limit/2) in
        (match batch.root_owner with Feed_roots scan->scan.root_page_size<-limit | _->());
        continue_root_batch t ~ports batch.root_owner batch.root_page batch.root_cursor limit
      | Root_preview preview, Logseq_db_worker.Error.Response_too_large when preview.preview_limit>1 ->
-       requests [read_root_preview ~ports {preview with preview_limit=max 1 (preview.preview_limit/2);
+       requests [read_root_preview t ~ports {preview with preview_limit=max 1 (preview.preview_limit/2);
          preview_members=Rrbvec.empty;preview_cursor=None}]
   | _ -> empty)
 ;;

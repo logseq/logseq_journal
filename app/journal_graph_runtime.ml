@@ -2727,6 +2727,8 @@ let receive_delivery_body t ~origin ~request_id result =
           Rrbvec.singleton (Reference.Missing_page uuid)
         | Query_result (Worker.Timeline_read {query=Worker.Timeline.Roots _;_}, Ok packet) ->
           Rrbvec.map (fun (item:Worker_pure_data.tree_member) -> block item.value) packet.items
+        | Query_result (Worker.Timeline_read {query=Worker.Timeline.Roots_through_grandchildren _;_}, Ok packet) ->
+          Rrbvec.map (fun (item:Worker_pure_data.tree_member) -> block item.value) packet.items
         | Query_result (Worker.Timeline_read {query=Worker.Timeline.Preview_children _;_}, Ok packet) ->
           Rrbvec.map (fun (item:Worker_pure_data.child_member) -> block item.value) packet.items
         | Query_result (Worker.Child_members _, { items; _ }) ->

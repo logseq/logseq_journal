@@ -1255,7 +1255,8 @@ let atomic_append_submits_and_replays_complete_tree ?(remote_day=false) database
        add_page "block/journal-day" (J.Int 20261102);
        add_child "block/uuid" (J.Uuid(Logseq_db_types.Graph_types.Uuid.to_string(T.mutation_uuid 7795)));
        add_child "block/title" (J.String "Remote first entry");add_child "block/parent" page_entity;
-       add_child "block/page" page_entity;add_child "block/order" (J.String "a9")];
+       add_child "block/page" page_entity;add_child "block/order" (J.String "a9");
+       add_child "logseq.property/status" (T.status_lookup (T.status_uuid 2))];
     let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
     Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
       T.require(match Database.get_outline_blocks snapshot [root_uuid] |> T.require_ok ~behavior with
@@ -1285,8 +1286,40 @@ let atomic_append_submits_and_replays_complete_tree ?(remote_day=false) database
   let sync=Database.inspect_sync database |> T.require_ok ~behavior in
   let prepared,crypto=Database.begin_authoritative database ~expected:(sync_view_token sync)batch |> T.require_ok ~behavior in
   let decrypted=Option.map(fun request->decrypt_submitted_request request behavior)crypto in
-  (match Database.apply_authoritative database prepared ~decrypted |> T.require_ok ~behavior with
-   | Authoritative_applied _->()|_->Alcotest.fail "atomic append echo was deferred");
+  let settle () =
+    match Database.apply_authoritative database prepared ~decrypted |> T.require_ok ~behavior with
+    | Authoritative_applied _ -> ()
+    | Authoritative_deferred _ -> Alcotest.fail "atomic append echo was deferred" in
+  let with_snapshot use =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () -> use snapshot) in
+  if not remote_day then settle () else
+    with_snapshot (fun before ->
+      let read snapshot after = Database.get_timeline_roots_through_grandchildren snapshot
+        ~page:resolved_page ~tags:[] ~statuses:[T.status_uuid 2] ~limit:1 ~after in
+      let first, next = read before None |> T.require_ok ~behavior in
+      let ids = List.map (fun (item : Types.tree_member) -> item.block.block.uuid) in
+      T.require (ids first = [T.mutation_uuid 7795] && Option.is_some next)
+        "accepted overlay must yield a real filtered continuation";
+      let suffix = read before next |> T.require_ok ~behavior in
+      T.require (ids (fst suffix) = [root_uuid] && snd suffix = None) "wrong overlay suffix";
+      let version snapshot scope = Database.timeline_scope_version snapshot scope |> T.require_ok ~behavior in
+      let roots snapshot = Database.get_timeline_roots snapshot ~page:resolved_page ~limit:3 ~after:None
+        |> T.require_ok ~behavior in
+      settle ();
+      T.require (read before next = Ok suffix) "settlement changed a retained snapshot";
+      with_snapshot (fun after ->
+        T.require (roots before = roots after) "settlement changed ordinary root DTOs";
+        List.iter (fun scope ->
+          T.require (Database.equal_timeline_scope_version (version before scope) (version after scope))
+            "settlement changed an unrelated Timeline proof")
+          [Database.Journal_index; Journal_root_membership; Page_roots resolved_page; Parent_children root_uuid];
+        (match read after next with
+         | Error Stale_read_cursor -> ()
+         | _ -> Alcotest.fail "authoritative settlement accepted the overlay continuation");
+        let fresh, next = read after None |> T.require_ok ~behavior in
+        T.require (fresh = first && Option.is_some next && read after next = Ok suffix)
+          "fresh authoritative prefix and continuation changed logical results"));
   let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
   Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
     (match Database.get_pages snapshot [resolved_page] |> T.require_ok ~behavior with

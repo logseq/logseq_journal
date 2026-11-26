@@ -15,7 +15,8 @@ let query_sample produce = function
 let fixture_scope : type a. a Read.Timeline.query -> string = function
   | Read.Timeline.Dates _ -> "dates"
   | Read.Timeline.Roots page -> "roots:" ^ Graph.Uuid.to_string page
-  | Read.Timeline.Preview_children parent -> "preview:" ^ Graph.Uuid.to_string parent
+  | Read.Timeline.Roots_through_grandchildren {page;_} -> "roots:" ^ Graph.Uuid.to_string page
+  | Read.Timeline.Preview_children {parent;_} -> "preview:" ^ Graph.Uuid.to_string parent
 ;;
 
 let fixture_versions = Hashtbl.create 32
@@ -54,6 +55,11 @@ let tree_sample ~(items : Worker_pure_data.tree_member list) ~next =
   query_sample (fun (Read.Read_query (budget, query)) ->
     match query with
     | Read.Timeline_read {query=(Read.Timeline.Roots _ as timeline);_} ->
+      Read.For_worker.answer budget query (Ok (Ok (fixture_packet budget timeline ~items ~next)))
+    | Read.Timeline_read {query=(Read.Timeline.Roots_through_grandchildren {tags;statuses;_} as timeline);_} ->
+      let items = List.filter (fun (item : Worker_pure_data.tree_member) ->
+        List.exists (fun tag -> List.mem tag tags) item.value.block.tags
+        || Option.exists (fun status -> List.mem status statuses) item.value.task_status) items in
       Read.For_worker.answer budget query (Ok (Ok (fixture_packet budget timeline ~items ~next)))
     | Read.Tree _ ->
       let module F = Read.For_worker in
@@ -287,7 +293,7 @@ let load_feed runtime =
 let rec finish_previews runtime ~children (output:Runtime.output) : Runtime.output =
   List.fold_left (fun (kept:Runtime.output) id ->
     match Worker_producer.transport runtime id with
-    |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Timeline_read {query=Read.Timeline.Preview_children parent;_} as query));_})->
+    |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Timeline_read {query=Read.Timeline.Preview_children {parent;_};_} as query));_})->
       let cursor=fixture_cursor budget query in
       let limit=Read.For_worker.read_budget_maximum_items budget in
       let items=List.filter(fun (item:Worker_pure_data.child_member)->item.value.block.parent=parent)children
@@ -667,7 +673,7 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
           ( "tree"
           , (tree_sample ~items:((List.filter (fun (m:Worker_pure_data.tree_member)->m.depth=0) items : Worker_pure_data.tree_member list)) ~next:(None)) )
         | Some(Runtime.Read{query=W.Child_members {parent;_};_})
-        | Some(Runtime.Read{query=W.Timeline_read {query=W.Timeline.Preview_children parent;_};_}) ->
+        | Some(Runtime.Read{query=W.Timeline_read {query=W.Timeline.Preview_children {parent;_};_};_}) ->
           ( "children"
           , (children_sample ~parent:(parent) ~scope_revision:("children-2") ~items:([]) ~next:(None)) )
         | Some(Runtime.Read{query=W.Outline_block {uuid=id;_};_}) ->
@@ -1053,7 +1059,7 @@ let test_older_feed_uses_calendar_upper_bound () =
          | _ -> Alcotest.fail "earliest date did not complete")
        else let request = only "older journal request" output.requests in
        match Runtime.worker_read runtime request with
-       | Some(Runtime.Read{query=W.Timeline_read {query=W.Timeline.Dates {from_day;through_day};_};_}) ->
+       | Some(Runtime.Read{query=W.Timeline_read {query=W.Timeline.Dates {from_day;through_day;_};_};_}) ->
          Alcotest.(check bool) "first valid lower date" true (W.journal_day 10101=Ok from_day);
          Alcotest.(check bool) "exclusive calendar upper date" true (W.journal_day expected=Ok through_day)
        | _ -> Alcotest.fail "older feed did not request journals")
@@ -2386,8 +2392,10 @@ let target_uuid = uuid "a1000000-0000-4000-9000-000000000050"
 let target_id = Graph.Uuid.to_string target_uuid
 let reference = "[[" ^ target_id ^ "]]"
 
-let reference_feed runtime source =
+let reference_feed ?(filtered = false) runtime source =
   set_calendar runtime;
+  let tags = if filtered then [block_uuid] else [] in
+  if filtered then Runtime.set_timeline_filter runtime ~tags ~statuses:[] ~days:None;
   let journals = load_feed runtime in
   let tree =
     deliver_sample
@@ -2401,7 +2409,7 @@ let reference_feed runtime source =
     runtime
     (sample
        tree
-       ((tree_sample ~items:(([ { value = { record with block = { block with title = source } }
+       ((tree_sample ~items:(([ { value = { record with block = { block with title = source; tags } }
                 ; revision = "block-1"
                 ; depth = 0
                 ; parent = page_uuid
@@ -2444,6 +2452,11 @@ let check_target_request runtime output =
     true
     ((match Runtime.worker_read runtime request with Some(Runtime.Read{query=W.Outline_block{uuid;revision=None};_})->uuid=target_uuid|_->false));
   request
+;;
+
+let test_filtered_root_reference () =
+  let runtime = Runtime.create () in
+  ignore (reference_feed ~filtered:true runtime reference |> check_target_request runtime)
 ;;
 
 let test_reference_hydration_and_changes () =
@@ -6776,7 +6789,7 @@ let drive_root_output ?(split_bytes = false) ?(filter_omitted = false) runtime f
     seen := Runtime.worker_read runtime request :: !seen;
     let outcome =
       match Worker_producer.transport runtime request with
-      |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Timeline_read {query=Read.Timeline.Dates {from_day=sealed_from_day;through_day=sealed_through_day};_} as query));_})->
+      |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Timeline_read {query=Read.Timeline.Dates {from_day=sealed_from_day;through_day=sealed_through_day;_};_} as query));_})->
       let cursor=fixture_cursor budget query in
       let from_day=Read.For_worker.journal_day_value sealed_from_day in
       let through_day=Read.For_worker.journal_day_value sealed_through_day in
@@ -6792,11 +6805,11 @@ let drive_root_output ?(split_bytes = false) ?(filter_omitted = false) runtime f
                    in
                    Worker_pure_data.{ page = f.owner; journal_day; revision = "page-1" })
                 selected : Worker_pure_data.journal_item list)) ~next:(next_cursor))
-      |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Timeline_read {query=Read.Timeline.Roots page;_} as query));_})->
+      |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Timeline_read {query=(Read.Timeline.Roots page | Read.Timeline.Roots_through_grandchildren {page;_});_} as query));_})->
       let cursor=fixture_cursor budget query in
       let limit=Read.For_worker.read_budget_maximum_items budget in
         (match Production_runtime.worker_read runtime request with
-         | Some (Production_runtime.Read {query=Journal_worker_coordination.Worker_api.Timeline_read {query=Journal_worker_coordination.Worker_api.Timeline.Roots _;_};_})->()
+         | Some (Production_runtime.Read {query=Journal_worker_coordination.Worker_api.Timeline_read {query=(W.Timeline.Roots _ | W.Timeline.Roots_through_grandchildren _);_};_})->()
          | _->Alcotest.fail "feed roots bypassed typed coordinator");
 
         if split_bytes && limit > 2
@@ -6811,7 +6824,7 @@ let drive_root_output ?(split_bytes = false) ?(filter_omitted = false) runtime f
                   (fun value ->
                      Worker_pure_data.{ value; revision = "root-1"; depth = 0; parent = page })
                   (if filter_omitted then List.filter (fun (value:Worker_pure_data.block_record)->value.block.title<>"__pbt-omitted-root__") selected else selected) : Worker_pure_data.tree_member list)) ~next:(next_cursor)))
-      |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Timeline_read {query=Read.Timeline.Preview_children parent;_} as query));_})->
+      |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Timeline_read {query=Read.Timeline.Preview_children {parent;_};_} as query));_})->
       let cursor=fixture_cursor budget query in
       let limit=Read.For_worker.read_budget_maximum_items budget in
         (match Production_runtime.worker_read runtime request with
@@ -8418,7 +8431,7 @@ let test_prefix_preserves_reconciliation ~resync stage () =
         let request = only "one retained refresh continuation" output.requests in
         match Runtime.worker_read runtime request with
         | Some(Runtime.Read{query=W.Timeline_read {query=W.Timeline.Roots _;_};_}) -> output
-        | Some(Runtime.Read{query=W.Timeline_read {query=W.Timeline.Preview_children parent;_};_}) ->
+        | Some(Runtime.Read{query=W.Timeline_read {query=W.Timeline.Preview_children {parent;_};_};_}) ->
           finish_previews (deliver_sample runtime (sample request
               ((children_sample ~parent:(parent) ~scope_revision:("children-1") ~items:([]) ~next:(None)))))
         | _ -> Alcotest.fail "unexpected reconciliation request"
@@ -8945,7 +8958,7 @@ let test_initial_reconciliation_restarts_prefix () =
     match Worker_producer.transport runtime request with
     |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(_,Read.Timeline_read {query=Read.Timeline.Roots _;_});_})->
       request
-    |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(_,Read.Timeline_read {query=Read.Timeline.Dates {from_day=sealed_from_day;through_day=sealed_through_day};_});_})->
+    |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(_,Read.Timeline_read {query=Read.Timeline.Dates {from_day=sealed_from_day;through_day=sealed_through_day;_};_});_})->
       let from_day=Read.For_worker.journal_day_value sealed_from_day in
       let through_day=Read.For_worker.journal_day_value sealed_through_day in
       let items=if from_day<=day && day<=through_day then
@@ -9329,7 +9342,7 @@ let test_timeline_root_filter () =
   let runtime = Runtime.create ~localtime:Unix.gmtime
       ~validate_session:Worker_producer.validate_session () in
   set_calendar runtime;
-  let fixture = root_fixture 0 65 0 in
+  let fixture = root_fixture 0 65 3 in
   let tag = (List.nth fixture.roots 61).block.uuid in
   let status = (List.nth fixture.roots 62).block.uuid in
   let roots = List.mapi (fun index (value : Worker_pure_data.block_record) ->
@@ -9346,13 +9359,22 @@ let test_timeline_root_filter () =
   let actual = List.concat_map (fun (day : Journal_graph_projection.day_feed) ->
     List.map (fun (entry : Journal_graph_projection.timeline_entry) -> Journal_model.id entry.block) day.entries) feed.days in
   Alcotest.(check (list string)) "only matching roots across sparse packets"
-    (List.map Graph.Uuid.to_string [tag;status]) actual
+    (List.map Graph.Uuid.to_string [tag;status]) actual;
+  let previews = List.concat_map (fun (day : Journal_graph_projection.day_feed) ->
+    List.map (fun (entry : Journal_graph_projection.timeline_entry) ->
+      List.map (fun (child : Journal_graph_projection.child_summary) -> child.block_id)
+        entry.child_summaries) day.entries) feed.days in
+  let expected = List.map (fun root ->
+    List.map (fun (child : Worker_pure_data.block_record) -> Graph.Uuid.to_string child.block.uuid)
+      (List.assoc root fixture.descendants)) [tag;status] in
+  Alcotest.(check (list (list string))) "matched roots publish ordinary children in order" expected previews
 ;;
 
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ("timeline filters", [Alcotest.test_case "sparse tag or status matches" `Quick test_timeline_root_filter;
+    [ ("timeline filters", [Alcotest.test_case "filtered roots hydrate references" `Quick test_filtered_root_reference;
+      Alcotest.test_case "sparse tag or status matches" `Quick test_timeline_root_filter;
       Alcotest.test_case "skipped day matches before empty publication" `Quick (fun () -> test_filtered_empty_skips_point_proofs false);
       Alcotest.test_case "skipped day matches after empty publication" `Quick (fun () -> test_filtered_empty_skips_point_proofs true)])
     ; ( "status recovery"

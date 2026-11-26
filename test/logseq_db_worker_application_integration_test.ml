@@ -199,7 +199,7 @@ let seed_visible_block ?(record = record) runtime =
   let check =
     Read_fixture.receive runtime preview (fun (Read.Read_query (budget, query)) ->
       match query with
-      | Read.Timeline_read { query = (Read.Timeline.Preview_children parent as timeline); _ } ->
+      | Read.Timeline_read { query = (Read.Timeline.Preview_children {parent;_} as timeline); _ } ->
         Alcotest.(check bool) "Timeline preview parent" true
           (Graph.Uuid.equal parent record.block.uuid);
         Read.For_worker.answer budget query (Ok (Ok (timeline_packet budget timeline [])))
