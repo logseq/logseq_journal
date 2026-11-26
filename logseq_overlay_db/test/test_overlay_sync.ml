@@ -1235,8 +1235,22 @@ let atomic_append_submits_and_replays_complete_tree ?(remote_day=false) database
   let behavior="atomic append submission and authoritative echo" in
   T.seed_task_statuses database;
   let page=T.mutation_uuid 7790 and root_uuid=T.mutation_uuid 7791 and child_uuid=T.mutation_uuid 7792 in
+  let task = T.uuid "00000002-1282-1814-5700-000000000000" in
+  let plain_uuid = T.mutation_uuid 7796 in
   let root:Types.append_node={uuid=root_uuid;title="Atomic wire root";task_status=Some(T.status_uuid 2);
-    children=Rrbvec.singleton{uuid=child_uuid;title="Atomic wire child";task_status=Some(T.status_uuid 3);children=Rrbvec.empty}} in
+    children=Rrbvec.of_list
+      [{uuid=child_uuid;title="Atomic wire child";task_status=Some(T.status_uuid 3);children=Rrbvec.empty};
+       {uuid=plain_uuid;title="Plain child";task_status=None;children=Rrbvec.empty}]} in
+  let check_tags stage =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () ->
+      match Database.get_outline_blocks snapshot [root_uuid; child_uuid; plain_uuid]
+            |> T.require_ok ~behavior with
+      | [Present_block {value=root;_}; Present_block {value=child;_}; Present_block {value=plain;_}] ->
+        T.require (root.block.tags = [task] && child.block.tags = [task] && plain.block.tags = [])
+          "%s: only status-bearing capture nodes must have the built-in Task tag" stage
+      | _ -> Alcotest.fail (stage ^ ": capture nodes missing"))
+  in
   let mutation=Types.Append_journal{mutation_id=T.mutation_uuid 7793;page;title="2026-11-02";journal_day=20261102;root} in
   let expected=Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior in
   let intent=Database.persist_local_intent database ~namespace:(String.make 64 'f') ~payload:"complete append wire"
@@ -1270,6 +1284,7 @@ let atomic_append_submits_and_replays_complete_tree ?(remote_day=false) database
       match Database.get_pages snapshot [resolved_page] |> T.require_ok ~behavior with
       |[Present_page{value;_}]->value|_->Alcotest.fail "atomic page disappeared") in
   let before_submit=page_value() in
+  if not remote_day then check_tags "local commit";
   let submitted=submit_one database local behavior in
   T.require(page_value()=before_submit) "transport submission changed complete append page DTO";
   T.require(List.length(submission_batch_wires submitted)=1) "append split one atomic action into separate outbox transactions";
@@ -1320,6 +1335,7 @@ let atomic_append_submits_and_replays_complete_tree ?(remote_day=false) database
         let fresh, next = read after None |> T.require_ok ~behavior in
         T.require (fresh = first && Option.is_some next && read after next = Ok suffix)
           "fresh authoritative prefix and continuation changed logical results"));
+  if not remote_day then check_tags "authoritative echo";
   let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
   Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
     (match Database.get_pages snapshot [resolved_page] |> T.require_ok ~behavior with
@@ -3922,6 +3938,210 @@ let stale_commit database mutation behavior =
   | Local_existing _ -> Alcotest.fail "Stale mutation fixture already exists"
 ;;
 
+let clear_removes_only_builtin_task ?(stale = false) database =
+  let behavior = "clear status and only the built-in Task tag" in
+  let module J = Transit_core.Json in
+  let block = T.authoritative_block_uuid in
+  let task = T.uuid "00000002-1282-1814-5700-000000000000" in
+  let other = T.mutation_uuid 7797 in
+  let other_entity = J.String "other-task-tag" in
+  T.apply_test_transaction database ~cursor:1
+    [ T.status_add other_entity "block/uuid" (J.Uuid (Graph.Uuid.to_string other))
+    ; T.status_add other_entity "block/title" (J.String "Task")
+    ; T.status_add (T.status_lookup block) "block/tags" other_entity
+    ; T.status_add (T.status_lookup block) "block/tags" (J.Keyword "logseq.class/Task")
+    ; T.status_add (T.status_lookup block) "logseq.property/status"
+        (J.Keyword "logseq.property/status.todo")
+    ];
+  let read () =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () ->
+      match Database.get_outline_blocks snapshot [block] |> T.require_ok ~behavior with
+      | [Present_block {value;_}] -> value
+      | _ -> Alcotest.fail "clear target missing")
+  in
+  let before = read () in
+  T.require (List.mem task before.block.tags && List.mem other before.block.tags
+             && Option.is_some before.task_status) "clear fixture missing status or tags";
+  let check stage =
+    let after = read () in
+    T.require (after.task_status = None && after.block.title = before.block.title
+               && after.block.tags = List.filter (fun tag -> not (Graph.Uuid.equal tag task)) before.block.tags)
+      "%s: clear must remove status and built-in Task without changing title or other tags" stage
+  in
+  let local = stale_commit database (Clear_task_status {mutation_id=T.mutation_uuid 7798;block}) behavior in
+  check "local commit";
+  let submitted = submit_one database local behavior in
+  let submitted, cursor =
+    if not stale then submitted, 2
+    else (
+      ignore (reject_stale database submitted 2 behavior);
+      T.apply_test_transaction database ~cursor:2
+        [J.Array [J.Keyword "db.fn/retractAttribute"; T.status_lookup block;
+                  J.Keyword "logseq.property/status"]];
+      check "after remote removed only status";
+      submit_one database local behavior, 3)
+  in
+  T.require (List.length (submission_batch_wires submitted) = 1) "clear split its transaction";
+  let wire = server_transaction ~mutation_id:local.mutation_id ~operation:"clear-task-status" submitted in
+  ignore (stale_apply_wires database cursor [wire] behavior);
+  check "authoritative echo"
+;;
+
+let legacy_task_tag_submission ?(recovery = `Echo) ~append () =
+  let behavior = if append then "legacy append" else "legacy clear" in
+  let module J = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let task = T.uuid "00000002-1282-1814-5700-000000000000" in
+  let block = if append then T.mutation_uuid 7821 else T.authoritative_block_uuid in
+  let mutation_id = T.mutation_uuid 7820 in
+  let title = "Legacy capture" in
+  let without_task_operation source =
+    match Codec.of_string source with
+    | J.Array operations ->
+      J.Array
+        (List.filter
+           (function
+             | J.Array [_; _; J.Keyword "block/tags"; J.Keyword "logseq.class/Task"] -> false
+             | _ -> true)
+           operations)
+      |> Codec.to_string ~mode:Codec.Verbose
+    | _ -> Alcotest.fail "expected a submitted Transit transaction"
+  in
+  T.with_temp_directory "overlay-legacy-task-" (fun support ->
+    let path = T.seed_mirror support in
+    let dependencies = T.dependencies ~behavior in
+    Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
+      let open_database () =
+        Database.inspect_mirror ~application_support_directory:support ~graph_id:T.graph_uuid
+        |> T.require_ok ~behavior
+        |> fun inspection -> Database.open_ ~sw dependencies inspection ~graph_name:"oracle-graph"
+        |> T.require_ok ~behavior
+      in
+      let first = open_database () in
+      T.seed_task_statuses first;
+      let baseline = sync_view_checkpoint (stale_view first behavior) |> Server_cursor.to_int64 in
+      let baseline = Int64.to_int baseline in
+      let before_title, baseline =
+        if append then title, baseline
+        else (
+          T.apply_test_transaction first ~cursor:(baseline + 1)
+            [ T.status_add (T.status_lookup block) "block/tags" (J.Keyword "logseq.class/Task")
+            ; T.status_add (T.status_lookup block) "logseq.property/status"
+                (J.Keyword "logseq.property/status.todo")
+            ];
+          let snapshot = Database.current_snapshot first |> T.require_ok ~behavior in
+          let outline = Database.get_outline_blocks snapshot [block] |> T.require_ok ~behavior in
+          Database.release_snapshot snapshot;
+          match outline with
+          | [Present_block {value; _}] -> value.block.title, baseline + 1
+          | _ -> Alcotest.fail "legacy clear target missing")
+      in
+      let mutation =
+        if append then
+          Append_journal
+            { mutation_id; page = T.mutation_uuid 7822; title = "Legacy day"; journal_day = 20261102
+            ; root = {uuid = block; title; task_status = Some (T.status_uuid 2); children = Rrbvec.empty}
+            }
+        else Clear_task_status {mutation_id; block}
+      in
+      let local = stale_commit first mutation behavior in
+      let submitted =
+        if recovery = `Queued then None else Some (submit_one first local behavior)
+      in
+      let protected_wire = Option.map submitted_transaction submitted in
+      Database.close first |> T.require_ok ~behavior;
+      let legacy_wire = Option.map without_task_operation protected_wire in
+      let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
+      Fun.protect ~finally:(fun () -> T.require (Sqlite3.db_close sqlite) "close legacy fixture")
+        (fun () ->
+           let normalized = ref None in
+           Sqlite3.Rc.check
+             (Sqlite3.exec sqlite ~cb:(fun row _ -> normalized := row.(0))
+                "SELECT json_extract(record, '$.normalized_transaction') FROM sync_outbox");
+           let old_normalized = without_task_operation (Option.get !normalized) in
+           let stmt = Sqlite3.prepare sqlite
+               "UPDATE sync_outbox SET record = json_set(record, '$.normalized_transaction', ?, '$.protected_transaction', ?)" in
+           Fun.protect ~finally:(fun () -> Sqlite3.Rc.check (Sqlite3.finalize stmt)) (fun () ->
+             Sqlite3.Rc.check (Sqlite3.bind_values stmt [TEXT old_normalized; (match legacy_wire with None -> NULL | Some wire -> TEXT wire)]);
+             T.require (Sqlite3.step stmt = DONE && Sqlite3.changes sqlite = 1)
+               "legacy fixture did not rewrite exactly one submitted record"));
+      let database = open_database () in
+      Fun.protect ~finally:(fun () -> Database.close database |> T.require_ok ~behavior) (fun () ->
+        let check stage =
+          let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+          let outline = Database.get_outline_blocks snapshot [block] |> T.require_ok ~behavior in
+          Database.release_snapshot snapshot;
+          match outline with
+          | [Present_block {value; _}] ->
+            T.require (value.block.title = before_title
+                       && value.task_status = (if append then Some (Status_uuid (T.status_uuid 2)) else None))
+              "%s: legacy title or status changed" stage;
+            T.require (List.mem task value.block.tags = not append)
+              "%s: projection must respect legacy Task tag semantics" stage
+          | _ -> Alcotest.failf "%s: legacy block missing" stage
+        in
+        check "after reopen";
+        (match recovery with
+         | `Stale ->
+           ignore (reject_stale database (Option.get submitted) (baseline + 1) behavior);
+           ignore (stale_apply_wires database (baseline + 1)
+             [stale_remote_wire T.page_uuid "block/updated-at" (J.Int 99)] behavior);
+           check "after Stale replan"
+         | `Queued | `Echo -> ());
+        if recovery <> `Echo then (
+          let fresh = submit_one database local behavior in
+          let cursor = baseline + (if recovery = `Stale then 2 else 1) in
+          let barrier = { through = server_cursor cursor; checksum = checksum "1111111111111111" } in
+          let accepted, _ = Database.begin_outbox_transition database
+              ~expected:(sync_view_token (stale_view database behavior))
+              (Accept_group {batch_id = submission_batch_id fresh; barrier}) |> T.require_ok ~behavior in
+          ignore (Database.apply_outbox_transition database accepted ~encrypted:None |> T.require_ok ~behavior);
+          ignore (stale_apply_wires database cursor
+            [server_transaction ~mutation_id ~operation:behavior fresh] behavior);
+          check "after recovered record echo";
+          T.require (sync_view_submissions (stale_view database behavior) = [])
+            "recovered record did not retire")
+        else (
+        let submitted = Option.get submitted in
+        let protected_wire = Option.get protected_wire in
+        let legacy_wire = Option.get legacy_wire in
+        let barrier = { through = server_cursor (baseline + 1); checksum = checksum "1111111111111111" } in
+        let accepted, _ = Database.begin_outbox_transition database
+            ~expected:(sync_view_token (stale_view database behavior))
+            (Accept_group {batch_id = submission_batch_id submitted; barrier}) |> T.require_ok ~behavior in
+        ignore (Database.apply_outbox_transition database accepted ~encrypted:None |> T.require_ok ~behavior);
+        let apply wire =
+          let cursor = server_cursor (baseline + 1) in
+          let transaction = server_normalized_transaction ~mutation_id ~operation:behavior wire in
+          let batch = authoritative_batch ~maximum_count:1 ~maximum_bytes:16384
+              ~transactions:[authoritative_transaction ~cursor ~transaction:(encoded ~maximum_bytes:16384 transaction)]
+              ~through:cursor ~checksum:None |> T.require_ok ~behavior in
+          let preparation, request = Database.begin_authoritative database
+              ~expected:(sync_view_token (stale_view database behavior)) batch |> T.require_ok ~behavior in
+          Database.apply_authoritative database preparation
+            ~decrypted:(Option.map (fun request -> decrypt_submitted_request request behavior) request)
+        in
+        (match apply protected_wire with
+         | Error (Authoritative_integrity_failure source) ->
+           let module D = Logseq_db_types.Authoritative_diagnostic in
+           (match D.decode source with
+            | Some diagnostic ->
+              T.require (List.mem "reason=payload-mismatch" (String.split_on_char ';' (D.message diagnostic)
+                |> List.map String.trim))
+                "legacy negative control failed outside the payload guard"
+            | None -> Alcotest.fail "legacy negative control returned no diagnostic")
+         | Error _ -> Alcotest.fail "legacy negative control returned the wrong error"
+         | Ok _ -> Alcotest.fail "legacy submission accepted a mismatched Task tag operation");
+        check "after mismatched echo";
+        (match apply legacy_wire |> T.require_ok ~behavior with
+         | Authoritative_applied _ -> ()
+         | Authoritative_deferred _ -> Alcotest.fail "matching legacy echo deferred");
+        check "after matching echo";
+        T.require (sync_view_submissions (stale_view database behavior) = [])
+          "matching legacy echo did not retire the outbox record")))))
+;;
+
 let stale_mutation kind =
   let mutation_id = T.mutation_uuid 901 in
   match kind with
@@ -4811,6 +5031,16 @@ let () =
       T.database_case "complete protected transaction echoes atomically" (atomic_append_submits_and_replays_complete_tree ~remote_day:false);
       T.database_case "queued append adopts remote day and follows its tail" (atomic_append_submits_and_replays_complete_tree ~remote_day:true);
       T.database_case "journal catalog keeps submitted page shadow" submitted_append_page_shadow_stays_in_journal_index]
+    ; "task tags",
+      [ T.database_case "clear preserves title and unrelated tags" (clear_removes_only_builtin_task ~stale:false)
+      ; T.database_case "stale clear still removes Task when only status was cleared remotely" (clear_removes_only_builtin_task ~stale:true)
+      ; Alcotest.test_case "legacy append keeps tags across reopen and echo" `Quick (legacy_task_tag_submission ~append:true)
+      ; Alcotest.test_case "legacy clear keeps tags across reopen and echo" `Quick (legacy_task_tag_submission ~append:false)
+      ; Alcotest.test_case "legacy queued append keeps tags" `Quick (legacy_task_tag_submission ~recovery:`Queued ~append:true)
+      ; Alcotest.test_case "legacy queued clear keeps tags" `Quick (legacy_task_tag_submission ~recovery:`Queued ~append:false)
+      ; Alcotest.test_case "legacy stale append keeps tags" `Quick (legacy_task_tag_submission ~recovery:`Stale ~append:true)
+      ; Alcotest.test_case "legacy stale clear keeps tags" `Quick (legacy_task_tag_submission ~recovery:`Stale ~append:false)
+      ]
     ; "empty authoritative compatibility",
       [ T.database_case "empty array advances only sync state" (empty_authoritative_preserves_logical_state "[]")
       ; T.database_case "empty Transit list advances only sync state" (empty_authoritative_preserves_logical_state

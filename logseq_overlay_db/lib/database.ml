@@ -1488,6 +1488,7 @@ type hydration_cache =
   ; block_presence : (string, bool) Hashtbl.t
   ; append_nodes : (string, (Types.append_node * Graph.Uuid.t) Uuid_map.t) Hashtbl.t
   ; insert_orders : (string, string Uuid_map.t) Hashtbl.t
+  ; task_tag_targets : (string, unit Uuid_map.t) Hashtbl.t
   ; property_class : int option
   ; property_definitions : (string, Graph.property_summary option) Hashtbl.t
   ; ident_entities : (string, int) Hashtbl.t
@@ -1510,6 +1511,7 @@ let hydration_cache ?(index_idents = true) database =
   ; block_presence = Hashtbl.create 8
   ; append_nodes = Hashtbl.create 4
   ; insert_orders = Hashtbl.create 4
+  ; task_tag_targets = Hashtbl.create 4
   ; property_class =
       (if index_idents
        then Hashtbl.find_opt ident_entities "logseq.class/Property"
@@ -1836,6 +1838,12 @@ let entity_datoms_for_ids database entities =
 let status_entity database = function
   | Types.Status_uuid uuid -> entity_of_uuid database uuid
   | Legacy_status_ident ident -> entity_of_ident database ident
+;;
+
+let task_class_ident = "logseq.class/Task"
+
+let task_class_uuid database =
+  Option.bind (entity_of_ident database task_class_ident) (uuid_of_entity database)
 ;;
 
 let task_status_of_datoms database datoms =
@@ -2522,6 +2530,40 @@ let cached_insert_orders cache (record:outbox_record) =
   memoized cache.insert_orders (Graph.Uuid.to_string record.mutation_id)(fun()->assigned_orders record)
 ;;
 
+let insert_temp_id uuid = "overlay-insert:" ^ Graph.Uuid.to_string uuid
+
+let record_changes_task_tag ?cache ?(submitted = false) (record : outbox_record) =
+  let targets () =
+    let module J = Transit_core.Json in
+    let source =
+      if submitted then Option.value record.protected_transaction ~default:record.normalized_transaction
+      else record.normalized_transaction
+    in
+    match Transit_native.Transit.Json.of_string source with
+    | J.Array operations ->
+      List.fold_left
+        (fun targets -> function
+           | J.Array [J.Keyword "db/add"; J.String target; J.Keyword "block/tags"; J.Keyword tag]
+           | J.Array [J.Keyword "db/retract"; J.Array [J.Keyword "block/uuid"; J.Uuid target];
+                      J.Keyword "block/tags"; J.Keyword tag]
+             when String.equal tag task_class_ident -> Uuid_map.add target () targets
+           | _ -> targets)
+        Uuid_map.empty operations
+    | _ -> invalid_arg "invalid outbox transaction shape"
+  in
+  let targets = lazy (match cache with
+    | None -> targets ()
+    | Some cache -> memoized cache.task_tag_targets (Graph.Uuid.to_string record.mutation_id) targets)
+  in
+  fun uuid ->
+    let target =
+      match record.mutation with
+      | Types.Append_journal _ -> insert_temp_id uuid
+      | _ -> Graph.Uuid.to_string uuid
+    in
+    Uuid_map.mem target (Lazy.force targets)
+;;
+
 let cached_append_node cache (record:outbox_record) root uuid =
   let nodes=memoized cache.append_nodes (Graph.Uuid.to_string record.mutation_id)(fun()->
     let rec index parent found (node:Types.append_node) =
@@ -2946,7 +2988,15 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                   |Some status->(match status_entity authoritative (Types.Status_uuid status) with None->inserted.block.properties
                     |Some entity->set_property_values ?cache authoritative "logseq.property/status"
                       [Datascript.Ref entity] inserted.block.properties) in
-                Some{inserted with block={inserted.block with properties};task_status=Option.map(fun id->Types.Status_uuid id)node.task_status})
+                let tags =
+                  if not (record_changes_task_tag ?cache ~submitted:true record uuid)
+                  then inserted.block.tags
+                  else
+                    (match task_class_uuid authoritative with
+                     | None -> inserted.block.tags
+                     | Some task -> List.sort_uniq Graph.Uuid.compare (task :: inserted.block.tags))
+                in
+                Some{inserted with block={inserted.block with properties; tags};task_status=Option.map(fun id->Types.Status_uuid id)node.task_status})
            | Insert_blocks { parent; tree; asset; _ } ->
              let page =
                match record.effect_footprint.page_uuids with
@@ -3149,6 +3199,13 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                           { value.block with
                             updated_at_ms = record.intent_time_ms
                           ; properties
+                          ; tags =
+                              (if not (record_changes_task_tag ?cache ~submitted:true record uuid)
+                               then value.block.tags
+                               else match task_class_uuid authoritative with
+                               | None -> value.block.tags
+                               | Some task ->
+                                 List.filter (fun tag -> not (Graph.Uuid.equal tag task)) value.block.tags)
                           }
                     ; task_status = None
                     })
@@ -5398,6 +5455,7 @@ let published_asset_matches descriptor version =
 ;;
 
 let rec local_operations
+      ?(changes_task_tag = fun _ -> true)
       ~append_create
       ~fingerprint:_
       ~intent_time_ms
@@ -5433,13 +5491,19 @@ let rec local_operations
         ~intent_time_ms ~next_tx ~orders ~effect_footprint ~delete_artifacts:None mutation in
       let creation=if append_create then run(Types.Create_journal_page{mutation_id;page;title;journal_day}) else [] in
       let rec add_tree parent_ref (node:Types.append_node) =
-        let node_ref=uuid_temp "overlay-insert" node.uuid in
+        let node_ref=Datascript.Temp_id (insert_temp_id node.uuid) in
         let fields=Datascript.[
           Add(node_ref,"block/uuid",Uuid(Graph.Uuid.to_string node.uuid));Add(node_ref,"block/title",String node.title);
           Add(node_ref,"block/parent",Ref_to parent_ref);Add(node_ref,"block/page",Ref_to(uuid_lookup page));
           Add(node_ref,"block/order",String(assigned_order orders node.uuid));
           Add(node_ref,"block/created-at",Int64 intent_time_ms);Add(node_ref,"block/updated-at",Int64 intent_time_ms);
           Add(node_ref,"block/tx-id",Int64(Int64.of_int next_tx))] in
+        let fields = match node.task_status with
+          | None -> fields
+          | Some _ when changes_task_tag node.uuid ->
+            Datascript.Add (node_ref, "block/tags", Ref_to (Ident task_class_ident)) :: fields
+          | Some _ -> fields
+        in
         Seq.append(List.to_seq fields)(Rrbvec.to_seq node.children |> Seq.flat_map(add_tree node_ref)) in
       let insertion=add_tree(uuid_lookup page)root |> List.of_seq in
       let statuses=Overlay_planner.append_nodes root |> Rrbvec.to_seq
@@ -5570,11 +5634,28 @@ let rec local_operations
       ; Add (uuid_lookup block, "block/updated-at", Int64 (Int64.of_int now))
       ; Add (uuid_lookup block, "block/tx-id", Int64 (Int64.of_int next_tx))
       ]
+      @ (if changes_task_tag block
+         then [Retract (uuid_lookup block, "block/tags", Some (Ref_to (Ident task_class_ident)))]
+         else [])
   in
   operations
 ;;
 
+let record_operations (record : outbox_record) =
+  local_operations
+    ~changes_task_tag:(record_changes_task_tag record)
+    ~append_create:record.append_create
+    ~fingerprint:record.fingerprint
+    ~intent_time_ms:record.intent_time_ms
+    ~next_tx:record.planned_tx
+    ~orders:(assigned_orders record)
+    ~effect_footprint:record.effect_footprint
+    ~delete_artifacts:record.delete_artifacts
+    record.mutation
+;;
+
 let normalized_transaction_in
+      ?changes_task_tag
       ~append_create
       authoritative_database
       ~fingerprint
@@ -5586,6 +5667,7 @@ let normalized_transaction_in
       mutation
   =
   local_operations
+    ?changes_task_tag
     ~append_create
     ~fingerprint
     ~intent_time_ms
@@ -6206,10 +6288,12 @@ let planned_effect database context ~now = function
   | Types.Append_journal{page;root;journal_day;_}->
     let resolved=resolve_append_page context.read_snapshot ~candidate:page ~day:journal_day in
     let nodes=Overlay_planner.append_nodes root in
+    let has_task_class = Option.is_some (task_class_uuid (authoritative_database database)) in
     let invalid=Rrbvec.find_map(fun(node:Types.append_node)->
       if append_identity_present context.read_snapshot node.uuid then Some "An append block UUID is already present."
       else match node.task_status with
         |Some status when task_status_at context.read_snapshot status=None ->Some "Append status is missing or recycled."
+        |Some _ when not has_task_class -> Some "Built-in Task class is missing or has no UUID."
         |_->None) nodes in
     (match invalid,read_page context resolved with
      | Some message,_->Error(Types.Invalid_local_mutation message)
@@ -6243,6 +6327,8 @@ let planned_effect database context ~now = function
                "Status is missing, recycled or belongs to another property")
         | Some _ ->
           Ok ({ block_uuids = [ block ]; page_uuids = []; structure_interests = [] }, None)))
+  | Clear_task_status _ when Option.is_none (task_class_uuid (authoritative_database database)) ->
+    Error (Types.Invalid_local_mutation "Built-in Task class is missing or has no UUID.")
   | Types.Save_block { block; _ } | Clear_task_status { block; _ } ->
     Ok ({ block_uuids = [ block ]; page_uuids = []; structure_interests = [] }, None)
   | Insert_blocks { tree; parent; asset; _ } ->
@@ -7554,11 +7640,23 @@ let authoritative_import_matches
       | _ -> false)
 ;;
 
-let authoritative_satisfies_mutation_in database = function
+let promised_task_tag_satisfied database changes_task_tag ~present (value : Types.block_record) =
+  not (changes_task_tag value.block.uuid)
+  || (match task_class_uuid database with
+      | Some task -> List.exists (Graph.Uuid.equal task) value.block.tags = present
+      | None -> not present)
+;;
+
+let authoritative_satisfies_record database (record : outbox_record) =
+  let tag_satisfied =
+    promised_task_tag_satisfied database (record_changes_task_tag ~submitted:true record)
+  in
+  match record.mutation with
   | Types.Append_journal{root;journal_day;_}->
     let rec matches parent (node:Types.append_node)=match block_of_database database node.uuid with
       | Some value->(match parent with None->true|Some parent->value.block.parent=parent)
         && value.block.title=node.title && value.task_status=Option.map(fun id->Types.Status_uuid id)node.task_status
+        && tag_satisfied ~present:true value
         && Rrbvec.for_all(matches(Some node.uuid))node.children
       | None->false in
     matches None root && (match block_of_database database root.uuid with
@@ -7602,7 +7700,7 @@ let authoritative_satisfies_mutation_in database = function
   | Clear_task_status { block; _ } ->
     block_of_database database block
     |> option_satisfies (fun (record : Types.block_record) ->
-      Option.is_none record.task_status)
+      Option.is_none record.task_status && tag_satisfied ~present:false record)
 ;;
 
 let mutation_supersedes earlier later =
@@ -7642,7 +7740,14 @@ let accepted_record_satisfied database records (record : outbox_record) =
     List.exists
       (fun (later : outbox_record) -> mutation_supersedes record.mutation later.mutation)
       later
-  then true
+  then (
+    match record.mutation with
+    | Types.Clear_task_status { block; _ } ->
+      let changes_task_tag = record_changes_task_tag ~submitted:true record in
+      not (changes_task_tag block)
+      || (block_of_database database block
+          |> option_satisfies (promised_task_tag_satisfied database changes_task_tag ~present:false))
+    | _ -> true)
   else (
     match record.mutation with
     | Types.Insert_blocks { parent; tree; asset; _ } ->
@@ -7663,7 +7768,7 @@ let accepted_record_satisfied database records (record : outbox_record) =
                      && Option.is_some metadata.replace_reference
                    | _ -> false)
                 later)
-    | mutation -> authoritative_satisfies_mutation_in database mutation)
+    | _ -> authoritative_satisfies_record database record)
 ;;
 
 let begin_outbox_transition database ~expected transition =
@@ -7738,15 +7843,7 @@ let begin_outbox_transition database ~expected transition =
                 let items =
                   records
                   |> List.concat_map (fun (record : outbox_record) ->
-                    local_operations
-                      ~append_create:record.append_create
-                      ~fingerprint:record.fingerprint
-                      ~intent_time_ms:record.intent_time_ms
-                      ~next_tx:record.planned_tx
-                      ~orders:(assigned_orders record)
-                      ~effect_footprint:record.effect_footprint
-                      ~delete_artifacts:record.delete_artifacts
-                      record.mutation
+                    record_operations record
                     |> Sync_tx_codec.protected_plaintexts
                     |> Result.get_ok
                     |> List.map (fun value -> record.mutation_id, value))
@@ -7960,32 +8057,14 @@ let make_batch preparation encrypted =
           then List.rev reversed
           else invalid_arg "encrypted value count exceeds normalized transaction"
         | (record : outbox_record) :: rest ->
+          let operations = record_operations record in
           let expected =
-            local_operations
-              ~append_create:record.append_create
-                      ~fingerprint:record.fingerprint
-              ~intent_time_ms:record.intent_time_ms
-              ~next_tx:record.planned_tx
-              ~orders:(assigned_orders record)
-              ~effect_footprint:record.effect_footprint
-              ~delete_artifacts:record.delete_artifacts
-              record.mutation
+            operations
             |> Sync_tx_codec.protected_plaintexts
             |> Result.get_ok
             |> List.length
           in
           let encrypted, remaining = take_prefix expected [] remaining in
-          let operations =
-            local_operations
-              ~append_create:record.append_create
-                      ~fingerprint:record.fingerprint
-              ~intent_time_ms:record.intent_time_ms
-              ~next_tx:record.planned_tx
-              ~orders:(assigned_orders record)
-              ~effect_footprint:record.effect_footprint
-              ~delete_artifacts:record.delete_artifacts
-              record.mutation
-          in
           let protected_transaction =
             Sync_tx_codec.encode_protected
               ~db:(authoritative_database preparation.transition_owner)
@@ -8269,15 +8348,7 @@ let split_prefix count values =
 ;;
 
 let synchronized_record_operations (record : outbox_record) =
-  local_operations
-    ~append_create:record.append_create
-                      ~fingerprint:record.fingerprint
-    ~intent_time_ms:record.intent_time_ms
-    ~next_tx:record.planned_tx
-    ~orders:(assigned_orders record)
-    ~effect_footprint:record.effect_footprint
-    ~delete_artifacts:record.delete_artifacts
-    record.mutation
+  record_operations record
   |> Sync_tx_codec.synchronized_operations
 ;;
 
@@ -8315,15 +8386,38 @@ let simulation_failure_context exn =
   [ "exception", authoritative_exception_kind exn; "simulationCause", cause ]
 ;;
 
+let expected_record_operations database (record : outbox_record) =
+  match record.mutation, record.protected_transaction with
+  | (Append_journal _ | Clear_task_status _), Some submitted ->
+    let decode_error source =
+      Option.iter
+        (fun detail ->
+           report_warning
+             ("journal-integrity: frozen submission decode: "
+              ^ Authoritative_diagnostic.encode detail ^ "\n"))
+        (Authoritative_diagnostic.decode source);
+      [ "simulationCause", "unknown" ]
+    in
+    Result.bind
+      (Sync_tx_codec.protected_values record.normalized_transaction
+       |> Result.map_error decode_error)
+      (fun decrypted_values ->
+         Sync_tx_codec.decode ~db:database ~decrypted_values submitted
+         |> Result.map_error decode_error)
+  | _ -> Ok (synchronized_record_operations record)
+;;
+
 let expected_record_transaction_data database record =
   try
-    Ok
-      (Datascript.transact
-         ~tx_meta:[ "skip-store?", Datascript.Bool true ]
-         database
-         (synchronized_record_operations record)
-       : Datascript.tx_report)
-        .tx_data
+    Result.map
+      (fun operations ->
+         (Datascript.transact
+            ~tx_meta:[ "skip-store?", Datascript.Bool true ]
+            database
+            operations
+          : Datascript.tx_report)
+           .tx_data)
+      (expected_record_operations database record)
   with
   | exn -> Error (simulation_failure_context exn)
 ;;
@@ -9336,11 +9430,17 @@ let rec logical_tree_is_present snapshot ~parent (tree : Types.block_tree) =
     && List.for_all (logical_tree_is_present snapshot ~parent:tree.uuid) tree.children
 ;;
 
-let logical_snapshot_satisfies_mutation snapshot = function
+let logical_snapshot_satisfies_record snapshot (record : outbox_record) =
+  let tag_satisfied =
+    promised_task_tag_satisfied
+      (Option.get snapshot.authoritative_database) (record_changes_task_tag record)
+  in
+  match record.mutation with
   | Types.Append_journal{root;journal_day;_}->
     let rec matches parent (node:Types.append_node)=match logical_block_at snapshot node.uuid with
       | Some value->(match parent with None->true|Some parent->value.block.parent=parent)
         && value.block.title=node.title && value.task_status=Option.map(fun id->Types.Status_uuid id)node.task_status
+        && tag_satisfied ~present:true value
         && Rrbvec.for_all(matches(Some node.uuid))node.children
       | None->false in
     matches None root && (match logical_block_at snapshot root.uuid with
@@ -9391,7 +9491,7 @@ let logical_snapshot_satisfies_mutation snapshot = function
   | Clear_task_status { block; _ } ->
     logical_block_at snapshot block
     |> option_satisfies (fun (record : Types.block_record) ->
-      Option.is_none record.task_status)
+      Option.is_none record.task_status && tag_satisfied ~present:false record)
 ;;
 
 let ordinary_effect_footprint ?append_owner snapshot = function
@@ -9653,7 +9753,7 @@ let replan_queued_ordinary database authoritative_database records =
          let append_owner=match mutation with
            | Types.Append_journal{page;journal_day;_}->Some(append_owner snapshot page journal_day)
            | _->None in
-         if logical_snapshot_satisfies_mutation snapshot mutation
+         if logical_snapshot_satisfies_record snapshot record
          then
            loop
              accumulated
@@ -9710,6 +9810,7 @@ let replan_queued_ordinary database authoritative_database records =
                { record with
                  normalized_transaction =
                    normalized_transaction_in
+                     ~changes_task_tag:(record_changes_task_tag record)
                      authoritative_database
                      ~append_create
                       ~fingerprint:record.fingerprint
