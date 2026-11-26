@@ -186,7 +186,7 @@ let set_filter t ~tags ~statuses ~days =
     t.days <- days)
 ;;
 
-let filtered t = t.tags <> [] || t.statuses <> [] || Option.is_some t.days
+let has_membership_filter t = t.tags <> [] || t.statuses <> []
 
 let timeline_uuid value =
   match Graph.Uuid.of_string value with
@@ -241,7 +241,7 @@ let make_root_batch t ~ports owner ~page_uuid (page : Projection.page) cursor li
       min limit (max 1 (refresh.refresh_prefix_limit - Rrbvec.length refresh.refresh_entries))
     | _ -> limit in
   (match owner with
-   | Feed_roots scan when filtered t && scan.root_start_day = None -> ()
+   | Feed_roots scan when has_membership_filter t && scan.root_start_day = None -> ()
    | _ ->
      Hashtbl.replace t.root_page_limits page.id (max limit (Option.value ~default:1 (Hashtbl.find_opt t.root_page_limits page.id)));
      ports.retain_root_interest page ~minimum_limit:limit);
@@ -526,7 +526,7 @@ let check t ~ports action =
 let validate_retained t ~ports ~request_generation ~refresh =
   if not (has_retained t) then empty else (
     t.window_epoch <- Int64.succ t.window_epoch;
-    check t ~ports (Window {request_generation;refresh;filtered=filtered t}))
+    check t ~ports (Window {request_generation;refresh;filtered=has_membership_filter t}))
 ;;
 
 let rec next_feed_batch ?(verified=false) t ~ports scan =
@@ -807,7 +807,7 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
       ; root_through_day = through_day
       ; root_proofs = Hashtbl.create 16
       ; root_retries = 0
-      ; root_reuse = reuse && not (filtered t)
+      ; root_reuse = reuse && not (has_membership_filter t)
       ; root_generation = request_generation
       ; root_continued = Option.exists (fun (_, cursor) -> Option.is_some cursor) after
       ; root_start_day = start_day
@@ -904,7 +904,7 @@ let receive_root_tree t ~ports batch (packet : Worker_pure_data.tree_member Pagi
         let todo = Rrbvec.filter (fun (m : Projection.tree_member) ->
           List.mem (Graph.Uuid.to_string m.block.uuid) ids) members in
         match batch.root_owner with
-        | Feed_roots scan when filtered t && Rrbvec.is_empty todo
+        | Feed_roots scan when has_membership_filter t && Rrbvec.is_empty todo
             && scan.root_start_day = None
             && not (Rrbvec.exists (fun (day : day_feed) -> day.page.id = batch.root_page.id) scan.root_days) ->
           (match next_cursor with
@@ -916,7 +916,7 @@ let receive_root_tree t ~ports batch (packet : Worker_pure_data.tree_member Pagi
                scan.root_date_boundary <- Some batch.root_page.day;
              next_feed_batch t ~ports scan)
         | _ ->
-          if filtered t && not (Rrbvec.is_empty todo) then (
+          if has_membership_filter t && not (Rrbvec.is_empty todo) then (
             let id = batch.root_page.id in
             Hashtbl.replace t.root_page_limits id (max batch.root_limit
               (Option.value ~default:1 (Hashtbl.find_opt t.root_page_limits id)));
@@ -1053,7 +1053,7 @@ let restart_dates t ~ports scan =
 ;;
 
 let with_coverage t ~ports scan receipt accept =
-  if not (filtered t) then accept () else
+  if not (has_membership_filter t) then accept () else
   match Paging.coverage receipt with
   | None -> scan_failure scan "Filtered Timeline read returned no coverage witness."
   | Some proof ->
@@ -1230,7 +1230,7 @@ let receive : type a. ?session:Worker.session -> t -> ports:ports
       | Check validation, Worker.Timeline_check _, checked -> receive_check t ~ports validation checked
       | Root_dates (scan, params), Worker.Timeline_read {query=Paging.Dates _;_}, Ok packet ->
         with_coverage t ~ports scan packet.receipt (fun () ->
-        if not (filtered t) then Hashtbl.replace scan.root_proofs
+        if not (has_membership_filter t) then Hashtbl.replace scan.root_proofs
           (Dates_scope (params.from_day, params.through_day))
           (Paging.Receipt packet.receipt);
         let items = packet.items in
@@ -1303,7 +1303,7 @@ let receive : type a. ?session:Worker.session -> t -> ports:ports
           else next_feed_batch t ~ports scan))
       | Root_today (scan, params), Worker.Timeline_read {query=Paging.Dates _;_}, Ok packet ->
         with_coverage t ~ports scan packet.receipt (fun () ->
-        if not (filtered t) then Hashtbl.replace scan.root_proofs
+        if not (has_membership_filter t) then Hashtbl.replace scan.root_proofs
           (Dates_scope (params.from_day, params.through_day))
           (Paging.Receipt packet.receipt);
         let items = packet.items in

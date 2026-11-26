@@ -8572,6 +8572,60 @@ let test_dates_change_preserves_retained_root_prefix () =
       | _ -> false) seen))
 ;;
 
+let test_rolling_dates_refresh_only_invalidated_roots () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar ~clock:1_790_726_400. runtime;
+  let fixture index day count =
+    let f = root_fixture index count 0 in
+    {f with owner={f.owner with kind=Journal_page {journal_day=day}}} in
+  let today = fixture 0 20260930 1
+  and changed_day = fixture 1 20260929 1
+  and recent = fixture 2 20260920 1
+  and empty_day = fixture 3 20260820 0
+  and oldest = fixture 4 20260630 1
+  and outside = fixture 5 20260629 1
+  and future = fixture 6 20261001 1 in
+  let fixtures = [future; today; changed_day; recent; empty_day; oldest; outside] in
+  let rolling = Some (20260630, 20260930) in
+  let narrow = Some (20260917, 20260930) in
+  let apply generation ~tags ~statuses days =
+    Runtime.set_timeline_filter runtime ~tags ~statuses ~days;
+    drive_roots runtime fixtures (initial_roots runtime generation) in
+  let check_days label expected (feed : Journal_graph_projection.feed) =
+    Alcotest.(check (option int)) "Today remains prioritized" (Some 20260930) feed.prioritized_day;
+    Alcotest.(check (list int)) label expected
+      (List.map (fun (day : Journal_graph_projection.day_feed) -> day.page.day) feed.days) in
+  let initial, _ = apply 980L ~tags:[] ~statuses:[] rolling in
+  check_days "rolling month bounds and empty-day omission" [20260930;20260929;20260920;20260630] initial;
+  let refreshed, seen = drive_roots runtime fixtures
+    (changed runtime (window ~scopes:[Worker_pure_data.V2_journal_index_interest;
+      Worker_pure_data.V2_page_tree_interest changed_day.owner.uuid] ())) in
+  check_days "refresh preserves chronological window" [20260930;20260929;20260920;20260630] refreshed;
+  let ordinary_reads seen = List.filter_map (function
+    | Some (Runtime.Read {query=W.Timeline_read {query=W.Timeline.Roots page;_};_}) ->
+      Some (Graph.Uuid.to_string page)
+    | _ -> None) seen in
+  let rereads = ordinary_reads seen in
+  Alcotest.(check (list string)) "only the invalidated day rereads roots"
+    [Graph.Uuid.to_string changed_day.owner.uuid] (List.sort_uniq String.compare rereads);
+  Alcotest.(check bool) "reconciliation and feed assembly issue at most one root read each"
+    true (List.length rereads <= 2);
+  let assert_depth ~tags ~statuses =
+    let filtered, seen = apply 981L ~tags ~statuses narrow in
+    check_days "unmatched roots do not leak from retained dates" [] filtered;
+    Alcotest.(check bool) "membership criteria select depth-aware reads" true
+      (List.exists (function
+        | Some (Runtime.Read {query=W.Timeline_read {query=W.Timeline.Roots_through_grandchildren _;_};_}) -> true
+        | _ -> false) seen);
+    Alcotest.(check (list string)) "membership criteria do not reuse ordinary reads" [] (ordinary_reads seen) in
+  assert_depth ~tags:[unrelated_uuid] ~statuses:[];
+  assert_depth ~tags:[] ~statuses:[unrelated_uuid];
+  let time_only, _ = apply 982L ~tags:[] ~statuses:[] narrow in
+  check_days "time-only criteria exclude the old date" [20260930;20260929;20260920] time_only;
+  let restored, _ = apply 983L ~tags:[] ~statuses:[] rolling in
+  check_days "default restores older in-range rows only" [20260930;20260929;20260920;20260630] restored
+;;
+
 let pending_retained_assembly_check runtime fixture =
   let day = match fixture.owner.kind with Journal_page {journal_day} -> journal_day | _ -> assert false in
   let root = Runtime.submit runtime (Journal_graph_request.Load_day_blocks
@@ -9586,6 +9640,7 @@ let () =
         Alcotest.test_case "proof failure is explicit" `Quick test_timeline_proof_failure_is_explicit;
         Alcotest.test_case "paging read error preserves Worker error" `Quick test_timeline_read_failed_preserves_worker_error;
         Alcotest.test_case "date changes preserve retained prefix" `Quick test_dates_change_preserves_retained_root_prefix;
+        Alcotest.test_case "rolling dates reread only invalidated roots" `Quick test_rolling_dates_refresh_only_invalidated_roots;
         Alcotest.test_case "cancel fences verification" `Quick (fun () -> test_verification_reply_is_fenced `Cancel);
         Alcotest.test_case "refresh fences verification" `Quick (fun () -> test_verification_reply_is_fenced `Refresh);
         Alcotest.test_case "reset fences verification" `Quick (fun () -> test_verification_reply_is_fenced `Reset);
