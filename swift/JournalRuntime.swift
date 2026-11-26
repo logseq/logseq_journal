@@ -116,13 +116,24 @@ private final class JournalPlatformRequestIngress: @unchecked Sendable {
     owner = nil; receiver = nil; pending = []; latest = [:]
   }
 }
+private typealias FilterCommitCallback = @convention(c) (UnsafePointer<CChar>?, Int32) -> Int32
+@_silgen_name("journal_ocaml_set_filter_commit_callback")
+private func journalOCamlSetFilterCommitCallback(_ callback: FilterCommitCallback?)
+
+private let filterCommit: FilterCommitCallback = { data, length in
+  guard Thread.isMainThread, let data, length > 0 else { return 0 }
+  let request = Data(bytes: data, count: Int(length))
+  return MainActor.assumeIsolated {
+    guard activeRuntime != nil else { return 0 }
+    return JournalTimelineFilterPreferences(defaults: .standard).handleCommit(request) ? 1 : 0
+  }
+}
+
 private let platformRequestIngress = JournalPlatformRequestIngress()
 private let platformRequest: PlatformRequestCallback = { data, length in
   guard let data, length > 0 else { return }
   let request = Data(bytes: data, count: Int(length))
-  if !JournalTimelineFilterPreferences(defaults: .standard).handleCommit(request) {
-    platformRequestIngress.submit(request)
-  }
+  platformRequestIngress.submit(request)
 }
 
 /// Owns the lui backend, the OCaml runtime, and the platform bridge for one
@@ -238,6 +249,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     defer { if !started { platformRequestIngress.close(identity) } }
     journalOCamlSetWakeupCallback(wakeup)
     journalOCamlSetPlatformRequestCallback(platformRequest)
+    journalOCamlSetFilterCommitCallback(filterCommit)
     activeRuntime = self
     #if os(macOS)
     let operatingSystem: Int32 = 1

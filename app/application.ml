@@ -173,151 +173,9 @@ type feed_refresh =
   ; graph_generation : Graph_service.graph_id option
   }
 
-module Timeline_filter = struct
-  module Uuid = Logseq_db_types.Graph_types.Uuid
+module Timeline_filter = Journal_timeline_filter.Timeline_filter
 
-  type tag_id = Uuid.t
-  type status_id = Uuid.t
-  type unit_ = Days | Weeks
-  type preset = Past_14_days | Past_3_months
-  type relative_time = [ `Any_time | `Preset of preset | `Custom of int * unit_ ]
-  type time_error = Invalid_count
-
-  let any_time = `Any_time
-  let preset value = `Preset value
-
-  let custom ~count ~unit_ =
-    let multiplier = match unit_ with Days -> 1 | Weeks -> 7 in
-    if count <= 0 || count > max_int / multiplier
-    then Error Invalid_count
-    else Ok (`Custom (count, unit_))
-  ;;
-
-  let time_choice time = time
-
-  type criteria = { tags : tag_id list; statuses : status_id list; time : relative_time }
-
-  let criteria ~tags ~statuses ~time =
-    { tags = List.sort_uniq Uuid.compare tags; statuses = List.sort_uniq Uuid.compare statuses; time }
-  ;;
-
-  let all = criteria ~tags:[] ~statuses:[] ~time:any_time
-  let tags criteria = criteria.tags
-  let statuses criteria = criteria.statuses
-  let time criteria = criteria.time
-
-  let active_count criteria =
-    Bool.to_int (criteria.tags <> [])
-    + Bool.to_int (criteria.statuses <> [])
-    + Bool.to_int (criteria.time <> any_time)
-  ;;
-
-  type time_control = Any_time | Preset of preset | Custom of { count_text : string; unit_ : unit_ }
-  type sheet = { draft_tags : tag_id list; draft_statuses : status_id list; draft_time : time_control }
-  type t = { applied : criteria; sheet : sheet option }
-
-  let restore applied = { applied; sheet = None }
-  let initial = restore all
-  let applied state = state.applied
-  let sheet state = state.sheet
-  let draft_tags sheet = sheet.draft_tags
-  let draft_statuses sheet = sheet.draft_statuses
-  let draft_time sheet = sheet.draft_time
-
-  let validate_draft_time sheet =
-    match sheet.draft_time with
-    | Any_time -> Ok any_time
-    | Preset value -> Ok (preset value)
-    | Custom { count_text; unit_ } ->
-      if not (String.for_all (function '0' .. '9' -> true | _ -> false) count_text)
-      then Error Invalid_count
-      else (
-        match int_of_string_opt count_text with
-        | None -> Error Invalid_count
-        | Some count -> custom ~count ~unit_)
-  ;;
-
-  let draft criteria =
-    let draft_time =
-      match time_choice criteria.time with
-      | `Any_time -> Any_time
-      | `Preset value -> Preset value
-      | `Custom (count, unit_) -> Custom { count_text = string_of_int count; unit_ }
-    in
-    { draft_tags = criteria.tags; draft_statuses = criteria.statuses; draft_time }
-  ;;
-
-  let open_sheet state =
-    match state.sheet with Some _ -> state | None -> { state with sheet = Some (draft state.applied) }
-  ;;
-
-  type edit = Toggle_tag of tag_id | Toggle_status of status_id | Set_time of time_control | Reset
-
-  let toggle id ids =
-    if List.exists (Uuid.equal id) ids
-    then List.filter (fun candidate -> not (Uuid.equal id candidate)) ids
-    else id :: ids
-  ;;
-
-  let resolve_days criteria ~today =
-    let calendar_months () =
-      let month_index = (today / 10000) * 12 + today / 100 mod 100 - 1 - 3 in
-      if month_index < 12 then invalid_arg "Filter range starts before year 1";
-      let year = month_index / 12 and month = month_index mod 12 + 1 in
-      let last_day = match month with
-        | 2 -> if year mod 4 = 0 && (year mod 100 <> 0 || year mod 400 = 0) then 29 else 28
-        | 4 | 6 | 9 | 11 -> 30
-        | _ -> 31 in
-      Some (year * 10000 + month * 100 + min (today mod 100) last_day, today)
-    in
-    let days count =
-      let civil day =
-        let year = day / 10000 and month = day / 100 mod 100 in
-        let year = if month <= 2 then year - 1 else year in
-        let era = year / 400 in
-        let year_of_era = year mod 400 in
-        let month = if month <= 2 then month + 9 else month - 3 in
-        era * 146097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100
-        + (153 * month + 2) / 5 + day mod 100 - 1 - 719468
-      in
-      let earliest = civil today - (count - 1) in
-      if earliest < civil 10101 then invalid_arg "Filter range starts before year 1";
-      let start = Unix.gmtime (float_of_int earliest *. 86400.) in
-      Some ((start.tm_year + 1900) * 10000 + (start.tm_mon + 1) * 100 + start.tm_mday, today)
-    in
-    match time_choice (time criteria) with
-    | `Any_time -> None
-    | `Preset Past_3_months -> calendar_months ()
-    | `Preset Past_14_days -> days 14
-    | `Custom (count, Days) -> days count
-    | `Custom (count, Weeks) -> days (7 * count)
-  ;;
-
-  let edit state change =
-    match state.sheet with
-    | None -> state
-    | Some sheet ->
-      let sheet =
-        match change with
-        | Toggle_tag id -> { sheet with draft_tags = toggle id sheet.draft_tags }
-        | Toggle_status id -> { sheet with draft_statuses = toggle id sheet.draft_statuses }
-        | Set_time draft_time -> { sheet with draft_time }
-        | Reset -> draft all
-      in
-      { state with sheet = Some sheet }
-  ;;
-
-  let cancel state = { state with sheet = None }
-
-  let apply state =
-    match state.sheet with
-    | None -> Ok state
-    | Some sheet ->
-      Result.map
-        (fun time -> restore (criteria ~tags:sheet.draft_tags ~statuses:sheet.draft_statuses ~time))
-        (validate_draft_time sheet)
-  ;;
-end
+let initial_filters = Timeline_filter.restore Timeline_filter.empty_preferences
 
 type modal =
   | No_modal
@@ -412,61 +270,6 @@ module Task_catalog = struct
   ;;
 end
 
-module Timeline_filter_preferences = struct
-  let startup_prefix = "JTF1"
-
-  let unwrap_startup payload =
-    if not (String.starts_with ~prefix:startup_prefix payload) then [], payload else
-    match String.index_from_opt payload (String.length startup_prefix) '\n' with
-    | None -> [], payload
-    | Some separator ->
-      let offset = String.length startup_prefix in
-      let snapshot = String.sub payload offset (separator - offset) in
-      let config = String.sub payload (separator + 1) (String.length payload - separator - 1) in
-      let entries =
-        try match Yojson.Safe.from_string snapshot with `Assoc entries -> entries | _ -> []
-        with Yojson.Json_error _ -> [] in
-      entries, config
-  ;;
-
-  let decode text =
-    let open Timeline_filter in
-    let open Yojson.Safe.Util in
-    let ids = function
-      | `List values -> List.map (fun value ->
-          match Uuid.of_string (to_string value) with
-          | Ok id -> id | Error _ -> raise Exit) values
-      | _ -> raise Exit in
-    try
-      let value = Yojson.Safe.from_string text in
-      if member "version" value <> `Int 1 then raise Exit;
-      let time = match member "time" value with
-        | `String "any" -> any_time
-        | `String "past-7-days" ->
-          (match custom ~count:7 ~unit_:Days with Ok time -> time | Error _ -> raise Exit)
-        | `String "past-2-weeks" -> preset Past_14_days
-        | `String "past-3-months" -> preset Past_3_months
-        | `List [`Int count; `String unit_] ->
-          let unit_ = match unit_ with "days" -> Days | "weeks" -> Weeks | _ -> raise Exit in
-          (match custom ~count ~unit_ with Ok time -> time | Error _ -> raise Exit)
-        | _ -> raise Exit in
-      Some (criteria ~tags:(ids (member "tags" value)) ~statuses:(ids (member "statuses" value)) ~time)
-    with Yojson.Json_error _ | Type_error _ | Exit -> None
-  ;;
-
-  let encode value =
-    let open Timeline_filter in
-    let ids values = `List (List.map (fun id -> `String (Uuid.to_string id)) values) in
-    let time = match time value with
-      | `Any_time -> `String "any"
-      | `Preset Past_14_days -> `String "past-2-weeks"
-      | `Preset Past_3_months -> `String "past-3-months"
-      | `Custom (count, unit_) -> `List [`Int count; `String (match unit_ with Days -> "days" | Weeks -> "weeks")] in
-    Yojson.Safe.to_string (`Assoc ["version", `Int 1; "tags", ids (tags value);
-      "statuses", ids (statuses value); "time", time])
-  ;;
-end
-
 type cleanup = Discard_staged_file of Journal_asset_import.staged
 type cleanup_plan = cleanup Rrbvec.t
 
@@ -494,6 +297,7 @@ type state =
   ; routes : Journal_routes.t
   ; filter_tag_picker : filter_tag_picker
   ; filters : Timeline_filter.t
+  ; filter_error : string option
   ; filters_restored : bool
   ; timeline : Journal_timeline_state.t
   ; timeline_structure_revision : int
@@ -651,7 +455,8 @@ let initial_state =
   ; favorites_requests = []
   ; routes = Journal_routes.create ()
   ; filter_tag_picker = { sheet_epoch = 0; search_epoch = 0; prefix = ""; labels = []; page = Tag_loading }
-  ; filters = Timeline_filter.initial
+  ; filters = initial_filters
+  ; filter_error = None
   ; filters_restored = false
   ; timeline = Journal_timeline_state.empty ~today:0
   ; timeline_structure_revision = 0
@@ -876,7 +681,8 @@ let clear_graph_surface ~discard ?(discard_capture = true) state =
   ; favorites_requests = []
   ; routes = Journal_routes.create ()
   ; filter_tag_picker = { sheet_epoch = 0; search_epoch = 0; prefix = ""; labels = []; page = Tag_loading }
-  ; filters = Timeline_filter.initial
+  ; filters = initial_filters
+  ; filter_error = None
   ; filters_restored = false
   ; timeline = Journal_timeline_state.empty ~today:0
   ; feed_loaded = false
@@ -2075,7 +1881,8 @@ module Root_navigation = struct
     ; task_status_page = 0
     ; reference_sources = Reference_sources.empty
     ; graph_state = { state.graph_state with generation }
-    ; filters = Timeline_filter.initial
+    ; filters = initial_filters
+  ; filter_error = None
     ; filters_restored = false
     ; graph_ready = false
     ; feed_loaded = false
@@ -2410,7 +2217,8 @@ type command =
   | More_filter_tags
   | Retry_filter_tags
   | Close_filters of int
-  | Apply_filters of int
+  | Reset_filter_error of int
+  | Submit_filters of int * Timeline_filter.command
   | Open_diagnostics
   | Close_diagnostics
   | Open_error_info
@@ -2834,11 +2642,12 @@ let filters_page state dispatch filter_draft =
   let custom_time = match time with
     | Custom _ -> time
     | Preset Past_14_days -> Custom { count_text = "14"; unit_ = Days }
-    | Any_time | Preset Past_3_months -> Custom { count_text = "7"; unit_ = Days }
+    | Preset Past_3_months -> Custom { count_text = "7"; unit_ = Days }
   in
-  let range = match apply state.filters, state.calendar with
-    | Ok filters, Some calendar ->
-      (try Some (resolve_days (applied filters) ~today:(Journal_calendar.local_day calendar))
+  let range = match validate_draft_time filter_draft, state.calendar with
+    | Ok time, Some calendar ->
+      let draft = criteria ~tags:[] ~statuses:[] ~time in
+      (try Some (Journal_filter_date.resolve_days draft ~today:(Journal_calendar.local_day calendar))
        with Invalid_argument _ -> None)
     | _ -> None
   in
@@ -2853,8 +2662,7 @@ let filters_page state dispatch filter_draft =
   let options = List.map (fun (id, title) ->
     choice ("status-" ^ Uuid.to_string id) title (List.mem id selected_statuses) (Toggle_status id)) statuses in
   let times = List.map (fun (id, label, control, selected) -> choice id label selected (Set_time control))
-    [ "any", "Any time", Any_time, time = Any_time
-    ; "fortnight", "14 days", Preset Past_14_days, time = Preset Past_14_days
+    [ "fortnight", "14 days", Preset Past_14_days, time = Preset Past_14_days
     ; "quarter", "3 months", Preset Past_3_months, time = Preset Past_3_months
     ; "custom", "Custom", custom_time, (match time with Custom _ -> true | _ -> false) ] in
   let custom = match time with
@@ -2863,7 +2671,7 @@ let filters_page state dispatch filter_draft =
         choice id label (unit_choice = unit_) (Set_time (Custom { count_text; unit_ = unit_choice })))
         [ "days", "days", Days; "weeks", "weeks", Weeks ] in
       `Assoc [ "count", `String count_text; "units", `List units ]
-    | Any_time | Preset _ -> `Null
+    | Preset _ -> `Null
   in
   let selected_tags = draft_tags filter_draft in
   let picker = state.filter_tag_picker in
@@ -2889,16 +2697,25 @@ let filters_page state dispatch filter_draft =
   let payload = Yojson.Safe.to_string (`Assoc
     [ "mode", `String "filter-overlay"; "enabled", `Bool enabled
     ; "sheetEpoch", `Int picker.sheet_epoch
+    ; "filterNames", `List (match Timeline_filter.entry state.filters with
+        | Configure_directly -> []
+        | Native_menu { names; _ } -> List.map (fun name -> `String name) names)
     ; "choices", `Assoc [ "tags", `List selected; "statuses", `List options
                         ; "times", `List times; "results", `List results ]
+    ; "filterError", Option.fold ~none:`Null ~some:(fun text -> `String text) state.filter_error
     ; "custom", custom; "dateRange", date_range; "text", `String picker.prefix
     ; "message", Option.fold ~none:`Null ~some:(fun text -> `String text) tag_message ]) in
   let on_event event =
     let raw = event.Journal_lui_native.payload in
-    match raw with
+    if event.event_id = picker.sheet_epoch then match raw with
     | "cancel" -> dispatch.send (Close_filters event.event_id)
+    | "name" -> dispatch.send (Reset_filter_error event.event_id)
     | "reset" -> dispatch.send (Edit_filters Reset)
-    | "apply" when enabled -> dispatch.send (Apply_filters event.event_id)
+    | "apply" when enabled -> dispatch.send (Submit_filters (event.event_id, Apply))
+    | _ when enabled && String.starts_with ~prefix:"save:" raw ->
+      dispatch.send (Submit_filters (event.event_id, Save_as (String.sub raw 5 (String.length raw - 5))))
+    | _ when String.starts_with ~prefix:"delete:" raw ->
+      dispatch.send (Submit_filters (event.event_id, Delete (String.sub raw 7 (String.length raw - 7))))
     | _ when String.starts_with ~prefix:"search:" raw ->
       dispatch.send (Edit_filter_tag_text (String.sub raw 7 (String.length raw - 7)))
     | _ when String.starts_with ~prefix:"count:" raw ->
@@ -2906,7 +2723,7 @@ let filters_page state dispatch filter_draft =
        | Custom { unit_; _ } ->
          let count_text = String.sub raw 6 (String.length raw - 6) in
          dispatch.send (Edit_filters (Set_time (Custom { count_text; unit_ })))
-       | Any_time | Preset _ -> ())
+       | Preset _ -> ())
     | _ -> Option.iter dispatch.send (List.assoc_opt raw !actions)
   in
   payload, on_event
@@ -2953,6 +2770,7 @@ let timeline_page
       ~on_error_info
       ~account_menu_available
       ~filter_count
+      ~filter_entry
       ~cache_reset_available
       ~on_account_action
   =
@@ -3010,11 +2828,25 @@ let timeline_page
   in
   let filter_control =
     if favorites_selected then None else
+    let names, active = match filter_entry with
+      | Timeline_filter.Configure_directly -> [], None
+      | Native_menu { names; active_name } -> names, active_name in
     let payload = Yojson.Safe.to_string (`Assoc
-      [ "mode", `String "filter-trigger"; "level", `Int filter_count
-      ; "enabled", `Bool interaction_enabled ]) in
+      [ "filterNames", `List (List.map (fun name -> `String name) names)
+      ; "filterActiveName", Option.fold ~none:`Null ~some:(fun name -> `String name) active
+      ; "mode", `String "filter-trigger"; "level", `Int filter_count
+      ; "filterOwner", `Int graph_generation; "enabled", `Bool interaction_enabled ]) in
     Some (V.of_lui (Journal_lui_native.mount ~key:"journal-filters" ~payload ~children:[]
-      ~on_event:(fun _ -> on_account_action.send Open_filters)
+      ~on_event:(fun event ->
+        let owner = event.Journal_lui_native.event_id in
+        let raw = event.payload in
+        if owner = graph_generation then
+          match raw with
+          | "open" -> on_account_action.send Open_filters
+          | "clear" -> on_account_action.send (Submit_filters (owner, Clear))
+          | _ when String.starts_with ~prefix:"select:" raw ->
+            on_account_action.send (Submit_filters (owner, Select (String.sub raw 7 (String.length raw - 7))))
+          | _ -> ())
       Journal_lui_native.chrome_identifier))
   in
   let destination_action index =
@@ -3649,23 +3481,47 @@ let start
   let filter_preferences = ref filter_preferences in
   let graph_filter_key id =
     String.lowercase_ascii (Logseq_db_types.Graph_types.Uuid.to_string id) in
-  let save_filters id criteria =
+  let save_filters id preferences =
     let key = graph_filter_key id in
-    let text = if criteria = Timeline_filter.all then "" else Timeline_filter_preferences.encode criteria in
-    filter_preferences := List.remove_assoc key !filter_preferences;
-    if text <> "" then filter_preferences := (key, `String text) :: !filter_preferences;
-    Journal_bridge.platform_request ("journal.timeline-filter.commit\n" ^ key ^ "\n" ^ text) in
+    match Timeline_filter_preferences.commit ~persist:Journal_bridge.commit_timeline_filter
+        !filter_preferences ~key preferences with
+    | Some retained -> filter_preferences := retained; true
+    | None -> false in
   let saved_filters id calendar =
-    let criteria = match List.assoc_opt (graph_filter_key id) !filter_preferences with
-      | Some (`String text) -> Timeline_filter_preferences.decode text
-      | _ -> None in
-    let criteria = Option.value criteria ~default:Timeline_filter.all in
-    try ignore (Timeline_filter.resolve_days criteria ~today:(Journal_calendar.local_day calendar)); criteria
-    with Invalid_argument _ -> Timeline_filter.all in
-  let restore_filters state =
-    match state.filters_restored, state.graph_state.graph_id, state.calendar with
-    | false, Some id, Some calendar ->
-      { state with filters_restored = true; filters = Timeline_filter.restore (saved_filters id calendar) }
+    let open Timeline_filter in
+    let invalid reason =
+      Printf.eprintf "Invalid Timeline filter preferences for %s: %s\n%!" (graph_filter_key id) reason;
+      initial_filters in
+    match List.assoc_opt (graph_filter_key id) !filter_preferences with
+    | None -> initial_filters
+    | Some (`String text) ->
+      (match Timeline_filter_preferences.decode text with
+       | Error message -> invalid message
+       | Ok preferences ->
+         let filters = restore preferences in
+         (try ignore (Journal_filter_date.resolve_days (applied filters) ~today:(Journal_calendar.local_day calendar)); filters
+          with Invalid_argument reason -> invalid reason))
+    | Some _ -> invalid "Expected a text record" in
+  let restore_filters ~switched state =
+    match state.graph_state.graph_id, state.calendar with
+    | Some id, Some calendar when switched || not state.filters_restored ->
+      let filters = saved_filters id calendar in
+      let restored = { state with filters_restored = true; filters } in
+      let restored =
+        if not state.filters_restored || Timeline_filter.applied filters = Timeline_filter.applied state.filters
+        then restored
+        else
+          { restored with feed_loaded = false; feed_refresh = None
+          ; timeline = Journal_timeline_state.empty ~today:(Journal_calendar.local_day calendar)
+          ; timeline_structure_revision = state.timeline_structure_revision + 1
+          ; presented_feed_context = None } in
+      let warning = match List.assoc_opt (graph_filter_key id) !filter_preferences with
+        | Some (`String "") -> Some "The saved Timeline filters for this graph exceed the storage limit or are invalid."
+        | None when List.mem_assoc "overflow" !filter_preferences ->
+          Some "Some saved Timeline filters could not be loaded (64-graph storage limit or invalid startup data)."
+        | _ -> None in
+      Option.fold ~none:restored ~some:(fun message ->
+        show_sync_error restored (Non_worker_sync_failure message)) warning
     | _ -> state in
   let pump = Journal_pump.create () in
   Journal_pump.set_wakeup pump Journal_bridge.wakeup;
@@ -5381,8 +5237,8 @@ let start
             | None -> Journal_graph_runtime.{ requests = []; responses = [] }
             | Some calendar ->
               let criteria = Option.fold ~none:Timeline_filter.all
-                  ~some:(fun id -> saved_filters id calendar) graph_state.graph_id in
-              let days = Timeline_filter.resolve_days criteria ~today:(Journal_calendar.local_day calendar) in
+                  ~some:(fun id -> Timeline_filter.applied (saved_filters id calendar)) graph_state.graph_id in
+              let days = Journal_filter_date.resolve_days criteria ~today:(Journal_calendar.local_day calendar) in
               Journal_graph_runtime.set_timeline_filter (!graph_runtime_cell)
                 ~tags:(Timeline_filter.tags criteria) ~statuses:(Timeline_filter.statuses criteria) ~days;
               submit
@@ -6284,7 +6140,7 @@ let start
     | Some context ->
       let generation = snapshot.next_request_generation in
       let criteria = Timeline_filter.applied snapshot.filters in
-      let days = Timeline_filter.resolve_days criteria ~today:context.local_day in
+      let days = Journal_filter_date.resolve_days criteria ~today:context.local_day in
       Journal_graph_runtime.set_timeline_filter (!graph_runtime_cell)
         ~tags:(Timeline_filter.tags criteria) ~statuses:(Timeline_filter.statuses criteria) ~days;
       let output =
@@ -7332,12 +7188,12 @@ let start
         let selected = Timeline_filter.tags (Timeline_filter.applied filters) in
         let labels = List.filter (fun (id, _) -> List.mem id selected) state.filter_tag_picker.labels in
         let picker = { sheet_epoch; search_epoch = 0; prefix = ""; labels; page = Tag_loading } in
-        { state with modal = Filters_sheet; filter_tag_picker = picker; filters },
+        { state with modal = Filters_sheet; filter_tag_picker = picker; filters; filter_error = None },
         Effect.many [ search_filter_tags ~owner picker ~after:None ~debounce:false
                     ; resolve_filter_tag_labels ~owner ~sheet_epoch selected ])
     | Edit_filters edit ->
       update (fun state ->
-        if state.modal = Filters_sheet then { state with filters = Timeline_filter.edit state.filters edit } else state)
+        if state.modal = Filters_sheet then { state with filters = Timeline_filter.edit state.filters edit; filter_error = None } else state)
     | (Edit_filter_tag_text _ | More_filter_tags | Retry_filter_tags) as action ->
       let owner = current_owner () in
       set_state_and_effect (fun state ->
@@ -7367,24 +7223,49 @@ let start
         if state.modal = Filters_sheet && state.filter_tag_picker.sheet_epoch = sheet_epoch
         then { state with modal = No_modal; filters = Timeline_filter.cancel state.filters }
         else state)
-    | Apply_filters sheet_epoch ->
-      set_state_and_effect (fun state ->
-        if state.modal <> Filters_sheet || state.filter_tag_picker.sheet_epoch <> sheet_epoch
-        then state, Effect.ignore else
-        match Timeline_filter.apply state.filters, state.graph_state.graph_id with
-        | Ok filters, Some graph_id when state.filters_restored
-            && Option.exists (fun calendar ->
-            try ignore (Timeline_filter.resolve_days (Timeline_filter.applied filters)
-                          ~today:(Journal_calendar.local_day calendar)); true
-            with Invalid_argument _ -> false) state.calendar ->
-          let changed = Timeline_filter.applied filters <> Timeline_filter.applied state.filters in
-          let next = if not changed then { state with modal = No_modal; filters } else
-            { state with modal = No_modal; filters; feed_loaded = false; feed_refresh = None
-            ; timeline = Journal_timeline_state.empty ~today:(Option.fold ~none:0 ~some:Journal_calendar.local_day state.calendar)
-            ; timeline_structure_revision = state.timeline_structure_revision + 1
-            ; presented_feed_context = None } in
-          next, Effect.of_thunk (fun () -> save_filters graph_id (Timeline_filter.applied filters))
-        | _ -> state, Effect.ignore)
+    | Reset_filter_error epoch ->
+      update (fun state ->
+        if state.modal = Filters_sheet && state.filter_tag_picker.sheet_epoch = epoch
+        then { state with filter_error = None } else state)
+    | Submit_filters (epoch, command) ->
+      update (fun state ->
+        let open Timeline_filter in
+        let valid_owner = match command with
+          | Apply | Save_as _ | Delete _ -> state.modal = Filters_sheet && state.filter_tag_picker.sheet_epoch = epoch
+          | Select _ | Clear -> state.modal = No_modal && state.graph_state.generation = epoch
+              && Journal_routes.destination state.routes = Journals in
+        if not valid_owner || not state.graph_ready || not state.filters_restored then state else
+        let report message =
+          if state.modal = Filters_sheet then
+            { state with filter_error = Some message }
+          else show_sync_error state (Non_worker_sync_failure message) in
+        match state.graph_state.graph_id, state.calendar, submit state.filters command with
+        | Some graph_id, Some calendar, Ok { next = filters; replacement } ->
+          let today = Journal_calendar.local_day calendar in
+          (match Journal_filter_date.resolve_days (applied filters) ~today with
+           | exception Invalid_argument reason -> report reason
+           | _ ->
+             if not (Option.fold ~none:true ~some:(save_filters graph_id) replacement)
+             then report "Could not update saved Timeline filters. Restart the app to reload saved filters. If you have filters saved for 64 graphs, remove filters from another graph before adding more."
+             else
+               let modal = match command with Delete _ -> Filters_sheet | _ -> No_modal in
+               let next = { state with modal; filters; filter_error = None } in
+               if applied filters = applied state.filters then next else
+               { next with feed_loaded = false; feed_refresh = None
+               ; timeline = Journal_timeline_state.empty ~today
+               ; timeline_structure_revision = state.timeline_structure_revision + 1
+               ; presented_feed_context = None })
+        | _, _, Error error ->
+          report (match error with
+            | Invalid_time Invalid_count -> "Enter a valid positive count."
+            | Invalid_preferences Empty_name -> "Enter a filter name."
+            | Invalid_preferences Duplicate_name -> "A filter with this name already exists."
+            | Invalid_preferences Name_too_long -> "Use a shorter, valid filter name."
+            | Invalid_preferences Too_many_filters -> "You can save up to five filters per graph."
+            | Invalid_preferences Too_many_selections -> "Select at most 100 tags and 100 statuses."
+            | Invalid_preferences Unknown_selection | Unknown_name -> "This saved filter is unavailable."
+            | No_open_sheet -> "The filter sheet is no longer open.")
+        | _ -> state)
     | Open_diagnostics ->
       set_state_and_effect (fun state ->
         let admission_refresh, directive =
@@ -7888,7 +7769,10 @@ let start
     Option.iter activate_runtime (timeline_scope model);
     let before = model in
     let model,eff=transition model in
-    let model = restore_filters model in
+    let switched = visible &&
+      (before.graph_state.graph_id <> model.graph_state.graph_id
+       || before.graph_state.generation <> model.graph_state.generation) in
+    let model = restore_filters ~switched model in
     match !before_transition_effect before model with
     | Error cause ->
       let message = "Nothing was submitted. " ^ cause in
@@ -8169,6 +8053,7 @@ let start
       && left.reference_sources == right.reference_sources
       && left.task_catalog.definitions == right.task_catalog.definitions
       && Timeline_filter.applied left.filters = Timeline_filter.applied right.filters
+      && Timeline_filter.entry left.filters = Timeline_filter.entry right.filters
       && left.feed_loaded = right.feed_loaded
       && left.graph_error == right.graph_error
       && (Option.is_none left.graph_error
@@ -8476,6 +8361,7 @@ let start
             ~on_error_info:(bind_action dispatch Open_error_info)
             ~account_menu_available:true
             ~filter_count:(Timeline_filter.active_count (Timeline_filter.applied state.filters))
+            ~filter_entry:(Timeline_filter.entry state.filters)
             ~on_account_action:dispatch
             ~cache_reset_available:(local_deletion_available state)
     in
@@ -9414,6 +9300,7 @@ module For_testing = struct
       ~on_error_info:handler
       ~account_menu_available:true
       ~filter_count:0
+      ~filter_entry:Timeline_filter.Configure_directly
       ~on_account_action:(ignore_dispatch handler)
       ~cache_reset_available:false
     |> fun page ->

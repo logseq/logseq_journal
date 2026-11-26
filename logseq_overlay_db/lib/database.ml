@@ -135,7 +135,7 @@ type task_catalog_cache =
   ; catalog_items : Graph.task_status_definition array
   }
 
-type timeline_scope = Journal_index | Journal_root_membership | Page_roots of Graph.page_uuid | Parent_children of Graph.block_uuid
+type timeline_scope = Journal_index | Journal_root_membership | Journal_root_and_descendant_membership | Page_roots of Graph.page_uuid | Parent_children of Graph.block_uuid
 type timeline_scope_version = string
 type journal_position = string
 type member_position = string
@@ -154,6 +154,7 @@ let member_position_of_string value =
 let timeline_scope_key = function
   | Journal_index -> "journal"
   | Journal_root_membership -> "journal-root-membership"
+  | Journal_root_and_descendant_membership -> "journal-root-and-descendant-membership"
   | Page_roots uuid -> "roots:" ^ Graph.Uuid.to_string uuid
   | Parent_children uuid -> "children:" ^ Graph.Uuid.to_string uuid
 
@@ -2273,23 +2274,19 @@ let index_ordered_effects select records =
   index_effects select records |> Uuid_map.map Rrbvec.of_list
 ;;
 
-let index_children_effects records =
-  index_effects
-    (fun record ->
-       List.filter_map
-         (function
-           | Types.Children_interest parent -> Some parent
-           | Page_tree_interest _ | Journal_index_interest -> None)
-         record.effect_footprint.structure_interests
-       @
-       if record_has_active_dependency_shadows record
-       then
-         List.map
-           (fun shadow -> shadow.shadow_parent)
-           record.dependency_shadows.shadow_blocks
-       else [])
-    records
+let children_effect_parents record =
+  List.filter_map
+    (function
+      | Types.Children_interest parent -> Some parent
+      | Page_tree_interest _ | Journal_index_interest -> None)
+    record.effect_footprint.structure_interests
+  @
+  if record_has_active_dependency_shadows record
+  then List.map (fun shadow -> shadow.shadow_parent) record.dependency_shadows.shadow_blocks
+  else []
 ;;
+
+let index_children_effects records = index_effects children_effect_parents records
 
 let frozen_outbox (records : outbox_record list) =
   List.map
@@ -4687,11 +4684,7 @@ let timeline_member_offset scope version = function
      | _ -> Error (Types.Invalid_read_request "timeline member position belongs to another query"))
 ;;
 
-let timeline_direct_members snapshot scope ~parent ~limit ~after =
-  with_snapshot_read snapshot (fun snapshot ->
-    if not (valid_page_limit limit) then Error (Types.Invalid_read_request "limit must be between 1 and 200")
-    else Result.bind (timeline_version_at snapshot scope) (fun version ->
-      Result.bind (timeline_member_offset scope version after) (fun offset ->
+let timeline_direct_candidates ?(charge = fun _ -> ()) ~truncate snapshot parent =
         let database = Option.get snapshot.authoritative_database in
         let cache =
           { hydration = hydration_cache ~index_idents:false database
@@ -4700,37 +4693,59 @@ let timeline_direct_members snapshot scope ~parent ~limit ~after =
         in
         let identities = Hashtbl.create 64 in
         let examined = ref 0 in
-        let add uuid =
+        let remember uuid = Hashtbl.replace identities (Graph.Uuid.to_string uuid) uuid in
+        let consume legacy_limit use value =
           incr examined;
-          if !examined > maximum_cursor_offset * 2 then raise Exit;
-          Hashtbl.replace identities (Graph.Uuid.to_string uuid) uuid
+          if not truncate && !examined > legacy_limit then raise Exit;
+          use value;
+          if truncate && !examined = maximum_cursor_offset then raise Exit
         in
-        let candidates = try
+        let add = consume (maximum_cursor_offset * 2) remember in
+        let complete = try
           (match tree_entity snapshot cache parent with
            | None -> ()
            | Some entity ->
              Datascript.datoms database Datascript.Avet ~a:"block/parent" ~v:(Datascript.Ref entity) ()
-             |> Seq.iter (fun (datom : Datascript.datom) ->
-               incr examined;
-               if !examined > maximum_cursor_offset then raise Exit;
-               Option.iter (fun uuid -> Hashtbl.replace identities (Graph.Uuid.to_string uuid) uuid)
-                 (cached_uuid_of_entity database cache.hydration datom.e)));
+             |> Seq.iter (consume maximum_cursor_offset (fun (datom : Datascript.datom) ->
+               Option.iter remember (cached_uuid_of_entity database cache.hydration datom.e))));
           Uuid_map.find_opt (Graph.Uuid.to_string parent) (Option.get snapshot.children_effects)
           |> Option.value ~default:[]
           |> List.iter (fun (record : outbox_record) ->
             if record_is_logically_active record then List.iter add record.effect_footprint.block_uuids;
             if record_has_active_dependency_shadows record then
-              List.iter (fun shadow -> if Graph.Uuid.equal shadow.shadow_parent parent then add shadow.shadow_block_uuid)
+              List.iter (fun shadow ->
+                if truncate then
+                  consume maximum_cursor_offset (fun shadow ->
+                    if Graph.Uuid.equal shadow.shadow_parent parent then remember shadow.shadow_block_uuid) shadow
+                else if Graph.Uuid.equal shadow.shadow_parent parent then add shadow.shadow_block_uuid)
                 record.dependency_shadows.shadow_blocks);
-          if Hashtbl.length identities > maximum_cursor_offset then raise Exit;
+          Hashtbl.length identities <= maximum_cursor_offset
+          with Exit -> false
+        in
+        charge !examined;
+        if not (complete || truncate) then None else
           Some (Hashtbl.to_seq_values identities |> Rrbvec.of_seq
             |> Rrbvec.sort Graph.Uuid.compare
             |> Rrbvec.filter_map (fun uuid -> match logical_tree_candidate snapshot cache uuid with
               | Some candidate when Graph.Uuid.equal candidate.tree_parent parent -> Some candidate
               | _ -> None)
             |> Rrbvec.sort (fun left right -> String.compare left.tree_order right.tree_order))
-          with Exit -> None
-        in
+;;
+
+let timeline_direct_members ?(preview_fallback=false) snapshot scope ~parent ~limit ~after =
+  with_snapshot_read snapshot (fun snapshot ->
+    if not (valid_page_limit limit) then Error (Types.Invalid_read_request "limit must be between 1 and 200")
+    else
+      let version = Result.bind (timeline_version_at snapshot scope) (fun parent_version ->
+        if preview_fallback then
+          timeline_version_at snapshot Journal_root_and_descendant_membership
+          |> Result.map (fun depth_version -> parent_version ^ "/" ^ depth_version)
+        else Ok parent_version) in
+      Result.bind version (fun version ->
+      Result.bind (timeline_member_offset scope version after) (fun offset ->
+        let candidates = match timeline_direct_candidates ~truncate:false snapshot parent with
+          | None when preview_fallback -> timeline_direct_candidates ~truncate:true snapshot parent
+          | result -> result in
         match candidates with
         | None -> Error Types.Read_limit_exceeded
         | Some candidates ->
@@ -4751,10 +4766,116 @@ let get_timeline_children snapshot ~parent ~limit ~after =
   timeline_direct_members snapshot (Parent_children parent) ~parent ~limit ~after
 ;;
 
+let get_timeline_filtered_preview_children snapshot ~parent ~limit ~after =
+  timeline_direct_members ~preview_fallback:true snapshot (Parent_children parent) ~parent ~limit ~after
+;;
+
 let get_timeline_roots snapshot ~page ~limit ~after =
   Result.map (fun (items,next) ->
     List.map (fun (item : Types.child_member) -> Types.{block=item.block; revision=item.revision;depth=0;parent=page}) items,next)
     (timeline_direct_members snapshot (Page_roots page) ~parent:page ~limit ~after)
+;;
+
+let get_timeline_roots_through_grandchildren snapshot ~page ~tags ~statuses ~limit ~after =
+  let ( let* ) = Result.bind in
+  let invalid = Error (Types.Invalid_read_request "invalid filtered Timeline position or limits") in
+  if not (valid_page_limit limit) || List.compare_length_with tags 200 > 0
+     || List.compare_length_with statuses 200 > 0 then invalid else
+  let root_scope = Page_roots page in
+  let* roots_version = timeline_scope_version snapshot root_scope in
+  let* coverage = timeline_scope_version snapshot Journal_root_and_descendant_membership in
+  let query = Digest.to_hex (Digest.string (String.concat ":"
+    (Graph.Uuid.to_string page :: List.map Graph.Uuid.to_string tags @ ["status"]
+     @ List.map Graph.Uuid.to_string statuses))) in
+  let position root child grandchild =
+    Printf.sprintf "tf1|%s|%s|%s|%d|%d|%d" query roots_version coverage root child grandchild in
+  let* root, child, grandchild = match after with
+    | None -> Ok (0, -1, -1)
+    | Some cursor ->
+      (match String.split_on_char '|' cursor with
+       | ["tf1"; key; roots; membership; root; child; grandchild] when key = query ->
+         if roots <> roots_version || membership <> coverage then Error Types.Stale_read_cursor
+         else (match int_of_string_opt root, int_of_string_opt child, int_of_string_opt grandchild with
+           | Some root, Some child, Some grandchild
+             when root >= 0 && root <= maximum_cursor_offset && child >= -1
+               && child <= maximum_cursor_offset && grandchild >= -1
+               && grandchild <= maximum_cursor_offset -> Ok (root, child, grandchild)
+           | _ -> invalid)
+       | _ -> invalid) in
+  let ordinary_steps = 16 and wide_steps = 256 in
+  let wide = ref false and examined_total = ref 0 in
+  let candidate_budget = (3 * maximum_cursor_offset) + wide_steps in
+  let exception Candidate_budget_spent in
+  let context = lazy (read_context snapshot) in
+  let read cache parent offset =
+    let candidates = match !cache with
+      | Some (previous, result) when Graph.Uuid.equal previous parent -> result
+      | _ ->
+        if !examined_total + maximum_cursor_offset > candidate_budget then
+          raise_notrace Candidate_budget_spent;
+        let charge examined =
+          wide := !wide || examined = maximum_cursor_offset;
+          examined_total := !examined_total + examined in
+        let result = timeline_direct_candidates ~charge ~truncate:true snapshot parent in
+        cache := Some (parent, result);
+        result in
+    match candidates with
+    | None -> Error Types.Read_limit_exceeded
+    | Some candidates ->
+      let total = Rrbvec.length candidates in
+      if offset > total then invalid else
+      let one = Option.bind (Rrbvec.nth_opt candidates offset) (fun candidate ->
+        Option.map (fun block -> Types.{block; revision=logical_block_revision candidate.tree_uuid (Some block)})
+          (read_block (Lazy.force context) candidate.tree_uuid)) in
+      Ok (one, offset + 1 < total) in
+  let roots_cache = ref None and children_cache = ref None and grandchildren_cache = ref None in
+  let matches (record : Types.block_record) =
+    List.exists (fun tag -> List.exists (Graph.Uuid.equal tag) tags) record.block.tags
+    || match record.task_status with
+       | Some (Status_uuid uuid) -> List.exists (Graph.Uuid.equal uuid) statuses
+       | Some (Legacy_status_ident _) | None -> false in
+  let resume = ref ([], root, child, grandchild) in
+  let rec scan fuel remaining items root child grandchild =
+    resume := (items, root, child, grandchild);
+    if remaining = 0 || fuel = 0
+       || (fuel <= wide_steps - ordinary_steps && not !wide)
+    then Ok (List.rev items, Some (position root child grandchild))
+    else
+      let* item, more_roots = read roots_cache page root in
+      let advance items remaining =
+        if more_roots then scan (fuel - 1) remaining items (root + 1) (-1) (-1)
+        else Ok (List.rev items, None) in
+      match item with
+      | None -> advance items remaining
+      | Some root_item when not (Graph.Uuid.equal root_item.block.block.page page) -> advance items remaining
+      | Some root_item ->
+        let hit () = advance
+          (Types.{block=root_item.block;revision=root_item.revision;depth=0;parent=page} :: items)
+          (remaining - 1) in
+        if child = -1 && matches root_item.block then hit () else
+        let child = max 0 child in
+        let parent = root_item.block.block.uuid in
+        let* item, siblings = read children_cache parent child in
+        let advance_child () =
+          if siblings then scan (fuel - 1) remaining items root (child + 1) (-1)
+          else advance items remaining in
+        match item with
+        | None -> advance_child ()
+        | Some item when not (Graph.Uuid.equal item.block.block.page page) -> advance_child ()
+        | Some item ->
+          if grandchild = -1 && matches item.block then hit () else
+          let grandchild = max 0 grandchild in
+          let parent = item.block.block.uuid in
+          let* item, more = read grandchildren_cache parent grandchild in
+          match item with
+          | Some item when Graph.Uuid.equal item.block.block.page page && matches item.block -> hit ()
+          | _ when more -> scan (fuel - 1) remaining items root child (grandchild + 1)
+          | _ -> advance_child () in
+  with_snapshot_read snapshot (fun _ ->
+    try scan wide_steps limit [] root child grandchild with
+    | Candidate_budget_spent ->
+      let items, root, child, grandchild = !resume in
+      Ok (List.rev items, Some (position root child grandchild)))
 ;;
 
 (* Writes own invalidation under the owner lock. Dependency cursors are lazy;
@@ -4780,6 +4901,24 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
         |> Seq.filter (fun (report : Datascript.tx_report) -> report.db_after.max_tx > old_db.max_tx)
         |> Seq.flat_map (fun (report : Datascript.tx_report) -> List.to_seq report.tx_data)
     in
+    let raw_parents = Hashtbl.create 16 in
+    let add_raw_parent uuid =
+      let key = Graph.Uuid.to_string uuid in
+      if not (Hashtbl.mem raw_parents key) then (
+        Hashtbl.add raw_parents key ();
+        enqueue (Seq.return (uuid, false))) in
+    let add_authoritative_parent db entity =
+      Option.iter add_raw_parent (uuid_of_entity db entity) in
+    Seq.iter (fun (datom : Datascript.datom) ->
+      List.iter (fun db ->
+        match datom.a, datom.v with
+        | "block/parent", Datascript.Ref entity -> add_authoritative_parent db entity
+        | "block/uuid", _ ->
+          add_authoritative_parent db datom.e;
+          (match one db datom.e "block/parent" with
+           | Some (Datascript.Ref entity) -> add_authoritative_parent db entity
+           | _ -> ())
+        | _ -> ()) [old_db; new_db]) changed_datoms;
     let revoked_identities = Hashtbl.create 16 in
     Seq.iter (fun (datom : Datascript.datom) ->
       if datom.a = "block/uuid" && not datom.added then
@@ -4795,10 +4934,23 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
         (Seq.append (List.to_seq record.effect_footprint.block_uuids)
            (List.to_seq record.effect_footprint.page_uuids))
     in
+    let raw_overlay_source = function
+      | None -> None
+      | Some (record : outbox_record) ->
+        let blocks = if record_is_logically_active record then record.effect_footprint.block_uuids else [] in
+        let shadows = if record_has_active_dependency_shadows record
+          then List.map (fun shadow -> shadow.shadow_parent, shadow.shadow_block_uuid)
+            record.dependency_shadows.shadow_blocks else [] in
+        if blocks = [] && shadows = [] then None
+        else Some (children_effect_parents record, blocks, shadows) in
     Uuid_map.merge (fun _ old current ->
       if old <> current then (
         Option.iter (fun record -> enqueue (record_jobs record)) old;
-        Option.iter (fun record -> enqueue (record_jobs record)) current);
+        Option.iter (fun record -> enqueue (record_jobs record)) current;
+        let old_source = raw_overlay_source old and new_source = raw_overlay_source current in
+        if old_source <> new_source then
+          List.iter (Option.iter (fun (parents, _, _) -> List.iter add_raw_parent parents))
+            [old_source; new_source]);
       None) old_records new_records |> ignore;
     if old_db != new_db then (
       let add_logical_dependents _ (record : outbox_record) =
@@ -4879,21 +5031,38 @@ let maintain_timeline_scopes database (before : snapshot) (after : snapshot) =
               if revoked || block_dto old_context old_block <> block_dto new_context new_block then
                 List.iter mark_parent (List.filter_map Fun.id [parent_of old_block;parent_of new_block]);
               let candidate context = function
-                | Some (record : Types.block_record) when Graph.Uuid.equal record.block.parent record.block.page ->
-                  (match journal_dto context (read_page context record.block.page) with
-                   | Some _ -> Some (record.block.page, record.block.order, record.block.tags, record.task_status)
-                   | None -> None)
+                | Some (record : Types.block_record) ->
+                  let page = record.block.page in
+                  let rec path remaining parent ancestors =
+                    if Graph.Uuid.equal parent page then Some ancestors
+                    else if remaining = 0 then None
+                    else match read_block context parent with
+                      | Some ancestor when Graph.Uuid.equal ancestor.block.page page ->
+                        path (remaining - 1) ancestor.block.parent (parent :: ancestors)
+                      | _ -> None in
+                  Option.bind (path 2 record.block.parent []) (fun ancestors ->
+                    Option.map (fun _ -> page, ancestors, record.block.order, record.block.tags, record.task_status)
+                      (journal_dto context (read_page context page)))
                 | _ -> None in
               let old_candidate = candidate old_context old_block
               and new_candidate = candidate new_context new_block in
-              if old_candidate <> new_candidate
-                 || (revoked && (Option.is_some old_candidate || Option.is_some new_candidate))
-              then mark Journal_root_membership;
+              let changed old_candidate new_candidate =
+                old_candidate <> new_candidate
+                || (revoked && (Option.is_some old_candidate || Option.is_some new_candidate)) in
+              let root_only = function Some (_, [], _, _, _) as candidate -> candidate | _ -> None in
+              if changed old_candidate new_candidate then mark Journal_root_and_descendant_membership;
+              if changed (root_only old_candidate) (root_only new_candidate) then mark Journal_root_membership;
               let old_journal = journal_dto old_context old_page
               and new_journal = journal_dto new_context new_page in
+              let scans_children journal = function
+                | Some (_, ([] | [_]), _, _, _) -> true
+                | _ -> Option.is_some journal in
+              if Hashtbl.mem raw_parents key
+                 && (scans_children old_journal old_candidate || scans_children new_journal new_candidate)
+              then mark Journal_root_and_descendant_membership;
               if old_journal <> new_journal
                  || (revoked && (Option.is_some old_journal || Option.is_some new_journal))
-              then (mark Journal_index; mark Journal_root_membership));
+              then (mark Journal_index; mark Journal_root_membership; mark Journal_root_and_descendant_membership));
             let rendered_title = function None -> None | Some (page : Types.page_record) -> Some page.page.title in
             let title_changed = rendered_title old_page <> rendered_title new_page in
             let deleted db = Option.bind (entity_of_uuid db uuid) (fun entity -> one db entity "logseq.property/deleted-at") in

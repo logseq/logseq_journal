@@ -5,6 +5,8 @@
   journal_validation
   journal_calendar
   journal_time
+  journal_filter_date
+  timeline_filter_preferences
   journal_model
   journal_environment
   journal_graph_projection
@@ -12,6 +14,7 @@
   journal_pure_copy)
  (libraries
   logseq_db_types
+  journal_timeline_filter
   mldoc
   ppx_deriving_yojson.runtime
   threads
@@ -86,6 +89,7 @@
   journal_worker_coordination_impl
   logseq_journal.timeline_cursor
   journal_timeline_cursor_impl
+  journal_timeline_filter_impl
   threads
   unix
   ppx_deriving_yojson.runtime

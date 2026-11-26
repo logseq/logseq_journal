@@ -1237,9 +1237,11 @@ let atomic_append_submits_and_replays_complete_tree ?(remote_day=false) database
   let page=T.mutation_uuid 7790 and root_uuid=T.mutation_uuid 7791 and child_uuid=T.mutation_uuid 7792 in
   let task = T.uuid "00000002-1282-1814-5700-000000000000" in
   let plain_uuid = T.mutation_uuid 7796 in
-  let root:Types.append_node={uuid=root_uuid;title="Atomic wire root";task_status=Some(T.status_uuid 2);
+  let root_status = if remote_day then None else Some (T.status_uuid 2) in
+  let child_status = if remote_day then None else Some (T.status_uuid 3) in
+  let root:Types.append_node={uuid=root_uuid;title="Atomic wire root";task_status=root_status;
     children=Rrbvec.of_list
-      [{uuid=child_uuid;title="Atomic wire child";task_status=Some(T.status_uuid 3);children=Rrbvec.empty};
+      [{uuid=child_uuid;title="Atomic wire child";task_status=child_status;children=Rrbvec.empty};
        {uuid=plain_uuid;title="Plain child";task_status=None;children=Rrbvec.empty}]} in
   let check_tags stage =
     let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
@@ -1257,19 +1259,24 @@ let atomic_append_submits_and_replays_complete_tree ?(remote_day=false) database
     ~expected mutation |> T.require_ok ~behavior in
   let proof=Database.commit_local_intent database intent |> T.require_ok ~behavior in
   let local=Database.intent_commit_outcome proof in
+  let earlier_root_uuid = T.mutation_uuid 7797 and tail_root_uuid = T.mutation_uuid 7795 in
   let resolved_page=if not remote_day then page else (
     let module J=Transit_core.Json in
     let web=T.mutation_uuid 7794 in
-    let page_entity=J.String "remote-web-day" and child_entity=J.String "remote-first-entry" in
+    let page_entity=J.String "remote-web-day" in
     let add_page attribute value=T.status_add page_entity attribute value in
-    let add_child attribute value=T.status_add child_entity attribute value in
+    let remote_root uuid title order =
+      let add = T.status_add (J.String title) in
+      [add "block/uuid" (J.Uuid (Logseq_db_types.Graph_types.Uuid.to_string uuid));
+       add "block/title" (J.String title); add "block/parent" page_entity;
+       add "block/page" page_entity; add "block/order" (J.String order);
+       add "logseq.property/status" (T.status_lookup (T.status_uuid 2))] in
     T.apply_test_transaction database ~cursor:2
-      [add_page "block/uuid" (J.Uuid(Logseq_db_types.Graph_types.Uuid.to_string web));
-       add_page "block/title" (J.String "Web day");add_page "block/name" (J.String "web-remote-day");
-       add_page "block/journal-day" (J.Int 20261102);
-       add_child "block/uuid" (J.Uuid(Logseq_db_types.Graph_types.Uuid.to_string(T.mutation_uuid 7795)));
-       add_child "block/title" (J.String "Remote first entry");add_child "block/parent" page_entity;
-       add_child "block/page" page_entity;add_child "block/order" (J.String "a9")];
+      ([add_page "block/uuid" (J.Uuid(Logseq_db_types.Graph_types.Uuid.to_string web));
+        add_page "block/title" (J.String "Web day");add_page "block/name" (J.String "web-remote-day");
+        add_page "block/journal-day" (J.Int 20261102)]
+       @ remote_root earlier_root_uuid "Remote first entry" "a8"
+       @ remote_root tail_root_uuid "Remote tail entry" "a9");
     let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
     Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
       T.require(match Database.get_outline_blocks snapshot [root_uuid] |> T.require_ok ~behavior with
@@ -1300,8 +1307,40 @@ let atomic_append_submits_and_replays_complete_tree ?(remote_day=false) database
   let sync=Database.inspect_sync database |> T.require_ok ~behavior in
   let prepared,crypto=Database.begin_authoritative database ~expected:(sync_view_token sync)batch |> T.require_ok ~behavior in
   let decrypted=Option.map(fun request->decrypt_submitted_request request behavior)crypto in
-  (match Database.apply_authoritative database prepared ~decrypted |> T.require_ok ~behavior with
-   | Authoritative_applied _->()|_->Alcotest.fail "atomic append echo was deferred");
+  let settle () =
+    match Database.apply_authoritative database prepared ~decrypted |> T.require_ok ~behavior with
+    | Authoritative_applied _ -> ()
+    | Authoritative_deferred _ -> Alcotest.fail "atomic append echo was deferred" in
+  let with_snapshot use =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () -> use snapshot) in
+  if not remote_day then settle () else
+    with_snapshot (fun before ->
+      let read ?(limit=1) snapshot after = Database.get_timeline_roots_through_grandchildren snapshot
+        ~page:resolved_page ~tags:[] ~statuses:[T.status_uuid 2] ~limit ~after in
+      let first, next = read before None |> T.require_ok ~behavior in
+      let ids = List.map (fun (item : Types.tree_member) -> item.block.block.uuid) in
+      T.require (ids first = [earlier_root_uuid] && Option.is_some next)
+        "accepted overlay must yield a real filtered continuation";
+      let suffix = read ~limit:2 before next |> T.require_ok ~behavior in
+      T.require (ids (fst suffix) = [tail_root_uuid] && snd suffix = None) "wrong overlay suffix";
+      let version snapshot scope = Database.timeline_scope_version snapshot scope |> T.require_ok ~behavior in
+      let roots snapshot = Database.get_timeline_roots snapshot ~page:resolved_page ~limit:3 ~after:None
+        |> T.require_ok ~behavior in
+      settle ();
+      T.require (read ~limit:2 before next = Ok suffix) "settlement changed a retained snapshot";
+      with_snapshot (fun after ->
+        T.require (roots before = roots after) "settlement changed ordinary root DTOs";
+        List.iter (fun scope ->
+          T.require (Database.equal_timeline_scope_version (version before scope) (version after scope))
+            "settlement changed an unrelated Timeline proof")
+          [Database.Journal_index; Journal_root_membership; Page_roots resolved_page; Parent_children root_uuid];
+        (match read after next with
+         | Error Stale_read_cursor -> ()
+         | _ -> Alcotest.fail "authoritative settlement accepted the overlay continuation");
+        let fresh, next = read after None |> T.require_ok ~behavior in
+        T.require (fresh = first && Option.is_some next && read ~limit:2 after next = Ok suffix)
+          "fresh authoritative prefix and continuation changed logical results"));
   if not remote_day then check_tags "authoritative echo";
   let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
   Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
@@ -1312,7 +1351,8 @@ let atomic_append_submits_and_replays_complete_tree ?(remote_day=false) database
     | [Present_block{value=root;_};Present_block{value=child;_}]->
       T.require(root.block.parent=resolved_page && child.block.parent=root_uuid && child.block.page=resolved_page)
         "echo changed atomic tree ownership";
-      T.require(root.task_status=Some(Status_uuid(T.status_uuid 2)) && child.task_status=Some(Status_uuid(T.status_uuid 3)))
+      T.require(root.task_status=Option.map (fun uuid -> Types.Status_uuid uuid) root_status
+        && child.task_status=Option.map (fun uuid -> Types.Status_uuid uuid) child_status)
         "echo lost atomic statuses"
     | _->Alcotest.fail "echo lost atomic blocks");
   let sync=Database.inspect_sync database |> T.require_ok ~behavior in

@@ -207,10 +207,13 @@ module Timeline : sig
       [Timeline_check]; each request borrows and releases one immutable snapshot. *)
   module Day = Logseq_db_worker_contract.Worker_pure_day
   type worker_error = error
+  type coverage_scope = Root_membership | Root_and_descendant_membership
   type _ query = private
-    | Dates : { from_day : Day.t; through_day : Day.t } -> Data.journal_item query
+    | Dates : { from_day : Day.t; through_day : Day.t; coverage_scope : coverage_scope } -> Data.journal_item query
     | Roots : Graph.page_uuid -> Data.tree_member query
-    | Preview_children : Graph.block_uuid -> Data.child_member query
+    | Roots_through_grandchildren : { page : Graph.page_uuid; tags : Uuid.t list; statuses : Uuid.t list }
+        -> Data.tree_member query
+    | Preview_children : { parent : Graph.block_uuid; overflow_fallback : bool } -> Data.child_member query
   type invalidation = Owner_changed | Scope_changed
   type error =
     | Invalid_request of string
@@ -228,6 +231,9 @@ module Timeline : sig
   (** Extract a membership-only proof obtained in the packet snapshot. *)
 
   val equal_coverage : packed_receipt -> packed_receipt -> bool
+  (** Compare membership proofs by session owner, coverage scope and version. *)
+
+  val coverage_scope : 'a query -> coverage_scope option
   val maximum_receipts : int
 
   (** {1 Minimal usage example}
@@ -244,9 +250,17 @@ module Timeline : sig
       result. *)
 
   (** {1 Construction and validation} *)
-  val dates : from_day:Day.t -> through_day:Day.t -> Data.journal_item query
+  val dates : coverage_scope:coverage_scope -> from_day:Day.t -> through_day:Day.t -> Data.journal_item query
   val roots : page:Graph.page_uuid -> Data.tree_member query
+  val roots_through_grandchildren
+    : page:Graph.page_uuid -> tags:Uuid.t list -> statuses:Uuid.t list -> Data.tree_member query
+  (** Returns top-level members only, matching at most the first 10,000 raw
+      candidates per parent, including the page. Excluded subtrees do not
+      match. An empty packet can have a continuation. *)
+
   val preview_children : parent:Graph.block_uuid -> Data.child_member query
+  val filtered_preview_children : parent:Graph.block_uuid -> Data.child_member query
+  (** Ordinary preview, falling back to the bounded prefix on structural overflow. *)
 
   (** {1 Lifecycle and recovery}
       Cursors and receipts bind the exact session owner, query and write-maintained

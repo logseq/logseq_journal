@@ -55,6 +55,7 @@ type _ kind =
 let kind : type a. a Worker.query -> a kind = function
   | Timeline_read{query=Worker.Timeline.Dates _;_}->Timeline_dates
   | Timeline_read{query=Worker.Timeline.Roots _;_}->Timeline_roots
+  | Timeline_read{query=Worker.Timeline.Roots_through_grandchildren _;_}->Timeline_roots
   | Timeline_read{query=Worker.Timeline.Preview_children _;_}->Timeline_preview
   | Timeline_check _->Timeline_check
   | Graph_info -> Info

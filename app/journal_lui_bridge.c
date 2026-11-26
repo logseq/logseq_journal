@@ -495,6 +495,18 @@ CAMLprim value journal_ml_wakeup(value unit) {
   return Val_unit;
 }
 
+typedef int32_t (*journal_filter_commit_callback)(const char *, int32_t);
+static journal_filter_commit_callback filter_commit_callback = NULL;
+
+LUI_EXPORT void journal_ocaml_set_filter_commit_callback(journal_filter_commit_callback callback) {
+  filter_commit_callback = callback;
+}
+
+CAMLprim value journal_ml_commit_timeline_filter(value payload) {
+  return Val_bool(filter_commit_callback != NULL && filter_commit_callback(
+      (const char *)Bytes_val(payload), (int32_t)caml_string_length(payload)));
+}
+
 CAMLprim value journal_ml_platform_request(value payload) {
   if (platform_request_callback != NULL) {
     platform_request_callback(

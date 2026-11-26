@@ -1573,8 +1573,206 @@ let timeline_remote_scopes_cover_metadata_moves_and_aba database =
    | Error Stale_read_cursor -> () | _ -> Alcotest.fail "changed root scope accepted old ordinal");
   Database.release_snapshot latest;
   let preview = version (Database.Parent_children (id 4)) in
-  apply 10 [add 1 "logseq.property/deleted-at" (J.Int 1234)];
+  let coverage = version Database.Journal_root_and_descendant_membership in
+  apply 10 [add 5 "block/tags" (lookup 2)];
+  changed "previously skipped child tag retained filter coverage" coverage Database.Journal_root_and_descendant_membership;
+  apply 11 [add 1 "logseq.property/deleted-at" (J.Int 1234)];
   changed "ancestor recycling retained preview receipt" preview (Database.Parent_children (id 4))
+;;
+
+let timeline_filter_depth database =
+  let behavior = "filter roots through grandchildren" in
+  let module J = Transit_core.Json in
+  let id n = T.uuid (Printf.sprintf "76100000-0000-4000-8000-%012d" n) in
+  let lookup n = T.status_lookup (id n) in
+  let add = T.status_add in
+  let create n fields =
+    List.map (fun (key,value) -> add (J.Int (31000+n)) key value)
+      (("block/uuid", J.Uuid (Graph.Uuid.to_string (id n))) :: fields) in
+  let block n parent = create n
+    ["block/title",J.String (string_of_int n); "block/parent",lookup parent;
+     "block/page",lookup 1; "block/order",J.String (Printf.sprintf "%04d" n)] in
+  let tag n = add (lookup n) "block/tags" (lookup 2) in
+  let apply cursor operations = T.apply_test_transaction database ~cursor operations in
+  apply 1 (create 1 ["block/title",J.String "Day";"block/name",J.String "day";
+                      "block/journal-day",J.Int 20261101]
+    @ create 2 ["block/title",J.String "Selected";"block/name",J.String "selected"]
+    @ List.concat_map (fun n -> block n 1) [3;4;5;6]
+    @ block 7 4 @ block 8 6 @ block 9 8 @ block 10 9
+    @ List.concat (List.init 38 (fun index -> block (20+index) 5)) @ block 58 57
+    @ [tag 3;add (lookup 7) "logseq.property/status" (J.Keyword "logseq.property/status.todo");tag 58;tag 10]);
+  let with_snapshot use =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () -> use snapshot) in
+  let read snapshot after = Database.get_timeline_roots_through_grandchildren snapshot
+    ~page:(id 1) ~limit:2 ~tags:[id 2] ~statuses:[T.builtin_todo_uuid] ~after in
+  let rec collect snapshot fuel after gathered =
+    T.require (fuel > 0) "filtered scan did not terminate";
+    let items,next = read snapshot after |> T.require_ok ~behavior in
+    List.iter (fun (item : Types.tree_member) ->
+      T.require (item.depth = 0 && Graph.Uuid.equal item.parent (id 1)) "matched descendant was promoted") items;
+    let gathered = gathered @ List.map (fun (item : Types.tree_member) -> item.block.block.uuid) items in
+    match next with None -> gathered | Some _ -> collect snapshot (fuel-1) next gathered in
+  with_snapshot (fun snapshot ->
+    let first, next = read snapshot None |> T.require_ok ~behavior in
+    T.require (List.length first = 2 && Option.is_some next) "expected first two root hits";
+    let sparse, continuation = read snapshot next |> T.require_ok ~behavior in
+    T.require (sparse = [] && Option.is_some continuation) "late grandchild did not require continuation";
+    T.require (collect snapshot 20 None [] = List.map id [3;4;5]) "wrong root membership by depth";
+    let previews,_ = Database.get_timeline_children snapshot ~parent:(id 5) ~limit:3 ~after:None
+      |> T.require_ok ~behavior in
+    T.require (List.map (fun (item : Types.child_member) -> item.block.block.uuid) previews = List.map id [20;21;22])
+      "ordinary preview lost nonmatching siblings";
+    apply 2 [add (lookup 58) "block/parent" (lookup 10); add (lookup 10) "block/parent" (lookup 8)];
+    T.require (collect snapshot 20 None [] = List.map id [3;4;5]) "old snapshot observed a move";
+    with_snapshot (fun latest ->
+      (match read latest continuation with
+       | Error Stale_read_cursor -> () | _ -> Alcotest.fail "cross-depth move accepted a stale scan");
+      T.require (collect latest 20 None [] = List.map id [3;4;6]) "cross-depth move did not change matching roots"))
+;;
+
+let timeline_filter_parent_cap database =
+  let behavior = "Timeline filter truncates each parent independently" in
+  let module J = Transit_core.Json in
+  let id = T.mutation_uuid in
+  let lookup n = T.status_lookup (id n) in
+  let create n fields =
+    List.map (fun (key, value) -> T.status_add (J.Int (31000 + n)) key value)
+      (("block/uuid", J.Uuid (Graph.Uuid.to_string (id n))) :: fields) in
+  let page n = create n ["block/title", J.String (string_of_int n);
+                        "block/name", J.String (string_of_int n)] in
+  let block n parent = create n
+    ["block/title", J.String (string_of_int n); "block/parent", lookup parent;
+     "block/page", lookup 1; "block/order", J.String (Printf.sprintf "%06d" n)] in
+  let tag n selected = T.status_add (lookup n) "block/tags" (lookup selected) in
+  let cursor = ref 0 in
+  let apply operations =
+    incr cursor;
+    T.apply_test_transaction database ~cursor:!cursor operations in
+  apply (page 1 @ page 2 @ page 3 @ page 4 @ page 5
+         @ [T.status_add (lookup 1) "block/journal-day" (J.Int 20261101)]
+         @ block 6 1 @ block 7 1 @ block 8 1 @ block 9 7 @ block 10 8);
+  let wide start parent =
+    for batch = 0 to 20 do
+      let offset = batch * 500 in
+      apply (List.concat_map (fun i -> block (start + offset + i) parent)
+               (List.init (min 500 (10_001 - offset)) Fun.id))
+    done in
+  wide 100 6;
+  wide 20_100 9;
+  apply (block 40_100 10_100
+         @ [tag 101 2; tag 10_099 3; tag 30_099 3;
+            tag 10_100 4; tag 30_100 4; tag 40_100 5; tag 10 4]);
+  let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  let preview_position = Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () ->
+    let read selected after = Database.get_timeline_roots_through_grandchildren snapshot
+      ~page:(id 1) ~tags:(List.map id selected) ~statuses:[] ~limit:3 ~after
+      |> T.require_ok ~behavior in
+    let uuids = List.map (fun (item : Types.tree_member) -> item.block.block.uuid) in
+    let first, _ = read [2] None in
+    T.require (uuids first = [id 6]) "early hit did not return the ordinary root";
+    let preview, next = Database.get_timeline_filtered_preview_children snapshot
+      ~parent:(id 6) ~limit:3 ~after:None |> T.require_ok ~behavior in
+    T.require (List.map (fun (item : Types.child_member) -> item.block.block.uuid) preview
+               = List.map id [100; 101; 102] && Option.is_some next)
+      "matched wide root lost its ordinary ordered preview, including nonmatches";
+    T.require (Database.get_timeline_children snapshot ~parent:(id 6) ~limit:3 ~after:None
+               = Error Types.Read_limit_exceeded) "ordinary preview overflow policy changed";
+    let rec collect selected fuel after roots =
+      T.require (fuel > 0) "bounded scan did not terminate";
+      let items, next = read selected after in
+      let roots = List.rev_append (uuids items) roots in
+      match next with None -> List.rev roots | Some _ -> collect selected (fuel - 1) next roots in
+    T.require (collect [3] 2000 None [] = [id 6; id 7])
+      "raw source entry 10,000 was excluded at child or grandchild depth";
+    T.require (collect [4; 5] 2000 None [] = [id 8])
+      "raw source entry 10,001 or its descendants matched, or a sibling branch was lost";
+    let roots, _ = Database.get_timeline_roots snapshot ~page:(id 1) ~limit:3 ~after:None
+      |> T.require_ok ~behavior in
+    T.require (uuids roots = List.map id [6; 7; 8]) "unfiltered roots changed";
+    let dates, _ = Database.get_timeline_journals snapshot ~from_day:20261101 ~through_day:20261101
+      ~limit:1 ~after:None |> T.require_ok ~behavior in
+    T.require (List.length dates = 1) "date selection changed";
+    let resumed, _ = Database.get_timeline_filtered_preview_children snapshot
+      ~parent:(id 6) ~limit:3 ~after:next |> T.require_ok ~behavior in
+    T.require (List.map (fun (item : Types.child_member) -> item.block.block.uuid) resumed
+               = List.map id [103; 104; 105]) "wide preview did not resume in order";
+    next) in
+  apply [tag 40_100 2];
+  let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () ->
+    T.require (Database.get_timeline_filtered_preview_children snapshot
+      ~parent:(id 6) ~limit:3 ~after:preview_position = Error Types.Stale_read_cursor)
+      "wide preview position survived a change to the depth witness")
+;;
+
+let timeline_filter_wide_continuations database =
+  let behavior = "wide root and child scans make bounded packet progress" in
+  let module J = Transit_core.Json in
+  let id = T.mutation_uuid in
+  let lookup n = T.status_lookup (id n) in
+  let create n fields =
+    List.map (fun (key, value) -> T.status_add (J.Int (31000 + n)) key value)
+      (("block/uuid", J.Uuid (Graph.Uuid.to_string (id n))) :: fields) in
+  let page n = create n ["block/title", J.String (string_of_int n);
+                         "block/name", J.String (string_of_int n)] in
+  let block n parent = create n
+    ["block/title", J.String (string_of_int n); "block/parent", lookup parent;
+     "block/page", lookup 1; "block/order", J.String (Printf.sprintf "%06d" n)] in
+  let tag n selected = T.status_add (lookup n) "block/tags" (lookup selected) in
+  let cursor = ref 0 in
+  let apply operations =
+    incr cursor;
+    T.apply_test_transaction database ~cursor:!cursor operations in
+  apply (page 1 @ page 2 @ page 3 @ page 4
+         @ [T.status_add (lookup 1) "block/journal-day" (J.Int 20261101)]);
+  let wide start parent =
+    for batch = 0 to 20 do
+      let offset = batch * 500 in
+      apply (List.concat_map (fun i -> block (start + offset + i) parent)
+               (List.init (min 500 (10_001 - offset)) Fun.id))
+    done in
+  wide 100 1;
+  wide 20_100 100;
+  apply [tag 30_099 2; tag 101 2; tag 101 3; tag 30_100 4; tag 10_100 4];
+  let with_snapshot f =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () -> f snapshot) in
+  let read snapshot selected after = Database.get_timeline_roots_through_grandchildren snapshot
+    ~page:(id 1) ~tags:(List.map id selected) ~statuses:[] ~limit:1 ~after in
+  let ids = List.map (fun (item : Types.tree_member) ->
+    T.require (item.depth = 0 && item.parent = id 1) "descendant was promoted";
+    item.block.block.uuid) in
+  let through_another_root snapshot selected expected =
+    let rec collect packets after hits =
+      T.require (packets < 48) "did not reach second root in the first %d packets" packets;
+      let items, next = read snapshot selected after |> T.require_ok ~behavior in
+      let hits = hits @ ids items in
+      if List.mem (id 101) hits then (
+        Printf.printf "second root, tag %d: %d packets\n%!" (List.hd selected) (packets + 1);
+        T.require (hits = expected) "wrong ordered roots before second root")
+      else (
+        T.require (Option.is_some next && next <> after) "continuation ended or stalled";
+        collect (packets + 1) next hits) in
+    collect 0 None [] in
+  with_snapshot (fun pinned ->
+    let first, position = read pinned [2] None |> T.require_ok ~behavior in
+    T.require (first = [] && Option.is_some position) "expected sparse first packet";
+    through_another_root pinned [2] [id 100; id 101];
+    through_another_root pinned [3] [id 101];
+    let rec collect_cap packets after =
+      T.require (packets < 90) "cap scan did not terminate";
+      let items, next = read pinned [4] after |> T.require_ok ~behavior in
+      T.require (items = []) "a raw candidate past the parent cap matched";
+      match next with None -> () | Some _ -> collect_cap (packets + 1) next in
+    collect_cap 0 None;
+    apply [tag 20_100 2];
+    with_snapshot (fun latest ->
+      T.require (read latest [2] position = Error Types.Stale_read_cursor) "old continuation stayed valid";
+      let items, _ = read latest [2] None |> T.require_ok ~behavior in
+      T.require (ids items = [id 100]) "fresh snapshot missed new early match");
+    let items, _ = read pinned [2] None |> T.require_ok ~behavior in
+    T.require (items = []) "pinned snapshot observed later write")
 ;;
 
 let timeline_overlay_roots_follow_remote_page_metadata database =
@@ -1761,6 +1959,9 @@ let cases =
   ; T.database_case "timeline history retirement recovers" timeline_history_retirement_recovers
   ; T.database_case "timeline large dependency fanout keeps authority" timeline_large_dependency_fanout_keeps_authority
   ; T.database_case "timeline overlay roots follow remote page metadata" timeline_overlay_roots_follow_remote_page_metadata
+  ; T.database_case "timeline filter depth and moves" timeline_filter_depth
+  ; T.database_case "timeline filter per-parent cap" timeline_filter_parent_cap
+  ; T.database_case "timeline wide continuation progress" timeline_filter_wide_continuations
   ; T.database_case "timeline remote scopes cover metadata moves and ABA" timeline_remote_scopes_cover_metadata_moves_and_aba
   ; T.database_case "timeline local scope versions bind payload and snapshots" timeline_scopes_follow_local_payload_and_snapshot
   ; T.database_case "timeline direct paging survives unrelated scopes" timeline_pages_continue_across_unrelated_scopes

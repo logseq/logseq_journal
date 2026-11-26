@@ -147,10 +147,13 @@ type (_, _) equality = Refl : ('a, 'a) equality
 module Timeline = struct
   module Day = Logseq_db_worker_contract.Worker_pure_day
   type worker_error = error
+  type coverage_scope = Root_membership | Root_and_descendant_membership
   type _ query =
-    | Dates : { from_day : Day.t; through_day : Day.t } -> Data.journal_item query
+    | Dates : { from_day : Day.t; through_day : Day.t; coverage_scope : coverage_scope } -> Data.journal_item query
     | Roots : Graph.page_uuid -> Data.tree_member query
-    | Preview_children : Graph.block_uuid -> Data.child_member query
+    | Roots_through_grandchildren : { page : Graph.page_uuid; tags : Uuid.t list; statuses : Uuid.t list }
+        -> Data.tree_member query
+    | Preview_children : { parent : Graph.block_uuid; overflow_fallback : bool } -> Data.child_member query
   type invalidation = Owner_changed | Scope_changed
   type error =
     | Invalid_request of string
@@ -166,13 +169,20 @@ module Timeline = struct
   type check = { results : (unit, error) result Rrbvec.t }
   let coverage (receipt : 'a receipt) =
     Option.map (fun version -> Receipt {receipt with version;coverage=None;coverage_only=true}) receipt.coverage
+  let coverage_scope : type item. item query -> coverage_scope option = function
+    | Dates {coverage_scope;_} -> Some coverage_scope
+    | Roots _ -> Some Root_membership
+    | Roots_through_grandchildren _ -> Some Root_and_descendant_membership
+    | Preview_children _ -> None
   let equal_coverage (Receipt left) (Receipt right) =
     left.coverage_only && right.coverage_only && left.version = right.version
-    && left.owner = right.owner
+    && left.owner = right.owner && coverage_scope left.query = coverage_scope right.query
   let maximum_receipts = 4096
-  let dates ~from_day ~through_day = Dates { from_day; through_day }
+  let dates ~coverage_scope ~from_day ~through_day = Dates { from_day; through_day; coverage_scope }
   let roots ~page = Roots page
-  let preview_children ~parent = Preview_children parent
+  let roots_through_grandchildren ~page ~tags ~statuses = Roots_through_grandchildren {page;tags;statuses}
+  let preview_children ~parent = Preview_children {parent; overflow_fallback=false}
+  let filtered_preview_children ~parent = Preview_children {parent; overflow_fallback=true}
   let worker_error_message = function
     |Revoked_session->"Worker session was revoked"
     |Invalid_input message|Stale_read message|Resync_required message|Protocol_mismatch message
@@ -207,19 +217,32 @@ module Timeline = struct
   let equal_query : type a. a query -> a query -> bool = fun left right ->
     match left,right with
     | Dates left,Dates right -> Day.value left.from_day=Day.value right.from_day
-      && Day.value left.through_day=Day.value right.through_day
+      && Day.value left.through_day=Day.value right.through_day && left.coverage_scope=right.coverage_scope
     | Roots left,Roots right -> Uuid.equal left right
-    | Preview_children left,Preview_children right -> Uuid.equal left right
+    | Roots_through_grandchildren left,Roots_through_grandchildren right ->
+      Uuid.equal left.page right.page && left.tags = right.tags && left.statuses = right.statuses
+    | Preview_children left,Preview_children right ->
+      Uuid.equal left.parent right.parent && left.overflow_fallback = right.overflow_fallback
+    | Roots _,Roots_through_grandchildren _ | Roots_through_grandchildren _,Roots _ -> false
   let result_equality : type a b. a query -> b query -> (a,b) equality option = fun left right ->
     match left,right with
     | Dates _,Dates _ -> Some Refl
     | Roots _,Roots _ -> Some Refl
+    | Roots_through_grandchildren _,Roots_through_grandchildren _ -> Some Refl
     | Preview_children _,Preview_children _ -> Some Refl
     | _ -> None
   let query_json : type a. a query -> Yojson.Safe.t = function
-    | Dates {from_day;through_day} -> `List [`String "Dates";`Int(Day.value from_day);`Int(Day.value through_day)]
+    | Dates {from_day;through_day;coverage_scope} ->
+      let kind = match coverage_scope with
+        | Root_membership -> "Dates"
+        | Root_and_descendant_membership -> "Dates_through_grandchildren" in
+      `List [`String kind;`Int(Day.value from_day);`Int(Day.value through_day)]
     | Roots page -> `List [`String "Roots";Uuid.to_yojson page]
-    | Preview_children parent -> `List [`String "Preview_children";Uuid.to_yojson parent]
+    | Roots_through_grandchildren {page;tags;statuses} ->
+      `List [`String "Roots_through_grandchildren"; Uuid.to_yojson page;
+        `List (List.map Uuid.to_yojson tags); `List (List.map Uuid.to_yojson statuses)]
+    | Preview_children {parent;overflow_fallback} ->
+      `List [`String (if overflow_fallback then "Filtered_preview_children" else "Preview_children");Uuid.to_yojson parent]
   let owner_json (owner:session) =
     `List [`Intlit(Int64.to_string owner.binding.serial);
       `String(Int64.to_string(Journal_worker_ids.Runtime.Epoch.to_int64 owner.binding.incarnation.runtime_epoch));
@@ -235,6 +258,7 @@ module Timeline = struct
   let packet_json : type a. a query -> a packet -> Yojson.Safe.t = fun query packet ->
     let encode : a -> Yojson.Safe.t = match query with
       |Dates _->Data.journal_item_to_yojson|Roots _->Data.tree_member_to_yojson
+      |Roots_through_grandchildren _->Data.tree_member_to_yojson
       |Preview_children _->Data.child_member_to_yojson in
     `Assoc ["items",`List(List.map encode(Rrbvec.to_list packet.items));"receipt",receipt_json packet.receipt;
       "next",(match packet.next with End->`Null|More cursor->cursor_json cursor)]
