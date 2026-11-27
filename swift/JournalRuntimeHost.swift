@@ -14,7 +14,20 @@ struct JournalRuntimeHost: View {
   let platform: JournalApplicationPlatform
   let payload: Data
   let extensions: LUIAppleExtensionRegistry
+  let prestarted: JournalRuntime?
   @State private var lifetime = JournalRuntimeLifetime()
+
+  init(
+    platform: JournalApplicationPlatform,
+    payload: Data,
+    extensions: LUIAppleExtensionRegistry,
+    prestarted: JournalRuntime? = nil
+  ) {
+    self.platform = platform
+    self.payload = payload
+    self.extensions = extensions
+    self.prestarted = prestarted
+  }
   private var runtime: JournalRuntime? {
     get { lifetime.runtime }
     nonmutating set { lifetime.runtime = newValue }
@@ -70,15 +83,25 @@ struct JournalRuntimeHost: View {
         let startupLogger = Logger(subsystem: "com.logseq.journal", category: "startup")
         let t0 = ProcessInfo.processInfo.systemUptime
         do {
-          let next = try JournalRuntime(
-            platform: platform,
-            startupPayload: payload,
-            extensionRegistry: extensions)
+          let next: JournalRuntime
+          let alreadyStarted: Bool
+          if startupRevision == 0, let prestarted, prestarted.failure == nil {
+            next = prestarted
+            alreadyStarted = true
+          } else {
+            next = try JournalRuntime(
+              platform: platform,
+              startupPayload: payload,
+              extensionRegistry: extensions)
+            alreadyStarted = false
+          }
           let t1 = ProcessInfo.processInfo.systemUptime
-          startupLogger.info("journal-startup stage=host.runtime.created elapsed_ms=\(Int(((t1 - t0) * 1000).rounded()), privacy: .public) since_start_ms=\(Int(((t1 - t0) * 1000).rounded()), privacy: .public)")
+          startupLogger.info("journal-startup stage=host.runtime.created elapsed_ms=\(Int(((t1 - t0) * 1000).rounded()), privacy: .public) since_start_ms=\(Int(((t1 - t0) * 1000).rounded()), privacy: .public) prestarted=\(alreadyStarted, privacy: .public)")
           startingRuntime = next
           do {
-            try next.start()
+            if !alreadyStarted {
+              try next.start()
+            }
             let t2 = ProcessInfo.processInfo.systemUptime
             startupLogger.info("journal-startup stage=host.runtime.started elapsed_ms=\(Int(((t2 - t1) * 1000).rounded()), privacy: .public) since_start_ms=\(Int(((t2 - t0) * 1000).rounded()), privacy: .public)")
             try await next.waitForInitialPlatformRequests()
@@ -184,6 +207,7 @@ struct JournalStartupLoadingSurface: View {
 struct JournalRuntimeSetup {
   let payload: Data
   let extensions: LUIAppleExtensionRegistry
+  var prestartedRuntime: JournalRuntime? = nil
 }
 
 /// Production account entry points with injectable native capabilities for QA.
@@ -196,6 +220,18 @@ struct JournalHost: View {
   @State private var signInPresented = false
   @State private var signInStartsImmediately = false
   @State private var clock = JournalStartupClock()
+
+  init(
+    platform: JournalApplicationPlatform,
+    prepare: @escaping @MainActor () async throws -> JournalRuntimeSetup,
+    authentication: any JournalAuthenticationAPI,
+    initialSetup: Result<JournalRuntimeSetup, Error>? = nil
+  ) {
+    self.platform = platform
+    self.prepare = prepare
+    self.authentication = authentication
+    _setup = State(initialValue: initialSetup)
+  }
 
   var body: some View {
     Group {
@@ -216,7 +252,11 @@ struct JournalHost: View {
               signIn: { signInStartsImmediately = true; signInPresented = true },
               retry: platform.accountIssue?.stage == .bindingRead ? nil : { platform.retryOnline() })
           }
-          JournalRuntimeHost(platform: platform, payload: setup.payload, extensions: setup.extensions)
+          JournalRuntimeHost(
+            platform: platform,
+            payload: setup.payload,
+            extensions: setup.extensions,
+            prestarted: setup.prestartedRuntime)
             .font(.body)
         }
       }

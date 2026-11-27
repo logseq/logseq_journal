@@ -407,7 +407,7 @@ extension EnvironmentValues {
     func didLayout() {
       presentationLayoutRevision+=1
       #if os(iOS)
-      reportPresentationLayout()
+      reportPresentationLayout(deferToNextTurn: false)
       #endif
     }
     var active = false
@@ -444,12 +444,18 @@ extension EnvironmentValues {
       }
       request.complete(y)
     }
-    func reportPresentationLayout() {
+    func reportPresentationLayout(deferToNextTurn: Bool = true) {
       // Empty timelines also have a completed native viewport layout. Requiring
       // positive content height would strand their initial loading cover.
       guard active, presentationLayout != nil, restoredOffset == nil, !reportingLayout,
         let scrollView, scrollView.window != nil, scrollView.bounds.height > 0,
         scrollView.bounds.width > 0 else { return }
+      if !deferToNextTurn {
+        reportingLayout = true
+        defer { reportingLayout = false }
+        presentationLayout?()
+        return
+      }
       reportingLayout = true
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }

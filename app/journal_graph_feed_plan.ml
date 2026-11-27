@@ -34,6 +34,7 @@ type feed_scan =
   ; root_consumed_by_page : (string, int) Hashtbl.t
   ; mutable root_remaining : int
   ; mutable root_page_size : int
+  ; mutable root_initial_slice_pending : bool
   ; mutable root_list_size : int
   ; mutable root_days : day_feed Rrbvec.t
   ; mutable root_queued : Projection.page Rrbvec.t
@@ -716,9 +717,16 @@ let complete_verified_batch t ~ports batch =
               | Some cursor when scan.root_remaining > 0 ->
                 if Some cursor = batch.root_cursor
                 then root_failure batch "The root cursor did not advance."
-                else
+                else (
+                  if scan.root_initial_slice_pending then (
+                    scan.root_initial_slice_pending <- false;
+                    let full_page_size =
+                      min scan.root_requested_root_limit Worker_pure_data.maximum_page_size
+                    in
+                    if scan.root_page_size < full_page_size
+                    then scan.root_page_size <- full_page_size);
                   continue_root_batch t ~ports batch.root_owner batch.root_page (Some cursor)
-                    (min scan.root_page_size scan.root_remaining)
+                    (min scan.root_page_size scan.root_remaining))
               | None | Some _ -> next_feed_batch ~verified:true t ~ports scan
             in
             if Rrbvec.is_empty next.publications && scan.root_publish_partial && not (Rrbvec.is_empty scan.root_days)
@@ -858,7 +866,12 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
       ; root_publish_partial = cursor = None && after = None
       ; root_consumed_by_page = Hashtbl.create 32
       ; root_remaining = root_limit
-      ; root_page_size = min root_limit Worker_pure_data.maximum_page_size
+      ; root_page_size =
+          (let full = min root_limit Worker_pure_data.maximum_page_size in
+           if cursor = None && after = None && full > 12 then 12 else full)
+      ; root_initial_slice_pending =
+          cursor = None && after = None
+          && min root_limit Worker_pure_data.maximum_page_size > 12
       ; root_list_size = min day_limit Worker_pure_data.maximum_page_size
       ; root_days = Rrbvec.empty
       ; root_queued = Rrbvec.empty
@@ -1423,7 +1436,11 @@ let failed t ~ports operation ~code =
        read_root_dates t ~ports scan
      | Root_tree batch, Logseq_db_worker.Error.Response_too_large when batch.root_limit>1 ->
        let limit=max 1 (batch.root_limit/2) in
-       (match batch.root_owner with Feed_roots scan->scan.root_page_size<-limit | _->());
+       (match batch.root_owner with
+        | Feed_roots scan ->
+          scan.root_initial_slice_pending <- false;
+          scan.root_page_size <- limit
+        | _ -> ());
        continue_root_batch t ~ports batch.root_owner batch.root_page batch.root_cursor limit
      | Root_preview preview, Logseq_db_worker.Error.Response_too_large when preview.preview_limit>1 ->
        requests [read_root_preview t ~ports {preview with preview_limit=max 1 (preview.preview_limit/2);
