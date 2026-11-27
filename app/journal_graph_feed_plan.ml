@@ -1241,7 +1241,12 @@ let failure_scope = function
   | Root_dates (scan, _) | Root_today (scan, _) ->
     (match scan.root_start_day with None -> Feed scan.root_generation
        | Some day -> Day {day;request_generation=scan.root_generation})
-  | Root_tree batch | Root_preview {preview_batch=batch;_} ->
+  | Root_tree batch ->
+    (match batch.root_owner with Changed_roots _ -> Reconciliation
+     | Feed_roots scan -> match scan.root_start_day with None -> Feed scan.root_generation
+       | Some day -> Day {day;request_generation=scan.root_generation})
+  | Root_preview {preview_batch=batch;_} ->
+    batch.root_preview_queue <- [];
     (match batch.root_owner with Changed_roots _ -> Reconciliation
      | Feed_roots scan -> match scan.root_start_day with None -> Feed scan.root_generation
        | Some day -> Day {day;request_generation=scan.root_generation})
