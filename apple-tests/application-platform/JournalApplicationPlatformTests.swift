@@ -16,6 +16,15 @@ struct JournalEnvironmentSample: Equatable, Codable {}
 }
 @main struct JournalApplicationPlatformTests {
   @MainActor static func main() async throws {
+    let clock = JournalStartupClock()
+    clock.begin(after: .zero)
+    while clock.phase == .waitingBeforeDeadline { await Task.yield() }
+    clock.requestPicker()
+    clock.deliverPicker {}
+    precondition(clock.phase == .pickerRequested, "dispatch is not presentation")
+    var retried = false
+    clock.deliverPicker { retried = true }
+    precondition(retried)
     func packet(_ tag: UInt8) -> Data {
       var bytes = Data("LJP2".utf8); bytes.append(contentsOf: [2,0,tag,0]); bytes.append(Data(repeating:0,count:24)); return bytes
     }

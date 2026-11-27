@@ -2019,32 +2019,28 @@ let decode_outbox records =
   loop [] [] 0 0 records
 ;;
 
-let read_outbox path =
-  let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
-  Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
-    (fun () ->
-       let exec sql =
-         let rc = Sqlite3.exec sqlite sql in
-         if Sqlite3.Rc.is_success rc then Ok () else Error (Sqlite3.errmsg sqlite)
-       in
-       Result.bind (exec "BEGIN") (fun () ->
-         let result =
-           try
-             Result.bind (Logseq_db_storage.Sync_outbox_store.read_database sqlite)
-               (fun records ->
-                  Result.map
-                    (fun revision -> records, revision)
-                    (Logseq_db_storage.Sync_outbox_store.read_revision sqlite))
-           with
-           | exn -> Error (Printexc.to_string exn)
-         in
-         match result with
-         | Error _ as error -> ignore (exec "ROLLBACK"); error
-         | Ok _ ->
-           (match exec "COMMIT" with
-            | Ok () -> result
-            | Error _ as error -> ignore (exec "ROLLBACK"); error)))
+let read_outbox_with_sqlite sqlite =
+  let exec sql =
+    let rc = Sqlite3.exec sqlite sql in
+    if Sqlite3.Rc.is_success rc then Ok () else Error (Sqlite3.errmsg sqlite)
+  in
+  Result.bind (exec "BEGIN") (fun () ->
+    let result =
+      try
+        Result.bind (Logseq_db_storage.Sync_outbox_store.read_database sqlite)
+          (fun records ->
+             Result.map
+               (fun revision -> records, revision)
+               (Logseq_db_storage.Sync_outbox_store.read_revision sqlite))
+      with
+      | exn -> Error (Printexc.to_string exn)
+    in
+    match result with
+    | Error _ as error -> ignore (exec "ROLLBACK"); error
+    | Ok _ ->
+      (match exec "COMMIT" with
+       | Ok () -> result
+       | Error _ as error -> ignore (exec "ROLLBACK"); error))
 ;;
 
 (* Global revision belongs to metadata. Frozen encodings are independent of it
@@ -2091,21 +2087,6 @@ let outbox_write_set database ~revision records =
   ( Logseq_db_storage.Sync_outbox_store.
       { expected_revision = database.durable_sync_revision; revision; upserts; deletes }
   , rows )
-;;
-
-let migrate_outbox path ~revision ~expected_records rows =
-  let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
-  Fun.protect ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" )) (fun () ->
-    Logseq_db_storage.Sync_outbox_store.migrate_database sqlite ~revision ~expected_records
-      (ordered_durable_rows rows))
-;;
-
-let initialize_durable_receipts path =
-  let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
-  Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
-    (fun () ->
-       Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite)
 ;;
 
 let with_receipt_database path read =
@@ -4277,20 +4258,37 @@ let authoritative_tree_candidate snapshot cache uuid =
     let database = Option.get snapshot.authoritative_database in
     let candidate =
       Option.bind (tree_entity snapshot cache uuid) (fun entity ->
-        let fields =
-          List.concat_map
-            (fun a ->
-               Datascript.datoms database Datascript.Eavt ~e:entity ~a () |> List.of_seq)
-            tree_identity_fields
+        let fields = ref [] in
+        let b_uuid = ref None and c_uuid = ref 0 in
+        let b_title = ref None and c_title = ref 0 in
+        let b_parent = ref None and c_parent = ref 0 in
+        let b_page = ref None and c_page = ref 0 in
+        let b_order = ref None and c_order = ref 0 in
+        let record_single cell count parse value =
+          incr count;
+          if !count = 1 then cell := parse value else cell := None
         in
-        Hashtbl.add cache.fields entity fields;
-        match
-          ( Option.bind (one_in_datoms fields "block/uuid") uuid_of_value
-          , Option.bind (one_in_datoms fields "block/title") string_of_value
-          , Option.bind (one_in_datoms fields "block/parent") reference_of_value
-          , Option.bind (one_in_datoms fields "block/page") reference_of_value
-          , Option.bind (one_in_datoms fields "block/order") string_of_value )
-        with
+        Datascript.datoms database Datascript.Eavt ~e:entity ()
+        |> Seq.iter (fun (datom : Datascript.datom) ->
+          match datom.a with
+          | "block/uuid" ->
+            fields := datom :: !fields;
+            record_single b_uuid c_uuid uuid_of_value datom.v
+          | "block/title" ->
+            fields := datom :: !fields;
+            record_single b_title c_title string_of_value datom.v
+          | "block/parent" ->
+            fields := datom :: !fields;
+            record_single b_parent c_parent reference_of_value datom.v
+          | "block/page" ->
+            fields := datom :: !fields;
+            record_single b_page c_page reference_of_value datom.v
+          | "block/order" ->
+            fields := datom :: !fields;
+            record_single b_order c_order string_of_value datom.v
+          | _ -> ());
+        Hashtbl.add cache.fields entity (List.rev !fields);
+        match !b_uuid, !b_title, !b_parent, !b_page, !b_order with
         | Some tree_uuid, Some _, Some parent, Some page, Some tree_order ->
           (match
              ( cached_uuid_of_entity database cache.hydration parent
@@ -4707,7 +4705,10 @@ let timeline_direct_candidates ?(charge = fun _ -> ()) ~truncate snapshot parent
            | Some entity ->
              Datascript.datoms database Datascript.Avet ~a:"block/parent" ~v:(Datascript.Ref entity) ()
              |> Seq.iter (consume maximum_cursor_offset (fun (datom : Datascript.datom) ->
-               Option.iter remember (cached_uuid_of_entity database cache.hydration datom.e))));
+               Option.iter (fun uuid ->
+                 Hashtbl.replace cache.entities (Graph.Uuid.to_string uuid) (Some datom.e);
+                 remember uuid)
+                 (cached_uuid_of_entity database cache.hydration datom.e))));
           Uuid_map.find_opt (Graph.Uuid.to_string parent) (Option.get snapshot.children_effects)
           |> Option.value ~default:[]
           |> List.iter (fun (record : outbox_record) ->
@@ -4725,11 +4726,13 @@ let timeline_direct_candidates ?(charge = fun _ -> ()) ~truncate snapshot parent
         charge !examined;
         if not (complete || truncate) then None else
           Some (Hashtbl.to_seq_values identities |> Rrbvec.of_seq
-            |> Rrbvec.sort Graph.Uuid.compare
             |> Rrbvec.filter_map (fun uuid -> match logical_tree_candidate snapshot cache uuid with
               | Some candidate when Graph.Uuid.equal candidate.tree_parent parent -> Some candidate
               | _ -> None)
-            |> Rrbvec.sort (fun left right -> String.compare left.tree_order right.tree_order))
+            |> Rrbvec.sort (fun left right ->
+              match String.compare left.tree_order right.tree_order with
+              | 0 -> Graph.Uuid.compare left.tree_uuid right.tree_uuid
+              | c -> c))
 ;;
 
 let timeline_direct_members ?(preview_fallback=false) snapshot scope ~parent ~limit ~after =
@@ -6615,27 +6618,59 @@ let mutation_has_logical_effect context mutation =
 ;;
 
 let open_owned ~sw dependencies inspection ~graph_name ownership =
+  let t0 = Unix.gettimeofday () in
   let current_generation = fresh_generation dependencies.monotonic_ns in
   let path = inspection.location.database_path in
   if not (Sys.file_exists path)
   then Error Types.Attachment_stale
   else (
-    match read_outbox path, initialize_durable_receipts path with
-    | Error message, _ -> Error (Types.Corrupt_outbox message)
-    | _, Error message -> Error (Types.Corrupt_mutation_receipt message)
-    | Ok (encoded, durable_revision), Ok () ->
-      (match decode_outbox encoded with
-       | Error message -> Error (Types.Corrupt_outbox message)
-       | Ok (outbox, _)
-         when List.exists (fun record -> not (outbox_record_is_canonical record)) outbox
-         -> Error (Types.Corrupt_outbox "non-canonical overlay outbox record")
-       | Ok (outbox, legacy_revision) ->
-         let sync_revision = Option.value durable_revision ~default:legacy_revision in
-         let durable_outbox = durable_outbox_rows outbox in
-         (match migrate_outbox path ~revision:sync_revision ~expected_records:encoded durable_outbox with
-          | Error message -> Error (Types.Corrupt_outbox message)
-          | Ok () ->
-         (match Storage.open_database path with
+    let prep_result =
+      let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
+      Fun.protect
+        ~finally:(fun () ->
+          if not (Sqlite3.db_close sqlite)
+          then
+            report_warning
+              "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n")
+        (fun () ->
+           let r_outbox = read_outbox_with_sqlite sqlite in
+           let t_outbox = Unix.gettimeofday () in
+           let r_receipts =
+             Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite
+           in
+           let t_receipts = Unix.gettimeofday () in
+           match r_outbox, r_receipts with
+           | Error message, _ -> Error (Types.Corrupt_outbox message)
+           | _, Error message -> Error (Types.Corrupt_mutation_receipt message)
+           | Ok (encoded, durable_revision), Ok () ->
+             (match decode_outbox encoded with
+              | Error message -> Error (Types.Corrupt_outbox message)
+              | Ok (outbox, _)
+                when List.exists (fun record -> not (outbox_record_is_canonical record)) outbox
+                -> Error (Types.Corrupt_outbox "non-canonical overlay outbox record")
+              | Ok (outbox, legacy_revision) ->
+                let sync_revision = Option.value durable_revision ~default:legacy_revision in
+                let durable_outbox = durable_outbox_rows outbox in
+                let r_migrate =
+                  match durable_revision with
+                  | Some _ -> Ok ()
+                  | None ->
+                    Logseq_db_storage.Sync_outbox_store.migrate_database sqlite
+                      ~revision:sync_revision ~expected_records:encoded
+                      (ordered_durable_rows durable_outbox)
+                in
+                let t_migrate = Unix.gettimeofday () in
+                (match r_migrate with
+                 | Error message -> Error (Types.Corrupt_outbox message)
+                 | Ok () ->
+                   Ok (outbox, sync_revision, durable_outbox, t_outbox, t_receipts, t_migrate))))
+    in
+    match prep_result with
+    | Error _ as error -> error
+    | Ok (outbox, sync_revision, durable_outbox, t_outbox, t_receipts, t_migrate) ->
+         let r_open = Storage.open_database path in
+         let t_storage_open = Unix.gettimeofday () in
+         (match r_open with
           | Error error -> Error (Types.Restore_failed (Storage.diagnostic_error ~operation:"attachGraph" error))
           | Ok connection ->
             let callbacks = Storage.connection_callbacks connection in
@@ -6651,7 +6686,9 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                     !installed_listener;
                   ignore (Storage.close callbacks)))
               (fun () ->
-                 match Storage.restore_database connection with
+                 let r_restore = Storage.restore_database connection in
+                 let t_restore = Unix.gettimeofday () in
+                 match r_restore with
                  | Error error ->
                    Error (Types.Restore_failed (Storage.diagnostic_error ~operation:"attachGraph" error))
                  | Ok authoritative_database ->
@@ -6680,10 +6717,24 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                             (Storage.datascript_storage connection))
                        ~callbacks
                    in
+                   let t_tail = Unix.gettimeofday () in
                    let release_slot = ref None in
                    let checkpoint_metadata =
                      Storage.sync_metadata connection |> Result.get_ok
                    in
+                   let t_meta = Unix.gettimeofday () in
+                   (try
+                      Printf.eprintf
+                        "journal-startup: {\"stage\":\"overlay.open_owned\",\"outbox_ms\":%.2f,\"receipts_ms\":%.2f,\"migrate_ms\":%.2f,\"storage_open_ms\":%.2f,\"storage_restore_ms\":%.2f,\"tail_session_ms\":%.2f,\"sync_meta_ms\":%.2f,\"total_ms\":%.2f}\n%!"
+                        ((t_outbox -. t0) *. 1000.)
+                        ((t_receipts -. t_outbox) *. 1000.)
+                        ((t_migrate -. t_receipts) *. 1000.)
+                        ((t_storage_open -. t_migrate) *. 1000.)
+                        ((t_restore -. t_storage_open) *. 1000.)
+                        ((t_tail -. t_restore) *. 1000.)
+                        ((t_meta -. t_tail) *. 1000.)
+                        ((t_meta -. t0) *. 1000.)
+                    with Sys_error _ -> ());
                    let checkpoint =
                      match inspection.presence with
                      | Types.Available { checkpoint; _ } -> checkpoint
@@ -6798,7 +6849,7 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                      `Stop_daemon);
                    transferred := true;
                    installed_listener := None;
-                   Ok database)))))
+                   Ok database)))
 ;;
 
 let open_ ~sw dependencies inspection ~graph_name =

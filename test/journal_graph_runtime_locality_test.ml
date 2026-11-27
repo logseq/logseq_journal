@@ -8427,16 +8427,23 @@ let test_prefix_preserves_reconciliation ~resync stage () =
   let held = match stage with
     | `Root | `Preview -> held
     | `Continuation ->
-      let rec finish_previews (output : Runtime.output) =
-        let request = only "one retained refresh continuation" output.requests in
-        match Runtime.worker_read runtime request with
-        | Some(Runtime.Read{query=W.Timeline_read {query=W.Timeline.Roots _;_};_}) -> output
-        | Some(Runtime.Read{query=W.Timeline_read {query=W.Timeline.Preview_children {parent;_};_};_}) ->
-          finish_previews (deliver_sample runtime (sample request
-              ((children_sample ~parent:(parent) ~scope_revision:("children-1") ~items:([]) ~next:(None)))))
-        | _ -> Alcotest.fail "unexpected reconciliation request"
+      let rec finish_previews (pending : Graph.Uuid.t list) =
+        match pending with
+        | [] -> Alcotest.fail "expected retained refresh continuation"
+        | request :: rest ->
+          (match Runtime.worker_read runtime request with
+           | Some(Runtime.Read{query=W.Timeline_read {query=W.Timeline.Roots _;_};_}) ->
+             { Runtime.requests = request :: rest; responses = [] }
+           | Some(Runtime.Read{query=W.Timeline_read {query=W.Timeline.Preview_children {parent;_};_};_}) ->
+             let next = deliver_sample runtime (sample request
+               ((children_sample ~parent:(parent) ~scope_revision:("children-1") ~items:([]) ~next:(None)))) in
+             finish_previews (rest @ next.requests)
+           | Some(Runtime.Read{query=W.Timeline_check _;_}) ->
+             let next = deliver_sample runtime (sample request check_sample) in
+             finish_previews (rest @ next.requests)
+           | _ -> Alcotest.fail "unexpected reconciliation request")
       in
-      finish_previews held
+      finish_previews held.requests
   in
   let prefix, _ = drive_roots runtime [fresh]
       { Runtime.requests = [dates]; responses = [] } in

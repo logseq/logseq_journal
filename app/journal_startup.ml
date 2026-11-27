@@ -208,6 +208,7 @@ module Presentation = struct
   type account = Discovering | Local_available | User_available | User_required
   type t =
     { screen : screen
+    ; initial : bool
     ; serial : int64
     ; account_serial : int64
     ; indicator : bool
@@ -227,7 +228,7 @@ module Presentation = struct
     | Elapsed of ticket * float
 
   let create () =
-    { screen = Waiting; serial = 0L; account_serial = 0L; indicator = false
+    { screen = Waiting; initial = true; serial = 0L; account_serial = 0L; indicator = false
     ; foreground = true; account = Discovering; local_available = false
     ; account_failed = false; observed = None }
   let foreground t = t.foreground
@@ -236,7 +237,7 @@ module Presentation = struct
   let loading_request t =
     if t.foreground && t.screen = Waiting && not t.indicator then Some t.serial else None
   let account_ticket t = t.account_serial
-  let initial_attempt t = t.serial = 0L
+  let initial_attempt t = t.initial
   let equal_presentation left right =
     left.screen = right.screen
     && (left.screen <> Waiting ||
@@ -269,7 +270,7 @@ module Presentation = struct
     let next = classify t in
     if next = t.screen then t
     else if next = Waiting then
-      {t with screen=next;serial=Int64.succ t.serial;indicator=false}
+      {t with screen=next;initial=false;serial=Int64.succ t.serial;indicator=false}
     else {t with screen=next;indicator=false}
 
   let step t event =
@@ -296,7 +297,7 @@ module Presentation = struct
       project {t with account;local_available;account_failed=false}
     | Account_error key when key=t.account_serial -> project {t with account_failed=true}
     | Retry ->
-      {t with screen=Waiting;serial=Int64.succ t.serial;account_serial=Int64.succ t.account_serial;
+      {t with screen=Waiting;initial=false;serial=Int64.succ t.serial;account_serial=Int64.succ t.account_serial;
         indicator=false;account=Discovering;local_available=false;account_failed=false;observed=None}
     | Signed_out ->
       {t with screen=required Signed_out;indicator=false;account=User_required;

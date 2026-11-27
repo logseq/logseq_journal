@@ -14,7 +14,20 @@ struct JournalRuntimeHost: View {
   let platform: JournalApplicationPlatform
   let payload: Data
   let extensions: LUIAppleExtensionRegistry
+  let prestarted: JournalRuntime?
   @State private var lifetime = JournalRuntimeLifetime()
+
+  init(
+    platform: JournalApplicationPlatform,
+    payload: Data,
+    extensions: LUIAppleExtensionRegistry,
+    prestarted: JournalRuntime? = nil
+  ) {
+    self.platform = platform
+    self.payload = payload
+    self.extensions = extensions
+    self.prestarted = prestarted
+  }
   private var runtime: JournalRuntime? {
     get { lifetime.runtime }
     nonmutating set { lifetime.runtime = newValue }
@@ -23,12 +36,17 @@ struct JournalRuntimeHost: View {
     get { lifetime.startingRuntime }
     nonmutating set { lifetime.startingRuntime = newValue }
   }
-  @State private var fallbackClock = JournalStartupClock()
   @State private var graphScrollOffsets = JournalGraphScrollOffsets()
-  @Environment(\.journalStartupClock) private var inheritedClock
   @State private var failure: Error?
   @State private var startupRevision = 0
-  private var clock: JournalStartupClock { inheritedClock ?? fallbackClock }
+
+  private var displayRuntime: JournalRuntime? {
+    #if os(iOS)
+    runtime ?? (platform.startupClock.phase != .waitingBeforeDeadline ? startingRuntime : nil)
+    #else
+    runtime
+    #endif
+  }
 
   private var content: some SwiftUI.View {
     Group {
@@ -39,7 +57,7 @@ struct JournalRuntimeHost: View {
           Text(runtime?.failureDescription ?? failure.map { JournalRuntime.safeDescription($0,operation:"runtime.start.failed") } ??
             "Journal could not start (runtime.start.failed).")
         }
-      } else if let runtime, let rootID = runtime.rootID {
+      } else if let runtime = displayRuntime, let rootID = runtime.rootID {
         LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
       } else {
         JournalStartupLoadingSurface(loading: false, initial: true, active: true)
@@ -62,24 +80,45 @@ struct JournalRuntimeHost: View {
       content
       #endif
     }
-    .environment(\.journalStartupClock, clock)
+    .environment(\.journalStartupClock, platform.startupClock)
     .environment(\.journalGraphScrollOffsets, graphScrollOffsets)
     .background(JournalEnvironmentObserver { platform.pushEnvironment($0) })
     .task(id: startupRevision) {
       if runtime == nil && startingRuntime == nil {
+        let startupLogger = Logger(subsystem: "com.logseq.journal", category: "startup")
+        let t0 = ProcessInfo.processInfo.systemUptime
         do {
-          let next = try JournalRuntime(
-            platform: platform,
-            startupPayload: payload,
-            extensionRegistry: extensions)
+          let next: JournalRuntime
+          let alreadyStarted: Bool
+          if startupRevision == 0, let prestarted, prestarted.failure == nil {
+            next = prestarted
+            alreadyStarted = true
+          } else {
+            next = try JournalRuntime(
+              platform: platform,
+              startupPayload: payload,
+              extensionRegistry: extensions)
+            alreadyStarted = false
+          }
+          let t1 = ProcessInfo.processInfo.systemUptime
+          startupLogger.info("journal-startup stage=host.runtime.created elapsed_ms=\(Int(((t1 - t0) * 1000).rounded()), privacy: .public) since_start_ms=\(Int(((t1 - t0) * 1000).rounded()), privacy: .public) prestarted=\(alreadyStarted, privacy: .public)")
           startingRuntime = next
           do {
-            try next.start()
+            if !alreadyStarted {
+              try next.start()
+            }
+            let t2 = ProcessInfo.processInfo.systemUptime
+            startupLogger.info("journal-startup stage=host.runtime.started elapsed_ms=\(Int(((t2 - t1) * 1000).rounded()), privacy: .public) since_start_ms=\(Int(((t2 - t0) * 1000).rounded()), privacy: .public)")
             try await next.waitForInitialPlatformRequests()
+            let t3 = ProcessInfo.processInfo.systemUptime
+            startupLogger.info("journal-startup stage=host.initial_platform_requests.done elapsed_ms=\(Int(((t3 - t2) * 1000).rounded()), privacy: .public) since_start_ms=\(Int(((t3 - t0) * 1000).rounded()), privacy: .public)")
+            try await next.waitForStartupContent()
             try Task.checkCancellation()
             guard startingRuntime === next else { throw CancellationError() }
             runtime = next
             startingRuntime = nil
+            let t4 = ProcessInfo.processInfo.systemUptime
+            startupLogger.info("journal-startup stage=host.root.mounted elapsed_ms=\(Int(((t4 - t3) * 1000).rounded()), privacy: .public) since_start_ms=\(Int(((t4 - t0) * 1000).rounded()), privacy: .public)")
           } catch {
             if next.stop() {
               if startingRuntime === next {
@@ -106,29 +145,7 @@ struct JournalRuntimeHost: View {
   }
 }
 
-@Observable @MainActor final class JournalStartupClock {
-  private(set) var expired = false
-  @ObservationIgnored private var started: TimeInterval?
-  @ObservationIgnored private var task: Task<Void, Never>?
-  @ObservationIgnored private var revision = 0
-  var elapsed: Bool {
-    expired || started.map { ProcessInfo.processInfo.systemUptime - $0 >= 0.1 } == true
-  }
-  func begin() {
-    guard started == nil else { return }
-    started = ProcessInfo.processInfo.systemUptime
-    let version = revision
-    task = Task { [weak self] in
-      do { try await Task.sleep(for: .milliseconds(100)) }
-      catch { return }
-      guard let self, !Task.isCancelled, version == revision else { return }
-      expired = true
-    }
-  }
-  func restart() {
-    revision += 1; task?.cancel(); task = nil; started = nil; expired = false
-  }
-}
+
 
 private struct JournalStartupClockKey: EnvironmentKey {
   static let defaultValue: JournalStartupClock? = nil
@@ -146,9 +163,15 @@ struct JournalStartupLoadingSurface: View {
   let active: Bool
   var value: Double? = nil
   var message = ""
-  var action = AnyView(EmptyView())
+  var action: AnyView? = nil
   @Environment(\.journalStartupClock) private var clock
-  private var visible: Bool { active && (loading || (initial && clock?.elapsed == true)) }
+  private var visible: Bool {
+    #if os(iOS)
+    active && (initial && clock?.phase != .finished ? clock?.phase == .slow : loading)
+    #else
+    active && (loading || (initial && clock?.phase == .slow))
+    #endif
+  }
   var body: some View {
     VStack(spacing: 12) {
       Group {
@@ -162,17 +185,39 @@ struct JournalStartupLoadingSurface: View {
     .accessibilityHidden(!visible)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     // Recovery actions do not change the centered waiting canvas.
-    .overlay(alignment: .bottom) { action }
+    .overlay(alignment: .bottom) {
+      #if os(iOS)
+      if active && initial && clock?.phase == .pickerRequested {
+        if let action { action }
+        else { Text("Opening graph picker…") }
+      } else if !initial || visible {
+        if let action { action }
+        else if initial, let clock {
+          Button("Choose other graph") { clock.requestPicker() }
+            .buttonStyle(.bordered).accessibilityIdentifier("graph-picker-choose")
+        }
+      }
+      #else
+      action
+      #endif
+    }
     .padding(24)
     .background(.background)
     .accessibilityIdentifier("journal-startup-waiting")
-    .onAppear { clock?.begin() }
+    .onAppear {
+      #if os(macOS)
+      clock?.begin(after: .milliseconds(100))
+      #else
+      clock?.begin()
+      #endif
+    }
   }
 }
 
 struct JournalRuntimeSetup {
   let payload: Data
   let extensions: LUIAppleExtensionRegistry
+  var prestartedRuntime: JournalRuntime? = nil
 }
 
 /// Production account entry points with injectable native capabilities for QA.
@@ -184,7 +229,18 @@ struct JournalHost: View {
   @State private var setup: Result<JournalRuntimeSetup, Error>?
   @State private var signInPresented = false
   @State private var signInStartsImmediately = false
-  @State private var clock = JournalStartupClock()
+
+  init(
+    platform: JournalApplicationPlatform,
+    prepare: @escaping @MainActor () async throws -> JournalRuntimeSetup,
+    authentication: any JournalAuthenticationAPI,
+    initialSetup: Result<JournalRuntimeSetup, Error>? = nil
+  ) {
+    self.platform = platform
+    self.prepare = prepare
+    self.authentication = authentication
+    _setup = State(initialValue: initialSetup)
+  }
 
   var body: some View {
     Group {
@@ -205,12 +261,13 @@ struct JournalHost: View {
               signIn: { signInStartsImmediately = true; signInPresented = true },
               retry: platform.accountIssue?.stage == .bindingRead ? nil : { platform.retryOnline() })
           }
-          JournalRuntimeHost(platform: platform, payload: setup.payload, extensions: setup.extensions)
+          JournalRuntimeHost(platform: platform, payload: setup.payload,
+            extensions: setup.extensions, prestarted: setup.prestartedRuntime)
             .font(.body)
         }
       }
     }
-    .environment(\.journalStartupClock, clock)
+    .environment(\.journalStartupClock, platform.startupClock)
     .task {
       guard setup == nil else { return }
       do { setup = .success(try await prepare()) }
@@ -220,14 +277,14 @@ struct JournalHost: View {
       if phase == .background { lifecycle(backgrounded: true) }
       else if phase == .active { lifecycle(backgrounded: false) }
     }
-    .onChange(of: platform.authenticationRequired) { _, required in
+    .onChange(of: platform.authenticationRequired, initial: true) { _, required in
       if required && platform.localAccountAvailable == false && !signInPresented {
         signInStartsImmediately = false; signInPresented = true
       }
       // The authentication owner closes its sheet after account preparation.
       // Closing on the intermediate native identity update can cancel that work.
     }
-    .onChange(of: platform.localAccountAvailable) { _, available in
+    .onChange(of: platform.localAccountAvailable, initial: true) { _, available in
       if available == false && platform.authenticationRequired && !signInPresented {
         signInStartsImmediately = false; signInPresented = true
       }

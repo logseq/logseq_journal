@@ -206,6 +206,7 @@ private struct WarmFixture: Decodable {
   @State private var probe: WarmProbe
   @State private var activeScene = true
   private let registry: LUIAppleExtensionRegistry
+  private let prestartedRuntime: JournalRuntime?
 
   init() {
     // This executable is test-only; never access the user's native secrets.
@@ -241,7 +242,22 @@ private struct WarmFixture: Decodable {
         missing: arguments.contains("--missing-key"), report: path.appendingPathExtension("observations.jsonl"))
       probe.observePlatform()
       _probe = State(initialValue: probe)
-      self.registry = try JournalExtensions.registry()
+      let registry = try JournalExtensions.registry()
+      self.registry = registry
+      if !arguments.contains("--pump-only"),
+         let runtime = try? JournalRuntime(
+           platform: probe.platform,
+           startupPayload: probe.payload,
+           extensionRegistry: registry) {
+        if (try? runtime.start()) != nil {
+          self.prestartedRuntime = runtime
+        } else {
+          runtime.stop()
+          self.prestartedRuntime = nil
+        }
+      } else {
+        self.prestartedRuntime = nil
+      }
     } catch { fatalError("Fixture setup failed: \(error)") }
   }
 
@@ -291,7 +307,7 @@ private struct WarmFixture: Decodable {
           Text("Inspecting the public native runtime").task { await probe.inspectFirstFrame() }
         } else {
           JournalRuntimeHost(platform: probe.platform, payload: probe.payload,
-            extensions: registry)
+            extensions: registry, prestarted: prestartedRuntime)
             .font(.body)
             .preferredColorScheme(ProcessInfo.processInfo.arguments.contains("--dark-appearance") ? .dark :
               ProcessInfo.processInfo.arguments.contains("--light-appearance") ? .light : nil)

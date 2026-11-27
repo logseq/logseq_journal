@@ -83,7 +83,7 @@ val detail
   -> Journal_view.View.Body.t
 
 (** Stable native startup surface; action remains reachable during waiting. *)
-val startup : loading:bool -> initial:bool -> active:bool -> ?value:float
+val startup : ?on_choose:(unit -> unit) -> loading:bool -> initial:bool -> active:bool -> ?value:float
   -> message:string -> Journal_view.View.t -> Journal_view.View.Body.t
 
 (** Full-canvas native list with floating close and catalog controls. *)

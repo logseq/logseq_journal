@@ -331,6 +331,7 @@ let test_stable_startup_presentation () =
       require (P.loading_request inactive=None && P.step inactive (Elapsed(old,1.))==inactive)
         "background keeps an active loading timer";
       let resumed=P.step inactive (Foreground true) in
+      require (P.initial_attempt resumed && not (P.initial_attempt (P.step resumed Retry))) "resume is not a business retry";
       require (timer resumed<>old && not(P.loading_indicator resumed)) "resume reuses old grace";
       require (P.step resumed (Elapsed(old,3600.))==resumed) "late background timer changes resume";
       let key=timer resumed in

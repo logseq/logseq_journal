@@ -23,12 +23,12 @@ module Json = struct
   type props =
     { mode : string; title : string option [@default None]; connecting : bool option [@default None]; controls : bool option [@default None]
     ; text : string option [@default None]; id : string option [@default None]; level : int option [@default None]
-    ; loading : bool option [@default None]; initial : bool option [@default None]; active : bool option [@default None]; value : float option [@default None]; message : string option [@default None] }
+    ; canChoose : bool option [@default None]; loading : bool option [@default None]; initial : bool option [@default None]; active : bool option [@default None]; value : float option [@default None]; message : string option [@default None] }
   [@@deriving yojson]
 end
 
-let props ~mode ?title ?connecting ?controls ?text ?id ?level ?loading ?initial ?active ?value ?message () : Json.props =
-  { mode; title; connecting; controls; text; id; level; loading; initial; active; value; message }
+let props ~mode ?title ?connecting ?controls ?text ?id ?level ?canChoose ?loading ?initial ?active ?value ?message () : Json.props =
+  { mode; title; connecting; controls; text; id; level; canChoose; loading; initial; active; value; message }
 ;;
 
 let chrome =
@@ -39,6 +39,7 @@ let chrome =
       match Journal_ids.Native_widget.Event_id.to_int event_id, Bytes.to_string bytes with
       | 1, "journals" -> Ok `Journals
       | 1, "favorites" -> Ok `Favorites
+      | 1, "choose-graph" -> Ok `Choose_graph
       | 1, "capture" -> Ok `Capture
       | _ -> Error "Unknown Journal chrome event")
     ()
@@ -80,11 +81,11 @@ let date_header ?relative_label ~title () =
     ()
 ;;
 
-let startup ~loading ~initial ~active ?value ~message action =
+let startup ?on_choose ~loading ~initial ~active ?value ~message action =
   Ui.Native_widget.widget chrome
     ~key:(Ui.Key.string "journal-startup-surface")
-    ~props:(props ~mode:"startup" ~loading ~initial ~active ~message ?value ())
-    ~on_event:(fun _ -> ()) ~children:[V.column [action]] () |> V.Body.static
+    ~props:(props ~mode:"startup" ~canChoose:(Option.is_some on_choose) ~loading ~initial ~active ~message ?value ())
+    ~on_event:(function `Choose_graph -> Option.iter (fun choose -> choose ()) on_choose | _ -> ()) ~children:[V.column [action]] () |> V.Body.static
 ;;
 
 let capture_control ~enabled ~on_capture =
@@ -480,6 +481,7 @@ let view_impl
                 in
                 match action with
                 | `Journals -> invoke on_journals
+                | `Choose_graph -> ()
                 | `Favorites -> invoke on_favorites
                 | `Capture ->
                   let current = Option.fold ~none:initial ~some:Signal.sample presentation_signal in

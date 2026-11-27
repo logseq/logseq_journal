@@ -167,7 +167,8 @@ let view ?picker_signal props ~on_action =
       "folder"
   in
   let busy ({ loading; initial; active; value; message; choose_graph = choose } : busy) =
-    Journal_header.startup ~loading ~initial ~active ?value ~message
+    Journal_header.startup ?on_choose:(if choose then Some (fun () -> on_action Switch_graph) else None)
+      ~loading ~initial ~active ?value ~message
       (if choose then choose_graph else V.empty ())
   in
   let graph_picker snapshot =

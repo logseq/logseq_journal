@@ -73,11 +73,15 @@ type root_batch =
   ; root_next : Projection.root_cursor option
   ; root_members : Projection.tree_member Rrbvec.t
   ; root_proofs : proofs
-  ; root_todo : Projection.tree_member Rrbvec.t
+  ; mutable root_pending_previews : int
+  ; mutable root_preview_results : Projection.tree_member Rrbvec.t array
+  ; mutable root_preview_queue : (int * Projection.tree_member) list
+  ; mutable root_batch_aborted : bool
   }
 
 type root_preview =
   { preview_batch : root_batch
+  ; preview_index : int
   ; preview_root : Projection.tree_member
   ; preview_members : Projection.tree_member Rrbvec.t
   ; preview_cursor : Worker_pure_data.child_member Paging.cursor option
@@ -218,7 +222,8 @@ let root_owner_current t = function
 ;;
 
 let root_batch_current t batch =
-  root_owner_current t batch.root_owner
+  (not batch.root_batch_aborted)
+  && root_owner_current t batch.root_owner
   && Hashtbl.find_opt t.root_page_epochs batch.root_page.Projection.id
      = Some batch.root_epoch
 ;;
@@ -230,6 +235,7 @@ let scan_failure scan message =
 ;;
 
 let root_failure batch message =
+  batch.root_batch_aborted <- true;
   match batch.root_owner with
   | Feed_roots scan -> scan_failure scan message
   | Changed_roots _ -> reject message
@@ -258,7 +264,10 @@ let make_root_batch t ~ports owner ~page_uuid (page : Projection.page) cursor li
   ; root_next = None
   ; root_members = Rrbvec.empty
   ; root_proofs = Hashtbl.create 8
-  ; root_todo = Rrbvec.empty
+  ; root_pending_previews = 0
+  ; root_preview_results = [||]
+  ; root_preview_queue = []
+  ; root_batch_aborted = false
   }
 ;;
 
@@ -745,22 +754,44 @@ let read_root_preview t ~ports preview =
   request
 ;;
 
-let next_root_preview t ~ports batch =
+let max_concurrent_root_previews = 8
+
+let start_root_previews t ~ports batch todo =
   if not (root_batch_current t batch)
   then empty
   else (
-    match Rrbvec.pop_front batch.root_todo with
-    | None -> check t ~ports (Assemble batch)
-    | Some (root, rest) ->
-      let preview =
-        { preview_batch = { batch with root_todo = rest }
-        ; preview_root = root
-        ; preview_members = Rrbvec.empty
-        ; preview_cursor = None
-        ; preview_limit = 3
-        }
+    let count = Rrbvec.length todo in
+    if count = 0
+    then check t ~ports (Assemble batch)
+    else (
+      batch.root_pending_previews <- count;
+      batch.root_preview_results <- Array.make count Rrbvec.empty;
+      let indexed =
+        Rrbvec.to_seq todo |> Seq.mapi (fun index root -> index, root) |> List.of_seq
       in
-      requests [ read_root_preview t ~ports preview ])
+      let rec split n acc = function
+        | rest when n <= 0 -> List.rev acc, rest
+        | [] -> List.rev acc, []
+        | head :: tail -> split (n - 1) (head :: acc) tail
+      in
+      let initial, queued = split max_concurrent_root_previews [] indexed in
+      batch.root_preview_queue <- queued;
+      let planned =
+        List.map
+          (fun (index, root) ->
+            read_root_preview
+              t
+              ~ports
+              { preview_batch = batch
+              ; preview_index = index
+              ; preview_root = root
+              ; preview_members = Rrbvec.empty
+              ; preview_cursor = None
+              ; preview_limit = 3
+              })
+          initial
+      in
+      requests planned))
 ;;
 
 let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation ?(reuse=false) ?after () =
@@ -857,8 +888,10 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
 ;;
 let superseded_root_batch t ~ports batch =
   match batch.root_owner with
-  | Feed_roots scan when root_owner_current t batch.root_owner
+  | Feed_roots scan when (not batch.root_batch_aborted)
+                         && root_owner_current t batch.root_owner
                          && Hashtbl.mem t.root_page_limits batch.root_page.id ->
+    batch.root_batch_aborted <- true;
     (match scan.root_start_day with
      | None ->
        (* A canonical local completion can invalidate a page while startup is
@@ -921,8 +954,8 @@ let receive_root_tree t ~ports batch (packet : Worker_pure_data.tree_member Pagi
             Hashtbl.replace t.root_page_limits id (max batch.root_limit
               (Option.value ~default:1 (Hashtbl.find_opt t.root_page_limits id)));
             ports.retain_root_interest batch.root_page ~minimum_limit:batch.root_limit);
-          next_root_preview t ~ports
-          {batch with root_members=members;root_todo=todo;root_next=next_cursor})
+          start_root_previews t ~ports
+          {batch with root_members=members;root_next=next_cursor} todo)
 ;;
 
 let receive_root_preview t ~ports preview (packet : Worker_pure_data.child_member Paging.packet) =
@@ -990,8 +1023,32 @@ let receive_root_preview t ~ports preview (packet : Worker_pure_data.child_membe
                    ; preview_cursor = next_cursor
                    }
                ]
-         else
-           next_root_preview t ~ports { batch with root_members = Rrbvec.append batch.root_members selected }))
+         else (
+           batch.root_preview_results.(preview.preview_index) <- selected;
+           batch.root_pending_previews <- batch.root_pending_previews - 1;
+           if batch.root_pending_previews = 0
+           then (
+             let all_members =
+               Array.fold_left Rrbvec.append batch.root_members batch.root_preview_results
+             in
+             check t ~ports (Assemble { batch with root_members = all_members }))
+           else (
+             match batch.root_preview_queue with
+             | [] -> empty
+             | (next_index, next_root) :: rest ->
+               batch.root_preview_queue <- rest;
+               requests
+                 [ read_root_preview
+                     t
+                     ~ports
+                     { preview_batch = batch
+                     ; preview_index = next_index
+                     ; preview_root = next_root
+                     ; preview_members = Rrbvec.empty
+                     ; preview_cursor = None
+                     ; preview_limit = 3
+                     }
+                 ]))))
 ;;
 
 let stale_continuation scan =
@@ -1001,6 +1058,7 @@ let stale_continuation scan =
 ;;
 
 let restart_batch t ~ports batch =
+  batch.root_batch_aborted <- true;
   let proofs = owner_proofs batch.root_owner in
   Hashtbl.filter_map_inplace (fun scope proof ->
     if scope_page scope = Some batch.root_page.id then None else Some proof) proofs;
@@ -1183,7 +1241,12 @@ let failure_scope = function
   | Root_dates (scan, _) | Root_today (scan, _) ->
     (match scan.root_start_day with None -> Feed scan.root_generation
        | Some day -> Day {day;request_generation=scan.root_generation})
-  | Root_tree batch | Root_preview {preview_batch=batch;_} ->
+  | Root_tree batch ->
+    (match batch.root_owner with Changed_roots _ -> Reconciliation
+     | Feed_roots scan -> match scan.root_start_day with None -> Feed scan.root_generation
+       | Some day -> Day {day;request_generation=scan.root_generation})
+  | Root_preview {preview_batch=batch;_} ->
+    batch.root_preview_queue <- [];
     (match batch.root_owner with Changed_roots _ -> Reconciliation
      | Feed_roots scan -> match scan.root_start_day with None -> Feed scan.root_generation
        | Some day -> Day {day;request_generation=scan.root_generation})
@@ -1360,7 +1423,9 @@ let failed t ~ports operation ~code =
        read_root_dates t ~ports scan
      | Root_tree batch, Logseq_db_worker.Error.Response_too_large when batch.root_limit>1 ->
        let limit=max 1 (batch.root_limit/2) in
-       (match batch.root_owner with Feed_roots scan->scan.root_page_size<-limit | _->());
+       (match batch.root_owner with
+        | Feed_roots scan -> scan.root_page_size <- limit
+        | _ -> ());
        continue_root_batch t ~ports batch.root_owner batch.root_page batch.root_cursor limit
      | Root_preview preview, Logseq_db_worker.Error.Response_too_large when preview.preview_limit>1 ->
        requests [read_root_preview t ~ports {preview with preview_limit=max 1 (preview.preview_limit/2);
