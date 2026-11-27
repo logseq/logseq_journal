@@ -407,7 +407,10 @@ private let platformRequest: PlatformRequestCallback = { data, length in
       guard generation == identity else { return }
       rootID = backend.rootIDs.first
       appliedPatches += 1
-      if !startupContentReady && appliedPatches >= 2 && json.contains("\"journal-list\"") {
+      if !startupContentReady && appliedPatches >= 2
+          && (json.contains("\"journal-list\"")
+              || (!json.contains("\"progress\"")
+                  && (json.contains("\"button\"") || json.contains("\"text-input\"")))) {
         startupContentReady = true
         resumeStartupContentWaiters()
       }
