@@ -4278,29 +4278,33 @@ let authoritative_tree_candidate snapshot cache uuid =
     let candidate =
       Option.bind (tree_entity snapshot cache uuid) (fun entity ->
         let fields = ref [] in
-        let b_uuid = ref None in
-        let b_title = ref None in
-        let b_parent = ref None in
-        let b_page = ref None in
-        let b_order = ref None in
+        let b_uuid = ref None and c_uuid = ref 0 in
+        let b_title = ref None and c_title = ref 0 in
+        let b_parent = ref None and c_parent = ref 0 in
+        let b_page = ref None and c_page = ref 0 in
+        let b_order = ref None and c_order = ref 0 in
+        let record_single cell count parse value =
+          incr count;
+          if !count = 1 then cell := parse value else cell := None
+        in
         Datascript.datoms database Datascript.Eavt ~e:entity ()
         |> Seq.iter (fun (datom : Datascript.datom) ->
           match datom.a with
           | "block/uuid" ->
             fields := datom :: !fields;
-            if Option.is_none !b_uuid then b_uuid := uuid_of_value datom.v
+            record_single b_uuid c_uuid uuid_of_value datom.v
           | "block/title" ->
             fields := datom :: !fields;
-            if Option.is_none !b_title then b_title := string_of_value datom.v
+            record_single b_title c_title string_of_value datom.v
           | "block/parent" ->
             fields := datom :: !fields;
-            if Option.is_none !b_parent then b_parent := reference_of_value datom.v
+            record_single b_parent c_parent reference_of_value datom.v
           | "block/page" ->
             fields := datom :: !fields;
-            if Option.is_none !b_page then b_page := reference_of_value datom.v
+            record_single b_page c_page reference_of_value datom.v
           | "block/order" ->
             fields := datom :: !fields;
-            if Option.is_none !b_order then b_order := string_of_value datom.v
+            record_single b_order c_order string_of_value datom.v
           | _ -> ());
         Hashtbl.add cache.fields entity (List.rev !fields);
         match !b_uuid, !b_title, !b_parent, !b_page, !b_order with
