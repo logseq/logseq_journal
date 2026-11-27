@@ -74,6 +74,7 @@ module Presentation : sig
     | Observe of observation
     | Account of ticket * account_result
     | Account_error of ticket
+    | Begin_operation
     | Retry
     | Signed_out
     | Foreground of bool
@@ -82,6 +83,7 @@ module Presentation : sig
   val foreground : t -> bool
   val screen : t -> screen
   val loading_indicator : t -> bool
+  val loading_delay : t -> float
   val loading_request : t -> ticket option
   val account_ticket : t -> ticket
   val initial_attempt : t -> bool

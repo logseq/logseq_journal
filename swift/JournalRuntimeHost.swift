@@ -166,11 +166,7 @@ struct JournalStartupLoadingSurface: View {
   var action: AnyView? = nil
   @Environment(\.journalStartupClock) private var clock
   private var visible: Bool {
-    #if os(iOS)
-    active && (initial && clock?.phase != .finished ? clock?.phase == .slow : loading)
-    #else
-    active && (loading || (initial && clock?.phase == .slow))
-    #endif
+    active && (initial ? clock?.phase == .slow : loading)
   }
   var body: some View {
     VStack(spacing: 12) {
@@ -204,12 +200,8 @@ struct JournalStartupLoadingSurface: View {
     .padding(24)
     .background(.background)
     .accessibilityIdentifier("journal-startup-waiting")
-    .onAppear {
-      #if os(macOS)
-      clock?.begin(after: .milliseconds(100))
-      #else
-      clock?.begin()
-      #endif
+    .onChange(of: initial, initial: true) { _, cold in
+      if cold { clock?.begin() } else { clock?.finish() }
     }
   }
 }
