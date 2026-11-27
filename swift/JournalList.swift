@@ -605,26 +605,33 @@ extension EnvironmentValues {
         resolveIfNeeded()
       }
 
+      private func attachScrollViewIfFound() -> Bool {
+        guard window != nil, let owner = self.owner, owner.scrollView?.window == nil else {
+          return owner?.scrollView?.window != nil
+        }
+        var ancestor = self.superview
+        while let candidate = ancestor, candidate !== self.window {
+          if let scrollView = self.findScrollView(candidate) {
+            owner.scrollView = scrollView
+            owner.applyRestoredOffset()
+            owner.reportPresentationLayout()
+            return true
+          }
+          ancestor = candidate.superview
+        }
+        return false
+      }
+
       func resolveIfNeeded() {
         owner?.applyRestoredOffset()
         owner?.reportPresentationLayout()
         guard window != nil, owner?.scrollView?.window == nil, !resolving else { return }
+        if attachScrollViewIfFound() { return }
         resolving = true
         DispatchQueue.main.async { [weak self] in
           guard let self else { return }
           defer { self.resolving = false }
-          guard self.window != nil, let owner = self.owner,
-            owner.scrollView?.window == nil else { return }
-          var ancestor = self.superview
-          while let candidate = ancestor, candidate !== self.window {
-            if let scrollView = self.findScrollView(candidate) {
-              owner.scrollView = scrollView
-              owner.applyRestoredOffset()
-              owner.reportPresentationLayout()
-              return
-            }
-            ancestor = candidate.superview
-          }
+          _ = self.attachScrollViewIfFound()
         }
       }
 
@@ -899,20 +906,33 @@ extension EnvironmentValues {
           ? EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 20) : nil)
         .listRowSeparator(separatorVisibility(row.separator))
         .accessibilityIdentifier(row.test_id ?? row.key)
-        .contextMenu {
-          ForEach(row.context_menu?.actions ?? []) { action in
-            Button(role: action.role == "destructive" ? .destructive : nil) {
-              rowEvent(action: action.key, row: row.key)
-            } label: {
-              actionLabel(action)
-            }
-            .disabled(!actionInteractive(action))
+        .modifier(RowContextMenuModifier(actions: row.context_menu?.actions ?? []) { action in
+          Button(role: action.role == "destructive" ? .destructive : nil) {
+            rowEvent(action: action.key, row: row.key)
+          } label: {
+            actionLabel(action)
           }
-        }
+          .disabled(!actionInteractive(action))
+        })
     }
 
-    // Opaque `some View` can't express the recursive disclosure shape.
-    private func rowBody(_ row: Row) -> AnyView {
+    private struct RowContextMenuModifier<Item: SwiftUI.View>: ViewModifier {
+      let actions: [Action]
+      @ViewBuilder let item: (Action) -> Item
+      func body(content: Content) -> some SwiftUI.View {
+        if actions.isEmpty {
+          content
+        } else {
+          content.contextMenu {
+            ForEach(actions) { action in
+              item(action)
+            }
+          }
+        }
+      }
+    }
+
+    @ViewBuilder private func rowBody(_ row: Row) -> some SwiftUI.View {
       let lease = prepared.lease(for: row.key)
       let content = rowActions(row)
         .onAppear {
@@ -926,7 +946,7 @@ extension EnvironmentValues {
           }
         }
       if row.isDisclosure {
-        return AnyView(DisclosureGroup(
+        AnyView(DisclosureGroup(
           isExpanded: Binding(
             get: { row.expanded == true },
             set: { value in
@@ -939,8 +959,9 @@ extension EnvironmentValues {
         } label: {
           content
         }.listRowSeparator(separatorVisibility(row.separator)))
+      } else {
+        content
       }
-      return AnyView(content)
     }
 
     private var style: ListStyleConfiguration {

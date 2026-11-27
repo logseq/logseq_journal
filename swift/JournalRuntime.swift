@@ -410,7 +410,10 @@ private let platformRequest: PlatformRequestCallback = { data, length in
       if !startupContentReady && appliedPatches >= 2
           && (json.contains("\"journal-list\"")
               || (!json.contains("\"progress\"")
-                  && (json.contains("\"button\"") || json.contains("\"text-input\"")))) {
+                  && !json.contains("startup-loading")
+                  && !json.contains("\"loading\":true")
+                  && !json.contains("timeline-host")
+                  && (json.contains("graph-picker-list") || json.contains("\"text-input\"")))) {
         startupContentReady = true
         resumeStartupContentWaiters()
       }
