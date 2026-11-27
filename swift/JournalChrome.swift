@@ -244,6 +244,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     case graphPicker = "graph-picker"
     case toolbarControl = "toolbar-control"
     case bottomBar = "bottom-bar"
+    case capturePresentation = "capture-presentation"
     case detailText = "detail-text"
     case boundedText = "bounded-text"
     case filterOverlay = "filter-overlay"
@@ -1742,6 +1743,12 @@ struct JournalSheetDismissButton: SwiftUI.View {
             JournalExtensions.emit(context: context, payload: Data(action.utf8))
           }
         }
+        #endif
+      case .capturePresentation:
+        #if os(iOS)
+        JournalCapturePresentation(content: child(0), interactive: context.isUserInteractionEnabled)
+        #else
+        child(0)
         #endif
       case .toolbarControl:
         if context.childIDs.count == 1 {

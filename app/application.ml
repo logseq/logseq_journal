@@ -8262,7 +8262,12 @@ let start
       match state.modal with
       | Capture_sheet when state.environment.platform = "ios" ->
         Option.map
-          (fun content -> V.column ~spacing:0. [ content ])
+          (fun content ->
+             V.of_lui
+               (Journal_lui_native.mount ~key:"journal-capture-presentation"
+                  ~payload:{|{"mode":"capture-presentation"}|}
+                  ~children:[ Journal_view.mount content ]
+                  Journal_lui_native.chrome_identifier))
           (capture_composer state ~render:composer_content)
       | Append_sheet when state.environment.platform = "ios" ->
         append_composer state ~render:composer_content
