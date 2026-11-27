@@ -754,7 +754,7 @@ let read_root_preview t ~ports preview =
   request
 ;;
 
-let max_concurrent_root_previews = 16
+let max_concurrent_root_previews = 8
 
 let start_root_previews t ~ports batch todo =
   if not (root_batch_current t batch)
