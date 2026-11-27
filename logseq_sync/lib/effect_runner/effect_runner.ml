@@ -1188,8 +1188,10 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
          | Some (Ok _) -> "ok"
          | Some (Error _) -> "error"
        in
-       Printf.eprintf "journal-startup: {\"stage\":%S,\"outcome\":%S,\"elapsed_ms\":%.2f}\n%!"
-         stage outcome elapsed_ms) startup_stage);
+       (try
+          Printf.eprintf "journal-startup: {\"stage\":%S,\"outcome\":%S,\"elapsed_ms\":%.2f}\n%!"
+            stage outcome elapsed_ms
+        with Sys_error _ -> ())) startup_stage);
     match result with
     | Some result when (not t.closed) && not operation.cancelled ->
       t.post (Core.Runner_completed (Core.Completion (ticket, result)))

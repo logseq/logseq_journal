@@ -1613,9 +1613,11 @@ let read_typed
            | Roots_through_grandchildren _ -> "roots_filtered"
            | Preview_children _ -> "preview_children"
          in
-         Printf.eprintf
-           "journal-startup: {\"stage\":\"worker.timeline_read\",\"kind\":%S,\"elapsed_ms\":%.2f}\n%!"
-           kind elapsed_ms);
+         (try
+            Printf.eprintf
+              "journal-startup: {\"stage\":\"worker.timeline_read\",\"kind\":%S,\"elapsed_ms\":%.2f}\n%!"
+              kind elapsed_ms
+          with Sys_error _ -> ()));
       Ok value)
     |Read.Timeline_check receipts->with_snapshot(fun snapshot _ _ ->
       let module Timeline=Read.Timeline in
@@ -2677,12 +2679,14 @@ let handle_sync_worker_effect t = function
          | Overlay.Absent _ -> "absent", Sync.Mirror_inspected (Mirror_absent request.scope)
          | Available _ -> "available", Sync.Mirror_inspected (Mirror_available request)
        in
-       Printf.eprintf
-         "journal-startup: {\"stage\":\"worker.inspect_mirror\",\"presence\":%S,\"recover_ms\":%.2f,\"inspect_ms\":%.2f,\"total_ms\":%.2f}\n%!"
-         presence_label
-         ((t1 -. t0) *. 1000.)
-         ((t2 -. t1) *. 1000.)
-         ((t2 -. t0) *. 1000.);
+       (try
+          Printf.eprintf
+            "journal-startup: {\"stage\":\"worker.inspect_mirror\",\"presence\":%S,\"recover_ms\":%.2f,\"inspect_ms\":%.2f,\"total_ms\":%.2f}\n%!"
+            presence_label
+            ((t1 -. t0) *. 1000.)
+            ((t2 -. t1) *. 1000.)
+            ((t2 -. t0) *. 1000.)
+        with Sys_error _ -> ());
        Ok (sync_result ~event ())))
   | Activate_snapshot request ->
     let key = Graph.Uuid.to_string (Sync.snapshot_activation_scope request).graph_id in
@@ -2909,12 +2913,14 @@ let handle_sync_worker_effect t = function
                    ignore (close_database_by_id t database_id);
                    Error (sync_read_error error)
                  | Ok sync ->
-                   Printf.eprintf
-                     "journal-startup: {\"stage\":\"worker.attach_graph\",\"open_ms\":%.2f,\"listen_ms\":%.2f,\"inspect_sync_ms\":%.2f,\"total_ms\":%.2f}\n%!"
-                     ((t_open_end -. t_open_start) *. 1000.)
-                     ((t_listen_end -. t_open_end) *. 1000.)
-                     ((t_sync_end -. t_listen_end) *. 1000.)
-                     ((t_sync_end -. t0) *. 1000.);
+                   (try
+                      Printf.eprintf
+                        "journal-startup: {\"stage\":\"worker.attach_graph\",\"open_ms\":%.2f,\"listen_ms\":%.2f,\"inspect_sync_ms\":%.2f,\"total_ms\":%.2f}\n%!"
+                        ((t_open_end -. t_open_start) *. 1000.)
+                        ((t_listen_end -. t_open_end) *. 1000.)
+                        ((t_sync_end -. t_listen_end) *. 1000.)
+                        ((t_sync_end -. t0) *. 1000.)
+                    with Sys_error _ -> ());
                    Ok
                      (sync_result
                         ~event:(Sync.Graph_attached { scope = request.scope; sync })

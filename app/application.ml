@@ -453,9 +453,11 @@ let log_startup_stage ~stage ?(extra = "") () =
     | None -> ""
     | Some started -> Printf.sprintf ",\"since_feed_start_ms\":%.2f" ((now -. started) *. 1000.)
   in
-  Printf.eprintf
-    "journal-startup: {\"stage\":%S,\"since_boot_ms\":%.2f%s%s}\n%!"
-    stage since_boot_ms since_feed_ms extra
+  (try
+     Printf.eprintf
+       "journal-startup: {\"stage\":%S,\"since_boot_ms\":%.2f%s%s}\n%!"
+       stage since_boot_ms since_feed_ms extra
+   with Sys_error _ -> ())
 ;;
 
 let initial_feed_root_limit = 30

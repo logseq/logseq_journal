@@ -6719,16 +6719,18 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                      Storage.sync_metadata connection |> Result.get_ok
                    in
                    let t_meta = Unix.gettimeofday () in
-                   Printf.eprintf
-                     "journal-startup: {\"stage\":\"overlay.open_owned\",\"outbox_ms\":%.2f,\"receipts_ms\":%.2f,\"migrate_ms\":%.2f,\"storage_open_ms\":%.2f,\"storage_restore_ms\":%.2f,\"tail_session_ms\":%.2f,\"sync_meta_ms\":%.2f,\"total_ms\":%.2f}\n%!"
-                     ((t_outbox -. t0) *. 1000.)
-                     ((t_receipts -. t_outbox) *. 1000.)
-                     ((t_migrate -. t_receipts) *. 1000.)
-                     ((t_storage_open -. t_migrate) *. 1000.)
-                     ((t_restore -. t_storage_open) *. 1000.)
-                     ((t_tail -. t_restore) *. 1000.)
-                     ((t_meta -. t_tail) *. 1000.)
-                     ((t_meta -. t0) *. 1000.);
+                   (try
+                      Printf.eprintf
+                        "journal-startup: {\"stage\":\"overlay.open_owned\",\"outbox_ms\":%.2f,\"receipts_ms\":%.2f,\"migrate_ms\":%.2f,\"storage_open_ms\":%.2f,\"storage_restore_ms\":%.2f,\"tail_session_ms\":%.2f,\"sync_meta_ms\":%.2f,\"total_ms\":%.2f}\n%!"
+                        ((t_outbox -. t0) *. 1000.)
+                        ((t_receipts -. t_outbox) *. 1000.)
+                        ((t_migrate -. t_receipts) *. 1000.)
+                        ((t_storage_open -. t_migrate) *. 1000.)
+                        ((t_restore -. t_storage_open) *. 1000.)
+                        ((t_tail -. t_restore) *. 1000.)
+                        ((t_meta -. t_tail) *. 1000.)
+                        ((t_meta -. t0) *. 1000.)
+                    with Sys_error _ -> ());
                    let checkpoint =
                      match inspection.presence with
                      | Types.Available { checkpoint; _ } -> checkpoint
