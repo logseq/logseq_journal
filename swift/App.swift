@@ -12,7 +12,14 @@ import AppKit
   @NSApplicationDelegateAdaptor(JournalApplicationDelegate.self) private var delegate
   #endif
 
+  #if os(iOS)
+  private let startupClock = JournalStartupClock()
+  #endif
+
   init() {
+    #if os(iOS)
+    startupClock.begin()
+    #endif
     let platform = JournalApplicationPlatform(services: JournalNativeServices.makePlatformServices())
     _platform = State(initialValue: platform)
     let prepared: Result<JournalRuntimeSetup, Error> = Result {
@@ -50,7 +57,7 @@ import AppKit
     WindowGroup("Logseq Journal") { JournalHost(platform: platform, prepare: {
         JournalRuntimeSetup(payload: try JournalNativeServices.startupPayload(),
           extensions: try JournalExtensions.registry())
-      }, authentication: JournalCognitoNative.shared, initialSetup: initialSetup) }
+      }, authentication: JournalCognitoNative.shared, initialSetup: initialSetup, startupClock: startupClock) }
     #endif
   }
 }

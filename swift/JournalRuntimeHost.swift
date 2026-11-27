@@ -142,25 +142,31 @@ struct JournalRuntimeHost: View {
 
 @Observable @MainActor final class JournalStartupClock {
   private(set) var expired = false
-  @ObservationIgnored private var started: TimeInterval?
+  @ObservationIgnored private var deadline: ContinuousClock.Instant?
+  #if os(iOS)
+  private let delay: Duration = .seconds(5)
+  #else
+  private let delay: Duration = .milliseconds(100)
+  #endif
   @ObservationIgnored private var task: Task<Void, Never>?
   @ObservationIgnored private var revision = 0
   var elapsed: Bool {
-    expired || started.map { ProcessInfo.processInfo.systemUptime - $0 >= 0.1 } == true
+    expired || deadline.map { ContinuousClock.now >= $0 } == true
   }
   func begin() {
-    guard started == nil else { return }
-    started = ProcessInfo.processInfo.systemUptime
+    guard deadline == nil else { return }
+    let limit = ContinuousClock.now.advanced(by: delay)
+    deadline = limit
     let version = revision
     task = Task { [weak self] in
-      do { try await Task.sleep(for: .milliseconds(100)) }
+      do { try await ContinuousClock().sleep(until: limit) }
       catch { return }
       guard let self, !Task.isCancelled, version == revision else { return }
       expired = true
     }
   }
   func restart() {
-    revision += 1; task?.cancel(); task = nil; started = nil; expired = false
+    revision += 1; task?.cancel(); task = nil; deadline = nil; expired = false
   }
 }
 
@@ -182,7 +188,13 @@ struct JournalStartupLoadingSurface: View {
   var message = ""
   var action = AnyView(EmptyView())
   @Environment(\.journalStartupClock) private var clock
-  private var visible: Bool { active && (loading || (initial && clock?.elapsed == true)) }
+  private var visible: Bool {
+    #if os(iOS)
+    active && (initial ? clock?.elapsed == true : loading)
+    #else
+    active && (loading || (initial && clock?.elapsed == true))
+    #endif
+  }
   var body: some View {
     VStack(spacing: 12) {
       Group {
@@ -219,17 +231,19 @@ struct JournalHost: View {
   @State private var setup: Result<JournalRuntimeSetup, Error>?
   @State private var signInPresented = false
   @State private var signInStartsImmediately = false
-  @State private var clock = JournalStartupClock()
+  @State private var clock: JournalStartupClock
 
   init(
     platform: JournalApplicationPlatform,
     prepare: @escaping @MainActor () async throws -> JournalRuntimeSetup,
     authentication: any JournalAuthenticationAPI,
-    initialSetup: Result<JournalRuntimeSetup, Error>? = nil
+    initialSetup: Result<JournalRuntimeSetup, Error>? = nil,
+    startupClock: JournalStartupClock? = nil
   ) {
     self.platform = platform
     self.prepare = prepare
     self.authentication = authentication
+    _clock = State(initialValue: startupClock ?? JournalStartupClock())
     _setup = State(initialValue: initialSetup)
   }
 
@@ -261,6 +275,7 @@ struct JournalHost: View {
     .environment(\.journalStartupClock, clock)
     .task {
       guard setup == nil else { return }
+      clock.begin()
       do { setup = .success(try await prepare()) }
       catch { if !Task.isCancelled { setup = .failure(error) } }
     }
