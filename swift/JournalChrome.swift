@@ -282,6 +282,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let level: Int?
     let loading: Bool?
     let initial: Bool?
+    let canChoose: Bool?
     let active: Bool?
     let value: Double?
     let message: String?
@@ -1604,6 +1605,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
+    #if os(iOS)
+    @Environment(\.journalStartupClock) private var startupClock
+    #endif
     @Environment(\.journalStartupContainerFrame) private var startupContainerFrame
     #if !os(iOS)
     @Environment(\.journalFilterAccessibilityFocus) private var filterAccessibilityFocus
@@ -1707,6 +1711,11 @@ struct JournalSheetDismissButton: SwiftUI.View {
           properties.connecting != nil, properties.controls != nil {
           FloatingChrome(content: child(0), cluster: child(1),
             progress: child(2), properties: properties, leading: child(3))
+            #if os(iOS)
+            .onAppear {
+              if startupClock?.phase == .pickerRequested { startupClock?.finish() }
+            }
+            #endif
         }
       case .startup:
         if let properties, context.childIDs.count == 1 {
@@ -1722,6 +1731,13 @@ struct JournalSheetDismissButton: SwiftUI.View {
                 $0.minY - bounds.frame(in: .global).minY
               } ?? 0)
           }
+          #if os(iOS)
+          .onChange(of: properties.canChoose == true && properties.active == true && context.isUserInteractionEnabled && startupClock?.phase == .pickerRequested, initial: true) { _, eligible in
+            if eligible { startupClock?.deliverManagerPicker {
+              JournalExtensions.emit(context: context, payload: Data("choose-graph".utf8))
+            } }
+          }
+          #endif
         }
       case .header:
         if let properties, context.childIDs.isEmpty, let title = properties.title {

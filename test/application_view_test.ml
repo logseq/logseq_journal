@@ -7746,7 +7746,7 @@ let test_graph_picker_controls scenario () =
         | Service.Get_graph_state | Get_graph_state_at _ ->
           let value = Atomic.get current in
           Ok (Service.Graph_state { generation = value.snapshot.startup.graph_generation
-            ; graph_id = value.snapshot.selected_graph; phase = (if scenario=`Retry_local || scenario=`Retry_graph_phase then Graph_failed else Graph_open); error = None })
+            ; graph_id = value.snapshot.selected_graph; phase = (if scenario=`Manager_startup then Graph_opening else if scenario=`Retry_local || scenario=`Retry_graph_phase then Graph_failed else Graph_open); error = None })
         | Client_command command ->
           if scenario=`Reordered_full && command=Service.Set_foreground true && Atomic.get refresh_full then
             while not(Atomic.get release_refresh) do Eio.Fiber.yield () done;
@@ -7943,7 +7943,21 @@ let test_graph_picker_controls scenario () =
     ignore (hooks.dispose ()); Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
     (fun () ->
       consume (hooks.init 2 2 config);
-      if scenario=`Retry_local || scenario=`Retry_graph_phase then (
+      if scenario = `Manager_startup then (
+        let startup () = Hashtbl.to_seq props |> Seq.find_map (fun (id, fields) ->
+          match List.assoc_opt "payload" fields with
+          | Some (`String text) -> (try
+              let json = Yojson.Safe.from_string text in
+              if Yojson.Safe.Util.member "mode" json = `String "startup" then Some id else None
+            with _ -> None)
+          | _ -> None) in
+        wait "manager offers graph selection before graph opens" (fun () ->
+          Option.is_some (startup ()) && Option.is_some (find "text" "Choose another graph"));
+        consume (hooks.extension_event (Option.get (startup ())) "event"
+          {|{"id":1,"payload":"choose-graph"}|});
+        wait "single startup event mounts picker" (fun () ->
+          Option.is_some (find "accessibility-identifier" "graph-picker-list"))
+      ) else if scenario=`Retry_local || scenario=`Retry_graph_phase then (
         wait "failed local resident retains graph selection" (fun()->Option.is_some(find "text" "Unable to open graph"));
         Alcotest.(check bool) "failed local resident has no Retry" true
           (Option.is_none(find "accessibility-identifier" "graph-picker-retry"));
@@ -8038,7 +8052,7 @@ let test_graph_picker_controls scenario () =
         for _ = 1 to 10 do range (); consume (hooks.pump ()) done;
         Alcotest.(check int) "same viewport reuses presence observations" 2 (Atomic.get inspections);
         Alcotest.(check int) "presence does not reconstruct the graph catalog" before !root_renders
-      | `Retry_local | `Retry_graph_phase -> ()
+      | `Manager_startup | `Retry_local | `Retry_graph_phase -> ()
       | `Automatic_auth | `Automatic_direct | `Automatic_stop ->
         let native user_id=
           let startup=(Atomic.get current).snapshot.startup in
@@ -8693,6 +8707,7 @@ let () =
     ; ( "graph picker", [
         Alcotest.test_case "presence updates preserve native node lifecycle" `Quick test_picker_presence_native_patch_lifecycle;
         Alcotest.test_case "failed resident local retry restarts open" `Quick (test_graph_picker_controls `Retry_local);
+        Alcotest.test_case "manager startup event opens picker before graph" `Quick (test_graph_picker_controls `Manager_startup);
         Alcotest.test_case "failed worker local retry restarts retained mirror" `Quick (test_graph_picker_controls `Retry_graph_phase);
         Alcotest.test_case "offline deletion is disabled with explanation" `Quick (test_graph_picker_controls `Offline);
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);

@@ -188,7 +188,8 @@ struct JournalStartupLoadingSurface: View {
     .overlay(alignment: .bottom) {
       #if os(iOS)
       if active && initial && clock?.phase == .pickerRequested {
-        Text("Opening graph picker…")
+        if let action { action }
+        else { Text("Opening graph picker…") }
       } else if !initial || visible {
         if let action { action }
         else if initial, let clock {

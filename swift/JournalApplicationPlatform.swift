@@ -70,9 +70,16 @@ import AppKit
     phase = .pickerRequested
   }
 
+  private var managerPickerSent = false
+
+  func deliverManagerPicker(_ send: () -> Bool) {
+    guard phase == .pickerRequested, !managerPickerSent else { return }
+    managerPickerSent = true
+    if !send() { managerPickerSent = false }
+  }
+
   func deliverPicker(_ open: () -> Void) {
     guard phase == .pickerRequested else { return }
-    finish()
     open()
   }
   private(set) var phase = Phase.waitingBeforeDeadline
