@@ -7974,12 +7974,19 @@ let test_graph_picker_controls scenario () =
         wait "Favorites action mounts" (fun () -> Option.is_some (find "accessibility-label" "Favorites"));
         press (Option.get (find "accessibility-label" "Favorites"));
         wait "old graph Favorite read is genuinely in flight" (fun () -> Atomic.get graph_read_started));
-      press (Option.get (find "text" "Switch graph"));
       let page=Hashtbl.to_seq props |> Seq.find_map(fun(id,fields)->
         match List.assoc_opt "payload" fields with
         | Some (`String payload) when String.contains payload 'g' ->
           (try if Yojson.Safe.Util.(Yojson.Safe.from_string payload |> member "mode" |> to_string)="graph-pages" then Some id else None with _->None)
         | _->None) |> Option.get in
+      if scenario = `Current then (
+        let payload = List.assoc "payload" (Hashtbl.find props page) |> Yojson.Safe.Util.to_string |> Yojson.Safe.from_string in
+        let source = Yojson.Safe.Util.member "pageID" payload in
+        let event = Yojson.Safe.to_string (`Assoc ["action",`String "choose-graph"; "source",source]) in
+        let values = Lui_protocol.String_map.(empty |> add "id" (Lui_protocol.IntValue 1)
+          |> add "payload" (Lui_protocol.StringValue event)) in
+        consume (hooks.dispatch (Lui_protocol.ExtensionEvent (page,"journal-chrome","event",values))))
+      else press (Option.get (find "text" "Switch graph"));
       Alcotest.(check int) "native page retains its materialized graph while picker covers it" 1
         (Hashtbl.to_seq_values page_parents |> Seq.filter((=)page) |> Seq.length);
       wait "graph list mounts" (fun () -> Option.is_some (find "accessibility-identifier" "graph-picker-list"));

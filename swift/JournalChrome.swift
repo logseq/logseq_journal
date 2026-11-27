@@ -842,7 +842,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @StateObject private var handoff=JournalGraphHandoff()
     @StateObject private var coldMotion=JournalGraphColdMotion()
-    @State private var initialPresentation=JournalGraphInitialPresentation()
+    @Environment(\.journalStartupClock) private var startupClock
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.journalGraphScrollOffsets) private var graphScrollOffsets
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1017,9 +1017,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
       }
     }
     private var initialCover:Bool {
-      initialPresentation.covers(page:properties.pageID,visible:properties.visible==true,
+      startupClock?.phase != .finished && startupClock?.layout.covers(page:properties.pageID,visible:properties.visible==true,
         loading:(properties.loadingPageIDs ?? []).contains(properties.pageID ?? ""),
-        cold:coldMotion.ticket != nil)
+        cold:coldMotion.ticket != nil) == true
     }
     private func emit(_ action:String,source:String?=nil,target:String?=nil) {
       guard let source=source ?? properties.pageID else {return}
@@ -1040,8 +1040,18 @@ struct JournalSheetDismissButton: SwiftUI.View {
       }
     }
     private func acknowledge() {
-      if properties.visible==true,coldMotion.ticket?.target != properties.pageID,
-        slots.contains(where:{$0.owner==properties.pageID}) {emit("presented")}
+      if properties.visible == true, properties.pageID != nil, scenePhase == .active,
+        startupClock?.phase == .pickerRequested {
+        startupClock?.deliverPicker { emit("choose-graph") }
+        return
+      }
+      if !initialCover, scenePhase == .active, properties.visible==true,coldMotion.ticket?.target != properties.pageID,
+        slots.contains(where:{$0.owner==properties.pageID}) {
+        if !(properties.loadingPageIDs ?? []).contains(properties.pageID ?? ""), !settling, !committing {
+          startupClock?.finish()
+        }
+        emit("presented")
+      }
     }
     private func handle(_ pan:UIPanGestureRecognizer,width:CGFloat) {
       switch pan.state {
@@ -1098,7 +1108,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
       default:break
       }
     }
-    var body:some SwiftUI.View {
+    private var graphCanvas: some SwiftUI.View {
       GeometryReader { bounds in
         ZStack(alignment:.topLeading) {
           ForEach(slots,id:\.owner) { slot in
@@ -1113,8 +1123,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
               shown:shown,
               interactive:current && properties.visible==true && !(settling && committing) && !covered && !initialCover,
               coldMotion:coldMotion,coldNonce:coldNonce,
-              initialNonce:(current && initialCover) || covered ? initialPresentation.nonce : nil,
-              initialReady:{page,nonce in initialPresentation.ready(page:page,nonce:nonce)},loading:(properties.loadingPageIDs ?? []).contains(slot.owner))
+              initialNonce:(current && initialCover) || covered ? startupClock?.layout.nonce : nil,
+              initialReady:{page,nonce in startupClock?.ready(page:page,nonce:nonce)},loading:(properties.loadingPageIDs ?? []).contains(slot.owner))
               .frame(width:bounds.size.width,height:bounds.size.height)
               .offset(x:current ? (ownsMotion ? translation : 0) : incoming ? translation-bounds.size.width : -bounds.size.width)
               .opacity(shown ? 1 : 0)
@@ -1128,7 +1138,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           if initialCover {
             ZStack(alignment:.topLeading) {
               Color(uiColor:.systemBackground)
-              JournalStartupLoadingSurface(loading:false,initial:true,active:true)
+              initialLoadingSurface()
                 .frame(width:bounds.size.width,
                   height:startupContainerFrame?.height ?? bounds.size.height)
                 .offset(y:startupContainerFrame.map {
@@ -1151,10 +1161,14 @@ struct JournalSheetDismissButton: SwiftUI.View {
         .gesture(RightGraphPan(enabled:properties.enabled==true && !settling && coldMotion.ticket==nil && !initialCover) {handle($0,width:bounds.size.width)})
         .onChange(of:bounds.size) { _,_ in reset(notify:true) }
       }
+    }
+    private var residentCanvas: some SwiftUI.View {
+      graphCanvas
       // Each native hosting root owns the same window-sized canvas as the
       // original app root; its own UIKit safe area is applied exactly once.
       .ignoresSafeArea(.container)
       .onAppear {graphScrollOffsets?.retain(properties.residentPageIDs ?? []);acknowledge()}
+      .onChange(of:initialCover) { _,covered in if !covered {acknowledge()} }
       .onChange(of:properties.slotOwners) { _,_ in acknowledge() }
       .onChange(of:coldMotion.ticket?.id) { _,id in if id==nil {acknowledge()} }
       .onChange(of:properties.residentPageIDs) { _,ids in
@@ -1166,7 +1180,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
       .onChange(of:properties.pageID) { previous,page in
         // Initial nil -> owner is admission. Replacing that owner interrupts
         // startup; a retained Favorites/Detail route need not own a List handshake.
-        if previous != nil {initialPresentation.cancel(page:previous)}
+        if previous != nil {startupClock?.invalidateLayout()}
         graphName.focusChanged(page)
         let keepName = graphName.presentation?.phase == .confirmed
         let keepCold=committing && coldMotion.ticket?.target==page
@@ -1177,6 +1191,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
         if keepCold {coldMotion.focused(page)}
         acknowledge()
       }
+    }
+    var body: some SwiftUI.View {
+      residentCanvas
       .onChange(of:properties.targetGraphName) { _,name in
         graphName.updateName(target:properties.targetPageID,name:name)
       }
@@ -1192,10 +1209,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
         if prepared == nil && source==properties.pageID && (dragging || settling) {reset(notify:false)}
       }
       .onChange(of:properties.visible) { _,visible in
-        if visible != true {initialPresentation.cancel(page:properties.pageID);reset(notify:true)} else {acknowledge()}
+        if visible != true {startupClock?.invalidateLayout();reset(notify:true)} else {acknowledge()}
       }
-      .onChange(of:scenePhase) { _,phase in if phase != .active {initialPresentation.cancel(page:properties.pageID);reset(notify:true)} }
-      .onDisappear {initialPresentation.cancel(page:properties.pageID);reset(notify:false)}
+      .onChange(of:scenePhase) { _,phase in if phase != .active {startupClock?.invalidateLayout();reset(notify:true)} else {acknowledge()} }
+      .onDisappear {startupClock?.invalidateLayout();reset(notify:false)}
       .task(id:graphName.presentation?.id) {
         guard let name = graphName.presentation,name.phase == .confirmed else { return }
         if UIAccessibility.isVoiceOverRunning {
@@ -1204,6 +1221,16 @@ struct JournalSheetDismissButton: SwiftUI.View {
         do { try await Task.sleep(for:.milliseconds(1100)) } catch { return }
         withAnimation(reduceMotion ? nil : .easeOut(duration:0.2)) { graphName.dismiss(name.id) }
       }
+    }
+
+    private func initialLoadingSurface() -> JournalStartupLoadingSurface {
+      let choose = SwiftUI.Button("Choose other graph") {
+        startupClock?.requestPicker()
+        startupClock?.deliverPicker { emit("choose-graph") }
+      }
+        .buttonStyle(.bordered).accessibilityIdentifier("graph-picker-choose")
+      return JournalStartupLoadingSurface(loading:false,initial:true,active:scenePhase == .active,
+        action:AnyView(choose))
     }
 
     private func nameLabel(_ name:String,font:Font) -> some SwiftUI.View {

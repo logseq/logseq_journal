@@ -6459,7 +6459,10 @@ let start
       let output=Journal_graph_runtime.resume_insertion_recovery (!graph_runtime_cell) ~root recovery in
       let delivery=deliver_output output in
       Effect.run(apply_graph_responses set_state_and_effect delivery.responses)));
-  let startup_loading_key state = Journal_startup.Presentation.loading_request state.startup_presentation in
+  let startup_loading_key state =
+    if platform_code = 2 && Journal_startup.Presentation.initial_attempt state.startup_presentation
+    then None else Journal_startup.Presentation.loading_request state.startup_presentation
+  in
   let prev_startup_loading_key = ref None in
   let arm_startup_loading_timer key =
     let started = Mtime_clock.counter () in
@@ -8893,6 +8896,7 @@ let start
         if model_key state=Some source then (
           if action="presented" then Option.iter (fun scope->
             Effect.run(send_manager(Graph_service.Acknowledge_timeline_presented scope))) (timeline_scope state)
+          else if action="choose-graph" && show_graphs state then dispatch.send Switch_graph
           else let target=member "target" event |> to_string in
             match action with
             | "cancel" when !preview_owner=Some target -> dispatch.send Graph_swipe_cancel

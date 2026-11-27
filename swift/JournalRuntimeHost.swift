@@ -36,12 +36,17 @@ struct JournalRuntimeHost: View {
     get { lifetime.startingRuntime }
     nonmutating set { lifetime.startingRuntime = newValue }
   }
-  @State private var fallbackClock = JournalStartupClock()
   @State private var graphScrollOffsets = JournalGraphScrollOffsets()
-  @Environment(\.journalStartupClock) private var inheritedClock
   @State private var failure: Error?
   @State private var startupRevision = 0
-  private var clock: JournalStartupClock { inheritedClock ?? fallbackClock }
+
+  private var displayRuntime: JournalRuntime? {
+    #if os(iOS)
+    runtime ?? (platform.startupClock.phase != .waitingBeforeDeadline ? startingRuntime : nil)
+    #else
+    runtime
+    #endif
+  }
 
   private var content: some SwiftUI.View {
     Group {
@@ -52,7 +57,7 @@ struct JournalRuntimeHost: View {
           Text(runtime?.failureDescription ?? failure.map { JournalRuntime.safeDescription($0,operation:"runtime.start.failed") } ??
             "Journal could not start (runtime.start.failed).")
         }
-      } else if let runtime, let rootID = runtime.rootID {
+      } else if let runtime = displayRuntime, let rootID = runtime.rootID {
         LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
       } else {
         JournalStartupLoadingSurface(loading: false, initial: true, active: true)
@@ -75,7 +80,7 @@ struct JournalRuntimeHost: View {
       content
       #endif
     }
-    .environment(\.journalStartupClock, clock)
+    .environment(\.journalStartupClock, platform.startupClock)
     .environment(\.journalGraphScrollOffsets, graphScrollOffsets)
     .background(JournalEnvironmentObserver { platform.pushEnvironment($0) })
     .task(id: startupRevision) {
@@ -140,35 +145,7 @@ struct JournalRuntimeHost: View {
   }
 }
 
-@Observable @MainActor final class JournalStartupClock {
-  private(set) var expired = false
-  @ObservationIgnored private var deadline: ContinuousClock.Instant?
-  #if os(iOS)
-  private let delay: Duration = .seconds(5)
-  #else
-  private let delay: Duration = .milliseconds(100)
-  #endif
-  @ObservationIgnored private var task: Task<Void, Never>?
-  @ObservationIgnored private var revision = 0
-  var elapsed: Bool {
-    expired || deadline.map { ContinuousClock.now >= $0 } == true
-  }
-  func begin() {
-    guard deadline == nil else { return }
-    let limit = ContinuousClock.now.advanced(by: delay)
-    deadline = limit
-    let version = revision
-    task = Task { [weak self] in
-      do { try await ContinuousClock().sleep(until: limit) }
-      catch { return }
-      guard let self, !Task.isCancelled, version == revision else { return }
-      expired = true
-    }
-  }
-  func restart() {
-    revision += 1; task?.cancel(); task = nil; deadline = nil; expired = false
-  }
-}
+
 
 private struct JournalStartupClockKey: EnvironmentKey {
   static let defaultValue: JournalStartupClock? = nil
@@ -186,13 +163,13 @@ struct JournalStartupLoadingSurface: View {
   let active: Bool
   var value: Double? = nil
   var message = ""
-  var action = AnyView(EmptyView())
+  var action: AnyView? = nil
   @Environment(\.journalStartupClock) private var clock
   private var visible: Bool {
     #if os(iOS)
-    active && (initial ? clock?.elapsed == true : loading)
+    active && (initial && clock?.phase != .finished ? clock?.phase == .slow : loading)
     #else
-    active && (loading || (initial && clock?.elapsed == true))
+    active && (loading || (initial && clock?.phase == .slow))
     #endif
   }
   var body: some View {
@@ -208,11 +185,31 @@ struct JournalStartupLoadingSurface: View {
     .accessibilityHidden(!visible)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     // Recovery actions do not change the centered waiting canvas.
-    .overlay(alignment: .bottom) { action }
+    .overlay(alignment: .bottom) {
+      #if os(iOS)
+      if active && initial && clock?.phase == .pickerRequested {
+        Text("Opening graph picker…")
+      } else if !initial || visible {
+        if let action { action }
+        else if initial, let clock {
+          Button("Choose other graph") { clock.requestPicker() }
+            .buttonStyle(.bordered).accessibilityIdentifier("graph-picker-choose")
+        }
+      }
+      #else
+      action
+      #endif
+    }
     .padding(24)
     .background(.background)
     .accessibilityIdentifier("journal-startup-waiting")
-    .onAppear { clock?.begin() }
+    .onAppear {
+      #if os(macOS)
+      clock?.begin(after: .milliseconds(100))
+      #else
+      clock?.begin()
+      #endif
+    }
   }
 }
 
@@ -231,19 +228,16 @@ struct JournalHost: View {
   @State private var setup: Result<JournalRuntimeSetup, Error>?
   @State private var signInPresented = false
   @State private var signInStartsImmediately = false
-  @State private var clock: JournalStartupClock
 
   init(
     platform: JournalApplicationPlatform,
     prepare: @escaping @MainActor () async throws -> JournalRuntimeSetup,
     authentication: any JournalAuthenticationAPI,
-    initialSetup: Result<JournalRuntimeSetup, Error>? = nil,
-    startupClock: JournalStartupClock? = nil
+    initialSetup: Result<JournalRuntimeSetup, Error>? = nil
   ) {
     self.platform = platform
     self.prepare = prepare
     self.authentication = authentication
-    _clock = State(initialValue: startupClock ?? JournalStartupClock())
     _setup = State(initialValue: initialSetup)
   }
 
@@ -272,10 +266,9 @@ struct JournalHost: View {
         }
       }
     }
-    .environment(\.journalStartupClock, clock)
+    .environment(\.journalStartupClock, platform.startupClock)
     .task {
       guard setup == nil else { return }
-      clock.begin()
       do { setup = .success(try await prepare()) }
       catch { if !Task.isCancelled { setup = .failure(error) } }
     }

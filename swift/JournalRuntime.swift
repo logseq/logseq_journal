@@ -355,7 +355,8 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     if startupContentReady { return }
     let identity = generation
     let timeoutTask = Task { @MainActor [weak self] in
-      try? await Task.sleep(for: .milliseconds(timeoutMilliseconds))
+      do { try await Task.sleep(for: .milliseconds(timeoutMilliseconds)) }
+      catch { return }
       guard let self, self.generation == identity else { return }
       self.resumeStartupContentWaiters()
     }

@@ -2,7 +2,7 @@ import Foundation
 import OSLog
 
 @MainActor enum JournalNativeServices {
-  static let managedSyncOrigin = "https://api.logseq.io"
+  nonisolated static let managedSyncOrigin = "https://api.logseq.io"
 
   static func makePlatformServices() -> JournalPlatformServices {
     let storage = JournalNativeAccountStorage()
@@ -15,7 +15,7 @@ import OSLog
       managedSyncOrigin: managedSyncOrigin)
   }
 
-  static func startupPayload() throws -> Data {
+  nonisolated static func startupPayload() throws -> Data {
     let manager = FileManager.default
     let support = try manager.url(for: .applicationSupportDirectory,
       in: .userDomainMask, appropriateFor: nil, create: true)
@@ -24,7 +24,7 @@ import OSLog
     return try startupPayload(applicationSupportPath:canonical,managedSyncOrigin:managedSyncOrigin)
   }
 
-  static func startupPayload(applicationSupportPath:String,managedSyncOrigin:String) throws -> Data {
+  nonisolated static func startupPayload(applicationSupportPath:String,managedSyncOrigin:String) throws -> Data {
     do {
       return try JournalStartupConfiguration.encode(applicationSupportPath:applicationSupportPath,
         managedSyncOrigin:managedSyncOrigin)

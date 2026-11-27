@@ -48,8 +48,57 @@ import AppKit
   }
 }
 
+@Observable @MainActor final class JournalStartupClock {
+  enum Phase { case waitingBeforeDeadline, slow, pickerRequested, finished }
+
+  #if os(iOS)
+  private(set) var layout = JournalGraphInitialPresentation()
+
+  func invalidateLayout() {
+    guard phase != .finished else { return }
+    layout = JournalGraphInitialPresentation()
+  }
+
+  func ready(page: String, nonce: UUID) {
+    guard phase != .pickerRequested, phase != .finished else { return }
+    layout.ready(page: page, nonce: nonce)
+  }
+  #endif
+
+  func requestPicker() {
+    guard phase == .slow else { return }
+    phase = .pickerRequested
+  }
+
+  func deliverPicker(_ open: () -> Void) {
+    guard phase == .pickerRequested else { return }
+    finish()
+    open()
+  }
+  private(set) var phase = Phase.waitingBeforeDeadline
+  @ObservationIgnored private var task: Task<Void, Never>?
+
+  func begin(after delay: Duration = .seconds(5)) {
+    guard phase == .waitingBeforeDeadline, task == nil else { return }
+    let deadline = ContinuousClock.now.advanced(by: delay)
+    task = Task { [weak self] in
+      do { try await ContinuousClock().sleep(until: deadline) } catch { return }
+      guard let self, phase == .waitingBeforeDeadline else { return }
+      phase = .slow
+    }
+  }
+
+  func finish() {
+    guard phase != .finished else { return }
+    task?.cancel()
+    task = nil
+    phase = .finished
+  }
+}
+
 /// Connects native services to one OCaml runtime without owning graph state.
 @Observable @MainActor final class JournalApplicationPlatform {
+  let startupClock = JournalStartupClock()
   private(set) var authenticationRequired = false
   private(set) var localAccountAvailable: Bool?
   private(set) var accountIssue: JournalAccountIssue?
@@ -94,6 +143,10 @@ import AppKit
     if let authListener { NotificationCenter.default.removeObserver(authListener) }
     authListener = nil
     connection = UUID()
+    #if os(iOS)
+    if startupClock.phase == .pickerRequested { startupClock.finish() }
+    startupClock.invalidateLayout()
+    #endif
     refresh?.cancel()
     refresh = nil
     shutdown?.cancel()
@@ -140,7 +193,14 @@ import AppKit
     if [.timelinePresented,.onlineRequested,.onlineCancelled].contains(request) {
       guard let scope=try? JournalPlatformWire.startupScope(bytes), scope>=startupScope else {return nil}
       if request != .onlineCancelled, !pending.acceptsOnlinePermission(scope) { return nil }
-      if scope != startupScope { services.cancelAuthenticationPreparation(); startupScope=scope }
+      if scope != startupScope {
+        #if os(iOS)
+        if startupScope != .initial, scope.accountGeneration != startupScope.accountGeneration,
+          startupClock.phase == .pickerRequested { startupClock.finish() }
+        startupClock.invalidateLayout()
+        #endif
+        services.cancelAuthenticationPreparation(); startupScope=scope
+      }
     }
     let requestScope = startupScope
     failureScope = requestScope
@@ -191,7 +251,9 @@ import AppKit
         onlineWaiter?.resume(); onlineWaiter=nil
         refreshAuthentication()
       }
-      if request == .timelinePresented { refreshAuthentication() }
+      if request == .timelinePresented {
+        refreshAuthentication()
+      }
       if request == .terminationReady { shutdown?.complete() }
       return encoded
     } catch JournalPlatformServices.Failure.authenticationRequired {

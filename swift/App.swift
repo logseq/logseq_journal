@@ -7,21 +7,18 @@ import AppKit
 
 @main struct JournalApplication: App {
   @State private var platform: JournalApplicationPlatform
-  @State private var initialSetup: Result<JournalRuntimeSetup, Error>
   #if os(macOS)
+  @State private var initialSetup: Result<JournalRuntimeSetup, Error>
   @NSApplicationDelegateAdaptor(JournalApplicationDelegate.self) private var delegate
   #endif
 
-  #if os(iOS)
-  private let startupClock = JournalStartupClock()
-  #endif
-
   init() {
-    #if os(iOS)
-    startupClock.begin()
-    #endif
     let platform = JournalApplicationPlatform(services: JournalNativeServices.makePlatformServices())
+    #if os(iOS)
+    platform.startupClock.begin()
+    #endif
     _platform = State(initialValue: platform)
+    #if os(macOS)
     let prepared: Result<JournalRuntimeSetup, Error> = Result {
       let payload = try JournalNativeServices.startupPayload()
       let extensions = try JournalExtensions.registry()
@@ -40,6 +37,7 @@ import AppKit
       return setup
     }
     _initialSetup = State(initialValue: prepared)
+    #endif
   }
 
   var body: some Scene {
@@ -55,9 +53,9 @@ import AppKit
     .defaultSize(width: 840, height: 720)
     #else
     WindowGroup("Logseq Journal") { JournalHost(platform: platform, prepare: {
-        JournalRuntimeSetup(payload: try JournalNativeServices.startupPayload(),
-          extensions: try JournalExtensions.registry())
-      }, authentication: JournalCognitoNative.shared, initialSetup: initialSetup, startupClock: startupClock) }
+        let payload = try await Task.detached { try JournalNativeServices.startupPayload() }.value
+        return JournalRuntimeSetup(payload: payload, extensions: try JournalExtensions.registry())
+      }, authentication: JournalCognitoNative.shared) }
     #endif
   }
 }
