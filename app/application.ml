@@ -444,6 +444,7 @@ let select_destination state destination =
 let feed_day_limit = 7
 let startup_boot_time = Unix.gettimeofday ()
 let startup_feed_load_time = ref None
+let startup_timeline_presented = ref false
 
 let log_startup_stage ~stage ?(extra = "") () =
   let now = Unix.gettimeofday () in
@@ -7736,8 +7737,6 @@ let start
             !prev_timeline_drain_key
             key)
      then (
-       if Option.is_none !prev_timeline_drain_key && Option.is_some key
-       then log_startup_stage ~stage:"app.timeline_presented" ();
        prev_timeline_drain_key := key;
        Effect.run (timeline_drain_callback key)));
     (let key = startup_loading_key model in
@@ -8427,8 +8426,11 @@ let start
           ~store:timeline_store ~media_store ~dispatch state
         |> fun content -> V.of_lui (Lui_elements.stack ~grow:1.
             ~on_appear:(fun _ -> Option.iter (fun scope ->
-              if model_key !state_ref=Some(owner_key scope) then
-                Effect.run (send_manager (Graph_service.Acknowledge_timeline_presented scope))) (timeline_scope state))
+              if model_key !state_ref=Some(owner_key scope) then (
+                if not !startup_timeline_presented then (
+                  startup_timeline_presented := true;
+                  log_startup_stage ~stage:"app.timeline_presented" ());
+                Effect.run (send_manager (Graph_service.Acknowledge_timeline_presented scope)))) (timeline_scope state))
             [Ui.mount content]))
     in
     let capture_adapter =
