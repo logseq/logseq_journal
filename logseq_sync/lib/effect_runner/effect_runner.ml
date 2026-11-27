@@ -1171,6 +1171,25 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
         |> Option.fold ~none:"none" ~some:string_of_int in
       unlock_log "op=%s request=%s phase=end result=%s failure_category=%s http_status=%s elapsed_ms=%.0f"
         id kind outcome category http_status (Float.max 0. ((Unix.gettimeofday () -. began) *. 1000.))) diagnostic_kind;
+    (let startup_stage = match request with
+       | Core.Load_catalog _ -> Some "sync.load_catalog"
+       | Core.Fetch_catalog _ -> Some "sync.fetch_catalog"
+       | Core.Load_and_unlock_graph_key _ -> Some "sync.load_and_unlock_graph_key"
+       | Core.Fetch_and_unlock_graph_key _ -> Some "sync.fetch_and_unlock_graph_key"
+       | Core.Unlock_private_key _ -> Some "sync.unlock_private_key"
+       | Core.Fetch_snapshot_metadata _ -> Some "sync.fetch_snapshot_metadata"
+       | Core.Download_snapshot _ -> Some "sync.download_snapshot"
+       | _ -> None
+     in
+     Option.iter (fun stage ->
+       let elapsed_ms = Float.max 0. ((Unix.gettimeofday () -. began) *. 1000.) in
+       let outcome = match result with
+         | None -> "cancelled"
+         | Some (Ok _) -> "ok"
+         | Some (Error _) -> "error"
+       in
+       Printf.eprintf "journal-startup: {\"stage\":%S,\"outcome\":%S,\"elapsed_ms\":%.2f}\n%!"
+         stage outcome elapsed_ms) startup_stage);
     match result with
     | Some result when (not t.closed) && not operation.cancelled ->
       t.post (Core.Runner_completed (Core.Completion (ticket, result)))

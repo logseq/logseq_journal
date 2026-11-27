@@ -60,6 +60,7 @@ type connection =
   { sqlite : Sqlite3.db
   ; storage : Datascript.storage
   ; callbacks : callbacks
+  ; active_restore_cache : (string, Datascript.storage_payload) Hashtbl.t option ref
   }
 
 type startup_metadata =
@@ -374,8 +375,7 @@ let open_database path =
       Sqlite3.Rc.check
         (Sqlite3.exec
            sqlite
-           "SELECT CAST(addr AS TEXT) FROM kvs WHERE typeof(addr) <> 'integer' OR addr < \
-            0 LIMIT 1"
+           "SELECT CAST(addr AS TEXT) FROM kvs WHERE addr < 0 LIMIT 1"
            ~cb:(fun row _ -> invalid_address := row.(0)));
       match !invalid_address with
       | Some address ->
@@ -385,35 +385,62 @@ let open_database path =
         let capture : (string, Datascript.storage_payload) Hashtbl.t option ref =
           ref None
         in
+        let restore_statement =
+          Sqlite3.prepare sqlite "SELECT content, addresses FROM kvs WHERE addr = ?"
+        in
+        let active_restore_cache : (string, Datascript.storage_payload) Hashtbl.t option ref =
+          ref None
+        in
+        let decode_addresses statement =
+          if Sqlite3.column_is_null statement 1
+          then []
+          else (
+            match
+              storage_addresses_of_yojson
+                (Yojson.Safe.from_string (Sqlite3.column_text statement 1))
+            with
+            | Ok values -> List.map Int64.to_string values
+            | Error message -> invalid_arg ("invalid addresses JSON: " ^ message))
+        in
+        let read_raw_row address =
+          match Int64.of_string_opt address with
+          | None -> None
+          | Some addr_int ->
+            Fun.protect
+              ~finally:(fun () ->
+                ignore (Sqlite3.reset restore_statement);
+                ignore (Sqlite3.clear_bindings restore_statement))
+              (fun () ->
+                Sqlite3.Rc.check (Sqlite3.bind_int64 restore_statement 1 addr_int);
+                match Sqlite3.step restore_statement with
+                | Sqlite3.Rc.ROW ->
+                  let content = Sqlite3.column_text restore_statement 0 in
+                  let addresses = decode_addresses restore_statement in
+                  Some (content, addresses)
+                | DONE -> None
+                | rc ->
+                  Sqlite3.Rc.check rc;
+                  None)
+        in
         let restore_sqlite address =
-          prepared
-            sqlite
-            "SELECT content, addresses FROM kvs WHERE addr = ?"
-            (fun statement -> Sqlite3.Rc.check (Sqlite3.bind_text statement 1 address))
-            (fun statement ->
-               match Sqlite3.step statement with
-               | Sqlite3.Rc.ROW ->
-                 let content = Sqlite3.column_text statement 0 in
-                 let addresses =
-                   if Sqlite3.column_is_null statement 1
-                   then []
-                   else (
-                     match
-                       storage_addresses_of_yojson
-                         (Yojson.Safe.from_string (Sqlite3.column_text statement 1))
-                     with
-                     | Ok values -> List.map Int64.to_string values
-                     | Error message -> invalid_arg ("invalid addresses JSON: " ^ message))
-                 in
-                 (match
-                    Logseq_sqlite_codec.decode_physical_payload ~content ~addresses
-                  with
-                  | Ok payload -> Some payload
-                  | Error error -> invalid_arg (Logseq_sqlite_codec.diagnostic_error error))
-               | DONE -> None
-               | rc ->
-                 Sqlite3.Rc.check rc;
-                 None)
+          let cached =
+            Option.bind !active_restore_cache (fun cache -> Hashtbl.find_opt cache address)
+          in
+          match cached with
+          | Some payload -> Some payload
+          | None ->
+            (match read_raw_row address with
+             | None -> None
+             | Some (content, addresses) ->
+               (match
+                  Logseq_sqlite_codec.decode_physical_payload ~content ~addresses
+                with
+                | Ok payload ->
+                  Option.iter
+                    (fun cache -> Hashtbl.replace cache address payload)
+                    !active_restore_cache;
+                  Some payload
+                | Error error -> invalid_arg (Logseq_sqlite_codec.diagnostic_error error)))
         in
         let list_addresses () =
           let addresses = ref [] in
@@ -540,30 +567,23 @@ let open_database path =
                  ; terminal_batch_receipts = None
                  })
         in
-        let initial_root_metadata =
-          prepared
-            sqlite
-            "SELECT content FROM kvs WHERE addr = 0"
-            (fun _ -> ())
-            (fun statement ->
-               match Sqlite3.step statement with
-               | Sqlite3.Rc.ROW ->
-                 (match
-                    Logseq_sqlite_codec.decode_root_index_metadata
-                      (Sqlite3.column_text statement 0)
-                  with
-                  | Ok metadata -> Some metadata
-                  | Error _ -> None)
-               | DONE -> None
-               | rc ->
-                 Sqlite3.Rc.check rc;
-                 None)
-        in
-        let initial_root_addresses =
-          match restore_sqlite Datascript.Storage.root_address with
-          | Some (Datascript.Storage_root root) ->
-            Some [ root.storage_eavt; root.storage_aevt; root.storage_avet ]
-          | Some (Storage_node _ | Storage_tail _) | None -> None
+        let initial_root_metadata, initial_root_addresses =
+          match read_raw_row Datascript.Storage.root_address with
+          | None -> None, None
+          | Some (content, addresses) ->
+            let metadata =
+              match Logseq_sqlite_codec.decode_root_index_metadata content with
+              | Ok metadata -> Some metadata
+              | Error _ -> None
+            in
+            let root_addresses =
+              match Logseq_sqlite_codec.decode_physical_payload ~content ~addresses with
+              | Ok (Datascript.Storage_root root) ->
+                Some [ root.storage_eavt; root.storage_aevt; root.storage_avet ]
+              | Ok (Storage_node _ | Storage_tail _) -> None
+              | Error error -> invalid_arg (Logseq_sqlite_codec.diagnostic_error error)
+            in
+            metadata, root_addresses
         in
         let unreachable_address_count_sql =
           Option.map
@@ -630,10 +650,12 @@ let open_database path =
           ; checkpoint = exec "PRAGMA wal_checkpoint(TRUNCATE)"
           ; close =
               (fun () ->
+                active_restore_cache := None;
+                ignore (Sqlite3.finalize restore_statement);
                 if Sqlite3.db_close sqlite then Ok () else Error (Sqlite3.errmsg sqlite))
           }
         in
-        Ok { sqlite; storage; callbacks })
+        Ok { sqlite; storage; callbacks; active_restore_cache })
   with
   | exn -> Error (Begin_failed (exception_source exn))
 ;;
@@ -692,7 +714,10 @@ let validate_storage_header connection =
          ( Logseq_sqlite_codec.decode_physical_payload ~content ~addresses:[]
          , Logseq_sqlite_codec.decode_root_index_metadata content )
        with
-       | Ok (Datascript.Storage_root root), Ok _metadata ->
+       | Ok (Datascript.Storage_root root as payload), Ok _metadata ->
+         Option.iter
+           (fun cache -> Hashtbl.replace cache Datascript.Storage.root_address payload)
+           !(connection.active_restore_cache);
          let require_index label address =
            match connection.storage.storage_restore address with
            | Some (Datascript.Storage_node _) -> Ok ()
@@ -718,14 +743,19 @@ let validate_storage_header connection =
 
 let restore_database connection =
   let corrupt message = Error (Corrupt_storage message) in
-  match validate_storage_header connection with
-  | Error _ as error -> error
-  | Ok () ->
-    (try
-       match Datascript.restore connection.storage with
-       | Some db -> Ok db
-       | None -> corrupt "DataScript restore returned no database"
-     with
-     | Invalid_argument message -> corrupt message
-     | exn -> corrupt (Printexc.to_string exn))
+  let previous = !(connection.active_restore_cache) in
+  connection.active_restore_cache := Some (Hashtbl.create 8);
+  Fun.protect
+    ~finally:(fun () -> connection.active_restore_cache := previous)
+    (fun () ->
+      match validate_storage_header connection with
+      | Error _ as error -> error
+      | Ok () ->
+        (try
+           match Datascript.restore connection.storage with
+           | Some db -> Ok db
+           | None -> corrupt "DataScript restore returned no database"
+         with
+         | Invalid_argument message -> corrupt message
+         | exn -> corrupt (Printexc.to_string exn)))
 ;;

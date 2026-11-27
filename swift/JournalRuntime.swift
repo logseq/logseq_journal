@@ -1,6 +1,7 @@
 import Foundation
 import LUIAppleBackend
 import Observation
+import OSLog
 
 /// C bridge entries exported by app/journal_lui_bridge.c (see also
 /// platform/native/lui_ocaml_bridge.c in the lui repository). Every entry that
@@ -237,12 +238,38 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     backend.onEvent = { [weak self] event in self?.handle(event) }
   }
 
+  @ObservationIgnored private var startUptime: TimeInterval = 0
+  @ObservationIgnored private var startupTimelinePresented = false
+  @ObservationIgnored private var startupContentReady = false
+  @ObservationIgnored private var startupContentContinuations: [CheckedContinuation<Void, Never>] = []
+  private static let startupLogger = Logger(subsystem: "com.logseq.journal", category: "startup")
+
+  private static func platformRequestKind(_ bytes: Data) -> String {
+    guard let decoded = try? JournalPlatformWire.decodeRequest(bytes) else { return "unknown" }
+    switch decoded {
+    case .authenticatedUser: return "authenticatedUser"
+    case .signOut: return "signOut"
+    case .terminationReady: return "terminationReady"
+    case .localAccount: return "localAccount"
+    case .timelinePresented: return "timelinePresented"
+    case .onlineRequested: return "onlineRequested"
+    case .onlineCancelled: return "onlineCancelled"
+    case .idToken: return "idToken"
+    case .copyText: return "copyText"
+    }
+  }
+
   /// Boots the OCaml runtime; the LDB1 startup payload rides inside
   /// `lui_ocaml_start` so init receives it before the worker session begins.
   /// The platform event stream attaches afterwards.
   func start() throws {
     if let reportedFailure { throw reportedFailure }
     guard !started else { return }
+    let t0 = ProcessInfo.processInfo.systemUptime
+    startUptime = t0
+    startupTimelinePresented = false
+    startupContentReady = false
+    resumeStartupContentWaiters()
     generation = UUID()
     let identity = generation
     platformRequestIngress.begin(identity)
@@ -284,6 +311,8 @@ private let platformRequest: PlatformRequestCallback = { data, length in
       record(.start,.missingRoot)
       throw reportedFailure!
     }
+    let tOcaml = ProcessInfo.processInfo.systemUptime
+    Self.startupLogger.info("journal-startup stage=runtime.ocaml_start.done elapsed_ms=\(Int(((tOcaml - t0) * 1000).rounded()), privacy: .public) initial_patches=\(self.appliedPatches, privacy: .public)")
     started = true
     platform.connect(to: self)
     let requests = platformRequestIngress.activate(identity) { [weak self] request in
@@ -298,6 +327,8 @@ private let platformRequest: PlatformRequestCallback = { data, length in
         await self.deliverPlatformRequest(request.bytes,receipt:request)
       }
     }
+    let tActivate = ProcessInfo.processInfo.systemUptime
+    Self.startupLogger.info("journal-startup stage=runtime.platform_ingress.activated elapsed_ms=\(Int(((tActivate - tOcaml) * 1000).rounded()), privacy: .public) initial_requests=\(requests.count, privacy: .public)")
   }
 
   /// Waits for requests emitted during admission, after native start/connect.
@@ -317,10 +348,47 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     }
   }
 
+  /// Waits briefly for the initial timeline tree to land in the backend before
+  /// mounting `LUISwiftUIRoot` so SwiftUI does not starve `@MainActor` worker
+  /// pumps while laying out an intermediate loading surface.
+  func waitForStartupContent(timeoutMilliseconds: Int = 200) async throws {
+    if startupContentReady { return }
+    let identity = generation
+    let timeoutTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(for: .milliseconds(timeoutMilliseconds))
+      guard let self, self.generation == identity else { return }
+      self.resumeStartupContentWaiters()
+    }
+    defer { timeoutTask.cancel() }
+    try await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        if startupContentReady || !started || generation != identity {
+          continuation.resume()
+        } else {
+          startupContentContinuations.append(continuation)
+        }
+      }
+      try Task.checkCancellation()
+      guard started, generation == identity else { throw CancellationError() }
+    } onCancel: {
+      Task { @MainActor [weak self] in
+        guard let self, self.generation == identity else { return }
+        self.resumeStartupContentWaiters()
+      }
+    }
+  }
+
+  private func resumeStartupContentWaiters() {
+    let waiters = startupContentContinuations
+    startupContentContinuations = []
+    for waiter in waiters { waiter.resume() }
+  }
+
   @discardableResult func stop() -> Bool {
     guard started || stopPending else { return true }
     platformRequestIngress.close(generation)
     generation = UUID()
+    resumeStartupContentWaiters()
     for task in initialPlatformTasks { task.cancel() }
     initialPlatformTasks = []
     platform.disconnect()
@@ -333,11 +401,22 @@ private let platformRequest: PlatformRequestCallback = { data, length in
 
   func apply(json: String) {
     let identity = generation
+    let t0 = ProcessInfo.processInfo.systemUptime
     do {
       try backend.apply(json: json)
       guard generation == identity else { return }
       rootID = backend.rootIDs.first
       appliedPatches += 1
+      if !startupContentReady && appliedPatches >= 2 && json.contains("\"journal-list\"") {
+        startupContentReady = true
+        resumeStartupContentWaiters()
+      }
+      let t1 = ProcessInfo.processInfo.systemUptime
+      let elapsedMs = Int(((t1 - t0) * 1000).rounded())
+      if !startupTimelinePresented && (elapsedMs >= 2 || json.utf8.count >= 4096) {
+        let sinceStartMs = Int(((t1 - startUptime) * 1000).rounded())
+        Self.startupLogger.info("journal-startup stage=runtime.apply_patch patch=\(self.appliedPatches, privacy: .public) bytes=\(json.utf8.count, privacy: .public) elapsed_ms=\(elapsedMs, privacy: .public) since_start_ms=\(sinceStartMs, privacy: .public)")
+      }
     } catch {
       guard generation == identity else { return }
       record(.patch,Self.safeReason(error))
@@ -346,7 +425,14 @@ private let platformRequest: PlatformRequestCallback = { data, length in
 
   func pump() {
     guard started else { return }
+    let t0 = ProcessInfo.processInfo.systemUptime
     let identity = generation, accepted = journalOCamlPump()
+    let t1 = ProcessInfo.processInfo.systemUptime
+    let elapsedMs = Int(((t1 - t0) * 1000).rounded())
+    if !startupTimelinePresented && elapsedMs >= 2 {
+      let sinceStartMs = Int(((t1 - startUptime) * 1000).rounded())
+      Self.startupLogger.info("journal-startup stage=runtime.pump elapsed_ms=\(elapsedMs, privacy: .public) since_start_ms=\(sinceStartMs, privacy: .public)")
+    }
     if generation == identity, started, accepted != 1 { recordBridge(.pump,3) }
   }
 
@@ -363,7 +449,16 @@ private let platformRequest: PlatformRequestCallback = { data, length in
       generation == identity && (receipt.map { platformRequestIngress.owns(identity,$0) } ?? true)
     }
     guard ownsRequest() else { return }
+    let kind = Self.platformRequestKind(bytes)
+    let reqStart = ProcessInfo.processInfo.systemUptime
     let response = await platform.request(bytes)
+    let reqEnd = ProcessInfo.processInfo.systemUptime
+    let elapsedMs = Int(((reqEnd - reqStart) * 1000).rounded())
+    if !startupTimelinePresented || elapsedMs >= 20 {
+      let sinceStartMs = Int(((reqEnd - startUptime) * 1000).rounded())
+      Self.startupLogger.info("journal-startup stage=runtime.platform_request kind=\(kind, privacy: .public) elapsed_ms=\(elapsedMs, privacy: .public) since_start_ms=\(sinceStartMs, privacy: .public)")
+    }
+    if kind == "timelinePresented" { startupTimelinePresented = true }
     guard started, ownsRequest(), !Task.isCancelled else { return }
     // nil belongs to retired/suppressed work. Current cancellation is an LJF1
     // result and still completes the original continuation without a ledger row.

@@ -442,6 +442,23 @@ let select_destination state destination =
 ;;
 
 let feed_day_limit = 7
+let startup_boot_time = Unix.gettimeofday ()
+let startup_feed_load_time = ref None
+
+let log_startup_stage ~stage ?(extra = "") () =
+  let now = Unix.gettimeofday () in
+  let since_boot_ms = (now -. startup_boot_time) *. 1000. in
+  let since_feed_ms =
+    match !startup_feed_load_time with
+    | None -> ""
+    | Some started -> Printf.sprintf ",\"since_feed_start_ms\":%.2f" ((now -. started) *. 1000.)
+  in
+  Printf.eprintf
+    "journal-startup: {\"stage\":%S,\"since_boot_ms\":%.2f%s%s}\n%!"
+    stage since_boot_ms since_feed_ms extra
+;;
+
+let initial_feed_root_limit = 30
 let feed_root_limit = 30
 let sync_error_card_lifetime = 5.
 
@@ -918,7 +935,11 @@ let apply_manager_state ~discard state (manager_state : Graph_service.state) =
 ;;
 
 let worker_request generation = function
-  | Journal_timeline_state.Feed { cursor } ->
+  | Journal_timeline_state.Feed { cursor = None } ->
+    Journal_graph_request.Load_feed
+      { cursor = None; root_limit = initial_feed_root_limit; day_limit = feed_day_limit
+      ; request_generation = generation }
+  | Journal_timeline_state.Feed { cursor = Some _ as cursor } ->
     Journal_graph_request.Load_feed
       { cursor; root_limit = feed_root_limit; day_limit = feed_day_limit
       ; request_generation = generation }
@@ -1441,9 +1462,23 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
                ~generation:request_generation
                (Feed { cursor = None })
          in
+         let next_feed_loaded = state.feed_loaded || complete in
+         if (not state.feed_loaded) && next_feed_loaded
+         then (
+           let day_count = List.length feed.Journal_graph_projection.days in
+           let entry_count =
+             List.fold_left
+               (fun acc (day : Journal_graph_projection.day_feed) -> acc + List.length day.entries)
+               0
+               feed.days
+           in
+           log_startup_stage
+             ~stage:"app.feed_loaded"
+             ~extra:(Printf.sprintf ",\"days\":%d,\"entries\":%d" day_count entry_count)
+             ());
          { state with
            timeline
-         ; feed_loaded = state.feed_loaded || complete
+         ; feed_loaded = next_feed_loaded
          ; presented_feed_context = Some refresh.context
          ; feed_refresh = (if complete then None else state.feed_refresh)
          })
@@ -1470,9 +1505,23 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
              ~generation:request_generation
              (Feed { cursor = None })
        in
+       let next_feed_loaded = state.feed_loaded || (accepted_initial_feed && complete) in
+       if (not state.feed_loaded) && next_feed_loaded
+       then (
+         let day_count = List.length feed.Journal_graph_projection.days in
+         let entry_count =
+           List.fold_left
+             (fun acc (day : Journal_graph_projection.day_feed) -> acc + List.length day.entries)
+             0
+             feed.days
+         in
+         log_startup_stage
+           ~stage:"app.feed_loaded"
+           ~extra:(Printf.sprintf ",\"days\":%d,\"entries\":%d" day_count entry_count)
+           ());
        { state with
          timeline
-       ; feed_loaded = state.feed_loaded || (accepted_initial_feed && complete)
+       ; feed_loaded = next_feed_loaded
        ; presented_feed_context =
            (if accepted_initial_feed
             then Option.map feed_projection_context state.calendar
@@ -5228,6 +5277,8 @@ let start
         then Effect.ignore
         else (
           started_graph_generation := Some (graph_key, graph_state.generation);
+          startup_feed_load_time := Some (Unix.gettimeofday ());
+          log_startup_stage ~stage:"app.graph_open.load_feed_start" ();
           retire_graph_scope ();
           let current = !state_ref in
           let graph_info = Journal_graph_runtime.start (!graph_runtime_cell) in
@@ -5243,7 +5294,7 @@ let start
                 ~tags:(Timeline_filter.tags criteria) ~statuses:(Timeline_filter.statuses criteria) ~days;
               submit
                 (Journal_graph_request.Load_feed
-                   { cursor = None; root_limit = feed_root_limit
+                   { cursor = None; root_limit = initial_feed_root_limit
                    ; day_limit = feed_day_limit
                    ; request_generation = feed_generation
                    })
@@ -6146,7 +6197,7 @@ let start
       let output =
         submit
           (Journal_graph_request.Load_feed
-             { cursor = None; root_limit = feed_root_limit
+             { cursor = None; root_limit = initial_feed_root_limit
              ; day_limit = feed_day_limit
              ; request_generation = generation
              })
@@ -7683,6 +7734,8 @@ let start
             !prev_timeline_drain_key
             key)
      then (
+       if Option.is_none !prev_timeline_drain_key && Option.is_some key
+       then log_startup_stage ~stage:"app.timeline_presented" ();
        prev_timeline_drain_key := key;
        Effect.run (timeline_drain_callback key)));
     (let key = startup_loading_key model in

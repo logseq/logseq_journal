@@ -4277,20 +4277,33 @@ let authoritative_tree_candidate snapshot cache uuid =
     let database = Option.get snapshot.authoritative_database in
     let candidate =
       Option.bind (tree_entity snapshot cache uuid) (fun entity ->
-        let fields =
-          List.concat_map
-            (fun a ->
-               Datascript.datoms database Datascript.Eavt ~e:entity ~a () |> List.of_seq)
-            tree_identity_fields
-        in
-        Hashtbl.add cache.fields entity fields;
-        match
-          ( Option.bind (one_in_datoms fields "block/uuid") uuid_of_value
-          , Option.bind (one_in_datoms fields "block/title") string_of_value
-          , Option.bind (one_in_datoms fields "block/parent") reference_of_value
-          , Option.bind (one_in_datoms fields "block/page") reference_of_value
-          , Option.bind (one_in_datoms fields "block/order") string_of_value )
-        with
+        let fields = ref [] in
+        let b_uuid = ref None in
+        let b_title = ref None in
+        let b_parent = ref None in
+        let b_page = ref None in
+        let b_order = ref None in
+        Datascript.datoms database Datascript.Eavt ~e:entity ()
+        |> Seq.iter (fun (datom : Datascript.datom) ->
+          match datom.a with
+          | "block/uuid" ->
+            fields := datom :: !fields;
+            if Option.is_none !b_uuid then b_uuid := uuid_of_value datom.v
+          | "block/title" ->
+            fields := datom :: !fields;
+            if Option.is_none !b_title then b_title := string_of_value datom.v
+          | "block/parent" ->
+            fields := datom :: !fields;
+            if Option.is_none !b_parent then b_parent := reference_of_value datom.v
+          | "block/page" ->
+            fields := datom :: !fields;
+            if Option.is_none !b_page then b_page := reference_of_value datom.v
+          | "block/order" ->
+            fields := datom :: !fields;
+            if Option.is_none !b_order then b_order := string_of_value datom.v
+          | _ -> ());
+        Hashtbl.add cache.fields entity (List.rev !fields);
+        match !b_uuid, !b_title, !b_parent, !b_page, !b_order with
         | Some tree_uuid, Some _, Some parent, Some page, Some tree_order ->
           (match
              ( cached_uuid_of_entity database cache.hydration parent
@@ -4707,7 +4720,10 @@ let timeline_direct_candidates ?(charge = fun _ -> ()) ~truncate snapshot parent
            | Some entity ->
              Datascript.datoms database Datascript.Avet ~a:"block/parent" ~v:(Datascript.Ref entity) ()
              |> Seq.iter (consume maximum_cursor_offset (fun (datom : Datascript.datom) ->
-               Option.iter remember (cached_uuid_of_entity database cache.hydration datom.e))));
+               Option.iter (fun uuid ->
+                 Hashtbl.replace cache.entities (Graph.Uuid.to_string uuid) (Some datom.e);
+                 remember uuid)
+                 (cached_uuid_of_entity database cache.hydration datom.e))));
           Uuid_map.find_opt (Graph.Uuid.to_string parent) (Option.get snapshot.children_effects)
           |> Option.value ~default:[]
           |> List.iter (fun (record : outbox_record) ->
@@ -4725,11 +4741,13 @@ let timeline_direct_candidates ?(charge = fun _ -> ()) ~truncate snapshot parent
         charge !examined;
         if not (complete || truncate) then None else
           Some (Hashtbl.to_seq_values identities |> Rrbvec.of_seq
-            |> Rrbvec.sort Graph.Uuid.compare
             |> Rrbvec.filter_map (fun uuid -> match logical_tree_candidate snapshot cache uuid with
               | Some candidate when Graph.Uuid.equal candidate.tree_parent parent -> Some candidate
               | _ -> None)
-            |> Rrbvec.sort (fun left right -> String.compare left.tree_order right.tree_order))
+            |> Rrbvec.sort (fun left right ->
+              match String.compare left.tree_order right.tree_order with
+              | 0 -> Graph.Uuid.compare left.tree_uuid right.tree_uuid
+              | c -> c))
 ;;
 
 let timeline_direct_members ?(preview_fallback=false) snapshot scope ~parent ~limit ~after =
@@ -6615,12 +6633,17 @@ let mutation_has_logical_effect context mutation =
 ;;
 
 let open_owned ~sw dependencies inspection ~graph_name ownership =
+  let t0 = Unix.gettimeofday () in
   let current_generation = fresh_generation dependencies.monotonic_ns in
   let path = inspection.location.database_path in
   if not (Sys.file_exists path)
   then Error Types.Attachment_stale
   else (
-    match read_outbox path, initialize_durable_receipts path with
+    let r_outbox = read_outbox path in
+    let t_outbox = Unix.gettimeofday () in
+    let r_receipts = initialize_durable_receipts path in
+    let t_receipts = Unix.gettimeofday () in
+    match r_outbox, r_receipts with
     | Error message, _ -> Error (Types.Corrupt_outbox message)
     | _, Error message -> Error (Types.Corrupt_mutation_receipt message)
     | Ok (encoded, durable_revision), Ok () ->
@@ -6632,10 +6655,18 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
        | Ok (outbox, legacy_revision) ->
          let sync_revision = Option.value durable_revision ~default:legacy_revision in
          let durable_outbox = durable_outbox_rows outbox in
-         (match migrate_outbox path ~revision:sync_revision ~expected_records:encoded durable_outbox with
+         let r_migrate =
+          match durable_revision with
+          | Some _ -> Ok ()
+          | None -> migrate_outbox path ~revision:sync_revision ~expected_records:encoded durable_outbox
+        in
+         let t_migrate = Unix.gettimeofday () in
+         (match r_migrate with
           | Error message -> Error (Types.Corrupt_outbox message)
           | Ok () ->
-         (match Storage.open_database path with
+         let r_open = Storage.open_database path in
+         let t_storage_open = Unix.gettimeofday () in
+         (match r_open with
           | Error error -> Error (Types.Restore_failed (Storage.diagnostic_error ~operation:"attachGraph" error))
           | Ok connection ->
             let callbacks = Storage.connection_callbacks connection in
@@ -6651,7 +6682,9 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                     !installed_listener;
                   ignore (Storage.close callbacks)))
               (fun () ->
-                 match Storage.restore_database connection with
+                 let r_restore = Storage.restore_database connection in
+                 let t_restore = Unix.gettimeofday () in
+                 match r_restore with
                  | Error error ->
                    Error (Types.Restore_failed (Storage.diagnostic_error ~operation:"attachGraph" error))
                  | Ok authoritative_database ->
@@ -6680,10 +6713,22 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                             (Storage.datascript_storage connection))
                        ~callbacks
                    in
+                   let t_tail = Unix.gettimeofday () in
                    let release_slot = ref None in
                    let checkpoint_metadata =
                      Storage.sync_metadata connection |> Result.get_ok
                    in
+                   let t_meta = Unix.gettimeofday () in
+                   Printf.eprintf
+                     "journal-startup: {\"stage\":\"overlay.open_owned\",\"outbox_ms\":%.2f,\"receipts_ms\":%.2f,\"migrate_ms\":%.2f,\"storage_open_ms\":%.2f,\"storage_restore_ms\":%.2f,\"tail_session_ms\":%.2f,\"sync_meta_ms\":%.2f,\"total_ms\":%.2f}\n%!"
+                     ((t_outbox -. t0) *. 1000.)
+                     ((t_receipts -. t_outbox) *. 1000.)
+                     ((t_migrate -. t_receipts) *. 1000.)
+                     ((t_storage_open -. t_migrate) *. 1000.)
+                     ((t_restore -. t_storage_open) *. 1000.)
+                     ((t_tail -. t_restore) *. 1000.)
+                     ((t_meta -. t_tail) *. 1000.)
+                     ((t_meta -. t0) *. 1000.);
                    let checkpoint =
                      match inspection.presence with
                      | Types.Available { checkpoint; _ } -> checkpoint

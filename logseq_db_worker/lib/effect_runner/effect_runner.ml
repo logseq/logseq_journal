@@ -1531,6 +1531,7 @@ let read_typed
         | _ -> Ok version) in
     match query with
     |Read.Timeline_read {query=timeline_query;after}->with_snapshot(fun snapshot record _ ->
+      let t_query_start = Unix.gettimeofday () in
       let module Timeline=Read.Timeline in
       let source_error error = match error with
         |Overlay.Read_limit_exceeded->Timeline.Limit_exceeded "Timeline source exceeded its structural bound"
@@ -1604,6 +1605,17 @@ let read_typed
             else if limit>1 then bounded(max 1(limit/2))
             else Error(Timeline.Limit_exceeded "Timeline packet exceeds its final encoded byte bound")) in
           bounded limit))) in
+      (let elapsed_ms = (Unix.gettimeofday () -. t_query_start) *. 1000. in
+       if elapsed_ms >= 2. then
+         let kind = match timeline_query with
+           | Timeline.Dates _ -> "dates"
+           | Roots _ -> "roots"
+           | Roots_through_grandchildren _ -> "roots_filtered"
+           | Preview_children _ -> "preview_children"
+         in
+         Printf.eprintf
+           "journal-startup: {\"stage\":\"worker.timeline_read\",\"kind\":%S,\"elapsed_ms\":%.2f}\n%!"
+           kind elapsed_ms);
       Ok value)
     |Read.Timeline_check receipts->with_snapshot(fun snapshot _ _ ->
       let module Timeline=Read.Timeline in
@@ -2641,7 +2653,9 @@ let release_host_copy t ~registration =match t.host_copy with
 
 let handle_sync_worker_effect t = function
   | Sync.Inspect_mirror request ->
+    let t0 = Unix.gettimeofday () in
     let recovery = with_staging_lock t (fun () -> recover_local_retirements t request.scope) in
+    let t1 = Unix.gettimeofday () in
     (match recovery with
      | Error message -> Error (effect_error message)
      | Ok () ->
@@ -2653,15 +2667,23 @@ let handle_sync_worker_effect t = function
      with
      | Error error -> Error (mirror_error error)
      | Ok inspection ->
+       let t2 = Unix.gettimeofday () in
        Hashtbl.replace
          t.inspections
          (Graph.Uuid.to_string request.graph.graph_id)
          inspection;
-       (match Database.mirror_presence inspection with
-        | Overlay.Absent _ ->
-          Ok (sync_result ~event:(Sync.Mirror_inspected (Mirror_absent request.scope)) ())
-        | Available _ ->
-             Ok (sync_result ~event:(Sync.Mirror_inspected (Mirror_available request)) ()))))
+       let presence_label, event =
+         match Database.mirror_presence inspection with
+         | Overlay.Absent _ -> "absent", Sync.Mirror_inspected (Mirror_absent request.scope)
+         | Available _ -> "available", Sync.Mirror_inspected (Mirror_available request)
+       in
+       Printf.eprintf
+         "journal-startup: {\"stage\":\"worker.inspect_mirror\",\"presence\":%S,\"recover_ms\":%.2f,\"inspect_ms\":%.2f,\"total_ms\":%.2f}\n%!"
+         presence_label
+         ((t1 -. t0) *. 1000.)
+         ((t2 -. t1) *. 1000.)
+         ((t2 -. t0) *. 1000.);
+       Ok (sync_result ~event ())))
   | Activate_snapshot request ->
     let key = Graph.Uuid.to_string (Sync.snapshot_activation_scope request).graph_id in
     (match Hashtbl.find_opt t.inspections key with
@@ -2830,6 +2852,7 @@ let handle_sync_worker_effect t = function
     in
     Ok (sync_result ~event:(Sync.Mirror_deleted (request, result)) ())
   | Attach_graph request ->
+    let t0 = Unix.gettimeofday () in
     (match t.latest_snapshot with
      | Some snapshot when snapshot.resident_graphs<>[] -> ()
      | _ -> ignore (close_attached t));
@@ -2837,11 +2860,13 @@ let handle_sync_worker_effect t = function
     (match Hashtbl.find_opt t.inspections key with
      | None -> Error (effect_error "The graph attachment inspection is stale.")
      | Some inspection ->
+       let t_open_start = Unix.gettimeofday () in
        (match
           Database.open_ ~sw:t.sw t.dependencies.overlay inspection ~graph_name:request.graph.name
         with
         | Error error -> Error (open_error error)
         | Ok database ->
+          let t_open_end = Unix.gettimeofday () in
           (match Database.listen database with
            | Error error ->
              ignore (Database.close database);
@@ -2873,7 +2898,9 @@ let handle_sync_worker_effect t = function
                 ignore (close_database_by_id t database_id);
                 Error (listen_error error)
               | Ok () ->
+                let t_listen_end = Unix.gettimeofday () in
                 let sync = Database.inspect_sync database in
+                let t_sync_end = Unix.gettimeofday () in
                 let opened =
                   Core.database_opened ~database_id ~graph_id:request.graph.graph_id
                 in
@@ -2882,6 +2909,12 @@ let handle_sync_worker_effect t = function
                    ignore (close_database_by_id t database_id);
                    Error (sync_read_error error)
                  | Ok sync ->
+                   Printf.eprintf
+                     "journal-startup: {\"stage\":\"worker.attach_graph\",\"open_ms\":%.2f,\"listen_ms\":%.2f,\"inspect_sync_ms\":%.2f,\"total_ms\":%.2f}\n%!"
+                     ((t_open_end -. t_open_start) *. 1000.)
+                     ((t_listen_end -. t_open_end) *. 1000.)
+                     ((t_sync_end -. t_listen_end) *. 1000.)
+                     ((t_sync_end -. t0) *. 1000.);
                    Ok
                      (sync_result
                         ~event:(Sync.Graph_attached { scope = request.scope; sync })

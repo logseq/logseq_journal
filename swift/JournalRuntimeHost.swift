@@ -67,19 +67,30 @@ struct JournalRuntimeHost: View {
     .background(JournalEnvironmentObserver { platform.pushEnvironment($0) })
     .task(id: startupRevision) {
       if runtime == nil && startingRuntime == nil {
+        let startupLogger = Logger(subsystem: "com.logseq.journal", category: "startup")
+        let t0 = ProcessInfo.processInfo.systemUptime
         do {
           let next = try JournalRuntime(
             platform: platform,
             startupPayload: payload,
             extensionRegistry: extensions)
+          let t1 = ProcessInfo.processInfo.systemUptime
+          startupLogger.info("journal-startup stage=host.runtime.created elapsed_ms=\(Int(((t1 - t0) * 1000).rounded()), privacy: .public) since_start_ms=\(Int(((t1 - t0) * 1000).rounded()), privacy: .public)")
           startingRuntime = next
           do {
             try next.start()
+            let t2 = ProcessInfo.processInfo.systemUptime
+            startupLogger.info("journal-startup stage=host.runtime.started elapsed_ms=\(Int(((t2 - t1) * 1000).rounded()), privacy: .public) since_start_ms=\(Int(((t2 - t0) * 1000).rounded()), privacy: .public)")
             try await next.waitForInitialPlatformRequests()
+            let t3 = ProcessInfo.processInfo.systemUptime
+            startupLogger.info("journal-startup stage=host.initial_platform_requests.done elapsed_ms=\(Int(((t3 - t2) * 1000).rounded()), privacy: .public) since_start_ms=\(Int(((t3 - t0) * 1000).rounded()), privacy: .public)")
+            try await next.waitForStartupContent()
             try Task.checkCancellation()
             guard startingRuntime === next else { throw CancellationError() }
             runtime = next
             startingRuntime = nil
+            let t4 = ProcessInfo.processInfo.systemUptime
+            startupLogger.info("journal-startup stage=host.root.mounted elapsed_ms=\(Int(((t4 - t3) * 1000).rounded()), privacy: .public) since_start_ms=\(Int(((t4 - t0) * 1000).rounded()), privacy: .public)")
           } catch {
             if next.stop() {
               if startingRuntime === next {

@@ -12,20 +12,39 @@ let valid_key key =
 ;;
 
 let initialize_database db =
-  Result.bind
-    (rc_result
-       db
-       (Sqlite3.exec
-          db
-          "CREATE TABLE IF NOT EXISTS overlay_mutation_receipts (receipt_key TEXT \
-           PRIMARY KEY CHECK(length(receipt_key) = 64), receipt TEXT NOT NULL)"))
-    (fun () ->
-       rc_result
+  let existing = ref 0 in
+  let check =
+    rc_result
+      db
+      (Sqlite3.exec
+         db
+         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN \
+          ('overlay_mutation_receipts', 'overlay_terminal_batch_receipts')"
+         ~cb:(fun row _ ->
+           match row.(0) with
+           | Some count ->
+             (match int_of_string_opt count with
+              | Some n -> existing := n
+              | None -> ())
+           | None -> ()))
+  in
+  match check with
+  | Ok () when !existing = 2 -> Ok ()
+  | _ ->
+    Result.bind
+      (rc_result
          db
          (Sqlite3.exec
             db
-            "CREATE TABLE IF NOT EXISTS overlay_terminal_batch_receipts (batch_key TEXT \
-             PRIMARY KEY CHECK(length(batch_key) = 64), receipt TEXT NOT NULL)"))
+            "CREATE TABLE IF NOT EXISTS overlay_mutation_receipts (receipt_key TEXT \
+             PRIMARY KEY CHECK(length(receipt_key) = 64), receipt TEXT NOT NULL)"))
+      (fun () ->
+         rc_result
+           db
+           (Sqlite3.exec
+              db
+              "CREATE TABLE IF NOT EXISTS overlay_terminal_batch_receipts (batch_key TEXT \
+               PRIMARY KEY CHECK(length(batch_key) = 64), receipt TEXT NOT NULL)"))
 ;;
 
 let read_database db =
