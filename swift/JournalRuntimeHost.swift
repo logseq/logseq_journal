@@ -252,11 +252,8 @@ struct JournalHost: View {
               signIn: { signInStartsImmediately = true; signInPresented = true },
               retry: platform.accountIssue?.stage == .bindingRead ? nil : { platform.retryOnline() })
           }
-          JournalRuntimeHost(
-            platform: platform,
-            payload: setup.payload,
-            extensions: setup.extensions,
-            prestarted: setup.prestartedRuntime)
+          JournalRuntimeHost(platform: platform, payload: setup.payload,
+            extensions: setup.extensions, prestarted: setup.prestartedRuntime)
             .font(.body)
         }
       }
@@ -271,14 +268,14 @@ struct JournalHost: View {
       if phase == .background { lifecycle(backgrounded: true) }
       else if phase == .active { lifecycle(backgrounded: false) }
     }
-    .onChange(of: platform.authenticationRequired) { _, required in
+    .onChange(of: platform.authenticationRequired, initial: true) { _, required in
       if required && platform.localAccountAvailable == false && !signInPresented {
         signInStartsImmediately = false; signInPresented = true
       }
       // The authentication owner closes its sheet after account preparation.
       // Closing on the intermediate native identity update can cancel that work.
     }
-    .onChange(of: platform.localAccountAvailable) { _, available in
+    .onChange(of: platform.localAccountAvailable, initial: true) { _, available in
       if available == false && platform.authenticationRequired && !signInPresented {
         signInStartsImmediately = false; signInPresented = true
       }
