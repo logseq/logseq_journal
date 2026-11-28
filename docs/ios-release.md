@@ -68,7 +68,10 @@ import keys, or alter Keychain permissions. A macOS signing permission prompt
 must be handled locally by its owner. Do not weaken access controls to suppress it.
 
 Export preserves version/build numbers, verifies dSYM UUIDs at archive time, and
-writes `export/verification.json`. Final IPA verification checks its SHA256,
+writes `export/verification.json`. The export lane temporarily limits child
+processes to system paths because Xcode's `/usr/bin/rsync` delegates to `rsync`
+from `PATH`; Homebrew rsync rejects the legacy flags used by Xcode export.
+Final IPA verification checks its SHA256,
 Bundle, Team, version/build, device family, encryption declaration, source SHA,
 experimental provenance, code signature, App Store profile, signed entitlements,
 certificate membership, arm64 architecture and iPhoneOS Mach-O platform. Source
