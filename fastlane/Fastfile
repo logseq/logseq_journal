@@ -83,4 +83,16 @@ platform :ios do
       proof: JSON.parse(File.read(o.fetch(:receipt_check))),retry_upload: o[:retry_upload]==true || o[:retry_upload]=='true')
     UI.user_error!('Upload failed or remains uncertain; inspect sanitized attempt and Apple before retry') unless report['status']=='tool_reported_success'
   end
+
+  desc 'Automated TestFlight publish: upload, wait for processing, assign only the internal Logseq Team group, then verify it'
+  lane :publish do |o|
+    ipa=File.expand_path(o.fetch(:ipa))
+    wait_timeout=(o[:wait_timeout] || 3600).to_i
+    UI.user_error!('wait_timeout must be a positive number of seconds') unless wait_timeout.positive?
+    package=JournalRelease.verify_ipa!(ipa: ipa,version: o.fetch(:version),build: o.fetch(:build),
+      sha256: o.fetch(:sha256),source_sha: o.fetch(:source),experimental: o[:experimental]==true || o[:experimental]=='true')
+    report=JournalRelease.publish!(package: package,ipa: ipa,state_dir: required_path(o,:state),
+      retry_upload: o[:retry_upload]==true || o[:retry_upload]=='true',wait_timeout: wait_timeout)
+    UI.user_error!('Publish failed or remains uncertain; inspect sanitized attempt and Apple before retry') unless report['status']=='published_to_logseq_team'
+  end
 end

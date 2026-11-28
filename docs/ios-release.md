@@ -68,7 +68,44 @@ Stable identity is `com.logseq.journal`, Developer Team `K378MFWK59`, ASC app
 `SOURCE_SHA` is the intended full source revision from the verified build receipt;
 the upload preflight requires an exact match in the IPA.
 
-Before **each attempt**, inspect that app's ASC Build Uploads and TestFlight
+### Automated TestFlight publish
+
+Use `ios publish` for the unattended path. It verifies the exact IPA offline,
+uses the App Store Connect API to reject a visible or active duplicate build,
+checks that no non-target beta group automatically receives all builds, uploads
+with Pilot, waits for processing, assigns only the internal **Logseq Team** group,
+and re-queries that assignment. It never selects all groups, invites testers,
+enables external testing or publishes to the App Store.
+
+Apple ID passwords are not sufficient for unattended group management: ASC web
+login requires interactive 2FA, and an app-specific password only authenticates
+the binary transporter. Provide a team App Store Connect API key with enough
+TestFlight/administration privilege through process environment variables, never
+lane arguments or files in Git:
+
+- `JOURNAL_ASC_KEY_ID`
+- `JOURNAL_ASC_ISSUER_ID`
+- `JOURNAL_ASC_PRIVATE_KEY` (PEM content) or `JOURNAL_ASC_PRIVATE_KEY_BASE64`
+
+The key can be created in ASC under Users and Access → Integrations → App Store
+Connect API. Keep the downloaded `.p8` outside Git. The lane reads key material
+into the release process, uses fastlane's API-key transporter support and does
+not store it in a credential manager.
+
+```sh
+bundle exec fastlane ios publish ipa:"$RELEASE_DIR/export/Journal.ipa" \
+  version:"$VERSION" build:"$BUILD" sha256:"$IPA_SHA256" source:"$SOURCE_SHA" experimental:true \
+  state:"$RELEASE_STATE" wait_timeout:3600
+```
+
+The automated preflight replaces the human receipt check below. If it reports
+that Apple has already received the build, follow that build instead of uploading
+again. If upload or processing fails after transport starts, preserve the ledger,
+inspect Apple, and only then use `retry_upload:true` under the existing rules.
+
+### Manual upload-only fallback
+
+Before **each manual attempt**, inspect that app's ASC Build Uploads and TestFlight
 records for the same version/build. Check for active uploads and confirm that
 automatic distribution cannot send the build to any non-target group. An empty
 build list alone does not resolve an interrupted transport or pending upload.
@@ -112,13 +149,14 @@ Altool can print `ERROR:` with exit 0. Full sanitized multiline/structured error
 are retained alongside the exit code. Never infer a password or ABI cause from
 a generic failure. Preserve the report, inspect Apple, then decide the next step.
 
-Upload explicitly skips submission, waiting and tester distribution. After Apple
-processing and compliance are resolved, assign only the existing internal
-**Logseq Team** group (`3fcd1cd3-cafa-44e4-987d-47a752174c32`) in ASC under separately
-authorized account access. Check the group belongs to Journal and verify build
-availability there. No lane selects all groups, invites testers, enables external
-testing or publishes to the App Store. App-specific upload credentials do not
-provide group-management access.
+`ios publish` waits for processing, assigns only the existing internal
+**Logseq Team** group (`3fcd1cd3-cafa-44e4-987d-47a752174c32`) and verifies the
+result through ASC before exiting successfully. The manual `ios upload` lane
+still skips submission, waiting and tester distribution. If that fallback is
+used, assign the same group later under separately authorized account access and
+verify build availability there. No lane selects all groups, invites testers,
+enables external testing or publishes to the App Store. App-specific upload
+credentials do not provide group-management access.
 
 ## Encryption declaration basis
 
