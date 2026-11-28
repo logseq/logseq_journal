@@ -156,8 +156,11 @@ module JournalRelease
     raise Failure, 'Uploaded build is not visible after processing' unless build
     assigned=target.fetch_builds.any? { |candidate| candidate.id==build.id }
     raise Failure, 'Logseq Team group is not assigned to the processed build' unless assigned
+    internal_state=build.build_beta_detail&.internal_build_state
+    internal_states=Spaceship::ConnectAPI::BuildBetaDetail::InternalState
     {'build_id'=>build.id,'processing_state'=>build.processing_state,
-     'ready_for_internal_testing'=>build.ready_for_internal_testing?,
+     'internal_build_state'=>internal_state,
+     'ready_for_internal_testing'=>[internal_states::READY_FOR_BETA_TESTING,internal_states::IN_BETA_TESTING].include?(internal_state),
      'target_group_id'=>target.id,'target_group_name'=>target.name,'target_group_assigned'=>true}
   end
 
