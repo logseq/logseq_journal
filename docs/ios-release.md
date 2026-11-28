@@ -52,7 +52,7 @@ than resetting the sequence if no prior sequence is visible or the four-digit
 suffix is exhausted.
 
 ```sh
-bundle exec fastlane ios prepare manifest:"$DEVICE_RECEIPT" lui:"$LUI_PACKAGE" \
+bundle exec fastlane ios prepare root:"$MAIN_WORKTREE" manifest:"$DEVICE_RECEIPT" lui:"$LUI_PACKAGE" \
   prepared:"$RELEASE_DIR/prepared" version:"$VERSION" build:"$BUILD" experimental:true
 bundle exec fastlane ios archive prepared:"$RELEASE_DIR/prepared" \
   archive:"$RELEASE_DIR/Journal.xcarchive" cache:"$RELEASE_CACHE"
