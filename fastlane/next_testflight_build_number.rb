@@ -3,7 +3,16 @@
 require_relative 'lib/journal_release'
 
 begin
-  puts JournalRelease.next_testflight_build_number!
+  result = nil
+  original_stdout = $stdout.dup
+  begin
+    $stdout.reopen(File::NULL, 'w')
+    result = JournalRelease.next_testflight_build_number!
+  ensure
+    $stdout.reopen(original_stdout)
+    original_stdout.close
+  end
+  puts result
 rescue StandardError => error
   secrets = ENV.values_at('JOURNAL_ASC_KEY_ID', 'JOURNAL_ASC_ISSUER_ID', 'JOURNAL_ASC_PRIVATE_KEY', 'JOURNAL_ASC_PRIVATE_KEY_BASE64')
   warn "#{error.class}: #{JournalRelease.redact(error.message, secrets: secrets)}"
