@@ -37,6 +37,20 @@ cache, `RELEASE_STATE` for durable attempt history, `DEVICE_RECEIPT` and
 the repository. Preserve old packages and attempt records. Use an unused release
 directory; serialize access to each cache.
 
+TestFlight build numbers use `yyyymmddXXXX`: the UTC date followed by a
+zero-padded four-digit global sequence. The sequence is not date-scoped and does
+not reset; each release adds one to the latest sequence visible in App Store
+Connect, including legacy dotted build numbers such as `1.5877.91`. Generate it
+immediately before preparation and use the same value for every later lane:
+
+```sh
+BUILD="$(bundle exec ruby fastlane/next_testflight_build_number.rb)"
+```
+
+The script requires the ASC API key environment described below. It fails rather
+than resetting the sequence if no prior sequence is visible or the four-digit
+suffix is exhausted.
+
 ```sh
 bundle exec fastlane ios prepare manifest:"$DEVICE_RECEIPT" lui:"$LUI_PACKAGE" \
   prepared:"$RELEASE_DIR/prepared" version:"$VERSION" build:"$BUILD" experimental:true

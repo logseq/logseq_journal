@@ -1,3 +1,5 @@
+require 'date'
+
 module JournalRelease
   class << self
     attr_accessor :transport
@@ -116,6 +118,25 @@ module JournalRelease
     parts=value.to_s.split('.')
     return value.to_s unless parts.all? { |part| part.match?(/\A\d+\z/) }
     parts.map { |part| part.to_i.to_s }.join('.')
+  end
+
+  def self.build_number_sequence(value)
+    text=value.to_s
+    return text.split('.').last.to_i if text.match?(/\A\d+(?:\.\d+)+\z/)
+    match=text.match(/\A(\d{4})(\d{2})(\d{2})(\d{4})\z/)
+    return unless match && Date.valid_date?(match[1].to_i,match[2].to_i,match[3].to_i)
+    match[4].to_i
+  end
+
+  def self.next_testflight_build_number!(api_key=asc_api_key!,now: Time.now.utc)
+    app=asc_app!(api_key)
+    builds=Spaceship::ConnectAPI::Build.all(app_id: app.id,platform: Spaceship::ConnectAPI::Platform::IOS,limit: 200)
+    sequences=builds.map { |build| build_number_sequence(build.version) }.compact
+    latest=sequences.max
+    raise Failure, 'No previous TestFlight build sequence is visible in App Store Connect' unless latest
+    sequence=latest+1
+    raise Failure, 'TestFlight build sequence exceeds the four-digit yyyymmddXXXX suffix' if sequence>9999
+    "#{now.utc.strftime('%Y%m%d')}#{format('%04d',sequence)}"
   end
 
   def self.release_version_queries(version)
