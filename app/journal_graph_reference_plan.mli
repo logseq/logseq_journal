@@ -41,17 +41,25 @@ val observe_creators
 (** {1 Minimal usage example}
 
     The caller supplies [ports], the current [source_epoch], a [creator_id]
-    from a Timeline block and handlers for [output]:
+    from a Timeline block and handlers for [output]. Retain each issued read
+    and its source epoch so its reply reaches the same plan:
     {[
       let plan = create ~localtime:Unix.localtime () in
-      let output =
-        observe_creators plan ~ports ~source_epoch (Seq.return creator_id)
+      let apply output =
+        Rrbvec.iter dispatch_request output.requests;
+        Rrbvec.iter publish_source output.updates
       in
-      Rrbvec.iter dispatch_request output.requests;
-      Rrbvec.iter publish_source output.updates;
-      plan
+      let on_page_reply ~source_epoch read lookup =
+        apply (receive_page plan ~ports ~source_epoch read lookup)
+      in
+      let on_outline_reply ~source_epoch read lookup =
+        apply (receive_outline plan ~ports ~source_epoch read lookup)
+      in
+      apply (observe_creators plan ~ports ~source_epoch (Seq.return creator_id));
+      (on_page_reply, on_outline_reply)
     ]}
-    Retain the plan for completions and later fragments. *)
+    A page miss can dispatch an outline lookup. A successful reply publishes
+    the profile label through [publish_source]. *)
 
 (** {1 Capability details} *)
 
