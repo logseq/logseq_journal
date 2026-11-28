@@ -56,7 +56,7 @@ module JournalTestFlightSigning
     p12_path = File.join(dir, 'distribution.p12')
     keychain_password = SecureRandom.hex(32)
     installed_profile = nil
-    installed_login_intermediate = false
+    login_intermediate_was_missing = false
     keychain_created = false
 
     profile_b64 = signing_secret!('JOURNAL_IOS_APPSTORE_PROFILE_BASE64')
@@ -113,9 +113,9 @@ module JournalTestFlightSigning
     rescue JournalRelease::Failure => error
       raise unless error.message.downcase.include?('unable to build chain') && File.file?(LOGIN_KEYCHAIN)
       unless security!('find-certificate', '-a', '-Z', LOGIN_KEYCHAIN).include?(intermediate_sha1)
-        # Xcode's trust lookup can require the public intermediate in login.
+        # Set ownership before import so an interruption still checks for cleanup.
+        login_intermediate_was_missing = true
         security!('import', intermediate, '-k', LOGIN_KEYCHAIN)
-        installed_login_intermediate = true
       end
       JournalRelease.run!(*sign_probe)
     end
@@ -144,7 +144,9 @@ module JournalTestFlightSigning
       end
     ensure
       begin
-        security!('delete-certificate', '-Z', intermediate_sha1, LOGIN_KEYCHAIN) if installed_login_intermediate
+        if login_intermediate_was_missing && security!('find-certificate', '-a', '-Z', LOGIN_KEYCHAIN).include?(intermediate_sha1)
+          security!('delete-certificate', '-Z', intermediate_sha1, LOGIN_KEYCHAIN)
+        end
       ensure
         if keychain_created
           # Deleting this keychain also removes its entry from the search list.
