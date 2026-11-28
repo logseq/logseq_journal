@@ -15,7 +15,8 @@ end
 platform :ios do
   desc 'Prepare an unsigned iPhone project from an explicitly experimental device build receipt'
   lane :prepare do |o|
-    JournalRelease.prepare!(root: JournalRelease::ROOT,manifest_path: File.expand_path(o.fetch(:manifest)),
+    root=o[:root].to_s.empty? ? JournalRelease::ROOT : File.expand_path(o[:root])
+    JournalRelease.prepare!(root: root,manifest_path: File.expand_path(o.fetch(:manifest)),
       lui: File.expand_path(o.fetch(:lui)),output: required_path(o,:prepared),
       version: o.fetch(:version),build: o.fetch(:build),experimental: o[:experimental]==true || o[:experimental]=='true')
   end
@@ -54,13 +55,20 @@ platform :ios do
     UI.user_error!('Export directory already exists; preserve it') if File.exist?(output)
     app=File.join(archive,'Products/Applications/JournalApp.app')
     JournalRelease.validate_info!(JournalRelease.read_plist(File.join(app,'Info.plist')),version: inputs.fetch('version'),build: inputs.fetch('build'),source_sha: inputs.fetch('source_sha'),experimental: true)
-    build_app(project: File.join(prepared,'Journal.xcodeproj'),scheme: 'Journal',
-      skip_build_archive: true,archive_path: archive,output_directory: output,output_name: 'Journal.ipa',
-      buildlog_path: File.join(output,'logs'),export_method: 'app-store',skip_profile_detection: true,xcodebuild_formatter: '',
-      export_options: {method: 'app-store-connect',destination: 'export',signingStyle: 'manual',
-        teamID: JournalRelease::TEAM,signingCertificate: identity,
-        provisioningProfiles: {JournalRelease::BUNDLE=>profile.fetch('UUID')},
-        manageAppVersionAndBuildNumber: false,uploadSymbols: true})
+    original_path=ENV['PATH']
+    begin
+      # Xcode's /usr/bin/rsync delegates to `rsync` from PATH; Homebrew rsync rejects its legacy export flags.
+      ENV['PATH']='/usr/bin:/bin:/usr/sbin:/sbin'
+      build_app(project: File.join(prepared,'Journal.xcodeproj'),scheme: 'Journal',
+        skip_build_archive: true,archive_path: archive,output_directory: output,output_name: 'Journal.ipa',
+        buildlog_path: File.join(output,'logs'),export_method: 'app-store',skip_profile_detection: true,xcodebuild_formatter: '',
+        export_options: {method: 'app-store-connect',destination: 'export',signingStyle: 'manual',
+          teamID: JournalRelease::TEAM,signingCertificate: identity,
+          provisioningProfiles: {JournalRelease::BUNDLE=>profile.fetch('UUID')},
+          manageAppVersionAndBuildNumber: false,uploadSymbols: true})
+    ensure
+      ENV['PATH']=original_path
+    end
     prepared_inputs(o)
     ipa=File.join(output,'Journal.ipa'); hash=Digest::SHA256.file(ipa).hexdigest
     report=JournalRelease.verify_ipa!(ipa: ipa,version: inputs.fetch('version'),build: inputs.fetch('build'),sha256: hash,source_sha: inputs.fetch('source_sha'),experimental: true)
@@ -82,5 +90,17 @@ platform :ios do
     report=JournalRelease.upload!(package: package,ipa: ipa,state_dir: required_path(o,:state),
       proof: JSON.parse(File.read(o.fetch(:receipt_check))),retry_upload: o[:retry_upload]==true || o[:retry_upload]=='true')
     UI.user_error!('Upload failed or remains uncertain; inspect sanitized attempt and Apple before retry') unless report['status']=='tool_reported_success'
+  end
+
+  desc 'Automated TestFlight publish: upload, wait for processing, assign only the internal Logseq Team group, then verify it'
+  lane :publish do |o|
+    ipa=File.expand_path(o.fetch(:ipa))
+    wait_timeout=(o[:wait_timeout] || 3600).to_i
+    UI.user_error!('wait_timeout must be a positive number of seconds') unless wait_timeout.positive?
+    package=JournalRelease.verify_ipa!(ipa: ipa,version: o.fetch(:version),build: o.fetch(:build),
+      sha256: o.fetch(:sha256),source_sha: o.fetch(:source),experimental: o[:experimental]==true || o[:experimental]=='true')
+    report=JournalRelease.publish!(package: package,ipa: ipa,state_dir: required_path(o,:state),
+      retry_upload: o[:retry_upload]==true || o[:retry_upload]=='true',wait_timeout: wait_timeout)
+    UI.user_error!('Publish failed or remains uncertain; inspect sanitized attempt and Apple before retry') unless report['status']=='published_to_logseq_team'
   end
 end

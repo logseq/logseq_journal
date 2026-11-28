@@ -148,8 +148,24 @@ module JournalRelease
         raise Failure, 'Existing attempt requires a fresh ASC check and explicit retry_upload:true' if !prior.empty? && !retry_upload
         raise Failure, 'Apple receipt must be resolved; successful upload cannot be retried' if prior.any? { |r| r['status']=='tool_reported_success' }
         age = Time.now.utc-Time.iso8601(proof.fetch('checked_utc'))
-        valid = @package.all? { |k,v| proof[k]==v } && age.between?(0,900) && proof['accepted_build_visible']==false && proof['active_upload']==false && proof['non_target_automatic_distribution']==false
-        raise Failure, 'Fresh exact-package ASC receipt check required (within 15 minutes)' unless valid
+        reasons=[]
+        reasons << 'package does not match the checked IPA' unless @package.all? { |k,v| proof[k]==v }
+        reasons << 'check is missing or older than 15 minutes' unless age.between?(0,900)
+        {
+          'accepted_build_visible'=>['visible-build evidence','a matching build is already visible'],
+          'active_upload'=>['active-upload evidence','a matching upload is active or already received'],
+          'non_target_automatic_distribution'=>['automatic-distribution evidence','a non-target beta group automatically receives builds']
+        }.each do |key,(label,positive)|
+          value=proof[key]
+          if value.nil?
+            reasons << "missing #{label}"
+          elsif value==true
+            reasons << positive
+          elsif value!=false
+            reasons << "invalid #{label}"
+          end
+        end
+        raise Failure, "Fresh exact-package ASC receipt check required: #{reasons.join('; ')}" unless reasons.empty?
         path=File.join(@directory,"#{key}-#{format('%04d',prior.length+1)}.json")
         record=@package.merge('started_utc'=>Time.now.utc.iso8601,'status'=>'failed_or_uncertain',
           'processing_state'=>'not_checked','distribution_changed'=>false)

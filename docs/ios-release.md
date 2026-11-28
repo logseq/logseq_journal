@@ -37,8 +37,50 @@ cache, `RELEASE_STATE` for durable attempt history, `DEVICE_RECEIPT` and
 the repository. Preserve old packages and attempt records. Use an unused release
 directory; serialize access to each cache.
 
+TestFlight build numbers use `yyyymmddXXXX`: the UTC date followed by a
+zero-padded four-digit global sequence. The sequence is not date-scoped and does
+not reset; each release adds one to the latest sequence visible in App Store
+Connect, including legacy dotted build numbers such as `1.5877.91`. Generate it
+immediately before preparation and use the same value for every later lane:
+
 ```sh
-bundle exec fastlane ios prepare manifest:"$DEVICE_RECEIPT" lui:"$LUI_PACKAGE" \
+BUILD="$(bundle exec ruby fastlane/next_testflight_build_number.rb)"
+```
+
+The script requires the ASC API key environment described below. It fails rather
+than resetting the sequence if no prior sequence is visible or the four-digit
+suffix is exhausted.
+
+### One-command TestFlight release
+
+`fastlane/release_testflight.sh` is the preferred operator entry when the intent
+is to publish the current `origin/main`. It requires a clean main checkout,
+verifies that checkout is still the remote main tip, generates the build number,
+runs prepare/archive/export, validates the exported IPA, re-checks the build
+sequence, source revision and IPA hash immediately before upload, then runs the
+automated publish lane. It intentionally refuses an existing `RELEASE_DIR` and a
+stale or dirty main checkout. It does not provision signing material or repair a
+keychain.
+
+```sh
+MAIN_WORKTREE="$MAIN_WORKTREE" \
+DEVICE_RECEIPT="$DEVICE_RECEIPT" \
+LUI_PACKAGE="$LUI_PACKAGE" \
+RELEASE_DIR="$RELEASE_DIR" \
+RELEASE_CACHE="$RELEASE_CACHE" \
+RELEASE_STATE="$RELEASE_STATE" \
+EXISTING_APPSTORE_PROFILE="$EXISTING_APPSTORE_PROFILE" \
+EXISTING_CERTIFICATE_SHA1="$EXISTING_CERTIFICATE_SHA1" \
+fastlane/release_testflight.sh
+```
+
+The script stores step logs and a small `release-summary.json` in the external
+release directory. For debugging or staged manual operation, the same path can
+still be run lane by lane:
+
+```sh
+BUILD="$(bundle exec ruby fastlane/next_testflight_build_number.rb)"
+bundle exec fastlane ios prepare root:"$MAIN_WORKTREE" manifest:"$DEVICE_RECEIPT" lui:"$LUI_PACKAGE" \
   prepared:"$RELEASE_DIR/prepared" version:"$VERSION" build:"$BUILD" experimental:true
 bundle exec fastlane ios archive prepared:"$RELEASE_DIR/prepared" \
   archive:"$RELEASE_DIR/Journal.xcarchive" cache:"$RELEASE_CACHE"
@@ -54,7 +96,10 @@ import keys, or alter Keychain permissions. A macOS signing permission prompt
 must be handled locally by its owner. Do not weaken access controls to suppress it.
 
 Export preserves version/build numbers, verifies dSYM UUIDs at archive time, and
-writes `export/verification.json`. Final IPA verification checks its SHA256,
+writes `export/verification.json`. The export lane temporarily limits child
+processes to system paths because Xcode's `/usr/bin/rsync` delegates to `rsync`
+from `PATH`; Homebrew rsync rejects the legacy flags used by Xcode export.
+Final IPA verification checks its SHA256,
 Bundle, Team, version/build, device family, encryption declaration, source SHA,
 experimental provenance, code signature, App Store profile, signed entitlements,
 certificate membership, arm64 architecture and iPhoneOS Mach-O platform. Source
@@ -68,7 +113,44 @@ Stable identity is `com.logseq.journal`, Developer Team `K378MFWK59`, ASC app
 `SOURCE_SHA` is the intended full source revision from the verified build receipt;
 the upload preflight requires an exact match in the IPA.
 
-Before **each attempt**, inspect that app's ASC Build Uploads and TestFlight
+### Automated TestFlight publish
+
+Use `ios publish` for the unattended path. It verifies the exact IPA offline,
+uses the App Store Connect API to reject a visible or active duplicate build,
+checks that no non-target beta group automatically receives all builds, uploads
+with Pilot, waits for processing, assigns only the internal **Logseq Team** group,
+and re-queries that assignment. It never selects all groups, invites testers,
+enables external testing or publishes to the App Store.
+
+Apple ID passwords are not sufficient for unattended group management: ASC web
+login requires interactive 2FA, and an app-specific password only authenticates
+the binary transporter. Provide a team App Store Connect API key with enough
+TestFlight/administration privilege through process environment variables, never
+lane arguments or files in Git:
+
+- `JOURNAL_ASC_KEY_ID`
+- `JOURNAL_ASC_ISSUER_ID`
+- `JOURNAL_ASC_PRIVATE_KEY` (PEM content) or `JOURNAL_ASC_PRIVATE_KEY_BASE64`
+
+The key can be created in ASC under Users and Access → Integrations → App Store
+Connect API. Keep the downloaded `.p8` outside Git. The lane reads key material
+into the release process, uses fastlane's API-key transporter support and does
+not store it in a credential manager.
+
+```sh
+bundle exec fastlane ios publish ipa:"$RELEASE_DIR/export/Journal.ipa" \
+  version:"$VERSION" build:"$BUILD" sha256:"$IPA_SHA256" source:"$SOURCE_SHA" experimental:true \
+  state:"$RELEASE_STATE" wait_timeout:3600
+```
+
+The automated preflight replaces the human receipt check below. If it reports
+that Apple has already received the build, follow that build instead of uploading
+again. If upload or processing fails after transport starts, preserve the ledger,
+inspect Apple, and only then use `retry_upload:true` under the existing rules.
+
+### Manual upload-only fallback
+
+Before **each manual attempt**, inspect that app's ASC Build Uploads and TestFlight
 records for the same version/build. Check for active uploads and confirm that
 automatic distribution cannot send the build to any non-target group. An empty
 build list alone does not resolve an interrupted transport or pending upload.
@@ -112,13 +194,14 @@ Altool can print `ERROR:` with exit 0. Full sanitized multiline/structured error
 are retained alongside the exit code. Never infer a password or ABI cause from
 a generic failure. Preserve the report, inspect Apple, then decide the next step.
 
-Upload explicitly skips submission, waiting and tester distribution. After Apple
-processing and compliance are resolved, assign only the existing internal
-**Logseq Team** group (`3fcd1cd3-cafa-44e4-987d-47a752174c32`) in ASC under separately
-authorized account access. Check the group belongs to Journal and verify build
-availability there. No lane selects all groups, invites testers, enables external
-testing or publishes to the App Store. App-specific upload credentials do not
-provide group-management access.
+`ios publish` waits for processing, assigns only the existing internal
+**Logseq Team** group (`3fcd1cd3-cafa-44e4-987d-47a752174c32`) and verifies the
+result through ASC before exiting successfully. The manual `ios upload` lane
+still skips submission, waiting and tester distribution. If that fallback is
+used, assign the same group later under separately authorized account access and
+verify build availability there. No lane selects all groups, invites testers,
+enables external testing or publishes to the App Store. App-specific upload
+credentials do not provide group-management access.
 
 ## Encryption declaration basis
 

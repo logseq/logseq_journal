@@ -1,3 +1,5 @@
+require 'date'
+
 module JournalRelease
   class << self
     attr_accessor :transport
@@ -24,8 +26,9 @@ module JournalRelease
         text=(defined?(@all_lines) && @all_lines ? @all_lines.join : '')
         errors=(defined?(@errors) && @errors ? @errors.join("\n") : '')
         JournalRelease.transport ||= {}
-        JournalRelease.transport[:output]=JournalRelease.redact(text,secrets: [ENV['JOURNAL_UPLOAD_PASSWORD']])
-        JournalRelease.transport[:errors]=JournalRelease.redact(errors,secrets: [ENV['JOURNAL_UPLOAD_PASSWORD']])
+        secrets=[ENV['JOURNAL_UPLOAD_PASSWORD'],ENV['JOURNAL_ASC_APPLE_ID_PASSWORD'],ENV['FASTLANE_PASSWORD']]
+        JournalRelease.transport[:output]=JournalRelease.redact(text,secrets: secrets)
+        JournalRelease.transport[:errors]=JournalRelease.redact(errors,secrets: secrets)
       end
     end)
     FastlaneCore::ItunesTransporter.prepend(Module.new do
@@ -34,6 +37,225 @@ module JournalRelease
       end
     end)
     @hooks_installed=true
+  end
+
+  def self.release_secret!(name)
+    value=ENV[name].to_s
+    raise Failure, "#{name} is required; provide it through the process environment only" if value.empty?
+    value
+  end
+
+  def self.wipe(value)
+    value.replace("\0"*value.bytesize) unless value.to_s.empty?
+  end
+
+  def self.normalize_private_key_pem(key)
+    header='-----BEGIN PRIVATE KEY-----'; footer='-----END PRIVATE KEY-----'
+    compact=key.strip
+    return key if compact.include?("\n") || !compact.start_with?(header) || !compact.end_with?(footer)
+    body=compact[header.length...-footer.length].to_s.gsub(/\s+/,'')
+    "#{header}\n#{body.scan(/.{1,64}/).join("\n")}\n#{footer}\n"
+  end
+
+  def self.asc_api_key!
+    require 'base64'
+    key_id=release_secret!('JOURNAL_ASC_KEY_ID')
+    issuer_id=release_secret!('JOURNAL_ASC_ISSUER_ID')
+    key=ENV['JOURNAL_ASC_PRIVATE_KEY'].to_s.dup
+    if key.empty? && !ENV['JOURNAL_ASC_PRIVATE_KEY_BASE64'].to_s.empty?
+      begin
+        key=Base64.strict_decode64(ENV['JOURNAL_ASC_PRIVATE_KEY_BASE64'])
+      rescue ArgumentError
+        raise Failure, 'JOURNAL_ASC_PRIVATE_KEY_BASE64 is not valid base64'
+      end
+    end
+    raise Failure, 'JOURNAL_ASC_PRIVATE_KEY or JOURNAL_ASC_PRIVATE_KEY_BASE64 is required' if key.empty?
+    key=normalize_private_key_pem(key)
+    raise Failure, 'ASC private key must be PEM content, not a path or lane argument' unless key.include?('-----BEGIN PRIVATE KEY-----')
+    {'key_id'=>key_id,'issuer_id'=>issuer_id,'key'=>key,'duration'=>1140,'in_house'=>false}
+  end
+
+  def self.wipe_api_key(api_key)
+    wipe(api_key['key']) if api_key['key'].is_a?(String)
+  end
+
+  def self.with_release_environment(api_key)
+    saved=ENV.to_h
+    begin
+      ENV.keys.each { |key| ENV.delete(key) unless %w[PATH HOME TMPDIR LANG LC_ALL TERM USER LOGNAME BUNDLE_GEMFILE BUNDLE_PATH BUNDLE_APP_CONFIG].include?(key) }
+      ENV['FASTLANE_OPT_OUT_USAGE']='1'; ENV['FASTLANE_SKIP_UPDATE_CHECK']='1'
+      ENV['FASTLANE_DONT_STORE_PASSWORD']='1'; ENV['FASTLANE_USER']=ACCOUNT
+      yield
+    ensure
+      ENV.replace(saved)
+      wipe_api_key(api_key)
+    end
+  end
+
+  def self.connect_api_login!(api_key)
+    require 'spaceship'
+    return unless Spaceship::ConnectAPI.client.nil?
+    token=Spaceship::ConnectAPI::Token.from(hash: api_key.transform_keys(&:to_sym))
+    raise Failure, 'ASC API key could not initialize a token' unless token
+    Spaceship::ConnectAPI.token=token
+  end
+
+  def self.asc_app!(api_key)
+    connect_api_login!(api_key)
+    app=Spaceship::ConnectAPI::App.get(app_id: APP_ID)
+    raise Failure, 'ASC app is unavailable or bundle ID differs' unless app && app.bundle_id==BUNDLE
+    app
+  end
+
+  def self.logseq_team_group!(groups)
+    group=groups.find { |candidate| candidate.id==INTERNAL_GROUP_ID }
+    valid=group && group.name==INTERNAL_GROUP && group.is_internal_group
+    raise Failure, 'Logseq Team internal tester group is unavailable on the Journal app' unless valid
+    group
+  end
+
+  def self.apple_version_value(value)
+    parts=value.to_s.split('.')
+    return value.to_s unless parts.all? { |part| part.match?(/\A\d+\z/) }
+    parts.map { |part| part.to_i.to_s }.join('.')
+  end
+
+  def self.build_number_sequence(value)
+    text=value.to_s
+    return text.split('.').last.to_i if text.match?(/\A\d+(?:\.\d+)+\z/)
+    match=text.match(/\A(\d{4})(\d{2})(\d{2})(\d{4})\z/)
+    return unless match && Date.valid_date?(match[1].to_i,match[2].to_i,match[3].to_i)
+    match[4].to_i
+  end
+
+  def self.next_testflight_build_number!(api_key=asc_api_key!,now: Time.now.utc)
+    app=asc_app!(api_key)
+    builds=Spaceship::ConnectAPI::Build.all(app_id: app.id,platform: Spaceship::ConnectAPI::Platform::IOS,limit: 200)
+    upload_pages=Spaceship::ConnectAPI.get_build_uploads(app_id: app.id,filter: {platform: 'IOS'},limit: 200).all_pages
+    upload_builds=upload_pages.flat_map(&:to_models).map(&:cf_build_version)
+    sequences=(builds.map(&:version)+upload_builds).map { |build| build_number_sequence(build) }.compact
+    latest=sequences.max
+    raise Failure, 'No previous TestFlight build sequence is visible in App Store Connect' unless latest
+    sequence=latest+1
+    raise Failure, 'TestFlight build sequence exceeds the four-digit yyyymmddXXXX suffix' if sequence>9999
+    "#{now.utc.strftime('%Y%m%d')}#{format('%04d',sequence)}"
+  end
+
+  def self.release_version_queries(version)
+    canonical=apple_version_value(version)
+    segments=canonical.split('.')
+    alternate=if segments.length==3 && segments[2]=='0'
+      segments[0..1].join('.')
+    elsif segments.length==2
+      "#{canonical}.0"
+    end
+    [canonical,alternate].compact.uniq
+  end
+
+  def self.release_build_uploads(app_id:,version:,build:)
+    build_number=apple_version_value(build)
+    release_version_queries(version).flat_map do |query|
+      Spaceship::ConnectAPI::BuildUpload.all(app_id: app_id,version: query,build_number: build_number)
+    end.uniq(&:id)
+  end
+
+  def self.release_builds(app_id:,version:,build:,limit: 10)
+    build_number=apple_version_value(build)
+    release_version_queries(version).flat_map do |query|
+      Spaceship::ConnectAPI::Build.all(app_id: app_id,version: query,build_number: build_number,
+        platform: Spaceship::ConnectAPI::Platform::IOS,limit: limit)
+    end.uniq(&:id)
+  end
+
+  def self.build_upload_state(upload)
+    detail=upload.state
+    detail=detail['state'] || detail[:state] if detail.is_a?(Hash)
+    detail.to_s
+  end
+
+  def self.automatic_receipt_check!(package,api_key)
+    app=asc_app!(api_key)
+    version=package.fetch('version'); build=package.fetch('build')
+    uploads=release_build_uploads(app_id: app.id,version: version,build: build)
+    active=uploads.any? { |upload| build_upload_state(upload)!='FAILED' }
+    accepted=!release_builds(app_id: app.id,version: version,build: build).empty?
+    groups=app.get_beta_groups
+    target=logseq_team_group!(groups)
+    automatic=groups.any? do |group|
+      next false if group.id==target.id
+      group.has_access_to_all_builds==true || (group.is_internal_group==true && group.has_access_to_all_builds.nil?)
+    end
+    package.merge('checked_utc'=>Time.now.utc.iso8601,'accepted_build_visible'=>accepted,
+      'active_upload'=>active,'non_target_automatic_distribution'=>automatic,
+      'target_group_id'=>target.id,'target_group_name'=>target.name)
+  end
+
+  def self.verify_logseq_team_assignment!(package,api_key)
+    app=asc_app!(api_key)
+    target=logseq_team_group!(app.get_beta_groups)
+    build=release_builds(app_id: app.id,version: package.fetch('version'),build: package.fetch('build')).first
+    raise Failure, 'Uploaded build is not visible after processing' unless build
+    assigned=target.fetch_builds.any? { |candidate| candidate.id==build.id }
+    raise Failure, 'Logseq Team group is not assigned to the processed build' unless assigned
+    internal_state=build.build_beta_detail&.internal_build_state
+    internal_states=Spaceship::ConnectAPI::BuildBetaDetail::InternalState
+    {'build_id'=>build.id,'processing_state'=>build.processing_state,
+     'internal_build_state'=>internal_state,
+     'ready_for_internal_testing'=>[internal_states::READY_FOR_BETA_TESTING,internal_states::IN_BETA_TESTING].include?(internal_state),
+     'target_group_id'=>target.id,'target_group_name'=>target.name,'target_group_assigned'=>true}
+  end
+
+  def self.publish_options(ipa,version:,build:,wait_timeout:,api_key:)
+    options=upload_options(ipa,version: version,build: build)
+    options.delete(:username)
+    options.merge(
+      api_key: api_key.transform_keys(&:to_sym),
+      skip_waiting_for_build_processing: false,skip_submission: false,
+      distribute_external: false,groups: [INTERNAL_GROUP_ID],notify_external_testers: false,
+      uses_non_exempt_encryption: false,expire_previous_builds: false,
+      reject_build_waiting_for_review: false,submit_beta_review: false,
+      wait_processing_interval: 30,wait_processing_timeout_duration: wait_timeout)
+  end
+
+  def self.publish!(package:, ipa:, state_dir:, retry_upload: false, wait_timeout: 3600)
+    require 'pilot'
+    api_key=asc_api_key!
+    external!(state_dir)
+    with_snapshot(ipa,package.fetch('ipa_sha256')) do |snapshot|
+      with_release_environment(api_key) do
+        proof=automatic_receipt_check!(package,api_key)
+        Ledger.new(state_dir,package).attempt!(proof,retry_upload: retry_upload) do
+          puts "Publish #{BUNDLE} #{package.fetch('version')} (#{package.fetch('build')}) to Apple app #{APP_ID}, then assign only #{INTERNAL_GROUP}."
+          out,err=STDOUT.dup,STDERR.dup
+          result={'status'=>'failed_or_uncertain','stage'=>'pilot_configuration'}
+          begin
+            install_transport_hooks!; self.transport={}
+            config=FastlaneCore::Configuration.create(Pilot::Options.available_options,
+              publish_options(snapshot,version: package.fetch('version'),build: package.fetch('build'),wait_timeout: wait_timeout,api_key: api_key))
+            STDOUT.reopen(File::NULL,'w'); STDERR.reopen(File::NULL,'w')
+            err.puts('Uploading and waiting for Apple processing; group assignment will be verified after distribution.')
+            result['stage']='pilot_upload_process_distribute'
+            Pilot::BuildManager.new.upload(config)
+            observed=transport || {}
+            raise Failure, 'Transporter did not report a successful upload' unless transport_success?(observed[:exit_code],observed[:output].to_s) && observed[:errors].to_s.empty?
+            result['status']='tool_reported_success'
+            result['stage']='verify_logseq_team_assignment'
+            result['distribution']=verify_logseq_team_assignment!(package,api_key)
+            result['distribution_changed']=true
+            result['status']='published_to_logseq_team'
+          rescue StandardError => error
+            result['error_class']=error.class.name
+            result['error']=redact(error.message,secrets: api_key.values.map(&:to_s))
+          ensure
+            result['transport']=transport || {}
+            result['apple_error_codes']=JSON.generate(result).scan(/ITMS-\d+|(?:STATE|ENTITY)_ERROR\.[A-Z_.]+|\(-?\d{1,6}\)/).uniq
+            STDOUT.reopen(out); STDERR.reopen(err); out.close; err.close
+          end
+          puts JSON.pretty_generate(result)
+          result
+        end
+      end
+    end
   end
 
   def self.upload!(package:, ipa:, state_dir:, proof:, retry_upload: false)
