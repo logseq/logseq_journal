@@ -589,11 +589,15 @@ let test_named_tags_reach_timeline_row () =
        ignore (Lui_app.flush app);
        let ops = List.concat_map (fun (b : Lui_protocol.patch_batch) -> b.ops) !batches in
        Alcotest.(check bool)
-         "tag labels reach actual timeline UI"
+         "ordered tag labels reach Timeline details"
          true
          (List.exists
             (function
-              | Lui_protocol.SetProp (_, TextValue, StringValue "#户外  #周末计划") -> true
+              | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+                let payload = Yojson.Basic.from_string json in
+                let member = Yojson.Basic.Util.member in
+                member "mode" payload = `String "timeline-row"
+                && member "tags" payload = `List [ `String "户外"; `String "周末计划" ]
               | _ -> false)
             ops))
 ;;
