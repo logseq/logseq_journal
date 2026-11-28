@@ -61,7 +61,7 @@ module JournalRelease
     end
     raise Failure, 'JOURNAL_ASC_PRIVATE_KEY or JOURNAL_ASC_PRIVATE_KEY_BASE64 is required' if key.empty?
     raise Failure, 'ASC private key must be PEM content, not a path or lane argument' unless key.include?('-----BEGIN PRIVATE KEY-----')
-    {'key_id'=>key_id,'issuer_id'=>issuer_id,'key'=>key,'duration'=>1200,'in_house'=>false}
+    {'key_id'=>key_id,'issuer_id'=>issuer_id,'key'=>key,'duration'=>1140,'in_house'=>false}
   end
 
   def self.wipe_api_key(api_key)
