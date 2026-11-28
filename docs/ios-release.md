@@ -51,7 +51,35 @@ The script requires the ASC API key environment described below. It fails rather
 than resetting the sequence if no prior sequence is visible or the four-digit
 suffix is exhausted.
 
+### One-command TestFlight release
+
+`fastlane/release_testflight.sh` is the preferred operator entry when the intent
+is to publish the current `origin/main`. It requires a clean main checkout,
+verifies that checkout is still the remote main tip, generates the build number,
+runs prepare/archive/export, validates the exported IPA, re-checks the build
+sequence, source revision and IPA hash immediately before upload, then runs the
+automated publish lane. It intentionally refuses an existing `RELEASE_DIR` and a
+stale or dirty main checkout. It does not provision signing material or repair a
+keychain.
+
 ```sh
+MAIN_WORKTREE="$MAIN_WORKTREE" \
+DEVICE_RECEIPT="$DEVICE_RECEIPT" \
+LUI_PACKAGE="$LUI_PACKAGE" \
+RELEASE_DIR="$RELEASE_DIR" \
+RELEASE_CACHE="$RELEASE_CACHE" \
+RELEASE_STATE="$RELEASE_STATE" \
+EXISTING_APPSTORE_PROFILE="$EXISTING_APPSTORE_PROFILE" \
+EXISTING_CERTIFICATE_SHA1="$EXISTING_CERTIFICATE_SHA1" \
+fastlane/release_testflight.sh
+```
+
+The script stores step logs and a small `release-summary.json` in the external
+release directory. For debugging or staged manual operation, the same path can
+still be run lane by lane:
+
+```sh
+BUILD="$(bundle exec ruby fastlane/next_testflight_build_number.rb)"
 bundle exec fastlane ios prepare root:"$MAIN_WORKTREE" manifest:"$DEVICE_RECEIPT" lui:"$LUI_PACKAGE" \
   prepared:"$RELEASE_DIR/prepared" version:"$VERSION" build:"$BUILD" experimental:true
 bundle exec fastlane ios archive prepared:"$RELEASE_DIR/prepared" \
