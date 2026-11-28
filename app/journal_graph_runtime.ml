@@ -1559,11 +1559,12 @@ let hydration_for_changes t ~request_generation windows =
   in
   let creator_reads =
     let ports = reference_ports ~creator:true t in
+    (* Creator labels have a separate cache from the retained content. *)
     List.filter_map
-      (fun page ->
+      (fun creator ->
         Reference.plan_change t.creators ~ports
-          (Page_changed { id = Graph.Uuid.to_string page; detail_page_owned = (fun () -> false) }))
-      pages
+          (Block_changed { id = Graph.Uuid.to_string creator; journal_block_known = false }))
+      (List.sort_uniq Graph.Uuid.compare (blocks @ pages))
   in
   let tree_reads =
     List.filter_map
