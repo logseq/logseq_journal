@@ -54,13 +54,20 @@ platform :ios do
     UI.user_error!('Export directory already exists; preserve it') if File.exist?(output)
     app=File.join(archive,'Products/Applications/JournalApp.app')
     JournalRelease.validate_info!(JournalRelease.read_plist(File.join(app,'Info.plist')),version: inputs.fetch('version'),build: inputs.fetch('build'),source_sha: inputs.fetch('source_sha'),experimental: true)
-    build_app(project: File.join(prepared,'Journal.xcodeproj'),scheme: 'Journal',
-      skip_build_archive: true,archive_path: archive,output_directory: output,output_name: 'Journal.ipa',
-      buildlog_path: File.join(output,'logs'),export_method: 'app-store',skip_profile_detection: true,xcodebuild_formatter: '',
-      export_options: {method: 'app-store-connect',destination: 'export',signingStyle: 'manual',
-        teamID: JournalRelease::TEAM,signingCertificate: identity,
-        provisioningProfiles: {JournalRelease::BUNDLE=>profile.fetch('UUID')},
-        manageAppVersionAndBuildNumber: false,uploadSymbols: true})
+    original_path=ENV['PATH']
+    begin
+      # Xcode's /usr/bin/rsync delegates to `rsync` from PATH; Homebrew rsync rejects its legacy export flags.
+      ENV['PATH']='/usr/bin:/bin:/usr/sbin:/sbin'
+      build_app(project: File.join(prepared,'Journal.xcodeproj'),scheme: 'Journal',
+        skip_build_archive: true,archive_path: archive,output_directory: output,output_name: 'Journal.ipa',
+        buildlog_path: File.join(output,'logs'),export_method: 'app-store',skip_profile_detection: true,xcodebuild_formatter: '',
+        export_options: {method: 'app-store-connect',destination: 'export',signingStyle: 'manual',
+          teamID: JournalRelease::TEAM,signingCertificate: identity,
+          provisioningProfiles: {JournalRelease::BUNDLE=>profile.fetch('UUID')},
+          manageAppVersionAndBuildNumber: false,uploadSymbols: true})
+    ensure
+      ENV['PATH']=original_path
+    end
     prepared_inputs(o)
     ipa=File.join(output,'Journal.ipa'); hash=Digest::SHA256.file(ipa).hexdigest
     report=JournalRelease.verify_ipa!(ipa: ipa,version: inputs.fetch('version'),build: inputs.fetch('build'),sha256: hash,source_sha: inputs.fetch('source_sha'),experimental: true)
