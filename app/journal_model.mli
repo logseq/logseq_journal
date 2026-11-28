@@ -1,3 +1,8 @@
+(** {1 TLDR}
+
+    Represent a graph block for Journal presentation. The model holds local
+    projections of the content, metadata and typed graph properties. *)
+
 type task_state =
   | No_status
   | Status of string
@@ -29,6 +34,17 @@ val create
   -> last_mutation_id:string
   -> (t, string) result
 
+(** {1 Minimal usage example}
+
+    Given a [block] and its [graph_properties], retain those properties and read
+    the creator UUID when present:
+    {[
+      let block = with_properties block ~properties:graph_properties in
+      creator_id (properties block)
+    ]} *)
+
+(** {1 Construction and validation} *)
+
 val create_on_page
   :  id:string
   -> page_id:string
@@ -42,6 +58,8 @@ val create_on_page
   -> revision:string
   -> last_mutation_id:string
   -> (t, string) result
+
+(** {1 Observation and helpers} *)
 
 val id : t -> string
 val page_id : t -> string
@@ -70,6 +88,10 @@ val render_references : lookup:(string -> string option) -> string -> string
 
 (** Typed graph properties retained by the projection, including hidden ownership metadata. *)
 val properties : t -> Logseq_db_types.Graph_types.property_summary list
+(** Return the creator UUID when the ownership property contains one entity. *)
+val creator_id
+  :  Logseq_db_types.Graph_types.property_summary list
+  -> Logseq_db_types.Graph_types.Uuid.t option
 
 (** Property presentation projected with the active local-time context; semantic values remain in [properties]. *)
 val display_properties : t -> Logseq_db_types.Graph_types.property_summary list

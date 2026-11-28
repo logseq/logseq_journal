@@ -4,6 +4,10 @@ import SwiftUI
 import UIKit
 #endif
 
+private extension EnvironmentValues {
+  @Entry var journalTimelineDetails: Binding<Bool>? = nil
+}
+
 #if !os(iOS)
 private enum JournalFilterAccessibilityTarget: Hashable {
   case trigger, heading
@@ -241,6 +245,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
     case page, header, detail, unlock, startup
     case graphPages = "graph-pages"
     case timelineHost = "timeline-host"
+    case timelineInteraction = "timeline-interaction"
+    case timelineRow = "timeline-row"
     case graphPicker = "graph-picker"
     case toolbarControl = "toolbar-control"
     case bottomBar = "bottom-bar"
@@ -269,6 +275,105 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let units: [FilterChoice]
   }
 
+  private struct TimelineCreator: Decodable {
+    let id: String
+    let name: String
+
+    var initials: String {
+      let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+      let prefixLength = name.range(of: #"^[\p{Latin}\p{N}]"#, options: .regularExpression) == nil ? 1 : 2
+      return name.prefix(prefixLength).uppercased()
+    }
+
+    var tint: Color {
+      let seed = UInt32(id.prefix(8), radix: 16) ?? 0
+      return Color(hue: Double(seed % 360) / 360, saturation: 0.48, brightness: 0.85)
+    }
+  }
+
+  private struct TimelineMetadata: SwiftUI.View {
+    let time: String
+    let creator: TimelineCreator?
+    let tags: [String]
+
+    var body: some SwiftUI.View {
+      VStack(alignment: .trailing, spacing: 2) {
+        HStack(spacing: 4) {
+          if let creator {
+            let initials = creator.initials
+            Group {
+              if initials.isEmpty {
+                Image(systemName: "person.fill")
+              } else {
+                Text(initials).lineLimit(1).minimumScaleFactor(0.75)
+              }
+            }
+              .font(.system(size: 9, weight: .semibold))
+              .frame(width: 16, height: 16)
+              .background(creator.tint.opacity(0.35), in: Circle())
+              .foregroundStyle(.primary)
+              .accessibilityLabel(initials.isEmpty ? Text("Block creator") : Text(verbatim: creator.name))
+              .accessibilityIdentifier("journal-timeline-creator")
+          }
+          Text(time)
+            .font(.caption.monospacedDigit())
+            .lineLimit(1)
+            .minimumScaleFactor(0.65)
+            .frame(minHeight: 16)
+            .accessibilityIdentifier("journal-timeline-created-time")
+        }
+        if let first = tags.first {
+          HStack(spacing: 4) {
+            Text("#" + first).lineLimit(1)
+            if tags.count > 1 {
+              Text("+\(tags.count - 1)").fixedSize()
+            }
+          }
+          .font(.caption2)
+          .accessibilityElement(children: .ignore)
+          .accessibilityLabel(Text(verbatim: tags.map { "#" + $0 }.joined(separator: ", ")))
+          .accessibilityIdentifier("journal-timeline-tags")
+        }
+      }
+      .foregroundStyle(.secondary)
+    }
+  }
+
+  private struct TimelineRowLayout: Layout {
+    var detailProgress: CGFloat
+
+    var animatableData: CGFloat {
+      get { detailProgress }
+      set { detailProgress = newValue }
+    }
+
+    private func widths(for width: CGFloat) -> (body: CGFloat, metadata: CGFloat) {
+      let metadata = (width * 0.18).rounded(.down)
+      return (max(0, width - metadata - 8), metadata)
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+      let width = proposal.width ?? subviews[0].sizeThatFits(.unspecified).width
+      let widths = widths(for: width)
+      // Both presentations use the same row size, including rows with wrapping
+      // text or attachments. Switching changes only the native placement.
+      let compact = subviews[0].sizeThatFits(.init(width: width, height: nil))
+      let detail = subviews[0].sizeThatFits(.init(width: widths.body, height: nil))
+      let metadata = subviews[1].sizeThatFits(.init(width: widths.metadata, height: nil))
+      return CGSize(width: width, height: max(compact.height, detail.height, metadata.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+      let widths = widths(for: bounds.width)
+      let bodyWidth = bounds.width + (widths.body - bounds.width) * detailProgress
+      let metadataTrailingOutset: CGFloat = 14
+      subviews[0].place(at: bounds.origin, anchor: .topLeading,
+                        proposal: .init(width: bodyWidth, height: nil))
+      subviews[1].place(at: CGPoint(x: bounds.maxX + metadataTrailingOutset, y: bounds.minY), anchor: .topTrailing,
+                        proposal: .init(width: widths.metadata, height: nil))
+    }
+  }
+
   private struct Properties: Decodable {
     let mode: Mode
     let title: String?
@@ -277,6 +382,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let pending: Bool?
     let error: String?
     let text: String?
+    let creator: TimelineCreator?
+    let tags: [String]?
     let runs: [TitleRun]?
     let maxLines: Int?
     let id: String?
@@ -792,6 +899,51 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
   /// Syntax and reference resolution belong to OCaml; this maps presentation data.
   #if os(iOS)
+  private struct TimelineLeftPan: UIGestureRecognizerRepresentable {
+    let enabled: Bool
+    let toggle: () -> Void
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+      func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+        guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
+        let velocity = pan.velocity(in: pan.view)
+        return -velocity.x > abs(velocity.y) * 1.4
+      }
+
+      func gestureRecognizer(
+        _ recognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+      ) -> Bool {
+        // Keep the native list pan available for vertical scrolling.
+        guard let scrollView = other.view as? UIScrollView else { return false }
+        return other === scrollView.panGestureRecognizer
+      }
+    }
+
+    func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator { Coordinator() }
+
+    func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
+      let pan = UIPanGestureRecognizer()
+      pan.maximumNumberOfTouches = 1
+      pan.delegate = context.coordinator
+      pan.isEnabled = enabled
+      return pan
+    }
+
+    func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
+      recognizer.isEnabled = enabled
+    }
+
+    func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
+      guard recognizer.state == .ended, enabled else { return }
+      let translation = recognizer.translation(in: recognizer.view)
+      let distance = -translation.x
+      guard distance > abs(translation.y) * 1.4 else { return }
+      let speed = -recognizer.velocity(in: recognizer.view).x
+      if distance >= 48 || (distance >= 24 && speed > 500) { toggle() }
+    }
+  }
+
   /// Native direction admission fails before vertical List scrolling is claimed.
   private struct RightGraphPan: UIGestureRecognizerRepresentable {
     let enabled: Bool
@@ -1606,6 +1758,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
+    @Environment(\.journalTimelineDetails) private var timelineDetails
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var showsTimelineDetails = false
     #if os(iOS)
     @Environment(\.journalStartupClock) private var startupClock
     #endif
@@ -1618,6 +1773,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
     private var properties: Properties? {
       JournalExtensions.decode(Properties.self, context: context)
+    }
+
+    private var timelineModeAnimation: Animation? {
+      reduceMotion ? nil : .easeInOut(duration: 0.24)
     }
 
     private func child(_ index: Int) -> AnyView {
@@ -1646,7 +1805,44 @@ struct JournalSheetDismissButton: SwiftUI.View {
           #endif
         }
       case .timelineHost:
-        if context.childIDs.count==1 {child(0)}
+        if context.childIDs.count == 1 {
+          child(0).environment(\.journalTimelineDetails, $showsTimelineDetails)
+        }
+      case .timelineInteraction:
+        if let details = timelineDetails, context.childIDs.count == 1 {
+          let enabled = context.isUserInteractionEnabled
+          child(0)
+            #if os(iOS)
+            .gesture(TimelineLeftPan(enabled: enabled) { details.wrappedValue.toggle() })
+            #endif
+            .accessibilityActions {
+              if enabled {
+                Button(details.wrappedValue ? "Hide block metadata" : "Show block metadata") {
+                  details.wrappedValue.toggle()
+                }
+              }
+            }
+        } else {
+          child(0)
+        }
+      case .timelineRow:
+        if let details = timelineDetails, let time = properties?.text, context.childIDs.count == 1 {
+          let detailed = details.wrappedValue
+          TimelineRowLayout(detailProgress: detailed ? 1 : 0) {
+            child(0)
+            TimelineMetadata(time: time, creator: properties?.creator, tags: properties?.tags ?? [])
+              // Reveal the portion of the rail that the body has made room for.
+              .mask {
+                Rectangle().scaleEffect(x: detailed ? 1 : 0, y: 1, anchor: .trailing)
+              }
+              .opacity(detailed ? 1 : 0)
+              .accessibilityHidden(!detailed)
+              .allowsHitTesting(false)
+          }
+          .animation(timelineModeAnimation, value: detailed)
+        } else {
+          child(0)
+        }
       case .filterOverlay:
         #if os(iOS)
         child(0).background {

@@ -217,6 +217,15 @@ let source value =
 ;;
 
 let properties value = value.properties
+
+let creator_id properties =
+  List.find_map (fun (property : Graph.property_summary) ->
+    match property.ident, property.values with
+    | "logseq.property/created-by-ref", [ Graph.Entity_value uuid ] ->
+      Some uuid
+    | _ -> None) properties
+;;
+
 let display_properties value = value.display_properties
 let with_properties ?(localtime = Unix.localtime) value ~properties =
   let display_properties = List.map (fun (p : Graph.property_summary) ->

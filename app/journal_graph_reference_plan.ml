@@ -120,6 +120,7 @@ let reference_needs_read t id =
 let observe_reference_sources
       ?(missing_is_final = false)
       ?(extra_sources = Seq.empty)
+      ?(extra_references = Seq.empty)
       ?(known_sources = Seq.empty)
       t
       ~ports
@@ -160,35 +161,34 @@ let observe_reference_sources
       (Seq.append values known_sources)
   in
   let rec discover depth source =
-    if depth < Journal_model.maximum_reference_depth
-    then
-      List.iter
-        (fun id ->
-           let next_depth = depth + 1 in
-           let previous = Hashtbl.find_opt t.reference_depths id in
-           if
-             match previous with
-             | Some old ->
-               next_depth < old
-               || (next_depth = old
-                   && reference_needs_read t id
-                   && not (Hashtbl.mem t.reference_pending id))
-             | None -> Hashtbl.length t.reference_depths < maximum_reference_targets
-           then (
-             Hashtbl.replace t.reference_depths id next_depth;
-             match Hashtbl.find_opt t.reference_sources id with
-             | Some (_, Source_text source) ->
-               updates := Rrbvec.push_back !updates (id, Some source);
-               discover next_depth source
-             | Some (_, Source_missing) -> updates := Rrbvec.push_back !updates (id, None)
-             | Some (_, Source_retryable) | None ->
-               Option.iter
-                 (fun request -> reads := Rrbvec.push_back !reads request)
-                 (reference_read t ~ports id next_depth)))
-        (Journal_model.reference_ids source)
+    if depth < Journal_model.maximum_reference_depth then
+      List.iter (discover_id depth) (Journal_model.reference_ids source)
+  and discover_id depth id =
+    let next_depth = depth + 1 in
+    let previous = Hashtbl.find_opt t.reference_depths id in
+    if
+      match previous with
+      | Some old ->
+        next_depth < old
+        || (next_depth = old
+            && reference_needs_read t id
+            && not (Hashtbl.mem t.reference_pending id))
+      | None -> Hashtbl.length t.reference_depths < maximum_reference_targets
+    then (
+      Hashtbl.replace t.reference_depths id next_depth;
+      match Hashtbl.find_opt t.reference_sources id with
+      | Some (_, Source_text source) ->
+        updates := Rrbvec.push_back !updates (id, Some source);
+        discover next_depth source
+      | Some (_, Source_missing) -> updates := Rrbvec.push_back !updates (id, None)
+      | Some (_, Source_retryable) | None ->
+        Option.iter
+          (fun request -> reads := Rrbvec.push_back !reads request)
+          (reference_read t ~ports id next_depth))
   in
   Rrbvec.iter (fun (_, source) -> Option.iter (discover depth) source) values;
   Seq.iter (discover depth) extra_sources;
+  Seq.iter (discover_id depth) extra_references;
   { requests = !reads; updates = !updates }
 ;;
 
@@ -381,6 +381,26 @@ let observe_fragment t ~ports ~source_epoch ~sources ~changes ~property_blocks =
         (Rrbvec.to_seq values)
 
 ;;
+
+let observe_creators t ~ports ~source_epoch creator_ids =
+  let extra_references = Seq.map Graph.Uuid.to_string creator_ids in
+  (* Profile labels are terminal even if their text contains reference syntax. *)
+  observe_reference_sources ~extra_references t ~ports ~source_epoch
+    (Journal_model.maximum_reference_depth - 1) Seq.empty
+;;
+
+let refresh_creators t ~ports ids =
+  let source_epoch = ports.now () in
+  let now () = source_epoch in
+  Hashtbl.iter
+    (fun id _ ->
+      fence t ~now id;
+      if Hashtbl.mem t.reference_pending id then Hashtbl.replace t.reference_dirty id ())
+    t.reference_depths;
+  observe_creators t ~ports ~source_epoch ids
+;;
+
+
 let abandon t ~source_epoch (read : read) =
   Hashtbl.remove t.reference_pending read.block_id;
   Hashtbl.remove t.reference_dirty read.block_id;

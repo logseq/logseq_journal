@@ -26,17 +26,18 @@ let deliver ~runtime ~send (output : Journal_graph_runtime.output) =
     List.iter (fun request -> Queue.push request pending) requests;
     while not (Queue.is_empty pending) do
       let request = Queue.pop pending in
+      let optional = Journal_graph_runtime.optional_read runtime request in
       let retired = Journal_graph_runtime.fail_request ~error runtime request ~message in
       responses := Rrbvec.append_list !responses retired.responses;
       (* Owned durable business failures retain their retry obligation. A
-         refusal of any other work still reports a transport failure. *)
+         refusal of required work still reports a transport failure. *)
       let business_responses=List.filter(fun response->match response.Journal_graph_runtime.payload with
         | Diagnostic _->false | _->true) retired.responses in
-      if (business_responses=[] && retired.requests=[]) || not(List.for_all(fun response->
+      if not optional && ((business_responses=[] && retired.requests=[]) || not(List.for_all(fun response->
         match response.Journal_graph_runtime.payload with
         | Child_waiting _ | Capture_waiting _ | Mutation_waiting _
         | Child_not_admitted _ | Capture_not_admitted _ -> true
-        | _ -> false) business_responses) then fatal:=true;
+        | _ -> false) business_responses)) then fatal:=true;
       (* A failed completion can release queued work. It is still unsent and
          must be settled, not retried against the refusing Worker. *)
       List.iter (fun request -> Queue.push request pending) retired.requests
