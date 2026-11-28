@@ -3,6 +3,7 @@ require 'digest'
 require 'time'
 require 'fileutils'
 require 'open3'
+require 'tempfile'
 require 'tmpdir'
 require 'plist'
 
@@ -15,6 +16,10 @@ module JournalRelease
   INTERNAL_GROUP = 'Logseq Team'.freeze
   INTERNAL_GROUP_ID = '3fcd1cd3-cafa-44e4-987d-47a752174c32'.freeze
   ROOT = File.expand_path('../..', __dir__)
+
+  def self.apple_uuid?(value)
+    value.is_a?(String) && value.match?(/\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/i)
+  end
 
   def self.run!(*argv)
     out, err, status = Open3.capture3(*argv.map(&:to_s))
@@ -140,13 +145,14 @@ module JournalRelease
       FileUtils.mkdir_p(directory,mode: 0o700)
     end
 
-    def attempt!(proof, retry_upload: false)
-      File.open(File.join(@directory,'upload.lock'),File::RDWR|File::CREAT,0o600) do |lock|
-        raise Failure, 'Another upload holds the lock' unless lock.flock(File::LOCK_EX|File::LOCK_NB)
-        key = Digest::SHA256.hexdigest(@package.values_at('app_id','version','build').join('/'))
-        prior = Dir[File.join(@directory,"#{key}-*.json")].sort.map { |p| JSON.parse(File.read(p)) }
+    def attempt!(proof, retry_upload: false, mode: 'upload')
+      with_lock do
+        paths = attempt_paths
+        prior = paths.map { |path| JSON.parse(File.read(path)) }
         raise Failure, 'Existing attempt requires a fresh ASC check and explicit retry_upload:true' if !prior.empty? && !retry_upload
-        raise Failure, 'Apple receipt must be resolved; successful upload cannot be retried' if prior.any? { |r| r['status']=='tool_reported_success' }
+        if prior.any? { |r| r['upload_accepted'] || r['apple_build_id'] || %w[tool_reported_success published_to_logseq_team].include?(r['status']) }
+          raise Failure, 'Apple has accepted this build; resume or inspect the existing build without uploading again'
+        end
         age = Time.now.utc-Time.iso8601(proof.fetch('checked_utc'))
         reasons=[]
         reasons << 'package does not match the checked IPA' unless @package.all? { |k,v| proof[k]==v }
@@ -166,17 +172,61 @@ module JournalRelease
           end
         end
         raise Failure, "Fresh exact-package ASC receipt check required: #{reasons.join('; ')}" unless reasons.empty?
-        path=File.join(@directory,"#{key}-#{format('%04d',prior.length+1)}.json")
+        path=File.join(@directory,"#{attempt_key}-#{format('%04d',paths.length+1)}.json")
         record=@package.merge('started_utc'=>Time.now.utc.iso8601,'status'=>'failed_or_uncertain',
-          'processing_state'=>'not_checked','distribution_changed'=>false)
-        File.write(path,JSON.pretty_generate(record)+"\n",mode:'wx',perm:0o600)
+          'processing_state'=>'not_checked','distribution_changed'=>false,'mode'=>mode)
+        checkpoint(path, record, {})
         begin
-          record.merge!(yield)
+          record.merge!(yield(->(fields) { checkpoint(path, record, fields) }))
         ensure
-          record['finished_utc']=Time.now.utc.iso8601
-          File.write(path,JSON.pretty_generate(record)+"\n",perm:0o600)
+          checkpoint(path, record, 'finished_utc'=>Time.now.utc.iso8601)
         end
         record
+      end
+    end
+
+    def resume_publish!(apple_id)
+      with_lock do
+        path = attempt_paths.last
+        raise Failure, 'No publish attempt in this release state directory for the exact version/build' unless path
+        record = JSON.parse(File.read(path))
+        unless record['mode'] == 'publish' && @package.all? { |name, value| record[name] == value }
+          raise Failure, 'The current record is not an automated publish attempt for this version/build'
+        end
+        if record['apple_build_id'] && record['apple_build_id'] != apple_id
+          raise Failure, 'The supplied Apple build ID differs from the recorded receipt'
+        end
+        persist = ->(fields) { checkpoint(path, record, fields) }
+        result = yield(record, persist)
+        persist.call(result.merge('resumed_utc'=>Time.now.utc.iso8601))
+        record
+      end
+    end
+
+    private
+
+    def with_lock
+      File.open(File.join(@directory,'upload.lock'),File::RDWR|File::CREAT,0o600) do |lock|
+        raise Failure, 'Another publish or upload holds the release state lock' unless lock.flock(File::LOCK_EX|File::LOCK_NB)
+        yield
+      end
+    end
+
+    def attempt_key
+      Digest::SHA256.hexdigest(@package.values_at('app_id','version','build').join('/'))
+    end
+
+    def attempt_paths
+      Dir[File.join(@directory,"#{attempt_key}-*.json")].sort
+    end
+
+    def checkpoint(path, record, fields)
+      record.merge!(fields)
+      Tempfile.create('.attempt-', @directory) do |file|
+        file.write(JSON.pretty_generate(record) + "\n")
+        file.flush
+        file.fsync
+        File.rename(file.path, path)
       end
     end
   end

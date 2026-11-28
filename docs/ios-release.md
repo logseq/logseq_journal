@@ -29,6 +29,10 @@ On a Mac with Xcode and Ruby 3.4, run `bundle install` using the checked-in lock
 (RubyGems). Keep Bundler's local dependencies outside tracked source. Set
 `FASTLANE_OPT_OUT_USAGE=1` and `FASTLANE_SKIP_UPDATE_CHECK=1` before the CLI.
 Do not put passwords, tokens or private keys in lane parameters or shell commands.
+The release driver keeps a UTF-8 locale if one is configured and sets
+`LANG` and `LC_ALL` to `en_US.UTF-8` when the effective locale uses another encoding.
+Set `LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8` before running lanes directly if
+Fastlane reports `invalid byte sequence in US-ASCII` while reading Xcode output.
 
 The following variables denote **operator-selected external paths**, not defaults:
 `RELEASE_DIR` for a new release, `RELEASE_CACHE` for an exclusively owned reusable
@@ -90,10 +94,43 @@ bundle exec fastlane ios export prepared:"$RELEASE_DIR/prepared" \
 ```
 
 Signing uses an existing local Apple Distribution identity and Journal App Store
-profile. Acquire any necessary signing access through your approved secure
-workflow; these lanes never change the signature repository, create identities,
-import keys, or alter Keychain permissions. A macOS signing permission prompt
-must be handled locally by its owner. Do not weaken access controls to suppress it.
+profile. The Fastlane lanes expect those inputs to be available already.
+
+### Signing preparation on a fresh macOS host
+
+For a host with no configured release identity, inject these existing repo-scoped
+secrets into the process environment through the approved secret manager:
+
+- `JOURNAL_IOS_APPSTORE_PROFILE_BASE64`
+- `JOURNAL_IOS_DISTRIBUTION_P12_BASE64`
+- `JOURNAL_IOS_DISTRIBUTION_P12_PASSWORD`
+
+With the remaining release variables set as above, start the driver in a temporary
+signing environment:
+
+```sh
+bundle exec ruby fastlane/with_testflight_signing.rb -- fastlane/release_testflight.sh
+```
+
+The wrapper validates the profile's app, team, expiry, and entitlements, then
+imports the existing identity into a temporary keychain and signs a local probe
+before starting the command. It supplies `EXISTING_APPSTORE_PROFILE` and
+`EXISTING_CERTIFICATE_SHA1` to the child. For earlier device-receipt preparation,
+run the device build in the same wrapper and pass
+`JOURNAL_IOS_SIGN_ENTITLEMENTS` to the build entry's `--sign-entitlements` option
+along with the provided profile and certificate fingerprint. The child does
+not inherit the three signing secrets.
+
+The wrapper serializes temporary signing setup for the current Mac user. It
+removes its keychain and any profile it installed when the command exits,
+including on handled interruption. Existing profiles are reused only when
+their contents match. Keep signing commands under the wrapper for as long as
+they use its temporary paths. If the signing probe fails to build a trust
+chain, check Apple's WWDR G3 intermediate in the login keychain and use the
+Apple Certificate Authority copy through your approved local procedure. Keep
+the existing trust settings and retry the signing probe before building.
+
+### Local export verification
 
 Export preserves version/build numbers, verifies dSYM UUIDs at archive time, and
 writes `export/verification.json`. The export lane temporarily limits child
@@ -145,8 +182,46 @@ bundle exec fastlane ios publish ipa:"$RELEASE_DIR/export/Journal.ipa" \
 
 The automated preflight replaces the human receipt check below. If it reports
 that Apple has already received the build, follow that build instead of uploading
-again. If upload or processing fails after transport starts, preserve the ledger,
-inspect Apple, and only then use `retry_upload:true` under the existing rules.
+again. The publish lane checkpoints transporter success and the Apple receipt
+in the attempt record under `RELEASE_STATE` before waiting for Apple processing.
+It prints observed processing and distribution milestones as the state changes.
+A recorded successful transport blocks another upload even if the delivery UUID
+was temporarily unavailable.
+
+### Check status or resume after an interruption
+
+Use the exact same version/build and the delivery UUID from the publish output,
+the attempt's `apple_build_id`, or App Store Connect Build Uploads. Querying
+status is read-only and can run while the original publish is waiting:
+
+```sh
+bundle exec fastlane ios testflight_status \
+  version:"$VERSION" build:"$BUILD" apple_id:"$APPLE_BUILD_ID"
+```
+
+For a recorded automated publish whose process has stopped, use the same durable
+`RELEASE_STATE` directory:
+
+```sh
+bundle exec fastlane ios resume_testflight \
+  version:"$VERSION" build:"$BUILD" apple_id:"$APPLE_BUILD_ID" \
+  state:"$RELEASE_STATE" wait_timeout:3600
+```
+
+Resume verifies the UUID against the exact Journal version/build in ASC, waits
+if needed, and assigns only the existing internal Logseq Team group. It does
+not need the IPA or signing secrets because it cannot upload. If the original
+process stopped before saving the receipt, use the matching UUID from ASC.
+Keep the attempt record even after a timeout, and use status or resume once
+Apple reports the build again.
+
+| Status | Meaning and next step |
+| --- | --- |
+| `awaiting_apple_receipt`, `awaiting_upload`, `processing` | The build is not yet installable. Check Build Uploads, then resume the existing attempt after it stops. |
+| `compliance_pending` | ASC reports missing export compliance or review in progress. Check the build in ASC and resume after the declaration or review is resolved. |
+| `ready_to_assign` | Apple reports a valid build ready for testing. Resume can assign the group or verify a pending assignment. |
+| `published_to_logseq_team` | ASC reports `VALID`, an internal Ready to Test or Testing state, and verified Logseq Team membership. |
+| `upload_failed`, `processing_failed`, `failed_or_uncertain` | Inspect Apple and the existing attempt before taking any action. A repeat upload requires the checks below. |
 
 ### Manual upload-only fallback
 
@@ -228,7 +303,13 @@ key can have its declaration completed in ASC without reuploading just for this 
 PYTHONDONTWRITEBYTECODE=1 python3 .agents/skills/journal-build/scripts/test_journal_build.py
 ```
 
-Release tooling was checked using temporary, external synthetic fixtures and the
+Run the offline recovery regression with:
+
+```sh
+bundle exec ruby test/test_testflight_recovery.rb
+```
+
+Release tooling was also checked using temporary, external synthetic fixtures and the
 actual pinned Pilot/Altool parser with its PTY execution replaced. Those fixtures
 are not shipped in this repository. No Apple network call, credential store,
 signing identity or graph is needed for that check. Keep credentials, profiles,

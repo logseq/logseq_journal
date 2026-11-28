@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 umask 077
+if [[ "$(locale charmap 2>/dev/null)" != UTF-8 ]]; then
+  export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+fi
 
 usage() {
   cat <<'USAGE'
@@ -98,14 +101,21 @@ mkdir -p "$RELEASE_DIR"
 
 run_step() {
   local name=$1
+  local status
   shift
   printf '==> %s\n' "$name"
   set +e
-  "$@" >"$RELEASE_DIR/$name.log" 2>&1
-  local status=$?
+  if [[ "$name" == publish ]]; then
+    "$@" 2>&1 | tee "$RELEASE_DIR/$name.log"
+  else
+    "$@" >"$RELEASE_DIR/$name.log" 2>&1
+  fi
+  status=$?
   set -e
   if [[ $status -ne 0 ]]; then
-    tail -80 "$RELEASE_DIR/$name.log" >&2 || true
+    if [[ "$name" != publish ]]; then
+      tail -80 "$RELEASE_DIR/$name.log" >&2 || true
+    fi
     printf 'release_testflight: %s failed; full log: %s\n' "$name" "$RELEASE_DIR/$name.log" >&2
     exit "$status"
   fi
