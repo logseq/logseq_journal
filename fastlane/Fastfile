@@ -15,7 +15,8 @@ end
 platform :ios do
   desc 'Prepare an unsigned iPhone project from an explicitly experimental device build receipt'
   lane :prepare do |o|
-    JournalRelease.prepare!(root: File.expand_path(o[:root] || JournalRelease::ROOT),manifest_path: File.expand_path(o.fetch(:manifest)),
+    root=o[:root].to_s.empty? ? JournalRelease::ROOT : File.expand_path(o[:root])
+    JournalRelease.prepare!(root: root,manifest_path: File.expand_path(o.fetch(:manifest)),
       lui: File.expand_path(o.fetch(:lui)),output: required_path(o,:prepared),
       version: o.fetch(:version),build: o.fetch(:build),experimental: o[:experimental]==true || o[:experimental]=='true')
   end
