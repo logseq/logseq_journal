@@ -152,10 +152,18 @@ module JournalRelease
     [canonical,alternate].compact.uniq
   end
 
-  def self.release_build_uploads(app_id:,version:,build:)
-    build_number=apple_version_value(build)
+  TestFlightUpload = Struct.new(:id, :state, :build_id, keyword_init: true)
+
+  def self.testflight_uploads(app_id:, version:, build:)
     release_version_queries(version).flat_map do |query|
-      Spaceship::ConnectAPI::BuildUpload.all(app_id: app_id,version: query,build_number: build_number)
+      pages = Spaceship::ConnectAPI.get_build_uploads(app_id: app_id, includes: 'build',
+        filter: {platform: 'IOS', cfBundleShortVersionString: query, cfBundleVersion: apple_version_value(build)}).all_pages
+      pages.flat_map do |page|
+        page.body.fetch('data').map do |upload|
+          TestFlightUpload.new(id: upload.fetch('id'), state: upload.fetch('attributes').fetch('state'),
+                               build_id: upload.dig('relationships', 'build', 'data', 'id'))
+        end
+      end
     end.uniq(&:id)
   end
 
@@ -176,7 +184,7 @@ module JournalRelease
   def self.automatic_receipt_check!(package,api_key)
     app=asc_app!(api_key)
     version=package.fetch('version'); build=package.fetch('build')
-    uploads=release_build_uploads(app_id: app.id,version: version,build: build)
+    uploads=testflight_uploads(app_id: app.id,version: version,build: build)
     active=uploads.any? { |upload| build_upload_state(upload)!='FAILED' }
     accepted=!release_builds(app_id: app.id,version: version,build: build).empty?
     groups=app.get_beta_groups
@@ -190,31 +198,132 @@ module JournalRelease
       'target_group_id'=>target.id,'target_group_name'=>target.name)
   end
 
-  def self.verify_logseq_team_assignment!(package,api_key)
-    app=asc_app!(api_key)
-    target=logseq_team_group!(app.get_beta_groups)
-    build=release_builds(app_id: app.id,version: package.fetch('version'),build: package.fetch('build')).first
-    raise Failure, 'Uploaded build is not visible after processing' unless build
-    assigned=target.fetch_builds.any? { |candidate| candidate.id==build.id }
-    raise Failure, 'Logseq Team group is not assigned to the processed build' unless assigned
-    internal_state=build.build_beta_detail&.internal_build_state
-    internal_states=Spaceship::ConnectAPI::BuildBetaDetail::InternalState
-    {'build_id'=>build.id,'processing_state'=>build.processing_state,
-     'internal_build_state'=>internal_state,
-     'ready_for_internal_testing'=>[internal_states::READY_FOR_BETA_TESTING,internal_states::IN_BETA_TESTING].include?(internal_state),
-     'target_group_id'=>target.id,'target_group_name'=>target.name,'target_group_assigned'=>true}
+  def self.testflight_package(version, build)
+    unless [version, build].all? { |value| value.to_s.match?(/\A\d+(?:\.\d+){0,2}\z/) }
+      raise Failure, 'Expected the exact numeric Journal version and build number'
+    end
+    {'app_id'=>APP_ID, 'version'=>version, 'build'=>build}
   end
 
-  def self.publish_options(ipa,version:,build:,wait_timeout:,api_key:)
+  def self.testflight_observation(app, package, apple_id)
+    scope = {app_id: app.id, version: package.fetch('version'), build: package.fetch('build')}
+    uploads = testflight_uploads(**scope)
+    builds = release_builds(**scope)
+    active_uploads = uploads.reject { |upload| build_upload_state(upload) == 'FAILED' }
+    if apple_id
+      upload = uploads.find { |candidate| candidate.id == apple_id || candidate.build_id == apple_id }
+      build = builds.find { |candidate| candidate.id == (upload&.build_id || apple_id) }
+      if !upload && !build && (active_uploads.any? || builds.any?)
+        raise Failure, 'App Store Connect shows a different active build for this version/build'
+      end
+    else
+      if active_uploads.length > 1 || builds.length > 1
+        raise Failure, 'Multiple builds or uploads match this version/build; inspect Build Uploads before proceeding'
+      end
+      upload = active_uploads.first
+      build = builds.first if !upload || [upload.id, upload.build_id].include?(builds.first&.id)
+    end
+    internal = build&.build_beta_detail&.internal_build_state
+    ready = build&.processing_state == 'VALID' && build.expired == false &&
+            %w[READY_FOR_BETA_TESTING IN_BETA_TESTING].include?(internal)
+    target = logseq_team_group!(app.get_beta_groups) if ready
+    assigned = target && target.fetch_builds.any? { |candidate| candidate.id == build.id }
+    report = {
+      'upload_state'=>upload && build_upload_state(upload),
+      'processing_state'=>build&.processing_state,
+      'internal_build_state'=>internal,
+      'uses_non_exempt_encryption'=>build&.uses_non_exempt_encryption,
+      'target_group_id'=>INTERNAL_GROUP_ID,
+      'target_group_name'=>INTERNAL_GROUP,
+      'target_group_assigned'=>assigned,
+      'ready_for_internal_testing'=>ready,
+    }
+    report['apple_upload_id'] = upload.id if upload
+    report['apple_build_id'] = build.id if build
+    report['status'] = testflight_status(report, expired: build&.expired)
+    [report, build, target]
+  end
+
+  def self.testflight_status(report, expired: false)
+    return 'published_to_logseq_team' if report['ready_for_internal_testing'] && report['target_group_assigned']
+    return 'ready_to_assign' if report['ready_for_internal_testing']
+    return 'upload_failed' if report['upload_state'] == 'FAILED'
+    if expired || %w[FAILED INVALID].include?(report['processing_state']) ||
+       %w[PROCESSING_EXCEPTION EXPIRED].include?(report['internal_build_state'])
+      return 'processing_failed'
+    end
+    if %w[MISSING_EXPORT_COMPLIANCE IN_EXPORT_COMPLIANCE_REVIEW].include?(report['internal_build_state'])
+      return 'compliance_pending'
+    end
+    return 'awaiting_upload' if report['upload_state'] == 'AWAITING_UPLOAD'
+    return 'processing' if report['upload_state'] || report['processing_state']
+    'awaiting_apple_receipt'
+  end
+
+  def self.wait_for_testflight!(app, package, apple_id, wait_timeout:, persist:, require_visible: false)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + wait_timeout
+    previous = nil
+    assignment_requested = false
+    loop do
+      report, build, target = testflight_observation(app, package, apple_id)
+      state = report.fetch('status')
+      if require_visible && state == 'awaiting_apple_receipt'
+        raise Failure, 'App Store Connect has not verified this receipt for the exact Journal version/build'
+      end
+      require_visible = false
+      apple_id = report['apple_upload_id'] || report['apple_build_id'] || apple_id
+      if report != previous
+        persist.call(report.merge('stage'=>'testflight_distribution'))
+        puts "TestFlight #{apple_id || '(receipt pending)'}: #{state}"
+        $stdout.flush
+        previous = report
+      end
+      return report if %w[published_to_logseq_team compliance_pending upload_failed processing_failed].include?(state)
+      if state == 'ready_to_assign' && !assignment_requested
+        build.add_beta_groups(beta_groups: [target])
+        assignment_requested = true
+        persist.call('distribution_changed'=>true)
+        next
+      end
+      remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      if remaining <= 0
+        puts 'Apple wait timed out. Use testflight_status or resume_testflight with the same receipt.'
+        return report
+      end
+      sleep [30, remaining].min
+    end
+  end
+
+  def self.publish_options(ipa,version:,build:,api_key:)
     options=upload_options(ipa,version: version,build: build)
     options.delete(:username)
-    options.merge(
-      api_key: api_key.transform_keys(&:to_sym),
-      skip_waiting_for_build_processing: false,skip_submission: false,
-      distribute_external: false,groups: [INTERNAL_GROUP_ID],notify_external_testers: false,
-      uses_non_exempt_encryption: false,expire_previous_builds: false,
-      reject_build_waiting_for_review: false,submit_beta_review: false,
-      wait_processing_interval: 30,wait_processing_timeout_duration: wait_timeout)
+    options.merge(api_key: api_key.transform_keys(&:to_sym))
+  end
+
+  def self.transport_publish!(snapshot, package, api_key)
+    out,err=STDOUT.dup,STDERR.dup
+    result={'status'=>'failed_or_uncertain','stage'=>'pilot_upload'}
+    begin
+      install_transport_hooks!; self.transport={}
+      config=FastlaneCore::Configuration.create(Pilot::Options.available_options,
+        publish_options(snapshot,version: package.fetch('version'),build: package.fetch('build'),api_key: api_key))
+      STDOUT.reopen(File::NULL,'w'); STDERR.reopen(File::NULL,'w')
+      Pilot::BuildManager.new.upload(config)
+      observed=transport || {}
+      raise Failure, 'Transporter did not report a successful upload' unless transport_success?(observed[:exit_code],observed[:output].to_s) && observed[:errors].to_s.empty?
+      result['status']='tool_reported_success'
+      result['upload_accepted']=true
+      receipt = observed[:output][/\b(?:RequestUUID|Delivery UUID)\s*[:=]\s*([0-9a-f-]{36})\b/i, 1]
+      result['apple_upload_id'] = receipt.downcase if apple_uuid?(receipt)
+    rescue StandardError => error
+      result['error_class']=error.class.name
+      result['error']=redact(error.message,secrets: api_key.values.map(&:to_s))
+    ensure
+      result['transport']=transport || {}
+      result['apple_error_codes']=JSON.generate(result).scan(/ITMS-\d+|(?:STATE|ENTITY)_ERROR\.[A-Z_.]+|\(-?\d{1,6}\)/).uniq
+      STDOUT.reopen(out); STDERR.reopen(err); out.close; err.close
+    end
+    result
   end
 
   def self.publish!(package:, ipa:, state_dir:, retry_upload: false, wait_timeout: 3600)
@@ -224,37 +333,41 @@ module JournalRelease
     with_snapshot(ipa,package.fetch('ipa_sha256')) do |snapshot|
       with_release_environment(api_key) do
         proof=automatic_receipt_check!(package,api_key)
-        Ledger.new(state_dir,package).attempt!(proof,retry_upload: retry_upload) do
-          puts "Publish #{BUNDLE} #{package.fetch('version')} (#{package.fetch('build')}) to Apple app #{APP_ID}, then assign only #{INTERNAL_GROUP}."
-          out,err=STDOUT.dup,STDERR.dup
-          result={'status'=>'failed_or_uncertain','stage'=>'pilot_configuration'}
-          begin
-            install_transport_hooks!; self.transport={}
-            config=FastlaneCore::Configuration.create(Pilot::Options.available_options,
-              publish_options(snapshot,version: package.fetch('version'),build: package.fetch('build'),wait_timeout: wait_timeout,api_key: api_key))
-            STDOUT.reopen(File::NULL,'w'); STDERR.reopen(File::NULL,'w')
-            err.puts('Uploading and waiting for Apple processing; group assignment will be verified after distribution.')
-            result['stage']='pilot_upload_process_distribute'
-            Pilot::BuildManager.new.upload(config)
-            observed=transport || {}
-            raise Failure, 'Transporter did not report a successful upload' unless transport_success?(observed[:exit_code],observed[:output].to_s) && observed[:errors].to_s.empty?
-            result['status']='tool_reported_success'
-            result['stage']='verify_logseq_team_assignment'
-            result['distribution']=verify_logseq_team_assignment!(package,api_key)
-            result['distribution_changed']=true
-            result['status']='published_to_logseq_team'
-          rescue StandardError => error
-            result['error_class']=error.class.name
-            result['error']=redact(error.message,secrets: api_key.values.map(&:to_s))
-          ensure
-            result['transport']=transport || {}
-            result['apple_error_codes']=JSON.generate(result).scan(/ITMS-\d+|(?:STATE|ENTITY)_ERROR\.[A-Z_.]+|\(-?\d{1,6}\)/).uniq
-            STDOUT.reopen(out); STDERR.reopen(err); out.close; err.close
-          end
-          puts JSON.pretty_generate(result)
-          result
+        Ledger.new(state_dir,package).attempt!(proof,retry_upload: retry_upload,mode: 'publish') do |persist|
+          puts "Uploading #{BUNDLE} #{package.fetch('version')} (#{package.fetch('build')}) for #{INTERNAL_GROUP}."
+          result = transport_publish!(snapshot, package, api_key)
+          persist.call(result)
+          next result unless result['status'] == 'tool_reported_success'
+          puts "Apple accepted the upload#{result['apple_upload_id'] ? " (#{result['apple_upload_id']})" : ''}."
+          $stdout.flush
+          app = asc_app!(api_key)
+          wait_for_testflight!(app, package, result['apple_upload_id'], wait_timeout: wait_timeout, persist: persist)
         end
+      rescue StandardError => error
+        raise Failure, redact(error.message,secrets: api_key.values.map(&:to_s)), cause: nil
       end
+    end
+  end
+
+  def self.inspect_testflight!(version:, build:, apple_id:, state_dir: nil, wait_timeout: 3600)
+    raise Failure, 'Expected an Apple delivery/build UUID' unless apple_uuid?(apple_id)
+    apple_id = apple_id.downcase
+    package = testflight_package(version, build)
+    api_key = asc_api_key!
+    with_release_environment(api_key) do
+      app = asc_app!(api_key)
+      next testflight_observation(app, package, apple_id).first unless state_dir
+      linked_ids = lambda do
+        report = testflight_observation(app, package, apple_id).first
+        ids = report.values_at('apple_upload_id', 'apple_build_id').compact
+        ids if ids.include?(apple_id)
+      end
+      Ledger.new(external!(state_dir),package).resume_publish!(apple_id, linked_ids: linked_ids) do |record, persist|
+        wait_for_testflight!(app, package, apple_id, wait_timeout: wait_timeout, persist: persist,
+                            require_visible: !record.key?('apple_upload_id') && !record.key?('apple_build_id'))
+      end
+    rescue StandardError => error
+      raise Failure, redact(error.message,secrets: api_key.values.map(&:to_s)), cause: nil
     end
   end
 

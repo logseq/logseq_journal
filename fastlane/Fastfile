@@ -12,6 +12,17 @@ def prepared_inputs(options)
   JournalRelease.prepared_inputs!(required_path(options,:prepared))
 end
 
+def testflight_timeout(options)
+  value=(options[:wait_timeout] || 3600).to_i
+  UI.user_error!('wait_timeout must be a positive number of seconds') unless value.positive?
+  value
+end
+
+def report_testflight_result(result)
+  return if result.fetch('status')=='published_to_logseq_team'
+  UI.user_error!("TestFlight publish stopped at #{result.fetch('status')}. Check the release state and App Store Connect before acting.")
+end
+
 platform :ios do
   desc 'Prepare an unsigned iPhone project from an explicitly experimental device build receipt'
   lane :prepare do |o|
@@ -95,12 +106,21 @@ platform :ios do
   desc 'Automated TestFlight publish: upload, wait for processing, assign only the internal Logseq Team group, then verify it'
   lane :publish do |o|
     ipa=File.expand_path(o.fetch(:ipa))
-    wait_timeout=(o[:wait_timeout] || 3600).to_i
-    UI.user_error!('wait_timeout must be a positive number of seconds') unless wait_timeout.positive?
     package=JournalRelease.verify_ipa!(ipa: ipa,version: o.fetch(:version),build: o.fetch(:build),
       sha256: o.fetch(:sha256),source_sha: o.fetch(:source),experimental: o[:experimental]==true || o[:experimental]=='true')
-    report=JournalRelease.publish!(package: package,ipa: ipa,state_dir: required_path(o,:state),
-      retry_upload: o[:retry_upload]==true || o[:retry_upload]=='true',wait_timeout: wait_timeout)
-    UI.user_error!('Publish failed or remains uncertain; inspect sanitized attempt and Apple before retry') unless report['status']=='published_to_logseq_team'
+    report_testflight_result(JournalRelease.publish!(package: package,ipa: ipa,state_dir: required_path(o,:state),
+      retry_upload: o[:retry_upload]==true || o[:retry_upload]=='true',wait_timeout: testflight_timeout(o)))
+  end
+
+  desc 'Read Apple processing, compliance, and Logseq Team availability for one exact build'
+  lane :testflight_status do |o|
+    report=JournalRelease.inspect_testflight!(version: o.fetch(:version),build: o.fetch(:build),apple_id: o.fetch(:apple_id))
+    UI.message(JSON.pretty_generate(report))
+  end
+
+  desc 'Resume processing and distribution of a recorded TestFlight upload'
+  lane :resume_testflight do |o|
+    report_testflight_result(JournalRelease.inspect_testflight!(version: o.fetch(:version),build: o.fetch(:build),
+      apple_id: o.fetch(:apple_id),state_dir: required_path(o,:state),wait_timeout: testflight_timeout(o)))
   end
 end
