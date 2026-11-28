@@ -32,6 +32,11 @@ let view
       ~children
       ()
   =
+  let empty_state =
+    match empty_state with
+    | Some _ when List.for_all (fun row -> row.header) rows -> empty_state
+    | _ -> None
+  in
   let indexed =
     List.map (fun (row, child) -> row.slot_index, row, child) (List.combine rows children)
   in
