@@ -5866,8 +5866,19 @@ let authenticated_local_catalog_refresh_waits_for_permission () =
   let confirmed=Core.step duplicate.next (Core.Account_authenticated {user_id=Some "user"}) in
   Alcotest.(check bool) "confirmed identity starts catalog refresh" true
     (has_catalog_request confirmed.effects);
-  let repeated=Core.step confirmed.next (Core.Catalog_refresh_requested (startup_ticket confirmed.next)) in
-  Alcotest.(check bool) "already online refresh remains direct" true (has_catalog_request repeated.effects)
+  let loaded=Core.step confirmed.next (fetch_catalog_completion confirmed.effects [graph]) in
+  let repeated=Core.step loaded.next (Core.Catalog_refresh_requested (startup_ticket loaded.next)) in
+  Alcotest.(check bool) "already online refresh publishes progress before fetching" true
+    (match repeated.effects with
+     | Core.Publish (Core.State_changed state) :: work ->
+       state.snapshot.startup.catalog_loading && has_catalog_request work
+     | _ -> false);
+  let duplicate=Core.step repeated.next (Core.Catalog_refresh_requested (startup_ticket repeated.next)) in
+  Alcotest.(check bool) "refresh stays loading without a concurrent fetch" true
+    ((Core.state duplicate.next).snapshot.startup.catalog_loading && not (has_catalog_request duplicate.effects));
+  let refreshed=Core.step duplicate.next (fetch_catalog_completion repeated.effects [graph]) in
+  Alcotest.(check bool) "completed refresh stops loading" false
+    (Core.state refreshed.next).snapshot.startup.catalog_loading
 ;;
 let scenarios = scenarios @
   [ Alcotest.test_case "authenticated local catalog refresh waits for permission" `Quick authenticated_local_catalog_refresh_waits_for_permission

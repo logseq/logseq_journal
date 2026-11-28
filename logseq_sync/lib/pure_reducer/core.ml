@@ -1554,19 +1554,22 @@ let clear_reconciliation_failure (snapshot : snapshot) =
 ;;
 
 let request_catalog_reconciliation core =
-  if not (network_allowed core) then unchanged { core with deferred_catalog_reconciliation = false } else
-  let snapshot = clear_reconciliation_failure core.public_state.snapshot in
-  let startup = { snapshot.startup with authenticated = true; catalog_loading = true } in
-  let core =
-    set_snapshot
-      { core with deferred_catalog_reconciliation = false }
-      { snapshot with startup }
-  in
+  let core = { core with deferred_catalog_reconciliation = false } in
   match core.user_id with
-  | None -> unchanged core
-  | Some user_id ->
-    let next, request = issue_request core (Fetch_catalog (account_scope core user_id)) in
-    { next; effects = [ publish next; Run request ] }
+  | Some user_id when network_allowed core ->
+    let scope = account_scope core user_id in
+    let fetches, other_pending = List.partition (fun (Pending_effect ticket) ->
+      match ticket.kind with Fetch_catalog_kind -> true | _ -> false) core.pending_effects in
+    if List.exists (fun (Pending_effect ticket) -> ticket.scope = effect_scope_of_account scope) fetches
+    then unchanged core
+    else
+      let snapshot = clear_reconciliation_failure core.public_state.snapshot in
+      let startup = { snapshot.startup with catalog_loading = true } in
+      (* A fetch admitted for this scope supersedes earlier catalog tickets. *)
+      let core = set_snapshot { core with pending_effects = other_pending } { snapshot with startup } in
+      let next, request = issue_request core (Fetch_catalog scope) in
+      { next; effects = [ publish next; Run request ] }
+  | Some _ | None -> unchanged core
 ;;
 
 let authenticate core user_id =
@@ -3420,14 +3423,8 @@ let step core event =
       (* Publishing opens the native gate; its verified identity round-trip owns
          catalog admission when this request resumes a local-only session. *)
       if needs_permission || not core.public_state.snapshot.startup.authenticated
-      then {next=core;effects=[publish core]} else
-      (match core.user_id with
-       | None -> unchanged core
-       | Some user_id ->
-         let next, request =
-           issue_request core (Fetch_catalog (account_scope core user_id))
-         in
-         { next; effects = [ Run request ] })
+      then {next=core;effects=[publish core]}
+      else request_catalog_reconciliation core
     | Online_recovery_requested scope when not (timeline_scope_is_current core scope) -> unchanged core
     | Online_recovery_requested _ ->
       let core=network_phase core Online_by_user in
