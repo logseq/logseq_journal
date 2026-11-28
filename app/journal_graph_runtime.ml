@@ -1559,12 +1559,16 @@ let hydration_for_changes t ~request_generation windows =
   in
   let creator_reads =
     let ports = reference_ports ~creator:true t in
+    let seen = Hashtbl.create 16 in
     (* Creator labels have a separate cache from the retained content. *)
-    List.filter_map
-      (fun creator ->
+    Seq.append (List.to_seq blocks) (List.to_seq pages)
+    |> Seq.filter_map (fun creator ->
+      if Hashtbl.mem seen creator then None
+      else (
+        Hashtbl.add seen creator ();
         Reference.plan_change t.creators ~ports
-          (Block_changed { id = Graph.Uuid.to_string creator; journal_block_known = false }))
-      (List.sort_uniq Graph.Uuid.compare (blocks @ pages))
+          (Block_changed { id = Graph.Uuid.to_string creator; journal_block_known = false })))
+    |> List.of_seq
   in
   let tree_reads =
     List.filter_map
