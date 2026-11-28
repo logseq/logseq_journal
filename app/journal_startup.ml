@@ -206,9 +206,10 @@ module Presentation = struct
   type account_result = Local | No_local | User | No_user
   type screen = Waiting | Timeline | Interaction of startup_state | Account_failure
   type account = Discovering | Local_available | User_available | User_required
+  type wait_kind = Cold_start | Operation
   type t =
     { screen : screen
-    ; initial : bool
+    ; wait_kind : wait_kind
     ; serial : int64
     ; account_serial : int64
     ; indicator : bool
@@ -222,13 +223,14 @@ module Presentation = struct
     | Observe of observation
     | Account of ticket * account_result
     | Account_error of ticket
+    | Begin_operation
     | Retry
     | Signed_out
     | Foreground of bool
     | Elapsed of ticket * float
 
   let create () =
-    { screen = Waiting; initial = true; serial = 0L; account_serial = 0L; indicator = false
+    { screen = Waiting; wait_kind = Cold_start; serial = 0L; account_serial = 0L; indicator = false
     ; foreground = true; account = Discovering; local_available = false
     ; account_failed = false; observed = None }
   let foreground t = t.foreground
@@ -237,7 +239,7 @@ module Presentation = struct
   let loading_request t =
     if t.foreground && t.screen = Waiting && not t.indicator then Some t.serial else None
   let account_ticket t = t.account_serial
-  let initial_attempt t = t.initial
+  let initial_attempt t = t.wait_kind = Cold_start
   let equal_presentation left right =
     left.screen = right.screen
     && (left.screen <> Waiting ||
@@ -266,11 +268,18 @@ module Presentation = struct
        | None -> if t.account_failed && not t.local_available then Account_failure else Waiting)
     | None -> if t.account_failed && not t.local_available then Account_failure else Waiting
 
+  let business_wait t = {t with wait_kind=Operation;serial=Int64.succ t.serial;indicator=false}
+  let loading_delay t = match t.wait_kind with Cold_start -> 5. | Operation -> 0.5
+
   let project t =
     let next = classify t in
-    if next = t.screen then t
+    if next = Waiting && t.wait_kind = Cold_start && Option.fold ~none:false
+      ~some:(fun o -> Option.fold ~none:false ~some:(fun (m:Graph_service.snapshot) ->
+        m.startup.bootstrapping || Option.is_some m.local_deletion) o.manager) t.observed
+    then business_wait {t with screen=Waiting}
+    else if next = t.screen then t
     else if next = Waiting then
-      {t with screen=next;initial=false;serial=Int64.succ t.serial;indicator=false}
+      business_wait {t with screen=next}
     else {t with screen=next;indicator=false}
 
   let step t event =
@@ -286,6 +295,11 @@ module Presentation = struct
             && not manager.startup.restoring_local && manager.startup.local_access=Graph_service.Local_pending -> User_required
         | Some manager when manager.startup.authenticated && t.account <> User_required -> User_available
         | _ -> t.account in
+      let t = match previous,o.manager with
+        | Some previous,Some next when t.screen=Waiting && previous.selected_graph<>None
+            && (previous.selected_graph<>next.selected_graph ||
+                previous.startup.graph_generation<>next.startup.graph_generation) -> business_wait t
+        | _ -> t in
       project {t with observed=Some o;account;
         account_serial=(if changed_account then Int64.succ t.account_serial else t.account_serial)}
     | Account (key,result) when key=t.account_serial ->
@@ -296,8 +310,9 @@ module Presentation = struct
         | No_user -> User_required,false in
       project {t with account;local_available;account_failed=false}
     | Account_error key when key=t.account_serial -> project {t with account_failed=true}
+    | Begin_operation -> business_wait t
     | Retry ->
-      {t with screen=Waiting;initial=false;serial=Int64.succ t.serial;account_serial=Int64.succ t.account_serial;
+      {t with screen=Waiting;wait_kind=Operation;serial=Int64.succ t.serial;account_serial=Int64.succ t.account_serial;
         indicator=false;account=Discovering;local_available=false;account_failed=false;observed=None}
     | Signed_out ->
       {t with screen=required Signed_out;indicator=false;account=User_required;
@@ -306,7 +321,7 @@ module Presentation = struct
       {t with foreground=active;indicator=false;
         serial=(if active && t.screen=Waiting then Int64.succ t.serial else t.serial)}
     | Elapsed (key,elapsed) when key=t.serial && t.foreground && t.screen=Waiting
-        && elapsed>=0.1 && not t.indicator -> {t with indicator=true}
+        && elapsed>=loading_delay t && not t.indicator -> {t with indicator=true}
     | Account _ | Account_error _ | Foreground _ | Elapsed _ -> t
     in
     if next=t then t else next

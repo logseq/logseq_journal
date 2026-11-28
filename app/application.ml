@@ -2149,7 +2149,7 @@ module Root_navigation = struct
           | Some retained -> retained
           | None -> let fresh=replace_graph ~discard {initial_state with graph_drafts=state.graph_drafts} generation (Some graph_id) in
             {fresh with graph_state={fresh.graph_state with graph_id=Some graph_id}} in
-        {retained with resident_states=states;calendar=state.calendar;environment=state.environment;
+        {retained with startup_presentation=state.startup_presentation;resident_states=states;calendar=state.calendar;environment=state.environment;
           manager=state.manager;graph_catalog=state.graph_catalog;local_copies=state.local_copies;
           local_copy_check=state.local_copy_check;local_copy_deleting=state.local_copy_deleting;
           local_copy_message=state.local_copy_message;graph_picker_open=state.graph_picker_open;
@@ -2837,7 +2837,9 @@ let timeline_page
         ~on_choose_graph:None
       |> V.Body.static
     | None when loading ->
-      Journal_timeline.loading_view ()
+      (* An unfocused resident preview has no loading deadline. The selected
+         graph presents its wait through the root manager, not this page. *)
+      V.empty ()
       |> V.with_test_id (Ui.Test_id.string "journal-timeline")
       |> V.Body.static
     | None ->
@@ -6460,13 +6462,15 @@ let start
       let delivery=deliver_output output in
       Effect.run(apply_graph_responses set_state_and_effect delivery.responses)));
   let startup_loading_key state =
-    if platform_code = 2 && Journal_startup.Presentation.initial_attempt state.startup_presentation
-    then None else Journal_startup.Presentation.loading_request state.startup_presentation
+    let presentation = state.startup_presentation in
+    if Journal_startup.Presentation.initial_attempt presentation then None
+    else Option.map (fun key -> key, Journal_startup.Presentation.loading_delay presentation)
+      (Journal_startup.Presentation.loading_request presentation)
   in
   let prev_startup_loading_key = ref None in
-  let arm_startup_loading_timer key =
+  let arm_startup_loading_timer (key,delay) =
     let started = Mtime_clock.counter () in
-    schedule_after 0.1 (fun () -> Effect.run (set_state (fun state ->
+    schedule_after delay (fun () -> Effect.run (set_root_state (fun state ->
       let elapsed = Mtime.Span.to_float_ns (Mtime_clock.count started) *. 1e-9 in
       let next = Journal_startup.Presentation.step state.startup_presentation (Elapsed(key,elapsed)) in
       if next == state.startup_presentation then state else {state with startup_presentation=next})))
@@ -7110,6 +7114,7 @@ let start
                       |head::rest->head::insert(index-1)rest in
                     let ids=if List.mem graph_id kept then kept else insert index kept in
                     Effect.bind(set_root_state(fun state->{state with resident_replacement=None;
+                      startup_presentation=Journal_startup.Presentation.step state.startup_presentation Begin_operation;
                       graph_picker_open=false;local_copy_message=None})) ~f:(fun()->
                       Effect.bind(send_manager(Graph_service.Configure_resident_graphs ids))
                         ~f:(fun()->send_manager(Graph_service.Focus_resident_graph graph_id))))))
@@ -7129,12 +7134,14 @@ let start
              error.recovery=Some Journal_startup.Retry_graph_open)
              (Journal_startup.derive ~snapshot:m ~graph:snapshot.graph_state).error) snapshot.manager in
          if retry_local then
-           Effect.bind (update (fun state->{state with graph_picker_open=false;resident_replacement=None;
+           Effect.bind (update (fun state->{state with startup_presentation=Journal_startup.Presentation.step state.startup_presentation Begin_operation;
+           graph_picker_open=false;resident_replacement=None;
              local_copy_check=None;local_copy_message=None;modal=No_modal}))
              ~f:(fun ()->send_manager (Graph_service.Select_graph graph_id))
          else if not (List.mem graph_id ids) && List.length ids>=3 then
            update (fun state->{state with resident_replacement=Some value})
-         else Effect.bind (update (fun state->{state with graph_picker_open=false;resident_replacement=None;
+         else Effect.bind (update (fun state->{state with startup_presentation=Journal_startup.Presentation.step state.startup_presentation Begin_operation;
+           graph_picker_open=false;resident_replacement=None;
            local_copy_check=None;local_copy_message=None;modal=No_modal})) ~f:(fun ()->
              let configured=if List.mem graph_id ids then ids else ids @ [graph_id] in
              Effect.bind (send_manager (Graph_service.Configure_resident_graphs configured))
@@ -7707,7 +7714,7 @@ let start
      comparison: the key is recomputed from the new model and the callback
      fires when it differs from the previous post-update value. *)
   let prev_detail_observation_routes=graph_ref(fun()->None) in
-  let run_edge_callbacks model =
+  let run_edge_callbacks ~visible model =
     (* A root manager push can still describe the graph being closed. Its
        physical retirement resets these cells; do not restart business work. *)
     if Option.exists(fun owner->not(runtime_owner_is_live model owner))(timeline_scope model)
@@ -7743,7 +7750,7 @@ let start
        prev_timeline_drain_key := key;
        Effect.run (timeline_drain_callback key)));
     (let key = startup_loading_key model in
-     if key <> !prev_startup_loading_key then (
+     if visible && key <> !prev_startup_loading_key then (
        prev_startup_loading_key := key;
        Option.iter arm_startup_loading_timer key));
     (let generation, requests = detail_loading_key model in
@@ -7866,7 +7873,7 @@ let start
       let key=owner_key owner in
       match Hashtbl.find_opt pending_change_notices key with
       | None->() | Some(notice,build)->Hashtbl.remove pending_change_notices key;Effect.run(build notice)) (timeline_scope model);
-    let model=sync_startup_presentation model |> run_edge_callbacks |> prune_resident_models in
+    let model=sync_startup_presentation model |> run_edge_callbacks ~visible |> prune_resident_models in
     let model=if visible then prepare_presentation model else model in
     state_ref:=model;save_runtime ();processing_owner:=previous;
     if visible then (retire_absent_runtimes model;drain_retired_runtimes ();

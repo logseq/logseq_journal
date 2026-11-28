@@ -254,21 +254,40 @@ let test_stable_startup_presentation () =
       let t=account t Local in
       let t=observe ~manager:(startup_snapshot ~authenticated:false ~restoring_local:true ()) ~graph:(graph_state ~phase:Graph_closed ()) t in
       require (P.screen t=Waiting) "local binding restore flashes intermediate page");
-    "one 100ms grace spans catalog restore and first feed",(fun () ->
+    "one five-second grace spans catalog restore and first feed",(fun () ->
       let t=observe ~manager:(startup_snapshot ~catalog_loading:true ()) ~graph:(graph_state ~phase:Graph_closed ()) (P.create ()) in
       let key=timer t in
       let early=P.step t (Elapsed(key,0.099)) in
       require (not(P.loading_indicator early)) "99ms shows loading";
-      require (P.step early (Elapsed(key,0.099999999))==early)
-        "one nanosecond before 100ms shows loading";
+      require (P.step early (Elapsed(key,4.999999999))==early)
+        "one nanosecond before five seconds shows loading";
       let t=observe ~manager:(startup_snapshot ~restoring_local:true ()) early in
       require (timer t=key) "busy phase restarts grace";
-      let slow=P.step t (Elapsed(key,0.1)) in
-      require (P.screen slow=Waiting && P.loading_indicator slow) "100ms waiting has no loading";
+      let slow=P.step t (Elapsed(key,5.)) in
+      require (P.screen slow=Waiting && P.loading_indicator slow) "five-second waiting has no loading";
       require (P.step slow (Elapsed(key,0.2))==slow) "duplicate elapsed changes owner";
       let ready=observe ~manager:(startup_snapshot ()) ~graph_ready:true ~feed_loaded:true slow in
       require (P.screen ready=Timeline && not(P.loading_indicator ready)) "ready body retains loading";
       require (P.step ready (Elapsed(key,2.))==ready) "late timer changes ready Timeline");
+    "automatic bootstrap takes over the cold deadline",(fun () ->
+      let cold=P.create () in
+      let snapshot=startup_snapshot ~bootstrapping:true () in
+      let download=observe ~manager:snapshot cold in
+      let key=timer download in
+      require (key<>timer cold && not(P.initial_attempt download)) "download inherited cold grace";
+      require (timer (observe ~manager:snapshot download)=key) "progress restarted download grace";
+      require (P.step download (Elapsed(timer cold,5.))==download) "cold callback leaked";
+      require (P.step download (Elapsed(key,0.499999999))==download) "early download indicator";
+      require (P.loading_indicator (P.step download (Elapsed(key,0.5)))) "download missed deadline");
+    "picker override starts a fresh wait even without a screen transition",(fun () ->
+      let cold=P.create () in
+      let slow=P.step cold (Elapsed(timer cold,5.)) in
+      let selected=P.step slow Begin_operation in
+      let key=timer selected in
+      require (not(P.initial_attempt selected) && not(P.loading_indicator selected)) "picker kept slow cold loading";
+      let pending=observe ~manager:(startup_snapshot ~bootstrapping:true ()) selected in
+      require (timer pending=key && P.step pending (Elapsed(timer cold,5.))==pending) "bootstrap displaced selection";
+      require (P.loading_indicator (P.step pending (Elapsed(key,0.5)))) "selection missed grace");
     "Graph_open waits for first feed and an empty feed completes",(fun () ->
       let t=observe ~manager:(startup_snapshot ()) ~graph_ready:true (P.create ()) in
       require (P.screen t=Waiting) "Graph_open mounts feed's transient loading page";
@@ -335,10 +354,10 @@ let test_stable_startup_presentation () =
       require (timer resumed<>old && not(P.loading_indicator resumed)) "resume reuses old grace";
       require (P.step resumed (Elapsed(old,3600.))==resumed) "late background timer changes resume";
       let key=timer resumed in
-      require (P.step resumed (Elapsed(key,0.099999999))==resumed)
+      require (P.step resumed (Elapsed(key,4.999999999))==resumed)
         "resume counts suspended time towards its fresh grace";
-      require (P.loading_indicator (P.step resumed (Elapsed(key,0.1))))
-        "resume does not show loading after its fresh 100ms grace");
+      require (P.loading_indicator (P.step resumed (Elapsed(key,5.))))
+        "resume does not show loading after its fresh five-second grace");
     "negative/NaN elapsed and explicit signout are safe",(fun () ->
       let t=observe ~manager:(startup_snapshot ~restoring_local:true ()) (P.create ()) in
       let key=timer t in
