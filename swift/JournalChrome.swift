@@ -909,6 +909,15 @@ struct JournalSheetDismissButton: SwiftUI.View {
         let velocity = pan.velocity(in: pan.view)
         return -velocity.x > abs(velocity.y) * 1.4
       }
+
+      func gestureRecognizer(
+        _ recognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+      ) -> Bool {
+        // Keep the native list pan available for vertical scrolling.
+        guard let scrollView = other.view as? UIScrollView else { return false }
+        return other === scrollView.panGestureRecognizer
+      }
     }
 
     func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator { Coordinator() }
@@ -1804,7 +1813,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           let enabled = context.isUserInteractionEnabled
           child(0)
             #if os(iOS)
-            .simultaneousGesture(TimelineLeftPan(enabled: enabled) { details.wrappedValue.toggle() })
+            .gesture(TimelineLeftPan(enabled: enabled) { details.wrappedValue.toggle() })
             #endif
             .accessibilityActions {
               if enabled {
