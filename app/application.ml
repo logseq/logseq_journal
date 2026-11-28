@@ -9308,7 +9308,6 @@ module For_testing = struct
            ~store:(Journal_media_view.Store.create ())
            state
            (ignore_dispatch dispatch))
-      ~show_timestamp:false
       entry
   ;;
 

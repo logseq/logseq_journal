@@ -9,67 +9,51 @@ let chrome fields child =
     Journal_lui_native.chrome_identifier
 ;;
 
-let compact_only child = chrome [ "mode", `String "timeline-compact-only" ] child
-
 let body ?(child = false) title =
   if String.trim (Journal_model.Title.plain title) = "" then V.column []
   else Journal_header.bounded_text ~child title
 ;;
 
-let metadata_view
-      ?(status_name = fun status -> Journal_model.status_name status)
-      ~timeline
-      block
-  =
+let status_badge ?(status_name = fun status -> Journal_model.status_name status) block =
   let status = Journal_model.task_state block in
-  let titles = Journal_model.tag_titles block in
-  let visible_titles, remaining =
-    if timeline then List.take 3 titles, max 0 (List.length titles - 3) else titles, 0
-  in
-  let state =
-    if status = No_status
-    then []
-    else
-      [ L.column
-          ~cross:`start
-          ~padding_horizontal:6
-          ~padding_vertical:2
-          ~background:"#839B7F16"
-          ~corner_radius:5
-          [ L.text
-              ~value:(status_name status)
-              ~style_class:"caption"
-              ~foreground:"secondary"
-              []
-          ]
-      ]
-  in
-  let tags =
-    if titles = []
-    then []
-    else
-      let text = L.text
-          ~value:
-            (String.concat
-               "  "
-               (List.map (fun title -> "#" ^ title) visible_titles
-                @ if remaining = 0 then [] else [ "+" ^ string_of_int remaining ]))
-          ?text_alignment:(if timeline then Some `end_ else None)
-          ?grow:(if timeline then None else Some 1.)
-          ~style_class:"caption"
-          ~foreground:"secondary"
-          []
-      in
-      if timeline
-      then [ L.column ~grow:1. ~cross:`stretch [ compact_only text ] ]
-      else [ text ]
-  in
-  match state @ tags with
+  if status = No_status
+  then []
+  else
+    [ L.column
+        ~cross:`start
+        ~padding_horizontal:6
+        ~padding_vertical:2
+        ~background:"#839B7F16"
+        ~corner_radius:5
+        [ L.text
+            ~value:(status_name status)
+            ~style_class:"caption"
+            ~foreground:"secondary"
+            []
+        ]
+    ]
+;;
+
+let metadata_row = function
   | [] -> []
   | children -> [ V.of_lui (L.row ~gap:8 ~cross:`start children) ]
 ;;
 
-let metadata ?status_name block = metadata_view ?status_name ~timeline:false block
+let metadata ?status_name block =
+  let tags =
+    match Journal_model.tag_titles block with
+    | [] -> []
+    | titles ->
+      [ L.text
+          ~value:(String.concat "  " (List.map (fun title -> "#" ^ title) titles))
+          ~grow:1.
+          ~style_class:"caption"
+          ~foreground:"secondary"
+          []
+      ]
+  in
+  metadata_row (status_badge ?status_name block @ tags)
+;;
 
 let view
       ?status_name
@@ -77,7 +61,6 @@ let view
       ?(render_source = Fun.id)
       ?render_title
       ~render_media
-      ~show_timestamp
       (entry : Journal_graph_projection.timeline_entry)
   =
   let block = entry.block in
@@ -117,7 +100,7 @@ let view
     V.column
       ~spacing:8.
       ~alignment:Leading
-      (body source :: metadata_view ?status_name ~timeline:true block)
+      (body source :: metadata_row (status_badge ?status_name block))
   in
   let preview_labels =
     [ render_media ~title:(Journal_model.source block) ~root:id ~image_children content ]
@@ -146,18 +129,6 @@ let view
       (Ui.mount (V.column ~spacing:12. ~alignment:Leading preview_labels))
     |> V.of_lui
   in
-  let row_children =
-    if show_timestamp
-    then
-      V.of_lui
-        (compact_only (L.text
-           ~value:time
-           ~style_class:"caption"
-           ~foreground:"secondary"
-           []))
-      :: [ details ]
-    else [ details ]
-  in
-  V.column ~spacing:12. ~alignment:Leading row_children
+  V.column ~spacing:12. ~alignment:Leading [ details ]
   |> V.with_test_id (Ui.Test_id.string ("journal-row-label:" ^ id))
 ;;

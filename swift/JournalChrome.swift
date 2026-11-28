@@ -247,7 +247,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
     case timelineHost = "timeline-host"
     case timelineInteraction = "timeline-interaction"
     case timelineRow = "timeline-row"
-    case timelineCompactOnly = "timeline-compact-only"
     case graphPicker = "graph-picker"
     case toolbarControl = "toolbar-control"
     case bottomBar = "bottom-bar"
@@ -1833,13 +1832,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
         } else {
           child(0)
         }
-      case .timelineCompactOnly:
-        let detailed = timelineDetails?.wrappedValue == true
-        child(0)
-          .opacity(detailed ? 0 : 1)
-          .accessibilityHidden(detailed)
-          .allowsHitTesting(!detailed)
-          .animation(timelineModeAnimation, value: detailed)
       case .filterOverlay:
         #if os(iOS)
         child(0).background {

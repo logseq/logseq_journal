@@ -2,28 +2,7 @@ module Timeline = Journal_timeline_state
 module Ui = Journal_view
 module V = Ui.View
 
-let same_creation_minute left right =
-  let left = Journal_model.creation_time left in
-  let right = Journal_model.creation_time right in
-  Journal_time.local_day left = Journal_time.local_day right
-  && Journal_time.local_minute_of_day left = Journal_time.local_minute_of_day right
-;;
-
-let should_show_timestamp ~today ~previous_slot = function
-  | Timeline.Top_level entry when Journal_model.journal_day entry.block = today ->
-    (match previous_slot with
-     | Some (Timeline.Top_level previous) ->
-       not (same_creation_minute previous.block entry.block)
-     | Some _ | None -> true)
-  | Top_level _ | Day_heading _ | Day_continuation _ | Feed_continuation _ -> false
-;;
-
 module Store = struct
-  type row =
-    { entry : Journal_graph_projection.timeline_entry
-    ; show_timestamp : bool
-    }
-
   type listener =
     { epoch : int
     ; mutable active : bool
@@ -36,7 +15,7 @@ module Store = struct
     | Other of Timeline.slot * string option * bool
 
   type t =
-    { rows : (string, row) Hashtbl.t
+    { rows : (string, Journal_graph_projection.timeline_entry) Hashtbl.t
     ; listeners : (string, (int, listener) Hashtbl.t) Hashtbl.t
     ; scroll_listeners : (int, listener) Hashtbl.t
     ; mutable scroll_target : (int64 * int * string) option
@@ -149,7 +128,6 @@ module Store = struct
     then (
       let seen = Hashtbl.create (Timeline.retained_slot_count state) in
       let changes = ref [] in
-      let previous = ref None in
       let shape =
         Timeline.fold_slots
           (fun reversed slot ->
@@ -157,20 +135,11 @@ module Store = struct
                match slot with
                | Timeline.Top_level entry ->
                  let block_id = Journal_model.id entry.block in
-                 let row =
-                   { entry
-                   ; show_timestamp =
-                       should_show_timestamp
-                         ~today:(Timeline.today state)
-                         ~previous_slot:!previous
-                         slot
-                   }
-                 in
                  Hashtbl.replace seen block_id ();
                  t.observe "timeline-item-compare";
-                 if find t block_id <> Some row
+                 if find t block_id <> Some entry
                  then (
-                   Hashtbl.replace t.rows block_id row;
+                   Hashtbl.replace t.rows block_id entry;
                    changes := block_id :: !changes);
                  Block (block_id, Journal_model.journal_day entry.block)
                | Day_continuation { day; _ } ->
@@ -180,7 +149,6 @@ module Store = struct
                    , Option.is_some (Timeline.pending_request state) )
                | Day_heading _ | Feed_continuation _ -> Other (slot, None, false)
              in
-             previous := Some slot;
              shape :: reversed)
           []
           state
@@ -265,22 +233,22 @@ let view
       ~title ()
     |> V.with_test_id (Ui.Test_id.string ("journal-day-heading:" ^ string_of_int day))
   in
-  let render previous_slot slot =
+  let render slot =
     let child =
       match slot with
       | Timeline.Day_heading page -> heading page.day page.title
       | Top_level entry ->
-        let render entry show_timestamp =
+        let render entry =
           on_region "timeline-item-build";
           Journal_row.view
             ?status_name
             ?creator_name
             ~render_source
             ?render_title
-            ~render_media ~show_timestamp entry
+            ~render_media entry
         in
         (match store with
-         | None -> render entry (should_show_timestamp ~today ~previous_slot slot)
+         | None -> render entry
          | Some store ->
            V.of_lui (fun context parent ->
              let block_id = Journal_model.id entry.block in
@@ -298,8 +266,7 @@ let view
                ~equal:( = )
                (function
                  | None -> Journal_view.mount (V.column [])
-                 | Some (row : Store.row) ->
-                   Journal_view.mount (render row.entry row.show_timestamp))
+                 | Some entry -> Journal_view.mount (render entry))
                (Signal.value current)
                context
                parent))
@@ -323,7 +290,7 @@ let view
     , V.column ~key:(Ui.Key.string ("day:" ^ section)) [ heading day "Date unavailable" ]
     )
   in
-  let rec present previous_section previous_slot = function
+  let rec present previous_section = function
     | [] -> []
     | (index, slot) :: rest ->
       let row = metadata index slot in
@@ -339,9 +306,9 @@ let view
         | _ -> []
       in
       header
-      @ ((row, render previous_slot slot) :: present (Some row.section) (Some slot) rest)
+      @ ((row, render slot) :: present (Some row.section) rest)
   in
-  let presented = present None None (List.mapi (fun index slot -> index, slot) slots) in
+  let presented = present None (List.mapi (fun index slot -> index, slot) slots) in
   let presented =
     if
       not

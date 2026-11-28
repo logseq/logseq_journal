@@ -1,6 +1,7 @@
 (** {1 TLDR}
 
     Render a Timeline entry using the supplied title and media renderers.
+    Creation time and tags appear in the Timeline details rail.
     [creator_name] returns [None] to hide the creator, or an empty name when
     the creator is visible but their profile name is unavailable. *)
 
@@ -15,7 +16,6 @@ val view
         -> image_children:(string * string) list
         -> Journal_view.View.t
         -> Journal_view.View.t)
-  -> show_timestamp:bool
   -> Journal_graph_projection.timeline_entry
   -> Journal_view.View.t
 
@@ -23,13 +23,13 @@ val view
 
     Given a Timeline [entry] and the caller's [render_media] callback:
     {[
-      let row = view ~render_media ~show_timestamp:true entry
+      let row = view ~render_media entry
     ]}
     Pass the returned view to the Timeline row container. *)
 
 (** {1 Observation and helpers} *)
 
-(** Shared status and tag presentation. *)
+(** Status and tag presentation for Block Detail. *)
 val metadata
   :  ?status_name:(Journal_model.task_state -> string)
   -> Journal_model.t
