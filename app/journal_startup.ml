@@ -101,6 +101,9 @@ let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
      | None -> {phase=Awaiting_e2ee_password;error=None}
      | Some stage -> {phase=Failed;error=Some(startup_error ~awaiting_e2ee_password:true stage
          (Option.value snapshot.last_error ~default:"Unable to unlock the graph."))})
+  else if facts.local_access = Graph_service.Local_unavailable Graph_service.Local_catalog_unavailable
+          && facts.authenticated && facts.catalog_loading && Option.is_none facts.failure
+  then { phase = Loading_catalog; error = None }
   else if (match facts.local_access with Graph_service.Local_unavailable _ -> true | _ -> false)
   then
     let error=startup_error ~awaiting_e2ee_password:false
