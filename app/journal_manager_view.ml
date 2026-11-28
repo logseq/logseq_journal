@@ -3,10 +3,16 @@ module V = Ui.View
 module Graph_service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Presentation = Journal_page_layout
 
+type picker_status =
+  | Idle
+  | Working of string
+  | Notice of string
+  | Problem of { message : string; retry_refresh : bool }
+
 type picker_live =
   { residents : string list
   ; replacement : string option
-  ; status : string
+  ; status : picker_status
   ; authenticated : bool
   ; checking : bool
   ; deleting : Graph_service.local_copy_request option
@@ -187,11 +193,37 @@ let view ?picker_signal props ~on_action =
         ~id:"graph-picker-refresh" ~command:Refresh_catalog ~label:"Refresh graphs"
         ~tooltip:"Refresh the authorized graph catalog" `refresh_cw) context parent)
     in
-    let status_text current = current.status in
-    let status = V.of_lui (fun context parent ->
+    let show_status when_ view =
+      V.of_lui (fun context parent ->
+        match projected context (fun current -> when_ current.status) with
+        | Some test -> Lui_elements.if_ ~test (Ui.mount view) context parent
+        | None -> if when_ snapshot.live.status then Ui.mount view context parent else 0)
+    in
+    let status_text current =
+      match current.status with
+      | Idle -> ""
+      | Working message | Notice message | Problem { message; _ } -> message
+    in
+    let status_color current =
+      match current.status with Problem _ -> "error-foreground" | _ -> "foreground"
+    in
+    let message = V.of_lui (fun context parent ->
       Lui_elements.text ~value:(status_text snapshot.live)
         ?value_signal:(projected context status_text)
-        ~foreground:"error-foreground" ~accessibility_identifier:"graph-picker-local-copy-status" [] context parent)
+        ~foreground:(status_color snapshot.live)
+        ?foreground_signal:(projected context status_color)
+        ~accessibility_identifier:"graph-picker-local-copy-status" [] context parent)
+    in
+    let progress =
+      show_status (function Working _ -> true | _ -> false)
+        (V.of_lui (Lui_elements.spinner ~size:`sm []))
+    in
+    let retry =
+      show_status (function Problem { retry_refresh = true; _ } -> true | _ -> false)
+        (button ~id:"graph-picker-refresh-retry" ~command:Refresh_catalog "Retry" "arrow.clockwise")
+    in
+    let status =
+      V.column ~alignment:Leading ~spacing:0. [ V.row ~spacing:8. [ progress; message ]; retry ]
     in
     let resident_name id = Rrbvec.to_seq snapshot.graphs |> Seq.find_map (fun (graph:Graph_service.graph)->
       if Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id=id then Some graph.name else None)
@@ -221,8 +253,10 @@ let view ?picker_signal props ~on_action =
       ~header:resident_header ~separator:Hidden resident_rows] in
     let content =
       match Rrbvec.is_empty snapshot.graphs with
-      | true -> unavailable ~title:"No graphs available" ~symbol:"folder"
-          ~message:"Refresh to check for graphs available to your account." ~actions:(V.empty ())
+      | true ->
+        let no_graphs = unavailable ~title:"No graphs available" ~symbol:"folder"
+          ~message:"Refresh to check for graphs available to your account." ~actions:(V.empty ()) in
+        V.column ~spacing:8. [ status; show_status (function Idle | Notice _ -> true | _ -> false) no_graphs ]
       | false ->
         let rows = Seq.map (fun (graph : Graph_service.graph) ->
           let id = Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id in

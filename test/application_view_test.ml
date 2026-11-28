@@ -7437,7 +7437,7 @@ let test_picker_presence_native_patch_lifecycle () =
   let module M = Journal_manager_view in
   let ids=List.init 4 (fun n->Printf.sprintf "96000000-0000-4000-8000-%012d" (n+1)) in
   let uuid id=Logseq_db_types.Graph_types.Uuid.of_string id |> Result.get_ok in
-  let live : M.picker_live={residents=List.filteri(fun n _->n<3)ids;replacement=None;status="";
+  let live : M.picker_live={residents=List.filteri(fun n _->n<3)ids;replacement=None;status=M.Idle;
     authenticated=true;checking=false;deleting=None;presence=(fun _->None)} in
   let graphs=List.map(fun id->({graph_id=uuid id;name="Synthetic graph " ^ id;
     schema={major=65;minor=33;exact=true};encrypted=false}:Service.graph))ids |> List.to_seq |> Rrbvec.of_seq in

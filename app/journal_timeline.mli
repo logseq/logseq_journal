@@ -1,3 +1,9 @@
+(** {1 TLDR}
+
+    Render the native journal timeline from caller-owned state. Use [view] with
+    the current slots and handlers. Supply [empty_state] for a loaded,
+    fully empty timeline. *)
+
 module Ui = Journal_view
 
 module Store : sig
@@ -20,6 +26,7 @@ val view
   -> ?current_day:int
   -> ?store:Store.t
   -> ?on_sync:Ui.Event.Handler.t
+  -> ?empty_state:Ui.View.t
   -> ?on_region:(string -> unit)
   -> render_source:(string -> string)
   -> ?render_title:(string -> Journal_model.Title.t)
@@ -42,3 +49,14 @@ val view
   -> on_copy:Ui.Event.Handler.t
   -> unit
   -> Ui.View.Body.t
+
+(** {1 Minimal usage example}
+
+    With the current state, rendering functions and event handlers from the
+    application, mount a timeline with its contextual empty presentation:
+
+    {[
+      view ~state ~day_presentation ~render_source ~render_media ~empty_state
+        ~on_visible_range ~on_scroll_completed ~on_retry_day ~on_open_block
+        ~delete_enabled ~actions_enabled ~on_status ~on_delete ~on_copy ()
+    ]} *)

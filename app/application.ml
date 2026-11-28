@@ -340,7 +340,7 @@ type state =
   ; local_copies : (Graph_service.local_copy_presence, string) result Local_copies.t
   ; local_copy_check : Graph_service.local_copy_request option
   ; local_copy_deleting : Graph_service.local_copy_request option
-  ; local_copy_message : string option
+  ; local_copy_message : (string, string) result option
   ; graph_state : Logseq_db_worker.graph_state
   ; diagnostics : Graph_service.diagnostics option
   ; admission_refresh : Admission_refresh.t
@@ -2781,6 +2781,50 @@ let filters_page state dispatch filter_draft =
   payload, on_event
 ;;
 
+let timeline_empty_state ~filters ~active_name ~interactive ~capture_enabled
+      ~on_clear ~on_capture =
+  let open Timeline_filter in
+  let applied = applied filters in
+  let action ~enabled ~id ~title on_press =
+    V.button ~style:Prominent ~enabled ~on_press ~child:(V.text title) ()
+    |> V.with_test_id (Ui.Test_id.string id)
+  in
+  let title, symbol, description, action =
+    if active_count applied > 0 || Option.is_some active_name then (
+      let count label plural items =
+        match List.length items with
+        | 0 -> None
+        | 1 -> Some ("1 " ^ label)
+        | n -> Some (Printf.sprintf "%d %s" n plural)
+      in
+      let time = match time_choice (time applied) with
+        | `Preset Past_14_days -> "Past 14 days"
+        | `Preset Past_3_months -> "Past 3 months"
+        | `Custom (n, unit_) ->
+          Printf.sprintf "Past %d %s" n
+            (match unit_, n with Days, 1 -> "day" | Days, _ -> "days"
+             | Weeks, 1 -> "week" | Weeks, _ -> "weeks")
+      in
+      let summary = List.filter_map Fun.id
+        [ active_name; count "tag" "tags" (tags applied)
+        ; count "status" "statuses" (statuses applied); Some time ] in
+      "No entries match your filters", "slider.horizontal.3",
+      String.concat " · " summary,
+      action ~enabled:interactive ~id:"journal-empty-clear-filters"
+        ~title:"Clear filters" on_clear)
+    else
+      "No recent journal entries", "book", "Write an entry to start your journal.",
+      action ~enabled:(interactive && capture_enabled) ~id:"journal-empty-write"
+        ~title:"Write an entry" on_capture
+  in
+  let centered_action =
+    V.of_lui (Lui_elements.row ~main:`center [ Ui.mount action ])
+  in
+  V.content_unavailable
+    ~label:(V.label ~title:(V.text title) ~icon:(V.symbol ~name:symbol ()) ())
+    ~description:(V.text description) ~actions:centered_action ()
+;;
+
 let timeline_page
       ~status_name
       ~header_signal
@@ -2821,11 +2865,15 @@ let timeline_page
       ~error_info_available
       ~on_error_info
       ~account_menu_available
-      ~filter_count
-      ~filter_entry
+      ~filters
       ~cache_reset_available
       ~on_account_action
   =
+  let filter_count = Timeline_filter.active_count (Timeline_filter.applied filters) in
+  let filter_names, active_name = match Timeline_filter.entry filters with
+    | Timeline_filter.Configure_directly -> [], None
+    | Native_menu { names; active_name } -> names, active_name in
+  let clear_filters = Submit_filters (graph_generation, Clear) in
   let timeline () =
     on_region "timeline";
     match graph_error with
@@ -2843,11 +2891,18 @@ let timeline_page
       |> V.with_test_id (Ui.Test_id.string "journal-timeline")
       |> V.Body.static
     | None ->
+      let empty_state =
+        timeline_empty_state ~filters ~active_name ~interactive:interaction_enabled
+          ~capture_enabled
+          ~on_clear:(bind_action on_account_action clear_filters)
+          ~on_capture:(bind_action on_capture_event Open_capture)
+      in
       Journal_timeline.view
         ~status_name
         ?current_day
         ?store:timeline_store
         ?on_sync:(if interaction_enabled then Some (bind_action on_account_action Begin_online_recovery) else None)
+        ~empty_state
         ~on_region
         ~render_source
         ~render_title
@@ -2882,12 +2937,9 @@ let timeline_page
   in
   let filter_control =
     if favorites_selected then None else
-    let names, active = match filter_entry with
-      | Timeline_filter.Configure_directly -> [], None
-      | Native_menu { names; active_name } -> names, active_name in
     let payload = Yojson.Safe.to_string (`Assoc
-      [ "filterNames", `List (List.map (fun name -> `String name) names)
-      ; "filterActiveName", Option.fold ~none:`Null ~some:(fun name -> `String name) active
+      [ "filterNames", `List (List.map (fun name -> `String name) filter_names)
+      ; "filterActiveName", Option.fold ~none:`Null ~some:(fun name -> `String name) active_name
       ; "mode", `String "filter-trigger"; "level", `Int filter_count
       ; "filterOwner", `Int graph_generation; "enabled", `Bool interaction_enabled ]) in
     Some (V.of_lui (Journal_lui_native.mount ~key:"journal-filters" ~payload ~children:[]
@@ -2897,7 +2949,7 @@ let timeline_page
         if owner = graph_generation then
           match raw with
           | "open" -> on_account_action.send Open_filters
-          | "clear" -> on_account_action.send (Submit_filters (owner, Clear))
+          | "clear" -> on_account_action.send clear_filters
           | _ when String.starts_with ~prefix:"select:" raw ->
             on_account_action.send (Submit_filters (owner, Select (String.sub raw 7 (String.length raw - 7))))
           | _ -> ())
@@ -3169,16 +3221,19 @@ let detail_page ~media_store ?(on_region = fun _ -> ()) ~state ~on_scroll_comple
 ;;
 
 let manager_picker_live state : Journal_manager_view.picker_live =
+  let open Journal_manager_view in
   let status = match state.local_copy_deleting, state.local_copy_check, state.local_copy_message with
-    | Some _, _, _ -> "Deleting local copy…"
-    | _, Some _, _ -> "Checking local copy…"
-    | _, _, Some message -> message
+    | Some _, _, _ -> Working "Deleting local copy…"
+    | _, Some _, _ -> Working "Checking local copy…"
+    | _, _, Some (Ok message) -> Notice message
+    | _, _, Some (Error message) -> Problem { message; retry_refresh = false }
     | _ -> (match state.manager with
+      | Some manager when manager.startup.catalog_loading -> Working "Refreshing graphs…"
       | Some manager -> (match manager.last_error with
-        | Some message -> message
-        | None when manager.startup.catalog_loading -> "Refreshing graphs…"
-        | None -> "")
-      | None -> "") in
+        | Some message ->
+          Problem { message; retry_refresh = manager.startup.failure = Some During_catalog }
+        | None -> Idle)
+      | None -> Idle) in
   let copies = state.local_copies in
   { residents=(match state.manager with None->[] | Some m->
       let ids=if m.resident_graphs=[] then Option.to_list m.selected_graph else m.resident_graphs in
@@ -4477,7 +4532,7 @@ let start
       match dispatch_worker(Graph_service.Inspect_local_copy request)with
       |Worker.Accepted id->Hashtbl.replace local_copy_requests id(request,confirm)
       |Full|Not_ready|Stopping->set_state(fun state->if confirm then
-          {state with local_copy_check=None;local_copy_message=Some "The local copy request could not start. Try again."}
+          {state with local_copy_check=None;local_copy_message=Some (Error "The local copy request could not start. Try again.")}
         else {state with local_copies=Local_copies.add(Logseq_db_types.Graph_types.Uuid.to_string request.graph_id)
           (Error "Unable to check the local copy. Try again.")state.local_copies})())
   in
@@ -5885,8 +5940,8 @@ let start
             | Ok Graph_service.Downloaded -> { state with modal = Cache_reset_confirmation request.graph_id
                 ; confirmation_sequence = Int64.succ state.confirmation_sequence
                 ; local_copy_message = None }
-            | Ok Not_downloaded -> { state with local_copy_message = Some "No local copy on this device." }
-               | Error message -> { state with local_copy_message = Some message }))))
+            | Ok Not_downloaded -> { state with local_copy_message = Some (Ok "No local copy on this device.") }
+               | Error message -> { state with local_copy_message = Some (Error message) }))))
         ~f:(fun () -> !drain_visible_copies ())
     | Worker.Push { payload = (Asset_notice _ | Asset_notices _) as payload; _ } ->
       let notices = Graph_service.asset_notices payload in
@@ -6129,7 +6184,7 @@ let start
           |Ok host->Effect.run(begin_host_change ~host Wc.Connection_will_stop ~f:(function
             |Error error->termination_in_flight:=false;
               account_lifecycle:=Account_pure_lifecycle.resume !account_lifecycle;
-              set_root_state(fun state->{state with local_copy_message=Some(coordinated_error_message error)})
+              set_root_state(fun state->{state with local_copy_message=Some (Error (coordinated_error_message error))})
             |Ok()->termination_host_completed:=true;shutdown_coordination();finish_termination())));
         Effect.run(finish_termination())))
     else (
@@ -6820,7 +6875,7 @@ let start
                         if state.local_copy_deleting<>Some request then state else
                         let state={state with local_copy_deleting=None} in
                         match result with
-                        |Error error->{state with local_copy_message=Some(coordinated_error_message error)}
+                        |Error error->{state with local_copy_message=Some (Error (coordinated_error_message error))}
                         |Ok()->{(discard_graph_copy_draft state graph_id)with
                           local_copies=Local_copies.add(Logseq_db_types.Graph_types.Uuid.to_string graph_id)
                             (Ok Graph_service.Not_downloaded)state.local_copies;local_copy_message=None})) ~f:finish_termination)) )
@@ -7081,7 +7136,7 @@ let start
            ~f:(fun()->begin_host_change(Wc.Graph_will_close graph) ~f:(fun result->
              set_root_state(fun state->{state with
                graph_picker_open=(if Result.is_error result then true else state.graph_picker_open);
-               local_copy_message=match result with Ok()->None|Error error->Some(coordinated_error_message error)}))))
+               local_copy_message=match result with Ok()->None|Error error->Some (Error (coordinated_error_message error))}))))
     | Move_resident (index,direction) ->
       let ids=Option.fold ~none:[] ~some:(fun (m:Graph_service.snapshot)->m.resident_graphs) snapshot.manager in
       let target=index+direction in
@@ -7099,7 +7154,7 @@ let start
             Effect.bind(set_root_state(fun state->{state with graph_picker_open=false;local_copy_message=None}))
               ~f:(fun()->begin_host_change(Wc.Graph_will_close old_graph) ~f:(function
                 |Error error->set_root_state(fun state->{state with graph_picker_open=true;
-                    local_copy_message=Some(coordinated_error_message error)})
+                    local_copy_message=Some (Error (coordinated_error_message error))})
                 |Ok()->
                   let current= !state_ref in
                   if current.resident_replacement<>Some replacement then Effect.ignore else
@@ -7412,7 +7467,7 @@ let start
       pending_resident_selection:=None;
       account_lifecycle:=Account_pure_lifecycle.invalidate !account_lifecycle;
       begin_host_change Wc.Account_will_change ~f:(function
-        |Error error->set_root_state(fun state->{state with local_copy_message=Some(coordinated_error_message error)})
+        |Error error->set_root_state(fun state->{state with local_copy_message=Some (Error (coordinated_error_message error))})
         |Ok()->
           coordination_sdk_seen:=true;coordination_account:=Some None;
           pending_startup_commands:=[];Hashtbl.clear pending_scope_refreshes;
@@ -8429,8 +8484,7 @@ let start
               (error_info_available state)
             ~on_error_info:(bind_action dispatch Open_error_info)
             ~account_menu_available:true
-            ~filter_count:(Timeline_filter.active_count (Timeline_filter.applied state.filters))
-            ~filter_entry:(Timeline_filter.entry state.filters)
+            ~filters:state.filters
             ~on_account_action:dispatch
             ~cache_reset_available:(local_deletion_available state)
     in
@@ -9372,8 +9426,7 @@ module For_testing = struct
       ~error_info_available:true
       ~on_error_info:handler
       ~account_menu_available:true
-      ~filter_count:0
-      ~filter_entry:Timeline_filter.Configure_directly
+      ~filters:initial_state.filters
       ~on_account_action:(ignore_dispatch handler)
       ~cache_reset_available:false
     |> fun page ->
