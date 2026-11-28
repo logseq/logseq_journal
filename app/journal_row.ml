@@ -2,6 +2,15 @@ module Ui = Journal_view
 module V = Ui.View
 module L = Lui_elements
 
+let chrome fields child =
+  Journal_lui_native.mount
+    ~payload:(Yojson.Safe.to_string (`Assoc fields))
+    ~children:[ child ]
+    Journal_lui_native.chrome_identifier
+;;
+
+let compact_only child = chrome [ "mode", `String "timeline-compact-only" ] child
+
 let body ?(child = false) title =
   if String.trim (Journal_model.Title.plain title) = "" then V.column []
   else Journal_header.bounded_text ~child title
@@ -39,18 +48,21 @@ let metadata_view
     if titles = []
     then []
     else
-      [ L.text
+      let text = L.text
           ~value:
             (String.concat
                "  "
                (List.map (fun title -> "#" ^ title) visible_titles
                 @ if remaining = 0 then [] else [ "+" ^ string_of_int remaining ]))
           ?text_alignment:(if timeline then Some `end_ else None)
-          ~grow:1.
+          ?grow:(if timeline then None else Some 1.)
           ~style_class:"caption"
           ~foreground:"secondary"
           []
-      ]
+      in
+      if timeline
+      then [ L.column ~grow:1. ~cross:`stretch [ compact_only text ] ]
+      else [ text ]
   in
   match state @ tags with
   | [] -> []
@@ -61,6 +73,7 @@ let metadata ?status_name block = metadata_view ?status_name ~timeline:false blo
 
 let view
       ?status_name
+      ?(creator_name = fun _ -> None)
       ?(render_source = Fun.id)
       ?render_title
       ~render_media
@@ -69,6 +82,7 @@ let view
   =
   let block = entry.block in
   let id = Journal_model.id block in
+  let time = Journal_time.format_hh_mm (Journal_model.creation_time block) in
   let is_image_asset file_type =
     Option.fold ~none:false ~some:Journal_media_view.is_image_type file_type
   in
@@ -105,11 +119,11 @@ let view
       ~alignment:Leading
       (body source :: metadata_view ?status_name ~timeline:true block)
   in
-  let labels =
+  let preview_labels =
     [ render_media ~title:(Journal_model.source block) ~root:id ~image_children content ]
   in
-  let labels =
-    labels
+  let preview_labels =
+    preview_labels
     @ List.map
         (fun (summary : Journal_graph_projection.child_summary) ->
            render_media
@@ -119,18 +133,31 @@ let view
              (body ~child:true (render summary.source)))
         text_children
   in
-  let labels =
+  let creator =
+    Option.bind (Journal_model.creator_id (Journal_model.properties block)) (fun id ->
+      let id = Logseq_db_types.Graph_types.Uuid.to_string id in
+      Option.map (fun name -> `Assoc [ "id", `String id; "name", `String name ]) (creator_name id))
+  in
+  let details =
+    chrome
+      ([ "mode", `String "timeline-row"; "text", `String time
+       ; "tags", `List (List.map (fun tag -> `String tag) (Journal_model.tag_titles block)) ]
+       @ Option.to_list (Option.map (fun creator -> "creator", creator) creator))
+      (Ui.mount (V.column ~spacing:12. ~alignment:Leading preview_labels))
+    |> V.of_lui
+  in
+  let row_children =
     if show_timestamp
     then
       V.of_lui
-        (L.text
-           ~value:(Journal_time.format_hh_mm (Journal_model.creation_time block))
+        (compact_only (L.text
+           ~value:time
            ~style_class:"caption"
            ~foreground:"secondary"
-           [])
-      :: labels
-    else labels
+           []))
+      :: [ details ]
+    else [ details ]
   in
-  V.column ~spacing:12. ~alignment:Leading labels
+  V.column ~spacing:12. ~alignment:Leading row_children
   |> V.with_test_id (Ui.Test_id.string ("journal-row-label:" ^ id))
 ;;

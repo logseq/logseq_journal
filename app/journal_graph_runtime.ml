@@ -185,6 +185,7 @@ type children_interest =
 type operation =
   | Feed_read of Feed.operation
   | Reference_read of Reference.read
+  | Creator_read of Reference.read
   | Favorite_read of Favorites.read
   | Task_catalog of
       { epoch : int64
@@ -313,7 +314,8 @@ type t =
   ; pending : (string, pending_operation) Hashtbl.t
   ; mutable insertion_recoveries : (Graph.Uuid.t * Child.recovery) Rrbvec.t
   ; hydration_queue : Graph.Uuid.t Queue.t
-  ; hydration_active : (string, unit) Hashtbl.t
+  ; creator_queue : Graph.Uuid.t Queue.t
+  ; hydration_active : (string, bool) Hashtbl.t
   ; mutable next_request : int64
   ; task_definitions : (string, int64 * Graph.task_status_definition option) Hashtbl.t
   ; task_lookup_epochs : (string, int64) Hashtbl.t
@@ -336,6 +338,7 @@ type t =
   ; mutable block_pages : (string * Projection.page) list
   ; tag_titles : (string, string list) Hashtbl.t
   ; references : Reference.t
+  ; creators : Reference.t
   ; projected_blocks : (string, Projection.block) Hashtbl.t
   ; page_tree_interests : (string, page_tree_interest) Hashtbl.t
   ; children_interests : (string, children_interest) Hashtbl.t
@@ -374,7 +377,8 @@ let create ?(on_change=fun _->()) ?(on_projection_changes=fun _->()) ?(localtime
   ; pending = Hashtbl.create 32
   ; insertion_recoveries=Rrbvec.empty
   ; hydration_queue = Queue.create ()
-  ; hydration_active = Hashtbl.create 4
+  ; creator_queue = Queue.create ()
+  ; hydration_active = Hashtbl.create 5
   ; next_request = 1L
   ; task_definitions = Hashtbl.create 32
   ; task_lookup_epochs = Hashtbl.create 32
@@ -397,6 +401,7 @@ let create ?(on_change=fun _->()) ?(on_projection_changes=fun _->()) ?(localtime
   ; block_pages = []
   ; tag_titles = Hashtbl.create 64
   ; references = Reference.create ~localtime ()
+  ; creators = Reference.create ~localtime ()
   ; projected_blocks = Hashtbl.create 64
   ; page_tree_interests = Hashtbl.create 32
   ; children_interests = Hashtbl.create 32
@@ -416,6 +421,7 @@ let reset t =
   Hashtbl.clear t.pending;
   t.insertion_recoveries<-Rrbvec.empty;
   Queue.clear t.hydration_queue;
+  Queue.clear t.creator_queue;
   Hashtbl.clear t.hydration_active;
   Hashtbl.clear t.task_definitions;
   Hashtbl.clear t.task_catalog_deletions;
@@ -435,6 +441,7 @@ let reset t =
   t.pages <- [];
   t.block_pages <- [];
   Reference.reset t.references;
+  Reference.reset t.creators;
   Hashtbl.clear t.projected_blocks;
   Hashtbl.clear t.tag_titles;
   Hashtbl.clear t.page_tree_interests;
@@ -483,6 +490,13 @@ let changed_point_current t operation epoch =
   | _ -> true
 ;;
 
+let is_creator_read = function Creator_read _ -> true | _ -> false
+
+let optional_read t request =
+  Option.exists (fun pending -> is_creator_read pending.operation)
+    (Hashtbl.find_opt t.pending (Graph.Uuid.to_string request))
+;;
+
 let make_request ?source_epoch ?(background = false) t operation planned =
   let source_epoch = Option.value source_epoch ~default:t.next_request in
   let request_id = request_uuid t in
@@ -495,7 +509,11 @@ let make_request ?source_epoch ?(background = false) t operation planned =
           Hashtbl.replace t.task_lookup_epochs (Graph.Uuid.to_string uuid) source_epoch)
        ids
    | _ -> ());
-  let participates=match operation with Acknowledge_changes _->false|_->true in
+  let participates =
+    match operation with
+    | Acknowledge_changes _ | Creator_read _ -> false
+    | _ -> true
+  in
   Hashtbl.replace
     t.pending
     (Graph.Uuid.to_string request_id)
@@ -541,7 +559,8 @@ let issue_request t (request : Graph.Uuid.t) =
   let key = Graph.Uuid.to_string request in
   let pending = Hashtbl.find t.pending key in
   pending.delivery <- Dispatched;
-  if pending.background then Hashtbl.replace t.hydration_active key ();
+  if pending.background then
+    Hashtbl.replace t.hydration_active key (is_creator_read pending.operation);
   request
 ;;
 
@@ -1278,24 +1297,25 @@ let favorite_request_current t pending =
   | _ -> true
 ;;
 
-let drain_hydration t =
-  let rec drain reversed =
-    if Hashtbl.length t.hydration_active >= maximum_active_hydration
-       || Queue.is_empty t.hydration_queue
+let drain_hydration t ~creator ~limit queue =
+  let active = Hashtbl.fold (fun _ optional count ->
+    if optional = creator then count + 1 else count) t.hydration_active 0 in
+  let rec drain available reversed =
+    if available = 0 || Queue.is_empty queue
     then List.rev reversed
     else (
-      let request = Queue.pop t.hydration_queue in
+      let request = Queue.pop queue in
       let key = Graph.Uuid.to_string request in
       match Hashtbl.find_opt t.pending key with
       | Some pending when pending.delivery = Queued ->
         if favorite_request_current t pending
-        then drain (issue_request t request :: reversed)
+        then drain (available - 1) (issue_request t request :: reversed)
         else (
           Option.iter(fun token->t.on_change(Coordination.Change_consumer_retired(token,request))) pending.change_application;
-          Hashtbl.remove t.pending key; drain reversed)
-      | None | Some _ -> drain reversed)
+          Hashtbl.remove t.pending key; drain available reversed)
+      | None | Some _ -> drain available reversed)
   in
-  drain []
+  drain (limit - active) []
 ;;
 
 let background_demands t output =
@@ -1314,11 +1334,14 @@ let dispatch_output t output =
     | Some pending when pending.delivery = Planned ->
       if pending.background then (
         pending.delivery <- Queued;
-        Queue.push request t.hydration_queue;
+        let queue = if is_creator_read pending.operation then t.creator_queue else t.hydration_queue in
+        Queue.push request queue;
         None)
       else Some (issue_request t request)
     | None | Some _ -> None) output.requests in
-  { output with requests = foreground @ drain_hydration t }
+  let hydration = drain_hydration t ~creator:false ~limit:maximum_active_hydration t.hydration_queue in
+  let creators = drain_hydration t ~creator:true ~limit:1 t.creator_queue in
+  { output with requests = foreground @ hydration @ creators }
 ;;
 
 let retire_timeline t ~before ~after =
@@ -1451,21 +1474,32 @@ let remember_detail_block t (block : Graph.block) revision =
     t.detail_children
 ;;
 
-let reference_ports t =
+let reference_ports ?(creator = false) t =
   Reference.
     { now = (fun () -> t.next_request)
     ; plan_read = (fun ~source_epoch value query ->
-        read ?source_epoch ~background:true t (Reference_read value) query)
+        let operation = if creator then Creator_read value else Reference_read value in
+        read ?source_epoch ~background:true t operation query)
     ; known_page = (fun id -> Hashtbl.find_opt t.graph_pages id)
     }
 ;;
 
-let reference_output (value : Reference.output) =
+let reference_output ?(creator = false) (value : Reference.output) =
+  let updates =
+    if creator then
+      Rrbvec.map (fun (id, name) -> Reference.creator_source_key id, name) value.updates
+    else value.updates
+  in
   { requests = Rrbvec.to_list value.requests
   ; responses =
-      if Rrbvec.is_empty value.updates then []
-      else [ response (Reference_sources_changed (Rrbvec.to_list value.updates)) ]
+      if Rrbvec.is_empty updates then []
+      else [ response (Reference_sources_changed (Rrbvec.to_list updates)) ]
   }
+;;
+
+let reference_plan t = function
+  | Creator_read _ -> t.creators, reference_ports ~creator:true t, reference_output ~creator:true
+  | _ -> t.references, reference_ports t, reference_output ~creator:false
 ;;
 
 let hydration_for_changes t ~request_generation windows =
@@ -1522,6 +1556,14 @@ let hydration_for_changes t ~request_generation windows =
             (Page_changed { id = Graph.Uuid.to_string page
                           ; detail_page_owned = (fun () -> owns_detail_page page) }))
         pages
+  in
+  let creator_reads =
+    let ports = reference_ports ~creator:true t in
+    List.filter_map
+      (fun page ->
+        Reference.plan_change t.creators ~ports
+          (Page_changed { id = Graph.Uuid.to_string page; detail_page_owned = (fun () -> false) }))
+      pages
   in
   let tree_reads =
     List.filter_map
@@ -1601,6 +1643,7 @@ let hydration_for_changes t ~request_generation windows =
     { requests =
         point_reads
         @ reference_reads
+        @ creator_reads
         @ tree_reads
         @ children_reads
         @ detail_page_reads
@@ -1655,6 +1698,17 @@ let rehydrate_current_interests t ~request_generation ~generation =
   let reference_requests =
     Reference.resync t.references ~ports:(reference_ports t) |> Rrbvec.to_list
   in
+  let creator_ids =
+    Hashtbl.to_seq_values t.projected_blocks
+    |> Seq.filter_map (fun block ->
+      if Journal_model.parent_id block = None && Feed.retained_page t.feed (Journal_model.page_id block)
+      then Journal_model.creator_id (Journal_model.properties block)
+      else None)
+  in
+  let creators =
+    Reference.refresh_creators t.creators ~ports:(reference_ports ~creator:true t) creator_ids
+    |> reference_output ~creator:true
+  in
   let detail_roots =
     Hashtbl.to_seq_values t.children_interests
     |> Seq.filter (fun (interest : children_interest) ->
@@ -1690,8 +1744,10 @@ let rehydrate_current_interests t ~request_generation ~generation =
         @ detail_roots
         @ detail_page_requests
         @ reference_requests
+        @ creators.requests
     ; responses =
-        response Projection_resync :: response Favorites_invalidated :: (timeline.responses @ journal.responses)
+        response Projection_resync :: response Favorites_invalidated ::
+        (timeline.responses @ journal.responses @ creators.responses)
     }
 ;;
 
@@ -1873,6 +1929,7 @@ let resolve_changed_point
 let operation_name = function
   | Feed_read operation -> Feed.operation_name operation
   | Reference_read _ -> "readUuidReference"
+  | Creator_read _ -> "readTimelineCreator"
   | Favorite_read value -> Favorites.operation_name value
   | Task_catalog _ -> "listTaskStatuses"
   | Task_definitions _ -> "readTaskStatuses"
@@ -1987,9 +2044,9 @@ let failure_output
              ; failure = Worker_failure worker_failure
              })
       ]
-  | Reference_read { block_id; depth; _ } ->
-    let output=Reference.read_failed t.references ~ports:(reference_ports t) ~source_epoch ~block_id ~depth
-      |> reference_output in
+  | Reference_read { block_id; depth; _ } | Creator_read { block_id; depth; _ } ->
+    let plan, ports, publish = reference_plan t operation in
+    let output = Reference.read_failed plan ~ports ~source_epoch ~block_id ~depth |> publish in
     {output with responses=response(Diagnostic worker_failure)::output.responses}
   | Changed_block { block_id; _ } | Changed_detail_block { block_id; _ } | Changed_point_context {block_id;_} ->
     let invalidation =
@@ -2244,9 +2301,10 @@ let receive_result t ~origin ~request_id result =
           publish_changed_point t ~block_id ~value ~revision ~child_count ~page
         |_,Changed_point_context _->reject "The changed block page is unavailable."
         | ( (Worker_pure_data.V2_present_page _ | Worker_pure_data.V2_missing_page _)
-          , Reference_read ({ lookup = Reference.Page_lookup; _ } as value) ) ->
-          Reference.receive_page t.references ~ports:(reference_ports t)
-            ~source_epoch value lookup |> reference_output
+          , (Reference_read ({ lookup = Reference.Page_lookup; _ } as value)
+            | Creator_read ({ lookup = Reference.Page_lookup; _ } as value)) ) ->
+          let plan, ports, publish = reference_plan t operation in
+          Reference.receive_page plan ~ports ~source_epoch value lookup |> publish
         | ( Worker_pure_data.V2_present_page { page; revision }
           , Detail_block { generation; block_id; limit; after } )
           when Graph.Uuid.to_string page.uuid = block_id && not page.recycled ->
@@ -2478,9 +2536,10 @@ let receive_result t ~origin ~request_id result =
           remember_block_revision t value.block.uuid revision;
           finish_child_parent t ~root ~round ~summary Projection.{block=value.block;revision}
         | ( (Worker_pure_data.V2_present_block _ | Worker_pure_data.V2_missing_block _)
-          , Reference_read ({ lookup = Reference.Outline_lookup; _ } as value) ) ->
-          Reference.receive_outline t.references ~ports:(reference_ports t)
-            ~source_epoch value lookup |> reference_output
+          , (Reference_read ({ lookup = Reference.Outline_lookup; _ } as value)
+            | Creator_read ({ lookup = Reference.Outline_lookup; _ } as value)) ) ->
+          let plan, ports, publish = reference_plan t operation in
+          Reference.receive_outline plan ~ports ~source_epoch value lookup |> publish
         | Worker_pure_data.V2_present_block { value; revision }, Find_block_result ->
           remember_block_revision t value.block.uuid revision;
           (match page_by_uuid t value.block.page, projection_time_context t with
@@ -2693,7 +2752,7 @@ let receive_delivery_body t ~origin ~request_id result =
   let references =
     match pending, result with
     | _ when not root_current -> empty
-    | None, _ | Some { operation = Reference_read _; _ }, _ -> empty
+    | None, _ | Some { operation = (Reference_read _ | Creator_read _); _ }, _ -> empty
     | Some pending, _ when not (favorite_request_current t pending) -> empty
     | Some { operation = Target_summary summary; _ }, _
       when not (Confirmation.current t.confirmations summary) ->
@@ -2773,8 +2832,27 @@ let receive_delivery_body t ~origin ~request_id result =
           Seq.return (page_root_member page revision).block
         | _ -> Seq.empty
       in
-      Reference.observe_fragment t.references ~ports:(reference_ports t)
-        ~source_epoch ~sources ~changes ~property_blocks |> reference_output
+      let creator_ids =
+        let creator (member : Worker_pure_data.tree_member) =
+          if member.depth = 0 then Journal_model.creator_id member.value.block.properties
+          else None in
+        match result with
+        | Query_result (Worker.Timeline_read {query=Worker.Timeline.Roots _;_}, Ok packet) ->
+          Seq.filter_map creator (Rrbvec.to_seq packet.items)
+        | Query_result (Worker.Timeline_read {query=Worker.Timeline.Roots_through_grandchildren _;_}, Ok packet) ->
+          Seq.filter_map creator (Rrbvec.to_seq packet.items)
+        | Query_result (Worker.Block_summary _,
+            {lookup=Worker_pure_data.V2_present_block {value;_};_}) ->
+          Option.to_seq (Journal_model.creator_id value.block.properties)
+        | _ -> Seq.empty in
+      let references =
+        Reference.observe_fragment t.references ~ports:(reference_ports t)
+          ~source_epoch ~sources ~changes ~property_blocks |> reference_output in
+      let creators =
+        Reference.observe_creators t.creators ~ports:(reference_ports ~creator:true t)
+          ~source_epoch creator_ids |> reference_output ~creator:true in
+      { requests = references.requests @ creators.requests
+      ; responses = references.responses @ creators.responses }
   in
   let output = { output with responses = output.responses @ references.responses } in
   let output = match Option.bind pending (fun pending -> pending.durable) with
@@ -3241,8 +3319,9 @@ let fail_request ?error t (request : Graph.Uuid.t) ~message =
 let abandon t (request : Graph.Uuid.t) =
   let key = Graph.Uuid.to_string request in
   (match Hashtbl.find_opt t.pending key with
-   | Some { operation = Reference_read value; source_epoch; _ } ->
-     Reference.abandon t.references ~source_epoch value
+   | Some { operation = (Reference_read value | Creator_read value) as operation; source_epoch; _ } ->
+     let plan, _, _ = reference_plan t operation in
+     Reference.abandon plan ~source_epoch value
    | Some { operation = Task_catalog { epoch; _ }; _ } when epoch = t.task_catalog_epoch
      ->
      t.task_catalog_loading <- false;

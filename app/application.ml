@@ -335,6 +335,7 @@ type state =
   ; sync_error : sync_error_notice option
   ; manager_attention : string option
   ; manager : Graph_service.snapshot option
+  ; account_user_id : string option
   ; graph_picker_open : bool
   ; graph_catalog : Graph_service.graph Rrbvec.t
   ; local_copies : (Graph_service.local_copy_presence, string) result Local_copies.t
@@ -514,6 +515,7 @@ let initial_state =
   ; sync_error = None
   ; manager_attention = None
   ; manager = None
+  ; account_user_id = None
   ; graph_picker_open = false
   ; graph_catalog = Rrbvec.empty
   ; local_copies = Local_copies.empty
@@ -2150,7 +2152,8 @@ module Root_navigation = struct
           | None -> let fresh=replace_graph ~discard {initial_state with graph_drafts=state.graph_drafts} generation (Some graph_id) in
             {fresh with graph_state={fresh.graph_state with graph_id=Some graph_id}} in
         {retained with startup_presentation=state.startup_presentation;resident_states=states;calendar=state.calendar;environment=state.environment;
-          manager=state.manager;graph_catalog=state.graph_catalog;local_copies=state.local_copies;
+          manager=state.manager;account_user_id=state.account_user_id;
+          graph_catalog=state.graph_catalog;local_copies=state.local_copies;
           local_copy_check=state.local_copy_check;local_copy_deleting=state.local_copy_deleting;
           local_copy_message=state.local_copy_message;graph_picker_open=state.graph_picker_open;
           resident_replacement=state.resident_replacement;graph_preview=None;graph_preview_revision=state.graph_preview_revision+1}
@@ -2158,7 +2161,8 @@ module Root_navigation = struct
         let state = replace_graph ~discard state generation graph_id in
         { state with graph_state = { state.graph_state with graph_id } }
       | Account_cleared ->
-        { (clear_account_drafts ~discard state) with resident_states=Graph_drafts.empty;graph_preview=None }
+        { (clear_account_drafts ~discard state) with
+          account_user_id=None;resident_states=Graph_drafts.empty;graph_preview=None }
       | Local_copy_deleted -> discard_local_graph_state ~discard state
     in
     track_capture_session state
@@ -2560,6 +2564,12 @@ let render_title state =
   Journal_model.Title.render ~lookup:(fun id -> Reference_sources.find_opt id state.reference_sources)
 ;;
 
+let timeline_account_id user_id =
+  Logseq_db_types.Graph_types.Uuid.of_string user_id
+  |> Result.to_option
+  |> Option.map Logseq_db_types.Graph_types.Uuid.to_string
+;;
+
 let favorites_view
       ~render_title
       ~state
@@ -2783,6 +2793,7 @@ let filters_page state dispatch filter_draft =
 
 let timeline_page
       ~status_name
+      ~creator_name
       ~header_signal
       ~timeline_store
       ~on_region
@@ -2845,6 +2856,7 @@ let timeline_page
     | None ->
       Journal_timeline.view
         ~status_name
+        ~creator_name
         ?current_day
         ?store:timeline_store
         ?on_sync:(if interaction_enabled then Some (bind_action on_account_action Begin_online_recovery) else None)
@@ -4634,7 +4646,13 @@ let start
               | _->None)
            | _->None in
          (match observed with Some result->result|None->
-         match Coordination_host.plan_query host ~owner ~maximum_items:read.maximum_items
+         let is_change_read =
+           match read.query with Wc.Changes _ -> true | _ -> Option.is_some application in
+         let plan_query =
+           if is_change_read
+           then Coordination_host.plan_query_when_available
+           else Coordination_host.plan_query in
+         match plan_query host ~owner ~maximum_items:read.maximum_items
            ~maximum_bytes:Worker_pure_data.maximum_response_bytes read.query with
           | Ok ticket->
             observe_projection_query ~request_id:request read.query;
@@ -6027,7 +6045,8 @@ let start
       Effect.run(Effect.bind(set_root_state(fun state->
         if not(Account_pure_lifecycle.current !account_lifecycle claim)then state else
         let ticket=Journal_startup.Presentation.account_ticket state.startup_presentation in
-        {state with startup_presentation=Journal_startup.Presentation.step state.startup_presentation
+        {state with account_user_id=Option.bind user_id timeline_account_id;
+          startup_presentation=Journal_startup.Presentation.step state.startup_presentation
           (Account(ticket,if user_id=None then No_user else User))}))
         ~f:(fun()->if Account_pure_lifecycle.current !account_lifecycle claim
           then send_manager(Graph_service.Reconcile_authenticated_user{user_id})else Effect.ignore)))) in
@@ -6074,7 +6093,7 @@ let start
     if not current_sdk_allows then Effect.ignore else
     let unavailable () =
       coordination_account := Some None;
-      Effect.bind (set_state (fun state -> {state with startup_presentation=
+      Effect.bind (set_state (fun state -> {state with account_user_id=None;startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Account(ticket,No_local))}))
         ~f:(fun () -> send_manager (Graph_service.Local_account_unavailable (startup_scope !state_ref,No_local_account))) in
     match decoded with
@@ -6085,7 +6104,8 @@ let start
     | Ok (Some binding) ->
       if String.equal binding.managed_sync_origin !managed_sync_origin
          && ticket = Journal_startup.Presentation.account_ticket !state_ref.startup_presentation
-      then Effect.bind (set_state (fun state -> {state with startup_presentation=
+      then Effect.bind (set_state (fun state -> {state with
+        account_user_id=timeline_account_id binding.user_id;startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Account(ticket,Local))}))
         ~f:(fun () -> cancel_copy();shutdown_coordination();
           coordination_account := Some (Some binding.user_id);
@@ -7824,7 +7844,8 @@ let start
       | None,Some shared -> Some {shared with selected_graph=Some owner.graph_id;
           startup={shared.startup with graph_generation=owner.graph_generation;presentation_generation=owner.startup.presentation_generation}}
       | saved,None -> saved in
-    {saved with resident_states=Graph_drafts.empty;manager;graph_catalog=root.graph_catalog;
+    {saved with resident_states=Graph_drafts.empty;manager;account_user_id=root.account_user_id;
+      graph_catalog=root.graph_catalog;
       local_copies=root.local_copies;local_copy_check=root.local_copy_check;
       local_copy_deleting=root.local_copy_deleting;local_copy_message=root.local_copy_message;
       calendar=root.calendar;environment=root.environment} in
@@ -8115,6 +8136,7 @@ let start
       && Journal_routes.destination left.routes = Journal_routes.destination right.routes
       && same_actions left right
       && left.reference_sources == right.reference_sources
+      && left.account_user_id = right.account_user_id
       && left.task_catalog.definitions == right.task_catalog.definitions
       && Timeline_filter.applied left.filters = Timeline_filter.applied right.filters
       && Timeline_filter.entry left.filters = Timeline_filter.entry right.filters
@@ -8357,6 +8379,12 @@ let start
     let render_graph_timeline ~interactive ~header_signal ~store ~media_store ~dispatch state =
           timeline_page
             ~status_name:(task_status_name state)
+            ~creator_name:(fun id ->
+              match state.account_user_id with
+              | Some current when current <> id ->
+                let key = Journal_graph_reference_plan.creator_source_key id in
+                Some (Option.value (Reference_sources.find_opt key state.reference_sources) ~default:"")
+              | _ -> None)
             ~header_signal
             ~timeline_store:(Some store)
             ~on_region:on_view_region
@@ -9330,6 +9358,7 @@ module For_testing = struct
     let handler = Ui.Event.Handler.create ~name:"root-visual-fixture" (fun _ -> ()) in
     timeline_page
       ~status_name:(task_status_name initial_state)
+      ~creator_name:(fun _ -> None)
       ~header_signal:None
       ~timeline_store:None
       ~on_region:(fun _ -> ())

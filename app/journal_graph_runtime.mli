@@ -205,6 +205,8 @@ type worker_read =
     the business operation/result; ordinary Worker transport IDs remain solely
     with the coordinator. No raw continuation extraction or cursor registry. *)
 val worker_read : t -> Logseq_db_types.Graph_types.Uuid.t -> worker_read option
+(** Whether this demand may fail admission without failing its originating delivery. *)
+val optional_read : t -> Worker.Uuid.t -> bool
 
 (** The token only associates a business request with its pure application
     ledger. It never grants a new session or advances the ACK chain. *)

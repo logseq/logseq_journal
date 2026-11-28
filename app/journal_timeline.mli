@@ -1,3 +1,9 @@
+(** {1 TLDR}
+
+    Render Timeline state as a native collection. The caller owns the state,
+    action handlers, presentation callbacks and optional mounted row store.
+    [creator_name] controls which creator names are displayed in details. *)
+
 module Ui = Journal_view
 
 module Store : sig
@@ -13,10 +19,9 @@ module Store : sig
   val reset : t -> unit
 end
 
-val loading_view : unit -> Ui.View.t
-
 val view
   :  ?status_name:(Journal_model.task_state -> string)
+  -> ?creator_name:(string -> string option)
   -> ?current_day:int
   -> ?store:Store.t
   -> ?on_sync:Ui.Event.Handler.t
@@ -42,3 +47,19 @@ val view
   -> on_copy:Ui.Event.Handler.t
   -> unit
   -> Ui.View.Body.t
+
+(** {1 Minimal usage example}
+
+    The caller supplies the current [state], [day_presentation], rendering
+    callbacks and event handlers:
+    {[
+      let timeline =
+        view ~render_source ~render_media ~state ~day_presentation
+          ~on_visible_range ~on_scroll_completed ~on_retry_day ~on_open_block
+          ~delete_enabled ~actions_enabled ~on_status ~on_delete ~on_copy ()
+    ]}
+    Mount the resulting body on the Timeline host. *)
+
+(** {1 Capability details} *)
+
+val loading_view : unit -> Ui.View.t

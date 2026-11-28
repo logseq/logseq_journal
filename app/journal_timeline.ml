@@ -217,6 +217,7 @@ let loading_view () = V.loading ~centered:true ~message:"Loading journal" ()
 
 let view
       ?status_name
+      ?creator_name
       ?current_day
       ?store
       ?on_sync
@@ -273,6 +274,7 @@ let view
           on_region "timeline-item-build";
           Journal_row.view
             ?status_name
+            ?creator_name
             ~render_source
             ?render_title
             ~render_media ~show_timestamp entry
@@ -391,6 +393,10 @@ let view
          unsubscribe ();
          Signal.dispose_signal (Signal.value command));
        Ui.mount (collection ~scroll_target_signal:(Signal.value command) None) context parent))
+  |> fun content -> V.of_lui
+    (Journal_lui_native.mount ~key:"journal-timeline-mode"
+       ~payload:{|{"mode":"timeline-interaction"}|}
+       ~children:[ Ui.mount content ] Journal_lui_native.chrome_identifier)
   |> V.Body.Vertical.fill
   |> fun content -> V.Body.Vertical.create [ content ]
 ;;
