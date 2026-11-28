@@ -151,9 +151,20 @@ module JournalRelease
         reasons=[]
         reasons << 'package does not match the checked IPA' unless @package.all? { |k,v| proof[k]==v }
         reasons << 'check is missing or older than 15 minutes' unless age.between?(0,900)
-        reasons << 'a matching build is already visible' unless proof['accepted_build_visible']==false
-        reasons << 'a matching upload is active or already received' unless proof['active_upload']==false
-        reasons << 'a non-target beta group automatically receives builds' unless proof['non_target_automatic_distribution']==false
+        {
+          'accepted_build_visible'=>['visible-build evidence','a matching build is already visible'],
+          'active_upload'=>['active-upload evidence','a matching upload is active or already received'],
+          'non_target_automatic_distribution'=>['automatic-distribution evidence','a non-target beta group automatically receives builds']
+        }.each do |key,(label,positive)|
+          value=proof[key]
+          if value.nil?
+            reasons << "missing #{label}"
+          elsif value==true
+            reasons << positive
+          elsif value!=false
+            reasons << "invalid #{label}"
+          end
+        end
         raise Failure, "Fresh exact-package ASC receipt check required: #{reasons.join('; ')}" unless reasons.empty?
         path=File.join(@directory,"#{key}-#{format('%04d',prior.length+1)}.json")
         record=@package.merge('started_utc'=>Time.now.utc.iso8601,'status'=>'failed_or_uncertain',
