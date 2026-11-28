@@ -135,11 +135,17 @@ module JournalRelease
     end.uniq(&:id)
   end
 
+  def self.build_upload_state(upload)
+    detail=upload.state
+    detail=detail['state'] || detail[:state] if detail.is_a?(Hash)
+    detail.to_s
+  end
+
   def self.automatic_receipt_check!(package,api_key)
     app=asc_app!(api_key)
     version=package.fetch('version'); build=package.fetch('build')
     uploads=release_build_uploads(app_id: app.id,version: version,build: build)
-    active=uploads.any? { |upload| upload.state!='FAILED' }
+    active=uploads.any? { |upload| build_upload_state(upload)!='FAILED' }
     accepted=!release_builds(app_id: app.id,version: version,build: build).empty?
     groups=app.get_beta_groups
     target=logseq_team_group!(groups)
