@@ -6795,6 +6795,22 @@ let resident_graph_failure_preserves_account_catalog_request () =
 let scenarios=scenarios @ [Alcotest.test_case "resident graph failure preserves account catalog ticket" `Quick resident_graph_failure_preserves_account_catalog_request]
 ;;
 
+let first_resident_preserves_catalog_refresh () =
+  let authenticated, ticket, _ = authenticated_fetch "user" in
+  let picker = Core.step authenticated.next (Core.Runner_completed (Core.Completion (ticket, Ok [graph]))) in
+  let refresh = Core.step picker.next (Core.Catalog_refresh_requested (startup_scope picker.next)) in
+  let selected = Core.step refresh.next (Core.Resident_graphs_changed [graph_id]) in
+  let updated = { graph with name = "Updated catalog name" } in
+  let completed = Core.step selected.next (fetch_catalog_completion refresh.effects [updated]) in
+  let snapshot = (Core.state completed.next).snapshot in
+  Alcotest.(check bool) "first resident keeps the account refresh until completion" true
+    (not snapshot.startup.catalog_loading && snapshot.catalog = [updated])
+;;
+
+let scenarios = scenarios @
+  [Alcotest.test_case "first resident preserves catalog refresh" `Quick first_resident_preserves_catalog_refresh]
+;;
+
 (* The reducer owns deletion failure projection; valid producer diagnostics must
    survive its public completion boundary without exposing arbitrary source text. *)
 let local_deletion_preserves_cause () =

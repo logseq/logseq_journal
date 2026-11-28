@@ -1553,13 +1553,16 @@ let clear_reconciliation_failure (snapshot : snapshot) =
     }
 ;;
 
+let is_catalog_fetch (Pending_effect ticket) =
+  match ticket.kind with Fetch_catalog_kind -> true | _ -> false
+;;
+
 let request_catalog_reconciliation core =
   let core = { core with deferred_catalog_reconciliation = false } in
   match core.user_id with
   | Some user_id when network_allowed core ->
     let scope = account_scope core user_id in
-    let fetches, other_pending = List.partition (fun (Pending_effect ticket) ->
-      match ticket.kind with Fetch_catalog_kind -> true | _ -> false) core.pending_effects in
+    let fetches, other_pending = List.partition is_catalog_fetch core.pending_effects in
     if List.exists (fun (Pending_effect ticket) -> ticket.scope = effect_scope_of_account scope) fetches
     then unchanged core
     else
@@ -4616,6 +4619,7 @@ let configure_residents core ids =
       | Some _ -> empty_session core
       | None -> let blank=initial core.config |> Result.get_ok in
         let base={blank with host_fence=core.host_fence;host_cleanup_scopes=core.host_cleanup_scopes;user_id=core.user_id;next_effect_id=core.next_effect_id;
+          pending_effects=List.filter is_catalog_fetch core.pending_effects;
           resident_order=core.resident_order;resident_enabled=true;resident_sessions=core.resident_sessions;
           resident_next_generation=core.resident_next_generation;foreground=core.foreground;
           lifecycle_generation=core.lifecycle_generation;public_state=core.public_state} in
