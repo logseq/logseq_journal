@@ -400,7 +400,6 @@ let refresh_creators t ~ports ids =
   observe_creators t ~ports ~source_epoch ids
 ;;
 
-let creator_source_key id = "timeline-creator:" ^ id
 
 let abandon t ~source_epoch (read : read) =
   Hashtbl.remove t.reference_pending read.block_id;

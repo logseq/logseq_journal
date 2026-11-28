@@ -2,12 +2,23 @@
 
     Render a Timeline entry using the supplied title and media renderers.
     Creation time and tags appear in the Timeline details rail.
-    [creator_name] returns [None] to hide the creator, or an empty name when
-    the creator is visible but their profile name is unavailable. *)
+    [creator_name] returns [None] to hide the creator, or a signal whose name
+    is empty until the profile becomes available. The row borrows this signal
+    for its mount scope.
+
+    {1 Minimal usage example}
+
+    Given a Timeline [entry] and the caller's [render_media] callback:
+    {[
+      let row = view ~render_media entry
+    ]}
+    Pass the returned view to the Timeline row container.
+
+    {1 Capability details} *)
 
 val view
   :  ?status_name:(Journal_model.task_state -> string)
-  -> ?creator_name:(string -> string option)
+  -> ?creator_name:(Lui_ui.ui_context -> string -> string Signal.signal option)
   -> ?render_source:(string -> string)
   -> ?render_title:(string -> Journal_model.Title.t)
   -> render_media:
@@ -18,14 +29,6 @@ val view
         -> Journal_view.View.t)
   -> Journal_graph_projection.timeline_entry
   -> Journal_view.View.t
-
-(** {1 Minimal usage example}
-
-    Given a Timeline [entry] and the caller's [render_media] callback:
-    {[
-      let row = view ~render_media entry
-    ]}
-    Pass the returned view to the Timeline row container. *)
 
 (** {1 Observation and helpers} *)
 

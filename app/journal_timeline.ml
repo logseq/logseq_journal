@@ -14,8 +14,15 @@ module Store = struct
     | Block of string * int
     | Other of Timeline.slot * string option * bool
 
+  type creator_source =
+    { name : string Signal.state
+    ; mutable mounts : int
+    }
+
   type t =
     { rows : (string, Journal_graph_projection.timeline_entry) Hashtbl.t
+    ; creator_names : (string, string) Hashtbl.t
+    ; creator_sources : (string, creator_source) Hashtbl.t
     ; listeners : (string, (int, listener) Hashtbl.t) Hashtbl.t
     ; scroll_listeners : (int, listener) Hashtbl.t
     ; mutable scroll_target : (int64 * int * string) option
@@ -30,6 +37,8 @@ module Store = struct
 
   let create ?(observe = fun _ -> ()) () =
     { rows = Hashtbl.create 64
+    ; creator_names = Hashtbl.create 16
+    ; creator_sources = Hashtbl.create 16
     ; listeners = Hashtbl.create 64
     ; scroll_listeners = Hashtbl.create 2
     ; scroll_target = None
@@ -44,6 +53,35 @@ module Store = struct
   ;;
 
   let find t block_id = Hashtbl.find_opt t.rows block_id
+
+  let creator_name t (context : Lui_ui.ui_context) id =
+    let source =
+      match Hashtbl.find_opt t.creator_sources id with
+      | Some source -> source
+      | None ->
+        let initial = Option.value (Hashtbl.find_opt t.creator_names id) ~default:"" in
+        let source = { name = Signal.state context.Lui_ui.ui_scheduler initial; mounts = 0 } in
+        Hashtbl.add t.creator_sources id source;
+        source
+    in
+    source.mounts <- source.mounts + 1;
+    Signal.on_dispose context.ui_scope (fun () ->
+      source.mounts <- source.mounts - 1;
+      if source.mounts = 0
+         && Option.exists (( == ) source) (Hashtbl.find_opt t.creator_sources id)
+      then Hashtbl.remove t.creator_sources id);
+    Signal.value source.name
+  ;;
+
+  let publish_creators t updates =
+    List.iter (fun (id, name) ->
+      if Hashtbl.find_opt t.creator_names id <> name then (
+        (match name with
+         | Some name -> Hashtbl.replace t.creator_names id name
+         | None -> Hashtbl.remove t.creator_names id);
+        Option.iter (fun source -> Signal.set source.name (Option.value name ~default:""))
+          (Hashtbl.find_opt t.creator_sources id))) updates
+  ;;
 
   let scroll_target t = t.scroll_target
 
@@ -177,7 +215,9 @@ module Store = struct
     t.epoch <- t.epoch + 1;
     t.last <- None;
     t.shape <- None;
-    Hashtbl.clear t.rows
+    Hashtbl.clear t.rows;
+    Hashtbl.clear t.creator_names;
+    Hashtbl.clear t.creator_sources
   ;;
 end
 
@@ -185,7 +225,7 @@ let loading_view () = V.loading ~centered:true ~message:"Loading journal" ()
 
 let view
       ?status_name
-      ?creator_name
+      ?account_user_id
       ?current_day
       ?store
       ?on_sync
@@ -242,7 +282,11 @@ let view
           on_region "timeline-item-build";
           Journal_row.view
             ?status_name
-            ?creator_name
+            ~creator_name:(fun context id ->
+              match account_user_id, store with
+              | Some current, Some store when current <> id ->
+                Some (Store.creator_name store context id)
+              | _ -> None)
             ~render_source
             ?render_title
             ~render_media entry

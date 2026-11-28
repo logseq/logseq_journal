@@ -2,13 +2,6 @@ module Ui = Journal_view
 module V = Ui.View
 module L = Lui_elements
 
-let chrome fields child =
-  Journal_lui_native.mount
-    ~payload:(Yojson.Safe.to_string (`Assoc fields))
-    ~children:[ child ]
-    Journal_lui_native.chrome_identifier
-;;
-
 let body ?(child = false) title =
   if String.trim (Journal_model.Title.plain title) = "" then V.column []
   else Journal_header.bounded_text ~child title
@@ -57,7 +50,7 @@ let metadata ?status_name block =
 
 let view
       ?status_name
-      ?(creator_name = fun _ -> None)
+      ?(creator_name = fun _ _ -> None)
       ?(render_source = Fun.id)
       ?render_title
       ~render_media
@@ -116,19 +109,36 @@ let view
              (body ~child:true (render summary.source)))
         text_children
   in
-  let creator =
-    Option.bind (Journal_model.creator_id (Journal_model.properties block)) (fun id ->
-      let id = Logseq_db_types.Graph_types.Uuid.to_string id in
-      Option.map (fun name -> `Assoc [ "id", `String id; "name", `String name ]) (creator_name id))
+  let creator_id =
+    Journal_model.creator_id (Journal_model.properties block)
+    |> Option.map Logseq_db_types.Graph_types.Uuid.to_string
   in
-  let details =
-    chrome
-      ([ "mode", `String "timeline-row"; "text", `String time
-       ; "tags", `List (List.map (fun tag -> `String tag) (Journal_model.tag_titles block)) ]
-       @ Option.to_list (Option.map (fun creator -> "creator", creator) creator))
-      (Ui.mount (V.column ~spacing:12. ~alignment:Leading preview_labels))
-    |> V.of_lui
+  let fields =
+    [ "mode", `String "timeline-row"; "text", `String time
+    ; "tags", `List (List.map (fun tag -> `String tag) (Journal_model.tag_titles block)) ]
   in
-  V.column ~spacing:12. ~alignment:Leading [ details ]
+  let content = Ui.mount (V.column ~spacing:12. ~alignment:Leading preview_labels) in
+  let details (context : Lui_ui.ui_context) parent =
+    let creator =
+      Option.bind creator_id (fun id ->
+        Option.map (fun name -> id, name) (creator_name context id))
+    in
+    let payload, payload_signal =
+      match creator with
+      | None -> Yojson.Safe.to_string (`Assoc fields), None
+      | Some (id, name) ->
+        let encode name =
+          Yojson.Safe.to_string
+            (`Assoc (("creator", `Assoc [ "id", `String id; "name", `String name ]) :: fields))
+        in
+        let payload_signal = Signal.map encode name in
+        Signal.on_dispose context.ui_scope (fun () -> Signal.dispose_signal payload_signal);
+        encode (Signal.sample name), Some payload_signal
+    in
+    Journal_lui_native.mount
+      ~payload ?payload_signal ~children:[ content ] Journal_lui_native.chrome_identifier
+      context parent
+  in
+  V.column ~spacing:12. ~alignment:Leading [ V.of_lui details ]
   |> V.with_test_id (Ui.Test_id.string ("journal-row-label:" ^ id))
 ;;

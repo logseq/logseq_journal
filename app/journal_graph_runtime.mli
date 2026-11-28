@@ -66,6 +66,7 @@ type payload =
       ; error : string option
       }
   | Reference_sources_changed of (string * string option) list
+  | Creator_names_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request
       * Journal_worker_coordination.Worker_api.favorites

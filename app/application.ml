@@ -1368,7 +1368,7 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
            (Logseq_db_types.Failure_diagnostic.decode message) in
          {state with timeline_notice=Some(Delete_pending message)}
        | _->state))
-  | Projection_changes _ | Projection_resync -> state
+  | Projection_changes _ | Projection_resync | Creator_names_changed _ -> state
   | Task_statuses_changed { items; default_status; complete; error } ->
     if
       Seq.equal ( = ) (Rrbvec.to_seq state.task_catalog.items) (Rrbvec.to_seq items)
@@ -2793,7 +2793,7 @@ let filters_page state dispatch filter_draft =
 
 let timeline_page
       ~status_name
-      ~creator_name
+      ~account_user_id
       ~header_signal
       ~timeline_store
       ~on_region
@@ -2856,7 +2856,7 @@ let timeline_page
     | None ->
       Journal_timeline.view
         ~status_name
-        ~creator_name
+        ?account_user_id
         ?current_day
         ?store:timeline_store
         ?on_sync:(if interaction_enabled then Some (bind_action on_account_action Begin_online_recovery) else None)
@@ -4781,7 +4781,15 @@ let start
       output in
     Rrbvec.iter(fun(root,recovery)-> !schedule_insertion_recovery root recovery)
       (Journal_graph_runtime.take_insertion_recoveries (!graph_runtime_cell));
-    delivery
+    (* Creator responses belong to the active graph runtime's row store.
+       Publish only to subscribed payloads, without changing the app model. *)
+    let responses = List.filter (fun response ->
+      match response.Journal_graph_runtime.payload with
+      | Creator_names_changed updates ->
+        Journal_timeline.Store.publish_creators !timeline_store_cell updates;
+        false
+      | _ -> true) delivery.responses in
+    { delivery with responses }
   in
   let retire_graph_scope () =
     Journal_graph_runtime.reset (!graph_runtime_cell)
@@ -4882,6 +4890,7 @@ let start
        |_->())
     |_->());
   let rec apply_graph_responses set_state_and_effect responses =
+    if responses = [] then Effect.ignore else
     set_state_and_effect (fun state ->
       let state, effects = List.fold_left (fun (state, effects) response ->
         let response=match response.Journal_graph_runtime.payload with
@@ -8379,12 +8388,7 @@ let start
     let render_graph_timeline ~interactive ~header_signal ~store ~media_store ~dispatch state =
           timeline_page
             ~status_name:(task_status_name state)
-            ~creator_name:(fun id ->
-              match state.account_user_id with
-              | Some current when current <> id ->
-                let key = Journal_graph_reference_plan.creator_source_key id in
-                Some (Option.value (Reference_sources.find_opt key state.reference_sources) ~default:"")
-              | _ -> None)
+            ~account_user_id:state.account_user_id
             ~header_signal
             ~timeline_store:(Some store)
             ~on_region:on_view_region
@@ -9357,7 +9361,7 @@ module For_testing = struct
     let handler = Ui.Event.Handler.create ~name:"root-visual-fixture" (fun _ -> ()) in
     timeline_page
       ~status_name:(task_status_name initial_state)
-      ~creator_name:(fun _ -> None)
+      ~account_user_id:None
       ~header_signal:None
       ~timeline_store:None
       ~on_region:(fun _ -> ())

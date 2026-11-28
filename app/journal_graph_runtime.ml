@@ -80,6 +80,7 @@ type payload =
       ; error : string option
       }
   | Reference_sources_changed of (string * string option) list
+  | Creator_names_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request
       * Journal_worker_coordination.Worker_api.favorites
@@ -1485,15 +1486,12 @@ let reference_ports ?(creator = false) t =
 ;;
 
 let reference_output ?(creator = false) (value : Reference.output) =
-  let updates =
-    if creator then
-      Rrbvec.map (fun (id, name) -> Reference.creator_source_key id, name) value.updates
-    else value.updates
-  in
   { requests = Rrbvec.to_list value.requests
   ; responses =
-      if Rrbvec.is_empty updates then []
-      else [ response (Reference_sources_changed (Rrbvec.to_list updates)) ]
+      if Rrbvec.is_empty value.updates then []
+      else (
+        let updates = Rrbvec.to_list value.updates in
+        [ response (if creator then Creator_names_changed updates else Reference_sources_changed updates) ])
   }
 ;;
 

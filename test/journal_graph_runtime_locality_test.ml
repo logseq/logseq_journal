@@ -2471,9 +2471,12 @@ let test_creator_name_refreshes_after_block_change () =
     }
   in
   let check_label output name =
-    let key = Journal_graph_reference_plan.creator_source_key target_id in
+    let updates = List.concat_map (fun (response : Runtime.response) ->
+      match response.payload with
+      | Creator_names_changed updates -> updates
+      | _ -> []) output.Runtime.responses in
     Alcotest.(check (option string)) "published creator name" (Some name)
-      (List.assoc_opt key (reference_updates output) |> Option.join)
+      (List.assoc_opt target_id updates |> Option.join)
   in
   let initial =
     reference_feed ~properties:[ creator ] runtime "Timeline entry"

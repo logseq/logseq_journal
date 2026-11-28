@@ -77,8 +77,3 @@ val refresh_creators : t -> ports:ports -> Graph.Uuid.t Seq.t -> output
 val shared_read_failed : t -> ports:ports -> source_epoch:int64 -> block_id:string -> output
 val read_failed : t -> ports:ports -> source_epoch:int64 -> block_id:string -> depth:int -> output
 val abandon : t -> source_epoch:int64 -> read -> unit
-
-(** {1 Observation and helpers} *)
-
-(** Keep creator source updates separate from content references in the UI. *)
-val creator_source_key : string -> string
