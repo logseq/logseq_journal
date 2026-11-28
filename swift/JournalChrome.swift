@@ -348,7 +348,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     }
 
     private func widths(for width: CGFloat) -> (body: CGFloat, metadata: CGFloat) {
-      let metadata = (width * 0.22).rounded(.down)
+      let metadata = (width * 0.18).rounded(.down)
       return (max(0, width - metadata - 8), metadata)
     }
 
@@ -899,13 +899,13 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
   /// Syntax and reference resolution belong to OCaml; this maps presentation data.
   #if os(iOS)
-  private struct TimelineEdgePan: UIGestureRecognizerRepresentable {
+  private struct TimelineLeftPan: UIGestureRecognizerRepresentable {
     let enabled: Bool
     let toggle: () -> Void
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
       func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
-        guard let pan = recognizer as? UIScreenEdgePanGestureRecognizer else { return false }
+        guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
         let velocity = pan.velocity(in: pan.view)
         return -velocity.x > abs(velocity.y) * 1.4
       }
@@ -913,21 +913,23 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
     func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator { Coordinator() }
 
-    func makeUIGestureRecognizer(context: Context) -> UIScreenEdgePanGestureRecognizer {
-      let pan = UIScreenEdgePanGestureRecognizer()
-      pan.edges = .right
+    func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
+      let pan = UIPanGestureRecognizer()
+      pan.maximumNumberOfTouches = 1
       pan.delegate = context.coordinator
       pan.isEnabled = enabled
       return pan
     }
 
-    func updateUIGestureRecognizer(_ recognizer: UIScreenEdgePanGestureRecognizer, context: Context) {
+    func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
       recognizer.isEnabled = enabled
     }
 
-    func handleUIGestureRecognizerAction(_ recognizer: UIScreenEdgePanGestureRecognizer, context: Context) {
+    func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
       guard recognizer.state == .ended, enabled else { return }
-      let distance = -recognizer.translation(in: recognizer.view).x
+      let translation = recognizer.translation(in: recognizer.view)
+      let distance = -translation.x
+      guard distance > abs(translation.y) * 1.4 else { return }
       let speed = -recognizer.velocity(in: recognizer.view).x
       if distance >= 48 || (distance >= 24 && speed > 500) { toggle() }
     }
@@ -1802,7 +1804,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           let enabled = context.isUserInteractionEnabled
           child(0)
             #if os(iOS)
-            .gesture(TimelineEdgePan(enabled: enabled) { details.wrappedValue.toggle() })
+            .simultaneousGesture(TimelineLeftPan(enabled: enabled) { details.wrappedValue.toggle() })
             #endif
             .accessibilityActions {
               if enabled {
