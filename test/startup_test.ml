@@ -150,6 +150,16 @@ let test_startup_phase_is_owned_by_ui_domain () =
        (startup_snapshot ~catalog_loading:true ())
        (graph_state ~phase:Graph_closed ())
        "catalog startup was not derived");
+  let refreshing = startup_snapshot ~catalog_loading:true () in
+  let refreshing =
+    { refreshing with selected_graph = None
+    ; startup = { refreshing.startup with network_phase = Online_by_user
+      ; local_access = Local_unavailable Local_catalog_unavailable } }
+  in
+  ignore
+    (require_startup_phase
+       Loading_catalog refreshing (graph_state ~phase:Graph_closed ())
+       "online catalog retry should show progress when the local catalog is unavailable");
   ignore
     (require_startup_phase
        Awaiting_selection

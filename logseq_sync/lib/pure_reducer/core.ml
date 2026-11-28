@@ -1553,20 +1553,29 @@ let clear_reconciliation_failure (snapshot : snapshot) =
     }
 ;;
 
-let request_catalog_reconciliation core =
-  if not (network_allowed core) then unchanged { core with deferred_catalog_reconciliation = false } else
-  let snapshot = clear_reconciliation_failure core.public_state.snapshot in
-  let startup = { snapshot.startup with authenticated = true; catalog_loading = true } in
-  let core =
-    set_snapshot
-      { core with deferred_catalog_reconciliation = false }
-      { snapshot with startup }
-  in
+let is_catalog_fetch (Pending_effect ticket) =
+  match ticket.kind with Fetch_catalog_kind -> true | _ -> false
+;;
+
+let request_catalog_reconciliation ?(coalesce = false) core =
+  let core = { core with deferred_catalog_reconciliation = false } in
   match core.user_id with
-  | None -> unchanged core
-  | Some user_id ->
-    let next, request = issue_request core (Fetch_catalog (account_scope core user_id)) in
-    { next; effects = [ publish next; Run request ] }
+  | Some user_id when network_allowed core ->
+    let scope = account_scope core user_id in
+    let fetches, other_pending = List.partition is_catalog_fetch core.pending_effects in
+    if coalesce
+       && List.exists (fun (Pending_effect ticket) -> ticket.scope = effect_scope_of_account scope) fetches
+    then unchanged core
+    else
+      let snapshot = clear_reconciliation_failure core.public_state.snapshot in
+      let startup = { snapshot.startup with catalog_loading = true } in
+      (* An explicit refresh supersedes earlier catalog scopes. Authentication
+         reconciliation may share a token flight with an earlier request. *)
+      let core = if coalesce then { core with pending_effects = other_pending } else core in
+      let core = set_snapshot core { snapshot with startup } in
+      let next, request = issue_request core (Fetch_catalog scope) in
+      { next; effects = [ publish next; Run request ] }
+  | Some _ | None -> unchanged core
 ;;
 
 let authenticate core user_id =
@@ -3420,14 +3429,8 @@ let step core event =
       (* Publishing opens the native gate; its verified identity round-trip owns
          catalog admission when this request resumes a local-only session. *)
       if needs_permission || not core.public_state.snapshot.startup.authenticated
-      then {next=core;effects=[publish core]} else
-      (match core.user_id with
-       | None -> unchanged core
-       | Some user_id ->
-         let next, request =
-           issue_request core (Fetch_catalog (account_scope core user_id))
-         in
-         { next; effects = [ Run request ] })
+      then {next=core;effects=[publish core]}
+      else request_catalog_reconciliation ~coalesce:true core
     | Online_recovery_requested scope when not (timeline_scope_is_current core scope) -> unchanged core
     | Online_recovery_requested _ ->
       let core=network_phase core Online_by_user in
@@ -4619,6 +4622,7 @@ let configure_residents core ids =
       | Some _ -> empty_session core
       | None -> let blank=initial core.config |> Result.get_ok in
         let base={blank with host_fence=core.host_fence;host_cleanup_scopes=core.host_cleanup_scopes;user_id=core.user_id;next_effect_id=core.next_effect_id;
+          pending_effects=List.filter is_catalog_fetch core.pending_effects;
           resident_order=core.resident_order;resident_enabled=true;resident_sessions=core.resident_sessions;
           resident_next_generation=core.resident_next_generation;foreground=core.foreground;
           lifecycle_generation=core.lifecycle_generation;public_state=core.public_state} in

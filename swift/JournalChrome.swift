@@ -1501,7 +1501,12 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let properties: Properties
     var leading: AnyView? = nil
     @Environment(\.journalContainerTopInset) private var containerTopInset
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var controlsSize = CGSize.zero
+
+    private var usesSeparateControlsRow: Bool {
+      properties.mode == .page && properties.title == nil && dynamicTypeSize.isAccessibilitySize
+    }
 
     var body: some SwiftUI.View {
       GeometryReader { bounds in
@@ -1513,7 +1518,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .scrollEdgeEffectHidden(true, for: .bottom)
           .scrollEdgeEffectStyle(.soft, for: .top)
           #endif
-          .environment(\.journalControlsSize, controlsSize)
+          .environment(\.journalControlsSize, usesSeparateControlsRow ? .zero : controlsSize)
           #if os(iOS)
           // Retaining the native bar host across Detail returns avoids the
           // reproduced soft scroll-edge flash during the pop transition.
@@ -1521,7 +1526,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .toolbarBackground(.hidden, for: .navigationBar)
           #endif
           .overlay(alignment: .topTrailing) {
-            if properties.title == nil && properties.message == nil {
+            if properties.title == nil && properties.message == nil && !usesSeparateControlsRow {
               controls.padding(.trailing, 16)
             }
           }
@@ -1545,7 +1550,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
               .padding(.horizontal, 16)
               // The native bar participates in the soft scroll edge, keeping
               // content visible beneath the title without another material.
-            } else if properties.message != nil {
+            } else if properties.message != nil ||
+                        (usesSeparateControlsRow && (properties.controls == true || properties.connecting == true)) {
               HStack {
                 Spacer(minLength: 0)
                 controls
@@ -1586,14 +1592,27 @@ struct JournalSheetDismissButton: SwiftUI.View {
     @Environment(\.journalControlsSize) private var controlsSize
 
     var body: some SwiftUI.View {
+      let date = Text(verbatim: title).font(.title2.weight(.semibold))
       HStack(spacing: 0) {
-        Text("\(Text(verbatim: title).font(.title2.weight(.semibold)))\(Text(verbatim: relativeLabel.map { "\u{2002}" + $0 } ?? "").font(.subheadline.weight(.regular)).foregroundStyle(Color.secondary))")
-          .foregroundStyle(.primary)
-          .monospacedDigit()
-          .textCase(nil)
-          .lineLimit(1)
-          .minimumScaleFactor(0.5)
-          .accessibilityAddTraits(.isHeader)
+        Group {
+          if let relativeLabel {
+            let relative = Text(verbatim: relativeLabel).font(.subheadline).foregroundStyle(Color.secondary)
+            ViewThatFits(in: .horizontal) {
+              Text("\(date) \(relative)").fixedSize(horizontal: true, vertical: false)
+              VStack(alignment: .leading, spacing: 2) {
+                date.fixedSize(horizontal: false, vertical: true)
+                relative.fixedSize(horizontal: false, vertical: true)
+              }
+            }
+          } else {
+            date.fixedSize(horizontal: false, vertical: true)
+          }
+        }
+        .foregroundStyle(.primary)
+        .monospacedDigit()
+        .textCase(nil)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
         Spacer(minLength: controlsSize.width > 0 ? controlsSize.width + 16 : 0)
       }
     }
@@ -1634,7 +1653,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           let child = UIViewController()
           child.view.backgroundColor = .clear
           child.view.isOpaque = false
-          child.tabBarItem = UITabBarItem(title: nil,
+          child.tabBarItem = UITabBarItem(title: destination.label,
             image: UIImage(systemName: destination.symbol), selectedImage: nil)
           child.tabBarItem.accessibilityLabel = destination.label
           return child

@@ -1,7 +1,18 @@
+(** {1 TLDR}
+
+    Present the caller-owned account and graph state with [view]. Use the
+    picker status to communicate progress, a notice, or an actionable problem. *)
+
+type picker_status =
+  | Idle
+  | Working of string
+  | Notice of string
+  | Problem of { message : string; retry_refresh : bool }
+
 type picker_live =
   { residents : string list
   ; replacement : string option
-  ; status : string
+  ; status : picker_status
   ; authenticated : bool
   ; checking : bool
   ; deleting : Logseq_db_worker_lui.Logseq_db_worker_lui_service.local_copy_request option
@@ -67,3 +78,9 @@ val view
   -> props
   -> on_action:(action -> unit)
   -> Journal_view.View.Body.t
+
+(** {1 Minimal usage example}
+
+    Mount the picker and send actions to the caller-owned dispatcher:
+
+    {[ view (Picker snapshot) ~on_action:dispatch ]} *)

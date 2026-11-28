@@ -21,6 +21,7 @@ let view
       ~scroll_target
       ?scroll_target_signal
       ?on_sync
+      ?empty_state
       ~on_scroll_completed
       ~actions_enabled
       ~on_visible_range
@@ -31,6 +32,11 @@ let view
       ~children
       ()
   =
+  let empty_state =
+    match empty_state with
+    | Some _ when List.for_all (fun row -> row.header) rows -> empty_state
+    | _ -> None
+  in
   let indexed =
     List.map (fun (row, child) -> row.slot_index, row, child) (List.combine rows children)
   in
@@ -96,8 +102,8 @@ let view
            ())
   in
   let sections =
-    List.map
-      (fun (section, group) ->
+    List.mapi
+      (fun section_index (section, group) ->
          let header = List.find_opt (fun (_, row, _) -> row.header) group in
          let content = List.filter (fun (_, row, _) -> not row.header) group in
          let content =
@@ -105,7 +111,9 @@ let view
            | [], Some (index, row, _) ->
              [ ( index
                , { row with header = false; id = "empty:" ^ row.id }
-               , V.text "No journal entries" )
+               , (match empty_state with
+                  | Some view when section_index = 0 -> view
+                  | _ -> V.text "No journal entries") )
              ]
            | _ -> content
          in
@@ -177,12 +185,12 @@ let view
        ~overlay:
          (if rows = []
           then
-            V.content_unavailable
-              ~label:
-                (V.label
-                   ~title:(V.text "No journal entries yet")
-                   ~icon:(V.symbol ~name:"book" ())
-                   ())
-              ()
+            match empty_state with
+            | Some view -> view
+            | None ->
+              V.content_unavailable
+                ~label:
+                  (V.label ~title:(V.text "No journal entries yet") ~icon:(V.symbol ~name:"book" ()) ())
+                ()
           else V.empty ())
 ;;

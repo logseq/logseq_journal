@@ -3,14 +3,15 @@
     Render Timeline state as a native collection. The caller owns the state,
     action handlers, presentation callbacks and optional mounted row store.
     The mounted store publishes creator names to rows for the supplied account.
+    Supply [empty_state] for a loaded, fully empty timeline.
 
     {1 Minimal usage example}
 
-    The caller supplies the current [state], [day_presentation], rendering
-    callbacks and event handlers:
+    The caller supplies the current [state], [day_presentation], contextual
+    [empty_state], rendering callbacks and event handlers.
     {[
       let timeline =
-        view ~render_source ~render_media ~state ~day_presentation
+        view ~render_source ~render_media ~state ~day_presentation ~empty_state
           ~on_visible_range ~on_scroll_completed ~on_retry_day ~on_open_block
           ~delete_enabled ~actions_enabled ~on_status ~on_delete ~on_copy ()
     ]}
@@ -48,6 +49,7 @@ val view
   -> ?current_day:int
   -> ?store:Store.t
   -> ?on_sync:Ui.Event.Handler.t
+  -> ?empty_state:Ui.View.t
   -> ?on_region:(string -> unit)
   -> render_source:(string -> string)
   -> ?render_title:(string -> Journal_model.Title.t)

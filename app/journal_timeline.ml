@@ -232,6 +232,7 @@ let view
       ?current_day
       ?store
       ?on_sync
+      ?empty_state
       ?(on_region = fun _ -> ())
       ~render_source
       ?render_title
@@ -250,6 +251,7 @@ let view
       ()
   =
   let slots = Timeline.fold_slots (fun acc slot -> slot :: acc) [] state |> List.rev in
+  let empty_state = if slots = [] then empty_state else None in
   let today = Timeline.today state in
   let current_day = Option.value current_day ~default:today in
   let metadata index slot : Journal_native_collection.row =
@@ -386,6 +388,7 @@ let view
     ~scroll_target:target
     ?scroll_target_signal
     ?on_sync
+    ?empty_state
     ~on_scroll_completed
     ~actions_enabled:(delete_enabled && actions_enabled)
     ~on_visible_range

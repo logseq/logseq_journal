@@ -24,7 +24,7 @@ type action =
   | Remove_attachment of string
 
 let scope = function Capture -> "journal-capture" | Append -> "journal-append"
-let placeholder = function Capture -> "New journal entry" | Append -> "Append a block"
+let title = function Capture -> "New journal entry" | Append -> "Append a block"
 
 let live_region_text value =
   V.text value
@@ -39,7 +39,7 @@ let can_submit ~capture ~saving ~enabled =
 
 let content { kind; capture; saving; enabled; error; assets } ~on_action =
   let scope = scope kind in
-  let placeholder = placeholder kind in
+  let title = title kind in
   let ignored = Ui.Event.Handler.create (fun _ -> ()) in
   let can_submit = can_submit ~capture ~saving ~enabled in
   let task_selected = Journal_capture.task_state capture <> Journal_model.No_status in
@@ -135,8 +135,8 @@ let content { kind; capture; saving; enabled; error; assets } ~on_action =
       ~key:(Ui.Key.string (scope ^ "-composer"))
       ~accessibility_identifier:(scope ^ "-composer")
       ~autofocus:true
-      ~label:"Draft"
-      ~placeholder
+      ~label:title
+      ~placeholder:""
       ~session_id:(Journal_capture.session_id capture)
       ~document_revision:(Journal_capture.document_revision capture)
       ~accepted_local_revision:(Journal_capture.accepted_local_revision capture)
@@ -161,10 +161,17 @@ let content { kind; capture; saving; enabled; error; assets } ~on_action =
       ~on_send:(Ui.Event.Handler.create ~name:"journal-action" (fun _ -> on_action Save))
       ()
   in
+  let heading =
+    V.of_lui
+      (Lui_elements.text ~value:title ~style_class:"caption semibold"
+         ~background:"background" ~corner_radius:12
+         ~padding_horizontal:12 ~padding_vertical:4 [])
+    |> V.with_test_id (Ui.Test_id.string (scope ^ "-composer-title"))
+  in
   let content =
     V.column
-      ~spacing:12.
-      ([ composer ] @ if saving then [ V.loading ~message:"Saving…" () ] else [])
+      ~alignment:Leading ~spacing:6.
+      ([ heading; composer ] @ if saving then [ V.loading ~message:"Saving…" () ] else [])
     |> V.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
   in
   content
