@@ -47,11 +47,19 @@ module JournalRelease
     value.replace("\0"*value.bytesize) unless value.to_s.empty?
   end
 
+  def self.normalize_private_key_pem(key)
+    header='-----BEGIN PRIVATE KEY-----'; footer='-----END PRIVATE KEY-----'
+    compact=key.strip
+    return key if key.include?("\n") || !compact.start_with?(header) || !compact.end_with?(footer)
+    body=compact[header.length...-footer.length].to_s.gsub(/\s+/,'')
+    "#{header}\n#{body.scan(/.{1,64}/).join("\n")}\n#{footer}\n"
+  end
+
   def self.asc_api_key!
     require 'base64'
     key_id=release_secret!('JOURNAL_ASC_KEY_ID')
     issuer_id=release_secret!('JOURNAL_ASC_ISSUER_ID')
-    key=ENV['JOURNAL_ASC_PRIVATE_KEY'].to_s
+    key=ENV['JOURNAL_ASC_PRIVATE_KEY'].to_s.dup
     if key.empty? && !ENV['JOURNAL_ASC_PRIVATE_KEY_BASE64'].to_s.empty?
       begin
         key=Base64.strict_decode64(ENV['JOURNAL_ASC_PRIVATE_KEY_BASE64'])
@@ -60,6 +68,7 @@ module JournalRelease
       end
     end
     raise Failure, 'JOURNAL_ASC_PRIVATE_KEY or JOURNAL_ASC_PRIVATE_KEY_BASE64 is required' if key.empty?
+    key=normalize_private_key_pem(key)
     raise Failure, 'ASC private key must be PEM content, not a path or lane argument' unless key.include?('-----BEGIN PRIVATE KEY-----')
     {'key_id'=>key_id,'issuer_id'=>issuer_id,'key'=>key,'duration'=>1140,'in_house'=>false}
   end
