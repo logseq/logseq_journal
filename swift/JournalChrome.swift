@@ -398,6 +398,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let pageID: String?
     let targetID: String?
     let targetPageID: String?
+    let sourceGraphName: String?
     let targetGraphName: String?
     let residentPageIDs: [String]?
     let slotOwners: [String]?
@@ -1227,9 +1228,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           let from=properties.pageID,let to=properties.targetPageID,
           from != to,(properties.residentPageIDs ?? []).contains(to) else {return}
         _=handoff.startGesture();source=from;target=to;dragging=true
-        withAnimation(reduceMotion ? nil : .easeOut(duration:0.12)) {
-          graphName.show(source:from,target:to,name:properties.targetGraphName)
-        }
+        graphName.show(source:from,target:to,sourceName:properties.sourceGraphName,name:properties.targetGraphName)
         let cold = !slots.contains(where:{$0.owner==to}) && coldMotion.begin(source:from,target:to)
         if !cold {emit("prepare",source:from,target:to)}
         translation=min(width,max(0,pan.translation(in:pan.view).x))
@@ -1245,9 +1244,14 @@ struct JournalSheetDismissButton: SwiftUI.View {
         let commit=distance>width*0.3 || (distance>30 && velocity>650)
         settling=true;committing=commit
         if commit,let source,let target { graphName.commit(source:source,target:target) }
+        let destination: CGFloat = commit ? width : 0
         if coldMotion.ticket != nil {
+          // The opaque cold surface animates the snapshot, while translation
+          // keeps the title in step with that motion.
+          withAnimation(reduceMotion ? .linear(duration:0.01) : .easeOut(duration:0.24)) {
+            translation=destination
+          }
           if commit {
-            withTransaction(Transaction(animation:nil)){translation=width}
             coldMotion.commit(width:width,reduced:reduceMotion,
               prepare:{emit("prepare",source:source,target:target)},complete:{
                 guard properties.enabled==true,handoff.acceptsGesture(gesture),let source,let target,
@@ -1256,13 +1260,12 @@ struct JournalSheetDismissButton: SwiftUI.View {
                 emit("commit",source:source,target:target)
               },cancelled:{reset(notify:true)})
           } else {
-            withTransaction(Transaction(animation:nil)){translation=0}
             coldMotion.returnToSource(reduced:reduceMotion){reset(notify:true)}
           }
           return
         }
         withAnimation(reduceMotion ? .linear(duration:0.01) : .smooth(duration:0.24),completionCriteria:.removed) {
-          translation=commit ? width : 0
+          translation=destination
         } completion: {
           guard properties.enabled==true,handoff.acceptsGesture(gesture),let source,let target,
             source==properties.pageID,target==properties.targetPageID else {return}
@@ -1316,10 +1319,12 @@ struct JournalSheetDismissButton: SwiftUI.View {
           }
         }
         .overlay(alignment:.top) {
-          if let name = graphName.presentation?.name {
-            nameCapsule(name)
-              // Reserve the full 44pt menu + progress + spacing on either side.
-              .frame(maxWidth:min(240,max(0,bounds.size.width-192)))
+          // Reserve the 44pt menu, progress, and spacing on either side.
+          let nameWidth = min(240,max(0,bounds.size.width-192))
+          if nameWidth > 0, let name = graphName.presentation {
+            let progress = name.phase == .confirmed || name.sourceName == nil
+              ? 1 : translation / bounds.size.width
+            nameCapsule(name,width:nameWidth,progress:progress)
               .padding(.top,containerTopInset+4)
               .transition(.opacity)
               .allowsHitTesting(false)
@@ -1410,13 +1415,31 @@ struct JournalSheetDismissButton: SwiftUI.View {
       .fixedSize(horizontal:false,vertical:true)
     }
 
-    @ViewBuilder private func nameCapsule(_ name:String) -> some SwiftUI.View {
+    private func fittedName(_ name:String) -> some SwiftUI.View {
       // This transient HUD shares the fixed gap above the date. Native fitting
       // preserves that slot at accessibility sizes; VoiceOver retains the full name.
-      let label = ViewThatFits(in:.vertical) {
+      ViewThatFits(in:.vertical) {
         nameLabel(name,font:.subheadline.weight(.semibold))
         nameLabel(name,font:.system(size:17,weight:.semibold))
-      }.frame(height:32)
+      }
+    }
+
+    @ViewBuilder private func nameCapsule(_ name:JournalGraphNameFeedback.Presentation,
+                                          width:CGFloat,progress:CGFloat) -> some SwiftUI.View {
+      let label = ZStack {
+        if let source = name.sourceName {
+          fittedName(source)
+            .offset(x:reduceMotion ? 0 : width * progress)
+            .opacity(reduceMotion ? 1 - progress : 1)
+            .accessibilityHidden(progress >= 0.5)
+        }
+        fittedName(name.name)
+          .offset(x:reduceMotion ? 0 : width * (progress - 1))
+          .opacity(reduceMotion ? progress : 1)
+          .accessibilityHidden(progress < 0.5)
+      }
+      .frame(width:width,height:32)
+      .clipShape(Capsule())
       if reduceTransparency {
         label.background(Color(uiColor:.secondarySystemBackground),in:Capsule())
       } else {
@@ -1688,7 +1711,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
       HStack(spacing: 0) {
         NativeTabs(selection: favorites ? .favorites : .journals, send: send)
           .frame(width: 190, height: height)
-          .scaleEffect(controlScale, anchor: UnitPoint(x: 0, y: (height - captureLift) / height))
         Spacer(minLength: 0)
         if !favorites {
           Button { send("capture") } label: {
@@ -1706,11 +1728,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .accessibilityLabel("Capture")
           .accessibilityIdentifier("journal-capture-open")
           .scaleEffect(controlScale, anchor: .bottomTrailing)
-          .offset(y: -captureLift)
+          .offset(y: min(29, containerBottomInset - 3) - captureLift)
         }
       }
       .foregroundStyle(Color.primary)
-      .offset(y: min(29, containerBottomInset - 3))
     }
   }
   #endif
