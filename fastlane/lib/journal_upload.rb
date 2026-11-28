@@ -131,7 +131,9 @@ module JournalRelease
   def self.next_testflight_build_number!(api_key=asc_api_key!,now: Time.now.utc)
     app=asc_app!(api_key)
     builds=Spaceship::ConnectAPI::Build.all(app_id: app.id,platform: Spaceship::ConnectAPI::Platform::IOS,limit: 200)
-    sequences=builds.map { |build| build_number_sequence(build.version) }.compact
+    upload_pages=Spaceship::ConnectAPI.get_build_uploads(app_id: app.id,filter: {platform: 'IOS'},limit: 200).all_pages
+    upload_builds=upload_pages.flat_map(&:to_models).map(&:cf_build_version)
+    sequences=(builds.map(&:version)+upload_builds).map { |build| build_number_sequence(build) }.compact
     latest=sequences.max
     raise Failure, 'No previous TestFlight build sequence is visible in App Store Connect' unless latest
     sequence=latest+1
