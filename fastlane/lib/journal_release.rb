@@ -150,7 +150,7 @@ module JournalRelease
         paths = attempt_paths
         prior = paths.map { |path| JSON.parse(File.read(path)) }
         raise Failure, 'Existing attempt requires a fresh ASC check and explicit retry_upload:true' if !prior.empty? && !retry_upload
-        if prior.any? { |r| r['upload_accepted'] || r['apple_build_id'] || %w[tool_reported_success published_to_logseq_team].include?(r['status']) }
+        if prior.any? { |record| accepted_upload?(record) }
           raise Failure, 'Apple has accepted this build; resume or inspect the existing build without uploading again'
         end
         age = Time.now.utc-Time.iso8601(proof.fetch('checked_utc'))
@@ -205,6 +205,12 @@ module JournalRelease
     end
 
     private
+
+    def accepted_upload?(record)
+      record['upload_accepted'] || record['apple_build_id'] ||
+        (record['apple_upload_id'] && record['upload_state'] != 'FAILED') ||
+        %w[tool_reported_success published_to_logseq_team].include?(record['status'])
+    end
 
     def with_lock
       File.open(File.join(@directory,'upload.lock'),File::RDWR|File::CREAT,0o600) do |lock|
