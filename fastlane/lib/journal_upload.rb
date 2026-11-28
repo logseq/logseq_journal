@@ -106,7 +106,8 @@ module JournalRelease
   def self.automatic_receipt_check!(package,api_key)
     app=asc_app!(api_key)
     version=package.fetch('version'); build=package.fetch('build')
-    active=!Spaceship::ConnectAPI::BuildDelivery.all(app_id: app.id,version: version,build_number: build).empty?
+    uploads=Spaceship::ConnectAPI::BuildUpload.all(app_id: app.id,version: version,build_number: build)
+    active=uploads.any? { |upload| upload.state!='FAILED' }
     accepted=!Spaceship::ConnectAPI::Build.all(app_id: app.id,version: version,build_number: build,
       platform: Spaceship::ConnectAPI::Platform::IOS,limit: 10).empty?
     groups=app.get_beta_groups
