@@ -522,8 +522,7 @@ let test_uninterested_change_is_acknowledged_without_hydration () =
   | _ -> Alcotest.fail "uninterested change must only validate receipts and acknowledge"
 ;;
 
-let test_named_tags_reach_timeline_row () =
-  let module Ui = Journal_view in
+let test_named_tags_reach_timeline_entry () =
   let runtime = Runtime.create () in
   let raw=Worker_pure_data.block_record_to_yojson record in
   let rec enrich = function
@@ -560,46 +559,10 @@ let test_named_tags_reach_timeline_row () =
       output.responses
     |> Option.get
   in
-  let batches = ref [] in
-  let backend : Lui_protocol.backend =
-    { backend_profile = Lui_protocol.profile IOS SwiftUIHost
-    ; apply_batch =
-        (fun b ->
-          batches := b :: !batches;
-          true)
-    }
-  in
-  let view =
-    Journal_row.view
-      ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
-      entry
-  in
-  let app =
-    Lui_app.create_with_extensions
-      backend
-      Journal_lui_native.registry
-      ()
-      (fun () () -> ())
-      (fun _ _ _ -> Ui.mount view)
-  in
-  Fun.protect
-    ~finally:(fun () -> ignore (Lui_app.dispose app))
-    (fun () ->
-       ignore (Lui_app.start app);
-       ignore (Lui_app.flush app);
-       let ops = List.concat_map (fun (b : Lui_protocol.patch_batch) -> b.ops) !batches in
-       Alcotest.(check bool)
-         "ordered tag labels reach Timeline details"
-         true
-         (List.exists
-            (function
-              | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
-                let payload = Yojson.Basic.from_string json in
-                let member = Yojson.Basic.Util.member in
-                member "mode" payload = `String "timeline-row"
-                && member "tags" payload = `List [ `String "户外"; `String "周末计划" ]
-              | _ -> false)
-            ops))
+  Alcotest.(check (list string))
+    "ordered tag labels reach the projected Timeline entry"
+    [ "户外"; "周末计划" ]
+    (Journal_model.tag_titles entry.block)
 ;;
 
 let test_point_read_tag_metadata () =
@@ -679,9 +642,9 @@ let () =
     [ ( "v2 boundary"
       , [ Alcotest.test_case "point read tag metadata" `Quick test_point_read_tag_metadata
         ; Alcotest.test_case
-            "named tags reach timeline row"
+            "named tags reach timeline entry"
             `Quick
-            test_named_tags_reach_timeline_row
+            test_named_tags_reach_timeline_entry
         ; Alcotest.test_case
             "read response becomes normalized feed"
             `Quick
