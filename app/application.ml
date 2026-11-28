@@ -4781,7 +4781,7 @@ let start
       output in
     Rrbvec.iter(fun(root,recovery)-> !schedule_insertion_recovery root recovery)
       (Journal_graph_runtime.take_insertion_recoveries (!graph_runtime_cell));
-    (* Creator responses belong to the active graph runtime's row store.
+    (* Creator responses belong to the completing graph runtime's row store.
        Publish only to subscribed payloads, without changing the app model. *)
     let responses = List.filter (fun response ->
       match response.Journal_graph_runtime.payload with
@@ -4792,7 +4792,8 @@ let start
     { delivery with responses }
   in
   let retire_graph_scope () =
-    Journal_graph_runtime.reset (!graph_runtime_cell)
+    Journal_graph_runtime.reset (!graph_runtime_cell);
+    Journal_timeline.Store.clear_creators !timeline_store_cell
   in
   let rec acknowledge_mutation ~applied_presentation intent =
     if not(Journal_graph_runtime.begin_mutation_acknowledgement (!graph_runtime_cell)intent)then () else
@@ -5411,7 +5412,7 @@ let start
       let pending=Hashtbl.to_seq worker_owners |> List.of_seq
         |> List.filter_map(fun(id,scope)->if owner_key scope=key then Some id else None) in
       List.iter(fun id->Worker.cancel client ~request_id:id) pending;
-      Journal_graph_runtime.reset (!graph_runtime_cell);
+      retire_graph_scope ();
       Journal_media_runtime.reset (!media_runtime_cell) ~graph_generation:None;
       Journal_asset_runtime.shutdown (!asset_runtime_cell);
       Hashtbl.replace retired_runtimes key (owner,snapshot_cells ());

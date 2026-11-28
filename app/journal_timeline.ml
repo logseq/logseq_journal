@@ -83,6 +83,11 @@ module Store = struct
           (Hashtbl.find_opt t.creator_sources id))) updates
   ;;
 
+  let clear_creators t =
+    Hashtbl.clear t.creator_names;
+    Hashtbl.iter (fun _ source -> Signal.set source.name "") t.creator_sources
+  ;;
+
   let scroll_target t = t.scroll_target
 
   let subscribe_scroll t callback =
@@ -215,9 +220,7 @@ module Store = struct
     t.epoch <- t.epoch + 1;
     t.last <- None;
     t.shape <- None;
-    Hashtbl.clear t.rows;
-    Hashtbl.clear t.creator_names;
-    Hashtbl.clear t.creator_sources
+    Hashtbl.clear t.rows
   ;;
 end
 

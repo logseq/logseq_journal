@@ -1105,6 +1105,48 @@ let test_attachment_unavailable_keeps_retry () =
          "unavailable image lost its real placeholder or retry")
 ;;
 
+(* A resident graph can resolve its creator names before its first mount.
+   The pure Timeline reducer only owns entries, so exercise the mounted Store. *)
+let test_preloaded_timeline_creator_survives_presentation_reset () =
+  let module Store = Journal_timeline.Store in
+  let module Timeline = Journal_timeline_state in
+  let creator_id = "20000000-0000-4000-a000-000000000002" in
+  let creator = Logseq_db_types.Graph_types.Uuid.of_string creator_id |> Result.get_ok in
+  let property_id = Logseq_db_types.Graph_types.Uuid.of_string
+    "20000000-0000-4000-a000-000000000003" |> Result.get_ok in
+  let owner_property : Logseq_db_types.Graph_types.property_summary =
+    { ident = "logseq.property/created-by-ref"; uuid = property_id; title = "Created by"
+    ; schema = { property_type = Entity; cardinality = One; hidden = true; public = false }
+    ; values = [ Entity_value creator ]; values_truncated = false }
+  in
+  let block = Journal_model.with_properties (block ()) ~properties:[ owner_property ] in
+  let state = Timeline.prepend_timeline_entry (Timeline.empty ~today:20260809)
+    { Journal_graph_projection.block; child_summaries = [] }
+  in
+  let store = Store.create () in
+  Store.publish_creators store [ creator_id, Some "Lin" ];
+  Store.reset store;
+  ignore (Store.synchronize store state : int);
+  let handler = Ui.Event.Handler.create (fun _ -> ()) in
+  let view = Journal_timeline.view ~store ~account_user_id:block_id
+    ~render_source:Fun.id ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
+    ~state ~day_presentation:(fun _ -> None) ~on_visible_range:handler
+    ~on_scroll_completed:handler ~on_retry_day:handler ~on_open_block:handler
+    ~delete_enabled:true ~actions_enabled:true ~on_status:handler
+    ~on_delete:handler ~on_copy:handler () |> V.Body.Private.to_widget
+  in
+  with_mounted view (fun _ ops ->
+    let open Yojson.Basic.Util in
+    let name = List.find_map (function
+      | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+        let payload = Yojson.Basic.from_string json in
+        if member "mode" payload = `String "timeline-row"
+        then Some (member "creator" payload |> member "name" |> to_string)
+        else None
+      | _ -> None) (ops ()) in
+    require (name = Some "Lin") "preloaded creator name is missing on first mount")
+;;
+
 let test_empty_media_has_no_attachment_chrome () =
   with_mounted (media_view []) (fun _ ops ->
     require
@@ -3180,6 +3222,7 @@ let tests =
   ; "shared mldoc title runs", test_mldoc_titles_share_runs
   ; "UUID reference body and summary", test_reference_body_and_summary
   ; "status and tags mount", test_status_and_tags_mount
+  ; "preloaded Timeline creator", test_preloaded_timeline_creator_survives_presentation_reset
   ; "timeline no chevron", test_timeline_has_no_chevron
   ; "Timeline four visual lines", test_timeline_body_four_lines
   ; "Timeline Options menu", test_timeline_options_menu

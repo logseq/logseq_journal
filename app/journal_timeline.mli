@@ -24,15 +24,21 @@ module Store : sig
   type t
 
   val create : ?observe:(string -> unit) -> unit -> t
+
+  (** Reconcile retained slots and return the native collection's structural
+      revision. Entry updates notify only the affected mounted rows. *)
   val synchronize : t -> Journal_timeline_state.t -> int
   val set_active : t -> bool -> unit
+
   (** Publish names by creator ID within this graph. Cached names are also used
       by rows mounted after publication. *)
   val publish_creators : t -> (string * string option) list -> unit
 
-  (* Return the native collection's structural presentation revision. Only
-      actual timeline changes reconcile retained slots; item publications go
-      to indexed mounted subscribers, never per-row global model selectors. *)
+  (** Clear creator names when the graph runtime resets its lookup planner. *)
+  val clear_creators : t -> unit
+
+  (** Reset row presentation while retaining names fetched by this graph's
+      runtime, including those loaded before the Timeline was first shown. *)
   val reset : t -> unit
 end
 
