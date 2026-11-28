@@ -39,11 +39,41 @@ for name in "${required[@]}"; do
   [[ -n "${!name:-}" ]] || fail "missing required environment variable $name"
 done
 
+absolute_path() {
+  case $1 in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$ORIGINAL_PWD" "$1" ;;
+  esac
+}
+
+ORIGINAL_PWD=$PWD
+MAIN_WORKTREE=$(absolute_path "$MAIN_WORKTREE")
+DEVICE_RECEIPT=$(absolute_path "$DEVICE_RECEIPT")
+LUI_PACKAGE=$(absolute_path "$LUI_PACKAGE")
+RELEASE_DIR=$(absolute_path "$RELEASE_DIR")
+RELEASE_CACHE=$(absolute_path "$RELEASE_CACHE")
+RELEASE_STATE=$(absolute_path "$RELEASE_STATE")
+EXISTING_APPSTORE_PROFILE=$(absolute_path "$EXISTING_APPSTORE_PROFILE")
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 cd "$REPO_ROOT"
 
+assert_external() {
+  ruby -e '
+    path = File.expand_path(ARGV.fetch(0))
+    roots = ARGV.drop(1).map { |root| File.realpath(root) }
+    ancestor = path
+    ancestor = File.dirname(ancestor) until File.exist?(ancestor)
+    resolved = File.realpath(ancestor) + path.delete_prefix(ancestor)
+    exit 1 if roots.any? { |root| resolved == root || resolved.start_with?(root + "/") }
+  ' "$1" "$REPO_ROOT" "$MAIN_WORKTREE" 2>/dev/null || fail "$2"
+}
+
 [[ -d "$MAIN_WORKTREE/.git" || -f "$MAIN_WORKTREE/.git" ]] || fail 'MAIN_WORKTREE is not a Git checkout'
+assert_external "$RELEASE_DIR" 'RELEASE_DIR must stay outside the automation and main checkouts'
+assert_external "$RELEASE_CACHE" 'RELEASE_CACHE must stay outside the automation and main checkouts'
+assert_external "$RELEASE_STATE" 'RELEASE_STATE must stay outside the automation and main checkouts'
 [[ -f "$DEVICE_RECEIPT" ]] || fail 'DEVICE_RECEIPT does not exist'
 [[ -d "$LUI_PACKAGE" ]] || fail 'LUI_PACKAGE does not exist'
 [[ -f "$EXISTING_APPSTORE_PROFILE" ]] || fail 'EXISTING_APPSTORE_PROFILE does not exist'
@@ -131,7 +161,8 @@ if [[ $status -ne 0 ]]; then
   exit "$status"
 fi
 printf '%s\n' "$FRESH_BUILD" >"$RELEASE_DIR/build-number-fresh"
-[[ "$FRESH_BUILD" == "$BUILD" ]] || fail "TestFlight sequence advanced during build ($BUILD != $FRESH_BUILD)"
+[[ "$FRESH_BUILD" =~ ^[0-9]{12}$ ]] || fail "invalid fresh build number: $FRESH_BUILD"
+[[ "${FRESH_BUILD:8:4}" == "${BUILD:8:4}" ]] || fail "TestFlight sequence advanced during build (${BUILD:8:4} != ${FRESH_BUILD:8:4})"
 [[ "$(sha256 "$IPA")" == "$IPA_SHA256" ]] || fail 'IPA changed after verification'
 REMOTE_SHA_NOW=$(git -C "$MAIN_WORKTREE" ls-remote origin refs/heads/main | awk 'NR==1 {print $1}')
 [[ "$REMOTE_SHA_NOW" == "$SOURCE_SHA" ]] || fail 'origin/main advanced during build; refusing stale release'
