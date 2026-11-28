@@ -7,15 +7,20 @@ struct JournalGraphNameFeedback {
     var id = UUID()
     let source: String
     let target: String
+    let sourceName: String?
     var name: String
     var phase = Phase.preview
   }
   private(set) var presentation: Presentation?
 
-  mutating func show(source: String, target: String, name: String?) {
-    presentation = name.flatMap { name in
-      name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil
-        : Presentation(source: source, target: target, name: name)
+  private func visibleName(_ name: String?) -> String? {
+    guard let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+    return name
+  }
+
+  mutating func show(source: String, target: String, sourceName: String? = nil, name: String?) {
+    presentation = visibleName(name).map {
+      Presentation(source: source, target: target, sourceName: visibleName(sourceName), name: $0)
     }
   }
   mutating func commit(source: String, target: String) {
@@ -34,7 +39,7 @@ struct JournalGraphNameFeedback {
   }
   mutating func updateName(target: String?, name: String?) {
     guard presentation?.target == target else { return }
-    guard let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+    guard let name = visibleName(name) else {
       cancel(); return
     }
     presentation?.name = name

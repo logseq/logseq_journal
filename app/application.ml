@@ -8861,9 +8861,9 @@ let start
        set changes; typing and worker refreshes must not scan the full catalog. *)
     let name_catalog = ref None and name_residents = ref [] in
     let resident_names = Hashtbl.create 3 in
-    let target_graph_name state =
-      match state.manager, next_resident_owner state with
-      | Some manager, Some owner ->
+    let refresh_resident_names state =
+      match state.manager with
+      | Some manager ->
         let same_catalog = match !name_catalog with
           | Some previous -> previous == state.graph_catalog | None -> false in
         if not same_catalog || !name_residents <> manager.resident_graphs then (
@@ -8872,10 +8872,13 @@ let start
           Hashtbl.clear resident_names;
           Rrbvec.to_seq state.graph_catalog |> Seq.iter (fun (graph:Graph_service.graph) ->
             if List.mem graph.graph_id manager.resident_graphs then
-              Hashtbl.replace resident_names graph.graph_id graph.name));
-        (match Hashtbl.find_opt resident_names owner.graph_id with
-         | Some name -> `String name | None -> `Null)
-      | _ -> name_catalog := None; name_residents := []; Hashtbl.clear resident_names; `Null
+              Hashtbl.replace resident_names graph.graph_id graph.name))
+      | None -> name_catalog := None; name_residents := []; Hashtbl.clear resident_names
+    in
+    let resident_name (owner : Graph_service.timeline_scope option) =
+      match Option.bind owner (fun owner -> Hashtbl.find_opt resident_names owner.graph_id) with
+      | Some name -> `String name
+      | None -> `Null
     in
     let root ()=Signal.sample model_signal in
     let host_model state owner =
@@ -8903,13 +8906,16 @@ let start
         match Hashtbl.find_opt refreshers (owner_key owner) with
         | None->()
         | Some refresh->refresh state) next;
+      refresh_resident_names state;
+      let target = next_resident_owner state in
       let json=Yojson.Safe.to_string (`Assoc
         ["mode",`String "graph-pages";"visible",`Bool(show_graphs state)
         ;"enabled",`Bool(graph_switch_enabled state)
         ;"pageID",(match selected with Some id->`String id | None->`Null)
         ;"targetID",(match state.graph_preview with Some id->`String id | None->`Null)
-        ;"targetPageID",(match next_resident_owner state with Some owner->`String(owner_key owner) | None->`Null)
-        ;"targetGraphName",target_graph_name state
+        ;"targetPageID",(match target with Some owner->`String(owner_key owner) | None->`Null)
+        ;"sourceGraphName",resident_name (timeline_scope state)
+        ;"targetGraphName",resident_name target
         ;"residentPageIDs",`List(List.map(fun owner->`String(owner_key owner))live)
         ;"slotOwners",`List(List.map(fun owner->`String(owner_key owner))next)
         ;"loadingPageIDs",`List(List.filter_map(fun owner->let model=host_model state owner in
