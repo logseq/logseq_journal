@@ -50,7 +50,7 @@ module JournalRelease
   def self.normalize_private_key_pem(key)
     header='-----BEGIN PRIVATE KEY-----'; footer='-----END PRIVATE KEY-----'
     compact=key.strip
-    return key if key.include?("\n") || !compact.start_with?(header) || !compact.end_with?(footer)
+    return key if compact.include?("\n") || !compact.start_with?(header) || !compact.end_with?(footer)
     body=compact[header.length...-footer.length].to_s.gsub(/\s+/,'')
     "#{header}\n#{body.scan(/.{1,64}/).join("\n")}\n#{footer}\n"
   end
