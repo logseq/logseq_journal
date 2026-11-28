@@ -633,6 +633,7 @@ let run_favorites_native_visibility
       ?(check_initial_feed = false)
       ?(check_generation = false)
       ?(check_reselect = false)
+      ?(check_timeline_metadata = false)
       ?(check_chrome = false)
       ?(check_error_control = false)
       ?(check_pending_changes = false)
@@ -670,7 +671,7 @@ let run_favorites_native_visibility
       ()
   =
   let owns_support = support_directory="/tmp/journal-favorites-synthetic"
-    && (check_capture_imports || Option.is_some detail_capture) in
+    && (check_timeline_metadata || check_capture_imports || Option.is_some detail_capture) in
   let support_directory = if owns_support then (
     let path=Filename.temp_file "journal-draft-fixture-" "" in
     Unix.unlink path;Unix.mkdir path 0o700;path) else support_directory in
@@ -684,6 +685,12 @@ let run_favorites_native_visibility
     G.Uuid.of_string (Printf.sprintf "82000000-0000-4000-8000-%012d" n) |> Result.get_ok
   in
   let roots = List.init 65 (fun n -> uuid (n + 1)) in
+  let creator = uuid 99000 in
+  let own_creator = uuid 99002 in
+  let account_user = if check_timeline_metadata then G.Uuid.to_string own_creator else "fixture" in
+  let creator_refresh_started = Atomic.make false in
+  let creator_release = Atomic.make false in
+  let ordered_tags = [ "户外"; "周末计划" ] in
   let status_value = Atomic.make (match status_scenario with
     | Some "none" -> None
        | Some (("now" | "waiting" | "later") as value) -> Some value
@@ -799,7 +806,7 @@ let run_favorites_native_visibility
   let scope : Service.asset_scope =
     { account =
         { managed_sync_origin = Uri.of_string "https://example.invalid"
-        ; user_id = "fixture"
+        ; user_id = account_user
         ; account_generation = 1
         ; presentation_generation = 1
         ; lifecycle_generation = 1L
@@ -874,8 +881,15 @@ let run_favorites_native_visibility
         ; created_at_ms = 1_788_192_000_000L
         ; updated_at_ms = 1_788_192_000_000L
         ; refs = (if n=0 && Atomic.get media_reference_changed then [uuid 60000] else [])
-        ; tags = []
-        ; properties = (match Atomic.get status_value with
+        ; tags = (if check_timeline_metadata && n = 0 then [ uuid 99003; uuid 99004 ] else [])
+        ; properties =
+            (if check_timeline_metadata && n < 3 then
+               [ { G.ident = "logseq.property/created-by-ref"; uuid = uuid 99001
+                 ; title = "Created by"
+                 ; schema = { property_type = Entity; cardinality = One; hidden = true; public = false }
+                 ; values = [ Entity_value (if n = 2 then own_creator else creator) ]
+                 ; values_truncated = false } ]
+             else []) @ (match Atomic.get status_value with
             | None -> []
             | Some value ->
               [ { G.ident = "logseq.property/status"; uuid = uuid 90001; title = "Status"
@@ -885,7 +899,7 @@ let run_favorites_native_visibility
         }
     ; task_status = Option.map status_uuid (Atomic.get status_value)
     ; rendered_page_title = page.title
-    ; tag_titles = []
+    ; tag_titles = (if check_timeline_metadata && n = 0 then ordered_tags else [])
     }
   in
   let favorites_page =
@@ -984,7 +998,11 @@ let run_favorites_native_visibility
   in
   (* Copy specifically exercises ordinary single-graph/native authority. Other
      UI fixtures declare their synthetic manager owner directly. *)
-  let manager=if check_copy || single_graph_shape then manager else fixture_with_scope manager in
+  let manager =
+    if check_timeline_metadata then
+      { manager with snapshot = { manager.snapshot with resident_scopes = [ scope ] } }
+    else if check_copy || single_graph_shape then manager else fixture_with_scope manager
+  in
   let point_reads=Atomic.make 0 in
   let offline_scans=Atomic.make 0 in
   let asset_change_armed = Atomic.make false in
@@ -1323,7 +1341,8 @@ let run_favorites_native_visibility
                       ; predecessor = "p"
                       ; successor = "p2"
                       ; block_uuids =
-                          (if Option.is_some asset_change then [] else if Atomic.get media_metadata_changed
+                          (if check_timeline_metadata then [ creator ]
+                           else if Option.is_some asset_change then [] else if Atomic.get media_metadata_changed
                            then [ uuid 20000 ]
                            else [if check_point_read_owner then uuid 1 else uuid 2])
                       ; page_uuids = []
@@ -1416,6 +1435,18 @@ let run_favorites_native_visibility
                         title="Canonical child";parent=root.uuid;page=page.uuid}};revision="child"}]
                     else [])) ~next:(next ((if capture_case=Some `Paged
                     then Some(G.Cursor.of_string "capture-more" |> Result.get_ok) else None))) ~scope_revision:("children") ~generation:(if confirmation then Printf.sprintf "generation:v1:1:%d"(Atomic.get graph_generation) else ("g")) ~projection_revision:(if confirmation then "projection:v1:1" else ("p2"))))
+            | Read.Page { uuid = requested; _ } when check_timeline_metadata && G.Uuid.equal requested creator ->
+              let title =
+                if Atomic.get updated_block then (
+                  Atomic.set creator_refresh_started true;
+                  while not (Atomic.get creator_release) do
+                    Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+                  done;
+                  "Mei")
+                else "Lin"
+              in
+              let creator = { page with uuid = creator; name = String.lowercase_ascii title; title; kind = Ordinary_page } in
+              Ok (Worker_pure_data.V2_present_page { page = creator; revision = title })
             | Read.Page { uuid = requested; _ } ->
               let known =
                 if G.Uuid.equal requested page.uuid
@@ -2060,6 +2091,7 @@ let run_favorites_native_visibility
   Fun.protect
     ~finally:(fun () ->
       Atomic.set initial_feed_release true;
+      Atomic.set creator_release true;
       Atomic.set failed_media_recovery_release true;
       Atomic.set coordination_release_allowed true;
       Atomic.set changed_media_fact_release true;
@@ -2082,9 +2114,10 @@ let run_favorites_native_visibility
       check_fixture_worker_idle ())
     (fun () ->
        hooks.init 2 2 startup |> consume;
-       if check_copy || single_graph_shape || check_capture_imports || Option.is_some detail_capture then (
+       if check_copy || single_graph_shape || check_timeline_metadata || check_capture_imports
+          || Option.is_some detail_capture then (
          let json = Yojson.Safe.to_string (`Assoc
-           [ "userId", `String "fixture";
+           [ "userId", `String account_user;
              "managedSyncOrigin", `String "https://example.invalid" ]) in
          let packet = Bytes.make (32 + String.length json) '\000' in
          Bytes.blit_string "LJP2" 0 packet 0 4;
@@ -2228,6 +2261,52 @@ let run_favorites_native_visibility
          wait "remaining bounded Tree page mounts" (fun () ->
            Option.is_some (find "text"
              (Printf.sprintf "Timeline fixture %d" (fixture_root_count - 1)))));
+       if check_timeline_metadata then (
+         let open Yojson.Safe.Util in
+         let rec row_payload node =
+           match List.assoc_opt "payload" (Hashtbl.find props node) with
+           | Some (`String text) when member "mode" (Yojson.Safe.from_string text) = `String "timeline-row" ->
+             node, Yojson.Safe.from_string text
+           | _ -> row_payload (Hashtbl.find parents node)
+         in
+         let metadata n =
+           find "text" (Printf.sprintf "Timeline fixture %d" n) |> Option.map row_payload
+         in
+         let creator_name n name =
+           Option.exists (fun (_, payload) ->
+             member "creator" payload |> member "name" = `String name) (metadata n)
+         in
+         wait "Timeline rows receive the original creator name" (fun () ->
+           creator_name 0 "Lin" && creator_name 1 "Lin" && Option.is_some (metadata 2));
+         let before = List.map (fun n -> Option.get (metadata n)) [ 0; 1; 2 ] in
+         let _, first = List.hd before in
+         Alcotest.(check (list string)) "Worker tags reach mounted Timeline details in order"
+           ordered_tags (member "tags" first |> to_list |> List.map to_string);
+         let time =
+           Journal_time.of_instant_unix_ms_with ~localtime:Unix.localtime
+             ~instant_unix_ms:(timeline_block 0).block.created_at_ms
+           |> Result.get_ok |> Journal_time.format_hh_mm
+         in
+         Alcotest.(check string) "Worker creation time reaches mounted Timeline details"
+           time (member "text" first |> to_string);
+         Alcotest.(check bool) "the current account has no creator avatar" true
+           (member "creator" (snd (List.nth before 2)) = `Null);
+         Atomic.set publish_block true;
+         ignore (W.send (Option.get !client) Service.Get_graph_state);
+         wait "creator refresh reaches Worker" (fun () -> Atomic.get creator_refresh_started);
+         hooks.pump () |> consume;
+         Hashtbl.clear regions;
+         Atomic.set creator_release true;
+         wait "creator completion updates both matching rows" (fun () ->
+           creator_name 0 "Mei" && creator_name 1 "Mei");
+         List.iter (fun name ->
+           Alcotest.(check int) ("creator completion does not rebuild " ^ name) 0
+             (Option.value (Hashtbl.find_opt regions name) ~default:0))
+           [ "root"; "timeline"; "timeline-item-build"; "timeline-item-compare"; "timeline-structure-change" ];
+         Alcotest.(check (list int)) "mounted row identity stays stable" (List.map fst before)
+           (List.map (fun n -> fst (Option.get (metadata n))) [ 0; 1; 2 ]);
+         Alcotest.(check bool) "unrelated row metadata is unchanged" true
+           (metadata 2 = Some (List.nth before 2)));
        if check_reselect then (
          let list () = Option.get (find "_extension" "journal-list") in
          let request () =
@@ -9159,6 +9238,9 @@ let () =
     ; ( "initial timeline presentation"
       , [ Alcotest.test_case "waits for the complete bounded feed" `Quick
             (fun () -> run_favorites_native_visibility ~check_initial_feed:true ()) ] )
+    ; ( "Timeline metadata"
+      , [ Alcotest.test_case "Worker tags and local creator updates" `Quick
+            (fun () -> run_favorites_native_visibility ~timeline_rows:50 ~check_timeline_metadata:true ()) ] )
     ; ( "root navigation"
       , [ Alcotest.test_case "Timeline reselect ownership" `Quick
             (fun () -> run_favorites_native_visibility ~check_reselect:true ())

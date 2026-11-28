@@ -108,7 +108,6 @@ let test_timeline_media_targets () =
     let before = Gc.allocated_bytes () in
     ignore
       (Journal_row.view
-         ~show_timestamp:false
          ~render_source:(fun source ->
            sources := source :: !sources;
            source)
@@ -838,7 +837,7 @@ let test_timeline_body_four_lines () =
     ]
   in
   List.iter (fun source ->
-    let view = Journal_row.view ~show_timestamp:false
+    let view = Journal_row.view
       ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
       { Journal_graph_projection.block = block ~source ~task_state:No_status ()
       ; child_summaries = [] }
@@ -1106,6 +1105,48 @@ let test_attachment_unavailable_keeps_retry () =
          "unavailable image lost its real placeholder or retry")
 ;;
 
+(* A resident graph can resolve its creator names before its first mount.
+   The pure Timeline reducer only owns entries, so exercise the mounted Store. *)
+let test_preloaded_timeline_creator_survives_presentation_reset () =
+  let module Store = Journal_timeline.Store in
+  let module Timeline = Journal_timeline_state in
+  let creator_id = "20000000-0000-4000-a000-000000000002" in
+  let creator = Logseq_db_types.Graph_types.Uuid.of_string creator_id |> Result.get_ok in
+  let property_id = Logseq_db_types.Graph_types.Uuid.of_string
+    "20000000-0000-4000-a000-000000000003" |> Result.get_ok in
+  let owner_property : Logseq_db_types.Graph_types.property_summary =
+    { ident = "logseq.property/created-by-ref"; uuid = property_id; title = "Created by"
+    ; schema = { property_type = Entity; cardinality = One; hidden = true; public = false }
+    ; values = [ Entity_value creator ]; values_truncated = false }
+  in
+  let block = Journal_model.with_properties (block ()) ~properties:[ owner_property ] in
+  let state = Timeline.prepend_timeline_entry (Timeline.empty ~today:20260809)
+    { Journal_graph_projection.block; child_summaries = [] }
+  in
+  let store = Store.create () in
+  Store.publish_creators store [ creator_id, Some "Lin" ];
+  Store.reset store;
+  ignore (Store.synchronize store state : int);
+  let handler = Ui.Event.Handler.create (fun _ -> ()) in
+  let view = Journal_timeline.view ~store ~account_user_id:block_id
+    ~render_source:Fun.id ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
+    ~state ~day_presentation:(fun _ -> None) ~on_visible_range:handler
+    ~on_scroll_completed:handler ~on_retry_day:handler ~on_open_block:handler
+    ~delete_enabled:true ~actions_enabled:true ~on_status:handler
+    ~on_delete:handler ~on_copy:handler () |> V.Body.Private.to_widget
+  in
+  with_mounted view (fun _ ops ->
+    let open Yojson.Basic.Util in
+    let name = List.find_map (function
+      | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+        let payload = Yojson.Basic.from_string json in
+        if member "mode" payload = `String "timeline-row"
+        then Some (member "creator" payload |> member "name" |> to_string)
+        else None
+      | _ -> None) (ops ()) in
+    require (name = Some "Lin") "preloaded creator name is missing on first mount")
+;;
+
 let test_empty_media_has_no_attachment_chrome () =
   with_mounted (media_view []) (fun _ ops ->
     require
@@ -1122,26 +1163,21 @@ let test_empty_media_has_no_attachment_chrome () =
    the narrowest boundary that executes native metadata presentation. *)
 let test_status_and_tags_mount () =
   let cases =
-    [ [], None
-    ; [ "阅读" ], Some "#阅读"
-    ; [ "阅读"; "工作"; "旅行" ], Some "#阅读  #工作  #旅行"
-    ; [ "阅读"; "工作"; "旅行"; "hidden" ], Some "#阅读  #工作  #旅行  +1"
-    ; List.init 9 (fun i -> "tag" ^ string_of_int i), Some "#tag0  #tag1  #tag2  +6"
-    ; ( [ "重复"; "重复"; "非常长的标签名称没有空格并保留完整文字"; "隐藏" ]
-      , Some "#重复  #重复  #非常长的标签名称没有空格并保留完整文字  +1" )
+    [ []
+    ; [ "阅读" ]
+    ; [ "阅读"; "工作"; "旅行"; "hidden" ]
     ]
   in
   List.iter
     (fun task_state ->
        List.iter
-         (fun (titles, expected) ->
+         (fun titles ->
             let block =
               Journal_model.with_tag_titles (block ~task_state ()) ~tag_titles:titles
             in
             let view =
               Journal_row.view
                 ~status_name:(Journal_model.status_name ~lookup:(fun _ -> Some "Doing"))
-                ~show_timestamp:false
                 ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
                 { Journal_graph_projection.block; child_summaries = [] }
             in
@@ -1152,41 +1188,32 @@ let test_status_and_tags_mount () =
                  = (task_state
                     = Journal_model.Status "00000002-1840-1229-0800-000000000000"))
                 "status presence changed with tags";
-              let tag_nodes =
-                List.filter_map
+              let time = Journal_time.format_hh_mm (Journal_model.creation_time block) in
+              require
+                (not
+                   (List.exists
+                      (function
+                        | Lui_protocol.SetProp (_, TextValue, StringValue value) ->
+                          value = time || String.starts_with ~prefix:"#" value
+                        | _ -> false)
+                      ops))
+                "Timeline mounted creation time or tags in its compact body";
+              let details =
+                List.find_map
                   (function
-                    | Lui_protocol.SetProp (node, TextValue, StringValue value)
-                      when String.starts_with ~prefix:"#" value -> Some (node, value)
+                    | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+                      let payload = Yojson.Basic.from_string json in
+                      let member = Yojson.Basic.Util.member in
+                      if member "mode" payload = `String "timeline-row"
+                      then Some (member "text" payload, member "tags" payload)
+                      else None
                     | _ -> None)
                   ops
               in
-              match expected, tag_nodes with
-              | None, [] -> ()
-              | Some expected, [ (node, actual) ] ->
-                require
-                  (actual = expected)
-                  "tags must keep the first three titles and exact remaining count: %s"
-                  actual;
-                require
-                  (List.exists
-                     (function
-                       | Lui_protocol.SetProp (id, TextAlignment, StringValue "end") ->
-                         id = node
-                       | _ -> false)
-                     ops)
-                  "tags must align to the trailing edge, with and without status";
-                require
-                  (not
-                     (List.exists
-                        (function
-                          | Lui_protocol.SetProp (id, StyleClass, StringValue value) ->
-                            id = node
-                            && (String.equal value "single-line"
-                                || String.equal value "line-clamp-3")
-                          | _ -> false)
-                        ops))
-                  "tags must retain native multiline wrapping"
-              | _ -> fail "unexpected tags rendering"))
+              require
+                (details =
+                 Some (`String time, `List (List.map (fun title -> `String title) titles)))
+                "Timeline details lost creation time or ordered tags"))
          cases)
     [ Journal_model.No_status
     ; Journal_model.Status "00000002-1840-1229-0800-000000000000"
@@ -1199,7 +1226,7 @@ let test_status_and_tags_mount () =
     (fun _ ops ->
        require
          (has_text (ops ()) "#one  #two  #three  #four")
-         "Timeline tag limit must not truncate Detail metadata")
+         "Block Detail lost tags")
 ;;
 
 (* Title layout is owned by the mounted view, outside the pure reducers. *)
@@ -1259,7 +1286,7 @@ let test_mldoc_titles_share_runs () =
         require (List.exists (fun run -> Yojson.Basic.Util.member "styles" run = `List [`String "italic"; `String "bold"] || Yojson.Basic.Util.member "styles" run = `List [`String "bold"; `String "italic"]) runs) "nested styles lost" ) payloads expected_lines)
   in
   check "bounded-text" [`Int 4; `Int 2]
-    (Journal_row.view ~show_timestamp:false ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child) entry);
+    (Journal_row.view ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child) entry);
   check "detail-text" [`Null]
     (Journal_header.detail_text ~id:"rich-detail" ~depth:0 source)
 ;;
@@ -1285,7 +1312,6 @@ let test_reference_body_and_summary () =
   let view =
     Journal_row.view
       ~render_source
-      ~show_timestamp:false
       ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
       entry
   in
@@ -1397,7 +1423,7 @@ let test_property_values_are_not_timeline_children () =
     "semantic property value displaced an ordinary child preview";
   require (Journal_model.child_count entry.block = 5)
     "presentation classification altered the complete child ownership count";
-  with_mounted (Journal_row.view ~show_timestamp:false
+  with_mounted (Journal_row.view
       ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child->child) entry) (fun _ ops ->
     require (not (has_text (ops ()) "https://example.com/value")) "Timeline exposes property value";
     let payloads = List.filter_map (function
@@ -1489,7 +1515,6 @@ let projected_row ?store ~views ~on_event entry =
     | None -> seeded_media_store views
   in
   Journal_row.view
-    ~show_timestamp:false
     ~render_media:(fun ~title ~root ~image_children child ->
       Journal_media_view.row
         ~store
@@ -3197,6 +3222,7 @@ let tests =
   ; "shared mldoc title runs", test_mldoc_titles_share_runs
   ; "UUID reference body and summary", test_reference_body_and_summary
   ; "status and tags mount", test_status_and_tags_mount
+  ; "preloaded Timeline creator", test_preloaded_timeline_creator_survives_presentation_reset
   ; "timeline no chevron", test_timeline_has_no_chevron
   ; "Timeline four visual lines", test_timeline_body_four_lines
   ; "Timeline Options menu", test_timeline_options_menu

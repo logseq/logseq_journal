@@ -2392,7 +2392,7 @@ let target_uuid = uuid "a1000000-0000-4000-9000-000000000050"
 let target_id = Graph.Uuid.to_string target_uuid
 let reference = "[[" ^ target_id ^ "]]"
 
-let reference_feed ?(filtered = false) runtime source =
+let reference_feed ?(filtered = false) ?(properties = []) runtime source =
   set_calendar runtime;
   let tags = if filtered then [block_uuid] else [] in
   if filtered then Runtime.set_timeline_filter runtime ~tags ~statuses:[] ~days:None;
@@ -2409,7 +2409,7 @@ let reference_feed ?(filtered = false) runtime source =
     runtime
     (sample
        tree
-       ((tree_sample ~items:(([ { value = { record with block = { block with title = source; tags } }
+       ((tree_sample ~items:(([ { value = { record with block = { block with title = source; tags; properties } }
                 ; revision = "block-1"
                 ; depth = 0
                 ; parent = page_uuid
@@ -2457,6 +2457,36 @@ let check_target_request runtime output =
 let test_filtered_root_reference () =
   let runtime = Runtime.create () in
   ignore (reference_feed ~filtered:true runtime reference |> check_target_request runtime)
+;;
+
+let test_creator_name_refreshes_after_block_change () =
+  let runtime = Runtime.create () in
+  let creator : Graph.property_summary =
+    { ident = "logseq.property/created-by-ref"
+    ; uuid = unrelated_uuid
+    ; title = "Created by"
+    ; schema = { property_type = Entity; cardinality = One; hidden = true; public = false }
+    ; values = [ Entity_value target_uuid ]
+    ; values_truncated = false
+    }
+  in
+  let check_label output name =
+    let updates = List.concat_map (fun (response : Runtime.response) ->
+      match response.payload with
+      | Creator_names_changed updates -> updates
+      | _ -> []) output.Runtime.responses in
+    Alcotest.(check (option string)) "published creator name" (Some name)
+      (List.assoc_opt target_id updates |> Option.join)
+  in
+  let initial =
+    reference_feed ~properties:[ creator ] runtime "Timeline entry"
+    |> check_target_request runtime
+  in
+  check_label (deliver_sample runtime (target_response initial "Lin")) "Lin";
+  let refreshed =
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
+  in
+  check_label (deliver_sample runtime (target_response refreshed "Mei")) "Mei"
 ;;
 
 let test_reference_hydration_and_changes () =
@@ -9603,6 +9633,10 @@ let () =
             "hydration, edits, deletion and reset"
             `Quick
             test_reference_hydration_and_changes
+        ; Alcotest.test_case
+            "Timeline creator name follows block changes"
+            `Quick
+            test_creator_name_refreshes_after_block_change
         ; Alcotest.test_case
             "cycles and failure recovery"
             `Quick
