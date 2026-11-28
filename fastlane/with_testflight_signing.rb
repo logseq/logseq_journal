@@ -8,6 +8,7 @@ require_relative 'lib/journal_release'
 module JournalTestFlightSigning
   WWDR_G3 = 'https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer'.freeze
   SECURITY = '/usr/bin/security'.freeze
+  LOGIN_KEYCHAIN = File.expand_path('~/Library/Keychains/login.keychain-db')
   XCODE_PROFILES = File.expand_path('~/Library/Developer/Xcode/UserData/Provisioning Profiles')
 
   def self.security!(*args)
@@ -55,6 +56,7 @@ module JournalTestFlightSigning
     p12_path = File.join(dir, 'distribution.p12')
     keychain_password = SecureRandom.hex(32)
     installed_profile = nil
+    installed_login_intermediate = false
     keychain_created = false
 
     profile_b64 = signing_secret!('JOURNAL_IOS_APPSTORE_PROFILE_BASE64')
@@ -105,7 +107,18 @@ module JournalTestFlightSigning
     fingerprint = matching.first
     probe = File.join(dir, 'signing-probe')
     FileUtils.cp('/usr/bin/true', probe)
-    JournalRelease.run!('/usr/bin/codesign', '--force', '--sign', fingerprint, probe)
+    sign_probe = ['/usr/bin/codesign', '--force', '--sign', fingerprint, probe]
+    begin
+      JournalRelease.run!(*sign_probe)
+    rescue JournalRelease::Failure => error
+      raise unless error.message.downcase.include?('unable to build chain') && File.file?(LOGIN_KEYCHAIN)
+      unless security!('find-certificate', '-a', '-Z', LOGIN_KEYCHAIN).include?(intermediate_sha1)
+        # Xcode's trust lookup can require the public intermediate in login.
+        security!('import', intermediate, '-k', LOGIN_KEYCHAIN)
+        installed_login_intermediate = true
+      end
+      JournalRelease.run!(*sign_probe)
+    end
     JournalRelease.run!('/usr/bin/codesign', '--verify', '--strict', probe)
 
     destination = File.join(XCODE_PROFILES, "#{uuid}.mobileprovision")
@@ -130,9 +143,13 @@ module JournalTestFlightSigning
         File.unlink(installed_profile)
       end
     ensure
-      if keychain_created
-        # Deleting this keychain also removes its entry from the search list.
-        security!('delete-keychain', keychain)
+      begin
+        security!('delete-certificate', '-Z', intermediate_sha1, LOGIN_KEYCHAIN) if installed_login_intermediate
+      ensure
+        if keychain_created
+          # Deleting this keychain also removes its entry from the search list.
+          security!('delete-keychain', keychain)
+        end
       end
     end
   end

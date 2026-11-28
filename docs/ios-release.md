@@ -121,14 +121,15 @@ run the device build in the same wrapper and pass
 along with the provided profile and certificate fingerprint. The child does
 not inherit the three signing secrets.
 
-The wrapper serializes temporary signing setup for the current Mac user. It
-removes its keychain and any profile it installed when the command exits,
+The wrapper serializes temporary signing setup for the current Mac user.
+If the signing probe cannot build a trust chain with the temporary keychain,
+the wrapper also makes Apple's public WWDR G3 intermediate available in the
+login keychain and retries the probe. The existing trust settings are preserved.
+The wrapper removes its keychain, any profile it installed and any copy of
+the public intermediate it added to the login keychain when the command exits,
 including on handled interruption. Existing profiles are reused only when
 their contents match. Keep signing commands under the wrapper for as long as
-they use its temporary paths. If the signing probe fails to build a trust
-chain, check Apple's WWDR G3 intermediate in the login keychain and use the
-Apple Certificate Authority copy through your approved local procedure. Keep
-the existing trust settings and retry the signing probe before building.
+they use its temporary paths.
 
 ### Local export verification
 
