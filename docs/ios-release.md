@@ -192,7 +192,8 @@ was temporarily unavailable.
 ### Check status or resume after an interruption
 
 Use the exact same version/build and the delivery UUID from the publish output,
-the attempt's `apple_build_id`, or App Store Connect Build Uploads. Querying
+the attempt's `apple_upload_id`, or App Store Connect Build Uploads. The attempt
+stores the processed `apple_build_id` separately when it becomes visible. Querying
 status is read-only and can run while the original publish is waiting:
 
 ```sh

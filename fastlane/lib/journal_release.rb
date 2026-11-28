@@ -193,7 +193,8 @@ module JournalRelease
         unless record['mode'] == 'publish' && @package.all? { |name, value| record[name] == value }
           raise Failure, 'The current record is not an automated publish attempt for this version/build'
         end
-        if record['apple_build_id'] && record['apple_build_id'] != apple_id
+        known_ids = record.values_at('apple_upload_id', 'apple_build_id').compact
+        if known_ids.any? && !known_ids.include?(apple_id)
           raise Failure, 'The supplied Apple build ID differs from the recorded receipt'
         end
         persist = ->(fields) { checkpoint(path, record, fields) }

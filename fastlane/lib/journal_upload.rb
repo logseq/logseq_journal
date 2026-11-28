@@ -152,10 +152,18 @@ module JournalRelease
     [canonical,alternate].compact.uniq
   end
 
-  def self.release_build_uploads(app_id:,version:,build:)
-    build_number=apple_version_value(build)
+  TestFlightUpload = Struct.new(:id, :state, :build_id, keyword_init: true)
+
+  def self.testflight_uploads(app_id:, version:, build:)
     release_version_queries(version).flat_map do |query|
-      Spaceship::ConnectAPI::BuildUpload.all(app_id: app_id,version: query,build_number: build_number)
+      pages = Spaceship::ConnectAPI.get_build_uploads(app_id: app_id, includes: 'build',
+        filter: {platform: 'IOS', cfBundleShortVersionString: query, cfBundleVersion: apple_version_value(build)}).all_pages
+      pages.flat_map do |page|
+        page.body.fetch('data').map do |upload|
+          TestFlightUpload.new(id: upload.fetch('id'), state: upload.fetch('attributes').fetch('state'),
+                               build_id: upload.dig('relationships', 'build', 'data', 'id'))
+        end
+      end
     end.uniq(&:id)
   end
 
@@ -176,7 +184,7 @@ module JournalRelease
   def self.automatic_receipt_check!(package,api_key)
     app=asc_app!(api_key)
     version=package.fetch('version'); build=package.fetch('build')
-    uploads=release_build_uploads(app_id: app.id,version: version,build: build)
+    uploads=testflight_uploads(app_id: app.id,version: version,build: build)
     active=uploads.any? { |upload| build_upload_state(upload)!='FAILED' }
     accepted=!release_builds(app_id: app.id,version: version,build: build).empty?
     groups=app.get_beta_groups
@@ -199,24 +207,28 @@ module JournalRelease
 
   def self.testflight_observation(app, package, apple_id)
     scope = {app_id: app.id, version: package.fetch('version'), build: package.fetch('build')}
-    uploads = release_build_uploads(**scope).select { |upload| upload.platform == 'IOS' }
+    uploads = testflight_uploads(**scope)
     builds = release_builds(**scope)
-    ids = (builds.map(&:id) + uploads.reject { |upload| build_upload_state(upload) == 'FAILED' }.map(&:id)).uniq
+    active_uploads = uploads.reject { |upload| build_upload_state(upload) == 'FAILED' }
     if apple_id
-      raise Failure, 'App Store Connect shows a different active build for this version/build' if (ids - [apple_id]).any?
-    elsif ids.length > 1
-      raise Failure, 'Multiple Apple IDs match this version/build; inspect Build Uploads before proceeding'
+      upload = uploads.find { |candidate| candidate.id == apple_id || candidate.build_id == apple_id }
+      build = builds.find { |candidate| candidate.id == (upload&.build_id || apple_id) }
+      if !upload && !build && (active_uploads.any? || builds.any?)
+        raise Failure, 'App Store Connect shows a different active build for this version/build'
+      end
+    else
+      if active_uploads.length > 1 || builds.length > 1
+        raise Failure, 'Multiple builds or uploads match this version/build; inspect Build Uploads before proceeding'
+      end
+      upload = active_uploads.first
+      build = builds.first if !upload || [upload.id, upload.build_id].include?(builds.first&.id)
     end
-    apple_id ||= ids.first
-    upload = uploads.find { |candidate| candidate.id == apple_id }
-    build = builds.find { |candidate| candidate.id == apple_id }
     internal = build&.build_beta_detail&.internal_build_state
     ready = build&.processing_state == 'VALID' && build.expired == false &&
             %w[READY_FOR_BETA_TESTING IN_BETA_TESTING].include?(internal)
     target = logseq_team_group!(app.get_beta_groups) if ready
-    assigned = target && target.fetch_builds.any? { |candidate| candidate.id == apple_id }
+    assigned = target && target.fetch_builds.any? { |candidate| candidate.id == build.id }
     report = {
-      'apple_build_id'=>apple_id,
       'upload_state'=>upload && build_upload_state(upload),
       'processing_state'=>build&.processing_state,
       'internal_build_state'=>internal,
@@ -226,6 +238,8 @@ module JournalRelease
       'target_group_assigned'=>assigned,
       'ready_for_internal_testing'=>ready,
     }
+    report['apple_upload_id'] = upload.id if upload
+    report['apple_build_id'] = build.id if build
     report['status'] = testflight_status(report, expired: build&.expired)
     [report, build, target]
   end
@@ -257,7 +271,7 @@ module JournalRelease
         raise Failure, 'App Store Connect has not verified this receipt for the exact Journal version/build'
       end
       require_visible = false
-      apple_id = report.fetch('apple_build_id')
+      apple_id = report['apple_upload_id'] || report['apple_build_id'] || apple_id
       if report != previous
         persist.call(report.merge('stage'=>'testflight_distribution'))
         puts "TestFlight #{apple_id || '(receipt pending)'}: #{state}"
@@ -300,7 +314,7 @@ module JournalRelease
       result['status']='tool_reported_success'
       result['upload_accepted']=true
       receipt = observed[:output][/\b(?:RequestUUID|Delivery UUID)\s*[:=]\s*([0-9a-f-]{36})\b/i, 1]
-      result['apple_build_id'] = receipt.downcase if apple_uuid?(receipt)
+      result['apple_upload_id'] = receipt.downcase if apple_uuid?(receipt)
     rescue StandardError => error
       result['error_class']=error.class.name
       result['error']=redact(error.message,secrets: api_key.values.map(&:to_s))
@@ -324,10 +338,10 @@ module JournalRelease
           result = transport_publish!(snapshot, package, api_key)
           persist.call(result)
           next result unless result['status'] == 'tool_reported_success'
-          puts "Apple accepted the upload#{result['apple_build_id'] ? " (#{result['apple_build_id']})" : ''}."
+          puts "Apple accepted the upload#{result['apple_upload_id'] ? " (#{result['apple_upload_id']})" : ''}."
           $stdout.flush
           app = asc_app!(api_key)
-          wait_for_testflight!(app, package, result['apple_build_id'], wait_timeout: wait_timeout, persist: persist)
+          wait_for_testflight!(app, package, result['apple_upload_id'], wait_timeout: wait_timeout, persist: persist)
         end
       rescue StandardError => error
         raise Failure, redact(error.message,secrets: api_key.values.map(&:to_s)), cause: nil
@@ -345,7 +359,7 @@ module JournalRelease
       next testflight_observation(app, package, apple_id).first unless state_dir
       Ledger.new(external!(state_dir),package).resume_publish!(apple_id) do |record, persist|
         wait_for_testflight!(app, package, apple_id, wait_timeout: wait_timeout, persist: persist,
-                            require_visible: record['apple_build_id'].nil?)
+                            require_visible: !record.key?('apple_upload_id') && !record.key?('apple_build_id'))
       end
     rescue StandardError => error
       raise Failure, redact(error.message,secrets: api_key.values.map(&:to_s)), cause: nil
