@@ -68,15 +68,14 @@ Dir.mktmpdir('journal-testflight-recovery-') do |directory|
   target.define_singleton_method(:fetch_builds) { assignments.include?(build_id) ? [build] : [] }
   JournalRelease.define_singleton_method(:testflight_uploads) { |**| [upload] }
   JournalRelease.define_singleton_method(:release_builds) { |**| [build] }
+  JournalRelease.define_singleton_method(:asc_app!) { |_| app }
 
   resume = lambda do |id|
-    ledger.resume_publish!(id) do |record, persist|
-      JournalRelease.wait_for_testflight!(app, package, id, wait_timeout: 1,
-                                        persist: persist, require_visible: record['apple_build_id'].nil?)
-    end
+    JournalRelease.inspect_testflight!(version: package.fetch('version'), build: package.fetch('build'),
+                                       apple_id: id, state_dir: directory, wait_timeout: 1)
   end
-  expect_release_failure('differs from the recorded receipt') { resume.call('3ee01318-7ee4-4cef-b27f-7aa077da6fc1') }
-  pending = resume.call(upload_id)
+  expect_release_failure('different active build') { resume.call('3ee01318-7ee4-4cef-b27f-7aa077da6fc1') }
+  pending = resume.call(build_id)
   raise 'Wrong build receipt or availability before compliance cleared' unless
     pending['apple_upload_id'] == upload_id && pending['apple_build_id'] == build_id &&
     pending['status'] == 'compliance_pending' && assignments.empty?

@@ -185,7 +185,7 @@ module JournalRelease
       end
     end
 
-    def resume_publish!(apple_id)
+    def resume_publish!(apple_id, linked_ids: nil)
       with_lock do
         path = attempt_paths.last
         raise Failure, 'No publish attempt in this release state directory for the exact version/build' unless path
@@ -194,7 +194,7 @@ module JournalRelease
           raise Failure, 'The current record is not an automated publish attempt for this version/build'
         end
         known_ids = (record.values_at('apple_upload_id', 'apple_build_id') + [record.dig('distribution', 'build_id')]).compact
-        if known_ids.any? && !known_ids.include?(apple_id)
+        if known_ids.any? && !known_ids.include?(apple_id) && (known_ids & Array(linked_ids&.call)).empty?
           raise Failure, 'The supplied Apple build ID differs from the recorded receipt'
         end
         persist = ->(fields) { checkpoint(path, record, fields.merge('mode'=>'publish')) }

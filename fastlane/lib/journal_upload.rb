@@ -357,7 +357,12 @@ module JournalRelease
     with_release_environment(api_key) do
       app = asc_app!(api_key)
       next testflight_observation(app, package, apple_id).first unless state_dir
-      Ledger.new(external!(state_dir),package).resume_publish!(apple_id) do |record, persist|
+      linked_ids = lambda do
+        report = testflight_observation(app, package, apple_id).first
+        ids = report.values_at('apple_upload_id', 'apple_build_id').compact
+        ids if ids.include?(apple_id)
+      end
+      Ledger.new(external!(state_dir),package).resume_publish!(apple_id, linked_ids: linked_ids) do |record, persist|
         wait_for_testflight!(app, package, apple_id, wait_timeout: wait_timeout, persist: persist,
                             require_visible: !record.key?('apple_upload_id') && !record.key?('apple_build_id'))
       end
