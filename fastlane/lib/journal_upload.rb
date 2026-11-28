@@ -103,13 +103,44 @@ module JournalRelease
     group
   end
 
+  def self.apple_version_value(value)
+    parts=value.to_s.split('.')
+    return value.to_s unless parts.all? { |part| part.match?(/\A\d+\z/) }
+    parts.map { |part| part.to_i.to_s }.join('.')
+  end
+
+  def self.release_version_queries(version)
+    canonical=apple_version_value(version)
+    segments=canonical.split('.')
+    alternate=if segments.length==3 && segments[2]=='0'
+      segments[0..1].join('.')
+    elsif segments.length==2
+      "#{canonical}.0"
+    end
+    [canonical,alternate].compact.uniq
+  end
+
+  def self.release_build_uploads(app_id:,version:,build:)
+    build_number=apple_version_value(build)
+    release_version_queries(version).flat_map do |query|
+      Spaceship::ConnectAPI::BuildUpload.all(app_id: app_id,version: query,build_number: build_number)
+    end.uniq(&:id)
+  end
+
+  def self.release_builds(app_id:,version:,build:,limit: 10)
+    build_number=apple_version_value(build)
+    release_version_queries(version).flat_map do |query|
+      Spaceship::ConnectAPI::Build.all(app_id: app_id,version: query,build_number: build_number,
+        platform: Spaceship::ConnectAPI::Platform::IOS,limit: limit)
+    end.uniq(&:id)
+  end
+
   def self.automatic_receipt_check!(package,api_key)
     app=asc_app!(api_key)
     version=package.fetch('version'); build=package.fetch('build')
-    uploads=Spaceship::ConnectAPI::BuildUpload.all(app_id: app.id,version: version,build_number: build)
+    uploads=release_build_uploads(app_id: app.id,version: version,build: build)
     active=uploads.any? { |upload| upload.state!='FAILED' }
-    accepted=!Spaceship::ConnectAPI::Build.all(app_id: app.id,version: version,build_number: build,
-      platform: Spaceship::ConnectAPI::Platform::IOS,limit: 10).empty?
+    accepted=!release_builds(app_id: app.id,version: version,build: build).empty?
     groups=app.get_beta_groups
     target=logseq_team_group!(groups)
     automatic=groups.any? { |group| group.id!=target.id && group.has_access_to_all_builds!=false }
@@ -121,8 +152,7 @@ module JournalRelease
   def self.verify_logseq_team_assignment!(package,api_key)
     app=asc_app!(api_key)
     target=logseq_team_group!(app.get_beta_groups)
-    build=Spaceship::ConnectAPI::Build.all(app_id: app.id,version: package.fetch('version'),
-      build_number: package.fetch('build'),platform: Spaceship::ConnectAPI::Platform::IOS,limit: 10).first
+    build=release_builds(app_id: app.id,version: package.fetch('version'),build: package.fetch('build')).first
     raise Failure, 'Uploaded build is not visible after processing' unless build
     assigned=target.fetch_builds.any? { |candidate| candidate.id==build.id }
     raise Failure, 'Logseq Team group is not assigned to the processed build' unless assigned
