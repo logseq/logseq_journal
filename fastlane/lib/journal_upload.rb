@@ -158,7 +158,10 @@ module JournalRelease
     accepted=!release_builds(app_id: app.id,version: version,build: build).empty?
     groups=app.get_beta_groups
     target=logseq_team_group!(groups)
-    automatic=groups.any? { |group| group.id!=target.id && group.has_access_to_all_builds!=false }
+    automatic=groups.any? do |group|
+      next false if group.id==target.id
+      group.has_access_to_all_builds==true || (group.is_internal_group==true && group.has_access_to_all_builds.nil?)
+    end
     package.merge('checked_utc'=>Time.now.utc.iso8601,'accepted_build_visible'=>accepted,
       'active_upload'=>active,'non_target_automatic_distribution'=>automatic,
       'target_group_id'=>target.id,'target_group_name'=>target.name)
