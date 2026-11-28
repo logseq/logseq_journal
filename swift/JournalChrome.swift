@@ -904,6 +904,19 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let toggle: () -> Void
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+      func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        var view = touch.view
+        while let current = view {
+          if let scrollView = current as? UIScrollView {
+            // The Timeline List may share its pan. A nested asset strip owns
+            // touches that start inside it, even when its content fits.
+            return scrollView is UICollectionView || scrollView is UITableView
+          }
+          view = current.superview
+        }
+        return true
+      }
+
       func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
         guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
         let velocity = pan.velocity(in: pan.view)
