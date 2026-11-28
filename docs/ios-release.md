@@ -202,7 +202,8 @@ bundle exec fastlane ios testflight_status \
 ```
 
 For a recorded automated publish whose process has stopped, use the same durable
-`RELEASE_STATE` directory:
+`RELEASE_STATE` directory. This also works with older attempts that recorded
+the automated upload or group verification stage.
 
 ```sh
 bundle exec fastlane ios resume_testflight \

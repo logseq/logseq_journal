@@ -190,14 +190,14 @@ module JournalRelease
         path = attempt_paths.last
         raise Failure, 'No publish attempt in this release state directory for the exact version/build' unless path
         record = JSON.parse(File.read(path))
-        unless record['mode'] == 'publish' && @package.all? { |name, value| record[name] == value }
+        unless publish_record?(record) && @package.all? { |name, value| record[name] == value }
           raise Failure, 'The current record is not an automated publish attempt for this version/build'
         end
-        known_ids = record.values_at('apple_upload_id', 'apple_build_id').compact
+        known_ids = (record.values_at('apple_upload_id', 'apple_build_id') + [record.dig('distribution', 'build_id')]).compact
         if known_ids.any? && !known_ids.include?(apple_id)
           raise Failure, 'The supplied Apple build ID differs from the recorded receipt'
         end
-        persist = ->(fields) { checkpoint(path, record, fields) }
+        persist = ->(fields) { checkpoint(path, record, fields.merge('mode'=>'publish')) }
         result = yield(record, persist)
         persist.call(result.merge('resumed_utc'=>Time.now.utc.iso8601))
         record
@@ -206,10 +206,16 @@ module JournalRelease
 
     private
 
+    def publish_record?(record)
+      record['mode'] == 'publish' ||
+        (record['mode'].nil? && %w[pilot_upload_process_distribute verify_logseq_team_assignment].include?(record['stage']))
+    end
+
     def accepted_upload?(record)
       record['upload_accepted'] || record['apple_build_id'] ||
         (record['apple_upload_id'] && record['upload_state'] != 'FAILED') ||
-        %w[tool_reported_success published_to_logseq_team].include?(record['status'])
+        %w[tool_reported_success published_to_logseq_team].include?(record['status']) ||
+        JournalRelease.transport_success?(record.dig('transport', 'exit_code'), record.dig('transport', 'output').to_s)
     end
 
     def with_lock
